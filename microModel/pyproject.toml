@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "microModel"
+dynamic = ["version"]
+description = "self-supervised learning, finetuning, and feature extraction for multi-channel fluorescent images"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "timm>=0.9",
+    "lightly>=1.5",
+    "numpy>=1.23",
+    "tifffile>=2023.1",
+    "pandas>=1.5",
+    "pyyaml>=6.0",
+    "Pillow>=9.0",
+    "scikit-learn>=1.2",
+    "scikit-image>=0.20",
+    "matplotlib>=3.6",
+    "tqdm>=4.64",
+    "umap-learn>=0.5",
+    "albumentationsx>=2.3",
+    "opencv-python>=4.8",
+    "flask>=3.0",
+    "microBase",
+]
+
+[project.scripts]
+micromodel = "microModel.cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/microModel"]
+
+[tool.hatch.version]
+path = "src/microModel/__init__.py"

@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+docs/
+.eggs/
+test_result/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+.DS_Store
+Thumbs.db
+nul
+
+# Non-package files
+.opencode/
+.claude/
+.scratch
+openspec/
+AGENTS.md
+CLAUDE.md
+CONTEXT.md

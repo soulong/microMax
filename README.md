@@ -1,0 +1,228 @@
+# microMax — Microscopy Suite
+
+`microMax` is a four-package Python suite for end-to-end microscopy image
+analysis: preprocessing, cell segmentation, feature profiling, interactive
+viewing/annotation, self-supervised pretraining, classification, and feature
+extraction. It is developed and tested on Windows 10/11 with Python >= 3.10
+(3.12 in CI).
+
+```
+microMax/
+├── microBase/       shared foundation (no internal deps)
+├── microProfiler/   preprocessing + segmentation + profiling pipeline (CLI + Qt GUI)
+├── microVis/        interactive Qt viewer + annotation + export (GUI)
+└── microModel/      SSL pretrain / train / infer (CLI + Flask viewer)
+```
+
+| Package | Version | Console script |
+|---|---|---|
+| microBase | 0.6.0 | — (library) |
+| microProfiler | 1.3.0 | `microprofiler` |
+| microVis | 1.1.0 | `microvis` |
+| microModel | 0.2.0 | `micromodel` |
+
+- `microBase` is the only shared dependency — the three consumers never
+  import each other.
+- The three tools talk to each other through on-disk artifacts: TIFFs,
+  masks, `result.db`, `infer.db`, and per-dataset `session.yml`.
+
+---
+
+## 1. Environment
+
+The suite is installed into a conda environment named `micro`.
+
+```powershell
+conda create -n micro python=3.12
+conda activate micro
+```
+
+If you plan to use a GPU (segmentation, pretraining, training), install a
+CUDA-enabled PyTorch build and make sure your NVIDIA drivers are up to date.
+
+---
+
+## 2. Installation
+
+Install the four packages in dependency order:
+
+```powershell
+python -m pip install -e c:\Users\haohe\GitHub\microMax\microBase
+python -m pip install -e c:\Users\haohe\GitHub\microMax\microProfiler
+python -m pip install -e c:\Users\haohe\GitHub\microMax\microVis
+python -m pip install -e c:\Users\haohe\GitHub\microMax\microModel
+```
+
+### Cellpose with DINOv3 models
+
+`microProfiler` segmentation is built on [Cellpose](https://github.com/MouseLand/cellpose).
+Cellpose is installed automatically as a dependency, but the DINOv3-based
+models (`cpdino`, `cpdino-vitb`) require one extra package straight from
+the upstream repo (Cellpose v4.2+, June 2026):
+
+```powershell
+python -m pip install cellpose --upgrade
+python -m pip install git+https://github.com/facebookresearch/dinov3
+```
+
+Notes:
+
+- Model weights download automatically on first use (from HuggingFace).
+- All Cellpose models are trained on data licensed **CC-BY-NC** — check the
+  license before commercial use.
+- See the Cellpose docs (https://cellpose.readthedocs.io) for GPU setup,
+  fine-tuning, and troubleshooting.
+
+---
+
+## 3. Typical usage
+
+### 3.1 microProfiler — profiling pipeline
+
+**GUI** (recommended for interactive work):
+
+```powershell
+microprofiler
+```
+
+Four-page flow: **Input → Pre-process → Segment → Profile**.
+
+1. **Input** — Browse to a dataset folder, then press **Load Dataset**.
+   The image/mask filename patterns are matched against your file naming.
+2. **Pre-process** (optional) — enable any of: resize, BaSiC illumination
+   correction, Z-projection (needs a `stack` metadata column), tiling
+   (needs a `field` column). Run with **Run Preprocessing**.
+3. **Segment** — configure one or more Cellpose runs (object name, model,
+   channels, diameter, thresholds), then **Run Segmentation**. Masks are
+   written next to the images as `<stem>_cp_masks_<name>.png`.
+4. **Profile** — choose image-level intensity features and per-object
+   features (shape, intensity, radial profiles, granularity, GLCM,
+   correlations), then **Run Profiling**. Results go into
+   `<dataset>/result.db` (tables `image`, plus one table per object type).
+
+**CLI** (same pipeline, headless — useful for batch/plate processing):
+
+```powershell
+microprofiler run --config pipeline_config.yml --dataset-dir D:\data\plate1
+```
+
+### 3.2 microVis — interactive viewer & annotation
+
+```powershell
+microvis            # then select a dataset folder in the UI
+microvis D:\data\plate1
+```
+
+Typical flow:
+
+1. **Select Dataset Directory** (Browse), then **Load Dataset** to scan the
+   images and load their profiling results from `result.db`.
+2. Inspect images: thumbnail grid, well-plate grid, filters on well/field/
+   stack/timepoint and any extra metadata columns, per-channel color and
+   contrast controls, full-resolution zoom, pixel readout.
+3. Pick a mask from the **Select object** dropdown (Object Overlay panel) to
+   see cell outlines and hover over individual objects.
+4. **Annotate**: drag objects onto class boxes to label them. Labels can be
+   written back to `result.db`.
+5. **Export**: exports the selected class's objects as multi-channel cell
+   TIFFs (ImageJ-compatible, one file per cell) plus a `{mask_name}.csv`
+   manifest — ready to feed `microModel` training.
+
+### 3.3 microModel — SSL pretrain / train / infer
+
+All commands are config-driven (`micromodel <subcommand> --config <file>`):
+
+```powershell
+micromodel pretrain --config configs/pretrain_dinov2.yml    # SSL backbone (BYOL or DINOv2)
+micromodel vis-augment --config configs/pretrain_dinov2.yml # preview the augmentation views
+micromodel train --config configs/train.yml                 # classifier (from SSL backbone or scratch)
+micromodel infer --config configs/infer_whole_image.yml     # predictions + features -> infer.db
+micromodel vis-reduction --config configs/infer_whole_image.yml
+micromodel vis-reduction-interactive --config configs/infer_whole_image.yml --port 5000
+```
+
+The end-to-end flow: **pretrain → train → infer**, with the interactive
+PCA/UMAP viewer (`vis-reduction-interactive`, served at
+`http://127.0.0.1:5000`) for clicking through individual cells. Training
+inputs can be the exported cells from microVis, or whole images with their
+segmentation masks.
+
+---
+
+## 4. Important things to know for accurate use
+
+### Filename patterns are regexes — get them right
+
+`image_pattern` / `mask_pattern` are regular expressions that must match
+your microscope's naming convention, with named capture groups such as
+`row`, `col`, `field`, `stack`, `channel`, `timepoint` (Operetta-style
+defaults are pre-filled in the GUI). Structural columns absent from the
+pattern are simply missing — they are never defaulted. Pattern edits require
+**Load Dataset** again to take effect.
+
+### Preprocessing overwrites your source files
+
+Resize, BaSiC correction, Z-projection, and tiling modify TIFFs **in place**.
+The suite remembers which steps already ran (per-dataset `applied_steps`) and
+skips them on re-runs — you cannot accidentally double-apply a step. If an
+in-place step is interrupted, restore the original raw files before
+re-running. Tiling writes only complete tiles: right/bottom remainders (and
+images smaller than the tile size) are intentionally dropped — pick tile
+sizes that divide your image dimensions, or that data is lost.
+
+### session.yml — per-dataset state
+
+Each dataset keeps a `session.yml` (patterns, step parameters, applied steps,
+channel colors). It is read once on the first Browse of a folder; after that,
+your GUI edits are preserved. Action buttons (Load Dataset, Run, Apply,
+Export, …) save current state back to it. The full **Reset** button returns
+the GUI to its initial state.
+
+### No database migrations — delete to redo
+
+`result.db` (profiling) and `infer.db` (predictions/features) have no schema
+versioning. To re-process or to change a table's structure, delete the DB
+file (or the affected table) and re-run. The microProfiler CLI also skips
+datasets it considers complete — delete `result.db` to force reprocessing.
+
+### Segmentation & profiling are safe to re-run
+
+Unlike preprocessing, segmentation and profiling never modify source images.
+Re-running them is intended (e.g. after tuning model parameters or adding a
+new object type); use the per-entry **Overwrite mask** / **Overwrite DB**
+toggles to control whether existing outputs are replaced.
+
+### Metadata is text — always
+
+Everything captured from filenames is treated as plain text end-to-end
+(`"01"` stays `"01"`, no numeric coercion), so metadata is preserved
+verbatim from extraction to the profiling DB, CSV exports, and `infer.db`.
+
+### microModel: config vs. bundle metadata
+
+- The model input size is defined by the augmentation steps in the config —
+  there is no separate input-size parameter.
+- Inference always uses the **normalization and augmentation settings baked
+  into the model bundle** at training time — do not expect config files to
+  override them.
+- Whole-image inference can use one-channel-per-file even when the model was
+  trained on multi-channel cell images.
+- If a dataset was processed and then deleted/recreated, stale rows in
+  `infer.db` can make the interactive viewer fail for individual cells —
+  re-run inference to refresh the DB.
+
+---
+
+## 5. Artifact quick-reference
+
+| Artifact | Location | Produced by |
+|---|---|---|
+| Profiling DB | `<dataset>/result.db` | microProfiler (image + object tables) |
+| Inference DB | `<dataset>/infer.db` or `{output_dir}/infer.db` | microModel |
+| Per-dataset state | `<dataset>/session.yml` | microProfiler / microVis |
+| Cellpose masks | `<stem>_cp_masks_<name>.png` next to images | microProfiler |
+| BaSiC shading models | `<dataset>/.microprofiler/BaSiC_model/` | microProfiler |
+| Exported cells | `<dataset>/objects_exported/<class>/` + `{mask_name}.csv` | microVis |
+| SSL bundles | `runs/ssl_model.pt`, `ssl_model_<epoch>.pt` | microModel pretrain |
+| Train bundles | `runs/model.pt`, `model_<epoch>.pt` | microModel train |
+| Reports & logs | `runs/*.pdf`, `runs/*.txt`, `runs/micromodel.log` | microModel |

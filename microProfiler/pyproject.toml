@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "microProfiler"
+dynamic = ["version"]
+description = "Microscopy image preprocessing, segmentation, and profiling pipeline"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "tqdm",
+    "cellpose",
+    "torch",
+    "jax",
+    "scikit-image",
+    "scipy",
+    "tifffile",
+    "Pillow",
+    "pyyaml",
+    "PySide6",
+    "microBase",
+    "pydantic",
+]
+
+[project.scripts]
+microprofiler = "microProfiler.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/microProfiler"]
+
+[tool.hatch.version]
+path = "src/microProfiler/__init__.py"

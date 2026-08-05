@@ -1,0 +1,306 @@
+"""Cellpose-SAM segmentation for microscopy images.
+
+Supports:
+    1. Single channel  → C1 = image, C2 = 0
+    2. Two channel groups → C1 = merge(chan1), C2 = merge(chan2)
+"""
+
+from __future__ import annotations
+
+import gc
+import sys
+import logging
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+from PIL import Image
+from cellpose import models
+from skimage.morphology import closing
+from skimage.transform import rescale, resize
+from tqdm import tqdm
+
+from microBase import ImageDataset
+from microProfiler.io import read_image, read_image_shape
+from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
+
+logger = logging.getLogger(__name__)
+
+
+def merge_channels(
+    paths: List[Path],
+    method: str = "mean",
+    resize_factor: float = 1.0,
+) -> np.ndarray:
+    """Read and merge a list of images into a single 2D array."""
+    imgs = [read_image(p) for p in paths]
+    stacked = np.stack(imgs, axis=0)
+
+    if stacked.ndim == 4:
+        stacked = np.mean(stacked, axis=3, keepdims=False)
+
+    if method == "mean":
+        merged = np.mean(stacked, axis=0)
+    elif method == "max":
+        merged = np.max(stacked, axis=0)
+    elif method == "min":
+        merged = np.min(stacked, axis=0)
+    else:
+        raise ValueError(f"Unsupported merge method: {method}")
+
+    if resize_factor != 1.0:
+        merged = rescale(
+            merged, resize_factor,
+            anti_aliasing=True, preserve_range=True,
+        ).astype(stacked.dtype)
+
+    return merged
+
+
+def build_cellpose_image(
+    row: pd.Series,
+    chan1: List[str],
+    chan2: Optional[List[str]],
+    merge1: str,
+    merge2: str,
+    resize_factor: float,
+) -> np.ndarray:
+    """Build a (C, H, W) array from metadata for Cellpose-SAM."""
+    img_dir = Path(row["directory"])
+
+    ch1_paths = [
+        img_dir / row[ch] for ch in chan1
+        if ch in row and pd.notna(row[ch])
+    ]
+    if not ch1_paths:
+        raise ValueError(f"Missing images for channel group 1: {chan1}")
+    c1 = merge_channels(ch1_paths, merge1, resize_factor)
+
+    if chan2:
+        ch2_paths = [
+            img_dir / row[ch] for ch in chan2
+            if ch in row and pd.notna(row[ch])
+        ]
+        if not ch2_paths:
+            raise ValueError(f"Missing images for channel group 2: {chan2}")
+        c2 = merge_channels(ch2_paths, merge2, resize_factor)
+        return np.stack([c1, c2], axis=0)
+
+    return c1[np.newaxis, ...]
+
+
+def segment_single(
+    row: pd.Series,
+    chan1: List[str],
+    chan2: Optional[List[str]] = None,
+    merge1: str = "mean",
+    merge2: str = "mean",
+    model_name: str = "cpdino",
+    diameter: Optional[float] = None,
+    normalize: Optional[Dict] = None,
+    flow_threshold: float = 0.4,
+    cellprob_threshold: float = 0.0,
+    resize_factor: float = 1.0,
+    gpu_batch_size: int = 16,
+    model=None,
+) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+    """Segment a single image row using Cellpose-SAM."""
+    device = _get_device()
+    if model is None:
+        model = models.CellposeModel(device=device, pretrained_model=model_name)
+    orig_shape = None
+    if resize_factor != 1.0:
+        from microProfiler.io import read_image_shape
+        img_dir = Path(row["directory"])
+        first_ch_path = img_dir / row[chan1[0]]
+        if first_ch_path.exists():
+            orig_shape = read_image_shape(first_ch_path)
+    img = build_cellpose_image(row, chan1, chan2, merge1, merge2, resize_factor)
+    diameter_val = None if diameter is None or diameter <= 0 else int(diameter * resize_factor)
+    if diameter_val is not None:
+        diameter_val = min(diameter_val, 10000)
+    if normalize is None:
+        normalize = {"percentile": [0.1, 99.9]}
+    masks, flows, _ = model.eval(
+        img,
+        normalize=normalize,
+        diameter=diameter_val,
+        flow_threshold=flow_threshold,
+        cellprob_threshold=cellprob_threshold,
+        batch_size=gpu_batch_size,
+    )
+    if resize_factor != 1.0 and orig_shape is not None:
+        masks = resize(masks, orig_shape, order=0, preserve_range=True).astype(np.uint16)
+        c1_img = resize(img[0], orig_shape, order=1, preserve_range=True).astype(img.dtype)
+        c2_img = resize(img[1], orig_shape, order=1, preserve_range=True).astype(img.dtype) if img.shape[0] >= 2 else None
+    elif resize_factor != 1.0:
+        # preserve_range=True: without it skimage min-max normalizes the
+        # label mask to [0,1] and astype truncates labels to 0.
+        masks = rescale(masks, 1.0 / resize_factor, order=0, preserve_range=True).astype(np.uint16)
+        c1_img = rescale(img[0], 1.0 / resize_factor, order=1, preserve_range=True).astype(img.dtype)
+        c2_img = rescale(img[1], 1.0 / resize_factor, order=1, preserve_range=True).astype(img.dtype) if img.shape[0] >= 2 else None
+    else:
+        c1_img = img[0]
+        c2_img = img[1] if img.shape[0] >= 2 else None
+    masks = closing(masks)
+    return c1_img, c2_img, masks
+
+
+def _get_device() -> torch.device:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    logger.debug("Device selected: %s", device)
+    return device
+
+
+def segment_dataset(
+    ds: ImageDataset,
+    object_name: str = "cell",
+    chan1: Optional[List[str]] = None,
+    chan2: Optional[List[str]] = None,
+    merge1: str = "mean",
+    merge2: str = "mean",
+    model_name: str = "cpdino",
+    diameter: Optional[float] = None,
+    normalize: Optional[Dict] = None,
+    resize_factor: float = 1.0,
+    overwrite_mask: bool = False,
+    flow_threshold: float = 0.4,
+    cellprob_threshold: float = 0.0,
+    gpu_batch_size: int = 16,
+    progress: ProgressCollector = NullProgressCollector(),
+) -> ImageDataset:
+    """Run Cellpose-SAM segmentation on every image in the dataset."""
+    summary: Dict = {
+        "success": False,
+        "processed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "masks_saved": 0,
+        "errors": [],
+    }
+
+    chan1 = chan1 or ds.intensity_colnames[:1]
+    if isinstance(chan1, str):
+        chan1 = [chan1]
+    if isinstance(chan2, str):
+        chan2 = [chan2]
+
+    logger.debug(
+        "segment_dataset: object=%s, model=%s, diameter=%s, chan1=%s, chan2=%s, resize=%s",
+        object_name, model_name, diameter, chan1, chan2, resize_factor,
+    )
+
+    missing = [ch for ch in (chan1 + (chan2 or [])) if ch not in ds.intensity_colnames]
+    if missing:
+        raise ValueError(
+            f"Segmentation channels not found in dataset: {missing}. "
+            f"Available channels: {ds.intensity_colnames}"
+        )
+
+    device = _get_device()
+    normalize = normalize or {"percentile": [0.1, 99.9]}
+
+    progress.report("Segment", 0, 1, "Loading Cellpose model...")
+    logger.info("Loading Cellpose model '%s'...", model_name)
+    model = models.CellposeModel(device=device, pretrained_model=model_name)
+    diameter_val = None if diameter is None or diameter <= 0 else int(diameter * resize_factor)
+    if diameter_val is not None:
+        diameter_val = min(diameter_val, 10000)
+
+    metadata = ds.metadata
+    for idx in tqdm(range(len(metadata)), desc="Cellpose", unit="img", disable=(sys.stdout is None and sys.stderr is None)):
+        progress.report("Segment", idx, len(metadata), f"Image {idx}")
+        row = metadata.iloc[idx]
+        stem_ch = chan1[0]
+        stem_val = row[stem_ch] if stem_ch in row.index else None
+        if stem_val is None or pd.isna(stem_val):
+            summary["skipped"] += 1
+            summary["errors"].append(f"Row {idx}: missing path for channel '{stem_ch}'")
+            continue
+        src_path = Path(row["directory"]) / stem_val
+        if not src_path.exists():
+            summary["skipped"] += 1
+            summary["errors"].append(f"Source not found: {src_path.name}")
+            continue
+
+        save_stem = src_path.parent / f"{src_path.stem}_cp_masks"
+        mask_path = save_stem.with_name(f"{save_stem.name}_{object_name}.png")
+
+        if mask_path.exists() and not overwrite_mask:
+            summary["skipped"] += 1
+            continue
+
+        try:
+            orig_shape = None
+            if resize_factor != 1.0:
+                orig_path = src_path
+                if orig_path.exists():
+                    orig_shape = read_image_shape(orig_path)
+
+            img = build_cellpose_image(row, chan1, chan2, merge1, merge2, resize_factor)
+
+            masks, flows, _ = model.eval(
+                img,
+                batch_size=gpu_batch_size,
+                normalize=normalize,
+                diameter=diameter_val,
+                flow_threshold=flow_threshold,
+                cellprob_threshold=cellprob_threshold,
+            )
+
+            if resize_factor != 1.0 and orig_shape is not None:
+                masks = resize(masks, orig_shape, order=0, preserve_range=True).astype(np.uint16)
+            elif resize_factor != 1.0:
+                # preserve_range=True is required: without it skimage
+                # min-max normalizes the label mask to [0,1] and astype
+                # truncates every label to 0 (empty/corrupt mask).
+                masks = rescale(masks, 1.0 / resize_factor, order=0, preserve_range=True).astype(np.uint16)
+
+            n_objects = len(np.unique(masks)) - 1
+            if n_objects <= 0:
+                summary["processed"] += 1
+                summary["errors"].append(f"No objects in {src_path.name}")
+                # A re-segmentation finding zero objects must not leave a
+                # stale mask behind — profiling would measure phantom objects.
+                if overwrite_mask and mask_path.exists():
+                    mask_path.unlink()
+                    logger.warning("Removed stale mask %s (re-segmentation found no objects)", mask_path)
+                continue
+
+            mask_to_save = closing(masks).astype(np.uint16)
+            mask_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(mask_to_save).save(str(mask_path))
+            summary["processed"] += 1
+            summary["masks_saved"] += 1
+
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            summary["failed"] += 1
+            summary["errors"].append(f"GPU OOM on {src_path.name}")
+        except Exception as e:
+            summary["failed"] += 1
+            summary["errors"].append(f"Error on {src_path.name}: {e}")
+
+        if idx % 200 == 0:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            gc.collect()
+
+    logger.info(
+        "Segmentation complete: %d processed, %d skipped, %d failed, %d masks saved",
+        summary["processed"], summary["skipped"], summary["failed"], summary["masks_saved"],
+    )
+    if summary["errors"]:
+        logger.debug("Segmentation errors: %s", summary["errors"])
+
+    ds.build_metadata()
+    return ds

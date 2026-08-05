@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "microVis"
+dynamic = ["version"]
+description = "Interactive desktop GUI for visualizing microscopy datasets"
+requires-python = ">=3.10"
+dependencies = [
+    "natsort",
+    "numpy",
+    "pandas",
+    "openpyxl",
+    "Pillow",
+    "matplotlib",
+    "pygwalker",
+    "PySide6",
+    "pyyaml",
+    "scikit-image",
+    "scipy",
+    "tifffile",
+    "microBase",
+]
+
+[project.scripts]
+microvis = "microVis.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/microVis"]
+
+[tool.hatch.version]
+path = "src/microVis/__init__.py"

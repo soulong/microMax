@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "microBase"
+dynamic = ["version"]
+description = "Shared base library for microProfiler / microVis / microModel"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "tifffile",
+    "Pillow",
+    "scikit-image",
+    "scipy",
+    "pyyaml",
+    "albumentationsx",
+    "natsort",
+]
+
+[tool.hatch.version]
+path = "src/microBase/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/microBase"]
