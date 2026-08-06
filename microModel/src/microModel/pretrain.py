@@ -16,7 +16,7 @@ from tqdm import tqdm
 from . import __version__
 from .utils import (logger, set_seed, select_device, copy_config_file,
                     add_file_logging, atomic_torch_save, merge_locked_normalize,
-                    resolve_channels, build_cell_datasets)
+                    resolve_channels, resolve_max_value, build_cell_datasets)
 from .dataset import SSLMultiViewDataset, subsample
 from .models import build_ssl_model, get_train_step, get_criterion
 
@@ -27,8 +27,8 @@ def _save_bundle(output_dir, epoch, model, opt, loss_history, config, meta, meth
     momentum nets), meta, config, optimizer state, epoch, loss history.
 
     Every saved .pt is a complete bundle — usable for exact resume, train
-    transfer, and feature extraction. final=True writes ssl_model.pt (final
-    epoch); otherwise ssl_model_{epoch}.pt (save_interval epochs). The epoch
+    transfer, and feature extraction. final=True writes model.pt (final
+    epoch); otherwise model_{epoch}.pt (save_interval epochs). The epoch
     is 1-based, matching the filename (no zero padding).
     """
     bundle = {
@@ -40,7 +40,7 @@ def _save_bundle(output_dir, epoch, model, opt, loss_history, config, meta, meth
         "loss_history": loss_history,
         "method": method,
     }
-    fname = "ssl_model.pt" if final else f"ssl_model_{epoch}.pt"
+    fname = "model.pt" if final else f"model_{epoch}.pt"
     path = os.path.join(output_dir, fname)
     atomic_torch_save(bundle, path)
     logger.info("SSL bundle saved to %s (epoch %d)", path, epoch)
@@ -89,42 +89,12 @@ def _run_umap_check(model, method, loader, device, epoch, seed, save_path):
 
 
 def _load_checkpoint_state(model, ckpt):
-    """Restore model state from a bundle.
-
-    New bundles carry the full model state_dict (exact resume, teacher/
-    momentum included). Old bundles carry only backbone_state_dict — heads
-    are re-initialized with a warning.
-    """
-    if "state_dict" in ckpt:
-        model.load_state_dict(ckpt["state_dict"])
-        return
-    if "backbone_state_dict" in ckpt:
-        _load_backbone_state_legacy(model, ckpt["backbone_state_dict"])
-        logger.warning("Old bundle: only backbone state restored; "
-                       "projection/prediction heads re-initialized")
-        return
-    print("Error: bundle has neither 'state_dict' nor 'backbone_state_dict'",
-          file=sys.stderr)
-    sys.exit(1)
-
-
-def _load_backbone_state_legacy(model, state_dict):
-    """Load a backbone state dict into an SSL model (student/online network).
-
-    BYOL: model.backbone (online network). DINOv2: model.student_backbone.
-    Momentum/teacher networks are re-initialized as a deepcopy of the student.
-    """
-    import copy
-    if hasattr(model, "student_backbone"):
-        model.student_backbone.load_state_dict(state_dict)
-        model.teacher_backbone.load_state_dict(copy.deepcopy(state_dict))
-    elif hasattr(model, "backbone"):
-        model.backbone.load_state_dict(state_dict)
-        if hasattr(model, "backbone_momentum"):
-            model.backbone_momentum.load_state_dict(copy.deepcopy(state_dict))
-    else:
-        print("Error: cannot load backbone state into SSL model", file=sys.stderr)
+    """Restore model state from a bundle (full model state_dict)."""
+    if "state_dict" not in ckpt:
+        print("Error: bundle has no 'state_dict' key (unsupported pre-0.2.1 "
+              "bundle format)", file=sys.stderr)
         sys.exit(1)
+    model.load_state_dict(ckpt["state_dict"])
 
 
 def _try_resume(config, device, method):
@@ -226,6 +196,13 @@ def pretrain_ssl(config, config_path=None):
         print(f"Error: unknown SSL method '{method}'. Available: byol, dinov2", file=sys.stderr)
         sys.exit(1)
 
+    mode = config.get("mode", "single_cell")
+    if mode not in ("single_cell",):
+        print(f"Error: pretrain mode '{mode}' is not supported. Available: "
+              f"single_cell (whole_image is planned but not yet implemented)",
+              file=sys.stderr)
+        sys.exit(1)
+
     device = select_device()
     if device.type == "cuda":
         # fp16 matmul reduced-precision reduction produced rare NaN on some
@@ -264,6 +241,8 @@ def pretrain_ssl(config, config_path=None):
     with_masking = norm_cfg.get("with_masking", False)
     clip_low = norm_cfg.get("clip_low", 0.05)
     clip_high = norm_cfg.get("clip_high", 99.95)
+    fixed_reference = norm_cfg.get("fixed_reference", False)
+    max_value = resolve_max_value(data_cfg)
 
     seed = 42
     output_dir = config.get("output_dir", "runs")
@@ -330,7 +309,8 @@ def pretrain_ssl(config, config_path=None):
             cell_ds, indices, resolved_channels,
             augmentation_specs=aug_views_cfg,
             normalize_method=normalize_method, clip_low=clip_low, clip_high=clip_high,
-            with_masking=with_masking)
+            with_masking=with_masking, fixed_reference=fixed_reference,
+            max_value=max_value)
         datasets.append(ds)
     if len(datasets) == 1:
         full_dataset = datasets[0]
@@ -390,10 +370,12 @@ def pretrain_ssl(config, config_path=None):
         "in_chans": backbone_cfg["in_chans"],
         "channels": resolved_channels,
         "channel_layout": channel_layout,
+        "max_value": max_value,
         "feat_dim": feat_dim,
         "augmentation_infer": augmentation_infer,
         "normalize_method": normalize_method,
         "normalize_with_masking": with_masking,
+        "normalize_fixed_reference": fixed_reference,
         "clip_low": clip_low,
         "clip_high": clip_high,
         "image_pattern": image_pattern,
@@ -514,14 +496,28 @@ def pretrain_ssl(config, config_path=None):
                     cell_ds, indices, resolved_channels,
                     augmentation_specs=[augmentation_infer],
                     normalize_method=normalize_method, clip_low=clip_low,
-                    clip_high=clip_high, with_masking=with_masking)
+                    clip_high=clip_high, with_masking=with_masking,
+                    fixed_reference=fixed_reference, max_value=max_value)
                 for cell_ds, indices in by_cell.values()
             ]
             umap_check_loader = DataLoader(
                 check_datasets[0] if len(check_datasets) == 1 else ConcatDataset(check_datasets),
                 batch_size=32, shuffle=False, num_workers=0)
-            logger.info("UMAP check enabled: %d fixed images, fresh UMAP at each "
-                        "save_interval + final epoch", n_pick)
+            logger.info("UMAP check enabled: %d fixed images, fresh UMAP at "
+                        "epoch 0 baseline + each save_interval + final epoch",
+                        n_pick)
+
+    # ---- Pre-training baseline UMAP check (epoch 0) ----
+    # Features BEFORE any training (fresh pretrained init, or transfer
+    # weights). Skipped when actually resuming with resume.type=continue —
+    # the run is an exact extension of a previous one, so the baseline
+    # belongs to that run.
+    if umap_check_loader is not None and (checkpoint is None or resume_type != "continue"):
+        try:
+            _run_umap_check(model, method, umap_check_loader, device, 0, seed,
+                            os.path.join(output_dir, "umap_check_epoch_0.pdf"))
+        except Exception as e:
+            logger.error("UMAP check failed at epoch 0: %s", e)
 
     # ---- Training loop ----
     for epoch in range(start_epoch, epochs):
@@ -604,7 +600,7 @@ def pretrain_ssl(config, config_path=None):
                             os.path.join(output_dir, f"umap_check_epoch_{last_epoch}.pdf"))
         except Exception as e:
             logger.error("UMAP check failed at final epoch %d: %s", last_epoch, e)
-    bundle_path = os.path.join(output_dir, "ssl_model.pt")
+    bundle_path = os.path.join(output_dir, "model.pt")
 
     if loss_history:
         from .vis import plot_pretrain_loss

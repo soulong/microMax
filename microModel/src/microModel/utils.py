@@ -127,6 +127,32 @@ def shorten_labels(paths):
     return labels
 
 
+def resolve_max_value(data_cfg):
+    """Resolve and validate data.max_value (required, > 0).
+
+    The max possible intensity of the input dtype (65535 for 16-bit, 255 for
+    8-bit). Images are divided by it on load so all view pipelines and the
+    fixed-reference stats share one [0, 1] domain. Shared by pretrain, train,
+    and infer — a missing or invalid value hard-exits.
+    """
+    max_value = data_cfg.get("max_value")
+    if max_value is None:
+        print("Error: data.max_value is required (e.g. 65535 for 16-bit, "
+              "255 for 8-bit); images are converted to float [0, 1] by it on load",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        max_value = float(max_value)
+    except (TypeError, ValueError):
+        print(f"Error: data.max_value must be a number, got {max_value!r}",
+              file=sys.stderr)
+        sys.exit(1)
+    if max_value <= 0:
+        print(f"Error: data.max_value must be > 0, got {max_value}", file=sys.stderr)
+        sys.exit(1)
+    return max_value
+
+
 def resolve_output_paths(data_roots, output_dir):
     """Pair each data root with an output dir. If output_dir is None, use the data root itself."""
     roots = [data_roots] if isinstance(data_roots, str) else list(data_roots)
@@ -140,7 +166,7 @@ def merge_locked_normalize(saved_cfg, config):
 
     Shared by pretrain and train resume (identical behavior in both).
     """
-    for key in ("method", "with_masking", "clip_low", "clip_high"):
+    for key in ("method", "with_masking", "clip_low", "clip_high", "fixed_reference"):
         sv = saved_cfg.get("normalize", {}).get(key)
         if sv is not None:
             cv = config.get("normalize", {}).get(key)

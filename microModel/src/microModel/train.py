@@ -1,6 +1,6 @@
 """Classification training from SSL backbone or scratch.
 
-Loads an SSL bundle (ssl_model.pt) or a timm pretrained backbone, adds a
+Loads an SSL bundle (model.pt) or a timm pretrained backbone, adds a
 ClassificationHead, and trains with FocalLoss. Saves a train bundle
 (model.pt) compatible with infer.py's classify mode.
 
@@ -22,7 +22,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from . import __version__
 from .utils import (logger, set_seed, select_device, load_label_csv, copy_config_file,
                     add_file_logging, atomic_torch_save, merge_locked_normalize,
-                    resolve_channels, build_cell_datasets)
+                    resolve_channels, resolve_max_value, build_cell_datasets)
 from .dataset import SingleCellDataset, stratified_split, subsample
 from .backbone import (
     build_backbone, build_dinov2_vit, cls_token_pool_fn,
@@ -190,8 +190,7 @@ def _build_model_from_ssl(ssl_bundle, model_cfg, num_classes, device):
         backbone, feat_dim, pool_fn = build_backbone(
             meta["backbone"], in_chans, pretrained=False)
 
-    # Load SSL backbone weights (new bundles carry full state_dict; old ones
-    # backbone_state_dict)
+    # Load SSL backbone weights from the bundle's full state_dict
     load_backbone_weights(backbone, ssl_bundle, method)
     logger.info("Loaded SSL backbone weights (method=%s)", method)
 
@@ -202,9 +201,19 @@ def _build_model_from_ssl(ssl_bundle, model_cfg, num_classes, device):
 
 def train(config, config_path=None):
     """Classification training from SSL backbone or scratch."""
+    method = config.get("method", "classification")
+    if method not in ("classification",):
+        print(f"Error: train method '{method}' is not supported. Available: "
+              f"classification (segmentation is planned but not yet implemented)",
+              file=sys.stderr)
+        sys.exit(1)
+
     mode = config.get("mode", "single_cell")
-    if mode != "single_cell":
-        raise ValueError(f"Train only supports 'single_cell' mode, got '{mode}'")
+    if mode not in ("single_cell",):
+        print(f"Error: train mode '{mode}' is not supported. Available: "
+              f"single_cell (whole_image is planned but not yet implemented)",
+              file=sys.stderr)
+        sys.exit(1)
 
     resume_cfg = config.get("resume", {})
     if resume_cfg.get("sl_model") and resume_cfg.get("ssl_model"):
@@ -226,6 +235,8 @@ def train(config, config_path=None):
     with_masking = norm_cfg.get("with_masking", False)
     clip_low = norm_cfg.get("clip_low", 0.05)
     clip_high = norm_cfg.get("clip_high", 99.95)
+    fixed_reference = norm_cfg.get("fixed_reference", False)
+    max_value = resolve_max_value(data_cfg)
     label_from_dir = data_cfg.get("label_from_dir", True)
     label_csv = data_cfg.get("label_csv")
     label_column = "directory"
@@ -310,6 +321,8 @@ def train(config, config_path=None):
         normalize_method=normalize_method,
         clip_low=clip_low, clip_high=clip_high,
         with_masking=with_masking,
+        fixed_reference=fixed_reference,
+        max_value=max_value,
         label_column=label_column)
     val_ds = SingleCellDataset(
         [(r["cell_dataset"], r["idx"]) for r in val_records],
@@ -319,6 +332,8 @@ def train(config, config_path=None):
         normalize_method=normalize_method,
         clip_low=clip_low, clip_high=clip_high,
         with_masking=with_masking,
+        fixed_reference=fixed_reference,
+        max_value=max_value,
         label_column=label_column)
 
     # ---- Build model ----
@@ -366,6 +381,7 @@ def train(config, config_path=None):
         "class_names": [lab for lab in sorted(label_to_idx, key=label_to_idx.get)],
         "channels": resolved_channels,
         "channel_layout": channel_layout,
+        "max_value": max_value,
         "in_chans": trained_in_chans,
         "backbone": trained_backbone,
         "num_classes": num_classes,
@@ -373,6 +389,7 @@ def train(config, config_path=None):
         "augmentation_infer": aug_infer_cfg,
         "normalize_method": normalize_method,
         "normalize_with_masking": with_masking,
+        "normalize_fixed_reference": fixed_reference,
         "clip_low": clip_low,
         "clip_high": clip_high,
         "image_pattern": image_pattern,

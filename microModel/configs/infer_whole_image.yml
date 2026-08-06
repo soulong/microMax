@@ -3,15 +3,15 @@
 # Scans whole-slide images + segmentation masks, crops individual cells,
 # and runs the model on each crop. Results are written to a SQLite DB.
 #
-# The bundle (model.path) determines classify vs features-only mode:
+# The bundle (model) determines classify vs features-only mode:
 #   - Train bundle (model.pt): pred_class/pred_prob + features
-#   - SSL bundle (ssl_model.pt): features only
+#   - SSL bundle (model.pt, no num_classes in meta): features only
 # augmentation_infer + normalize come from the bundle meta (not configurable).
 # All data.* keys are REQUIRED (null is allowed; missing is not).
 
 mode: whole_image
 
-model: runs_dino/ssl_model.pt         # train bundle (model.pt) or SSL bundle (ssl_model.pt)
+model: runs_dino/ssl_model.pt         # train bundle (model.pt) or SSL bundle (model.pt)
 
 output_dir: runs_dino/infer           # shared DB dir for all roots; null = per-dataset
 
@@ -26,12 +26,13 @@ data:
   mask_pattern: r(?P<row>\d+)c(?P<col>\d+)f0?(?P<field>\d+)p0?(?P<stack>\d+)-ch0?(?P<channel>\d+)(?:sk|t)0?(?P<timepoint>\d+).*_cp_masks_(?P<mask_name>.+)\.png
   image_subdir_pattern: images        # subdirectory under root; null = scan root directly
   mask_name: cell                     # value of mask_name regex group; null = first available
+  max_value: 65535                    # max possible intensity of the input dtype (65535 for 16-bit, 255 for 8-bit); images are divided by it on load
   channels: [1]                       # 1-based indices; null = all
   channel_layout: null                # CHW | HWC | null (one-channel-per-file)
   label_from_dir: true                # label from parent dir name
   label_csv: null                     # CSV [path, label]; null = not used
   sample_max: null                    # null = no limit
-  sample_by: per_class                # per_class | per_dataset
+  sample_by: per_dataset              # per_class | per_dataset
 
 dataloader:
   num_workers: 4
@@ -48,7 +49,7 @@ inference:
 # Reducers are fit once on merged features from all DBs, then applied per-DB.
 reduction:
   color_by: [pred_class, pred_prob]   # first = stratification column; valid: pred_class, pred_prob, directory, ground_truth
-  pca_components: 50                  # also used as UMAP preprocessing dim
+  var_threshold: 0.95                 # auto PCA dims covering this fraction of variance (min 2); also used as UMAP preprocessing dim
   sample_per_class: 2000              # max points per class to fit reducers; 0 = all
   reducer_pca: null                   # path to pre-fitted PCA .pkl; null = fit new
   reducer_umap: null                  # path to pre-fitted UMAP .pkl; null = fit new

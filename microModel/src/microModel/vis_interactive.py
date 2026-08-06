@@ -35,7 +35,8 @@ from microBase import (
     get_labels,
 )
 
-from .utils import logger, resolve_output_paths, stratified_sample_indices
+from .utils import logger, resolve_output_paths, resolve_max_value, stratified_sample_indices
+from .dataset import _to_float_max
 
 
 def main(config, port=5000):
@@ -57,10 +58,14 @@ class VisInteractiveServer:
         self.data_roots = self.data_cfg["root"]
 
         # Load model bundle to get augmentation_infer + normalize defaults.
-        # Both SSL pretrain bundles (backbone_state_dict) and train bundles
-        # (state_dict) carry the same meta fields needed here.
-        model_path = config.get("model", {}).get("path")
-        if not model_path or not os.path.exists(model_path):
+        # SSL pretrain bundles and train bundles carry the same meta fields
+        # needed here.
+        model_path = config.get("model")
+        if not isinstance(model_path, str) or not model_path:
+            print("Error: config 'model' must be a string path to a model bundle "
+                  "(train model.pt or SSL model.pt)", file=sys.stderr)
+            sys.exit(1)
+        if not os.path.exists(model_path):
             print(f"Error: model bundle not found: {model_path}", file=sys.stderr)
             sys.exit(1)
         logger.info("Loading model bundle from %s", model_path)
@@ -68,8 +73,15 @@ class VisInteractiveServer:
         self.meta = bundle["meta"]
 
         # Build augmentation_infer pipeline from bundle meta
-        aug_infer_spec = self.meta.get("augmentation_infer", [])
+        if "augmentation_infer" not in self.meta:
+            print("Error: bundle meta missing 'augmentation_infer' (unsupported "
+                  "pre-0.2.1 bundle format)", file=sys.stderr)
+            sys.exit(1)
+        aug_infer_spec = self.meta["augmentation_infer"]
         self.aug_infer_pipeline = build_pipeline(aug_infer_spec) if aug_infer_spec else None
+
+        # Images are converted to float [0, 1] by data.max_value on load
+        self.max_value = resolve_max_value(self.data_cfg)
 
         # Display defaults: percentile-based norm (per_channel or per_image).
         # Mask default comes from the bundle's training-time setting.
@@ -418,9 +430,11 @@ class VisInteractiveServer:
                 requested_channels = requested_channels[:actual_n]
 
             mask = (img_hwc != 0).any(axis=2).astype(np.uint8) if do_mask else None
-            # size="model": apply bundle's augmentation_infer (ToFloat + Pad + Resize)
-            # size="original": only ToFloat (no resize, no pad) — for visual inspection
+            # size="model": convert to float [0, 1] by data.max_value, then
+            # apply bundle's augmentation_infer (no ToFloat in new specs)
+            # size="original": only the float conversion (no resize, no pad)
             if disp_size == "model" and self.aug_infer_pipeline is not None:
+                img_hwc = _to_float_max(img_hwc, self.max_value)
                 img_hwc, mask = apply(self.aug_infer_pipeline, img_hwc, mask)
             else:
                 if img_hwc.dtype == np.uint16:
@@ -531,8 +545,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
   <label><input type="checkbox" id="cb-mask" checked> Mask</label>
   <span>Size:</span>
   <div class="norm-group">
-    <label><input type="radio" name="display-size" value="original" checked> original</label>
-    <label><input type="radio" name="display-size" value="model"> model</label>
+    <label><input type="radio" name="display-size" value="original"> original</label>
+    <label><input type="radio" name="display-size" value="model" checked> model</label>
   </div>
   <label>Color_by:
     <select id="color-by-select"></select>
@@ -785,6 +799,7 @@ function handleClick(eventData) {
   if (!eventData.points || eventData.points.length === 0) return;
   var pt = eventData.points[0];
   var idx = pt.customdata ? pt.customdata[2] : pt.pointNumber;
+  if (typeof idx !== 'number' || idx < 0 || idx >= scatterData.length) return;
   var pointData = scatterData[idx];
   if (pinnedPoints.has(idx)) {
     pinnedPoints.delete(idx);

@@ -1,6 +1,6 @@
 # Classification train config — single-cell mode only.
 #
-# Loads an SSL pretrain bundle (ssl_model.pt) OR a timm pretrained backbone,
+# Loads an SSL pretrain bundle (model.pt) OR a timm pretrained backbone,
 # adds a ClassificationHead, and trains with FocalLoss. Saves train bundles
 # compatible with `micromodel infer` (classify mode):
 #   - model.pt (final; eval/best weights, always written)
@@ -9,34 +9,37 @@
 
 mode: single_cell
 
-output_dir: runs_dino/runs_finetune_p53
+method: classification               # classification | segmentation | ...
+
+output_dir: 20260806_train_p53_puncta
 
 data:
   root:
-    - 2026-07-10_63x__2026-07-10T09_27_38-Measurement 1/objects_exported_p53
-    - 2026-07-11_63x__2026-07-11T18_11_55-Measurement 1/objects_exported_p53
-    - 2026-07-14_63x_22_Reza__2026-07-14T18_33_00-Measurement 1/objects_exported_p53
-    - 2026-07-18_22-cmpd__2026-07-18T00_00_00-Measurement 1/objects_exported_p53
-    - 2026-07-18_37-ctrl__2026-07-18T00_00_00-Measurement 1/objects_exported_p53
+    - sc_dataset/p53/2026-07-10_63x
+    - sc_dataset/p53/2026-07-11_63x
+    - sc_dataset/p53/2026-07-14_63x
+    - sc_dataset/p53/2026-07-18_22_63x
+    - sc_dataset/p53/2026-07-18_37_63x
+    # - sc_dataset/opencell/single_cell
   image_pattern: null                 # regex for metadata extraction; null = none
+  max_value: 65535                    # max possible intensity of the input dtype (65535 for 16-bit, 255 for 8-bit); images are divided by it on load
   channels: [1]                       # 1-based indices; null = all
   channel_layout: null                # CHW | HWC | null (one-channel-per-file)
   label_from_dir: true                # label from parent dir name
   label_csv: null                     # CSV [path, label]; null = not used
   sample_max: null                    # null = no limit
-  sample_by: per_class                # per_class | per_dataset
+  sample_by: per_dataset              # per_class | per_dataset
 
 # resume.sl_model and resume.ssl_model are mutually exclusive.
 resume:
   sl_model: null                      # train bundle (model.pt or any model_{epoch}.pt); mutually exclusive with ssl_model
-  ssl_model: runs_dino/ssl_model.pt   # SSL bundle for backbone transfer; null = from scratch
+  ssl_model: 20260805_pretrain_dino/model.pt   # SSL bundle for backbone transfer; null = from scratch
 
 # Augmentation pipeline — list of {AlbumentationsClassName: {kwargs}} dicts.
 # train = random transforms; infer = deterministic resize (validation).
 # Both must end at the same size (LongestMaxSize + PadIfNeeded + Resize).
 # Locked to bundle values when resume.sl_model is set.
 augmentation_train:
-  - ToFloat: {max_value: 65535, p: 1.0}
   - HorizontalFlip: {p: 0.5}
   - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.5}
   - RandomScale: {scale_range: [-0.1, 0.2], p: 0.7}
@@ -47,13 +50,13 @@ augmentation_train:
   - LongestMaxSize: {max_size: 224, p: 1.0}
   - PadIfNeeded: {min_height: 224, min_width: 224, p: 1.0}
 augmentation_infer:
-  - ToFloat: {max_value: 65535, p: 1.0}
   - LongestMaxSize: {max_size: 224, p: 1.0}
   - PadIfNeeded: {min_height: 224, min_width: 224, p: 1.0}
 
 normalize:
   method: global                      # global | per_channel | null
   with_masking: false                 # true = stats from cell foreground only
+  fixed_reference: true               # stats on RAW cell, fixed transform per view; preserves brightness/contrast aug
   clip_low: 0.05
   clip_high: 99.95
 

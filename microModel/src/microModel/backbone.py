@@ -167,17 +167,14 @@ def load_model_from_bundle(bundle, device=None):
 def load_backbone_weights(backbone, bundle, method):
     """Load a bare backbone's weights from an SSL bundle.
 
-    New bundles carry the full model state_dict (the backbone is extracted
-    by prefix); old ones carry backbone_state_dict directly.
+    The bundle carries the full model state_dict; the backbone is extracted
+    by prefix (student_backbone.vit.* for DINOv2, backbone.* for BYOL/conv).
     """
-    if "backbone_state_dict" in bundle:
-        backbone.load_state_dict(bundle["backbone_state_dict"])
-    elif "state_dict" in bundle:
-        backbone.load_state_dict(extract_backbone_state_dict(bundle["state_dict"], method))
-    else:
-        print("Error: SSL bundle has neither 'state_dict' nor 'backbone_state_dict'",
-              file=sys.stderr)
+    if "state_dict" not in bundle:
+        print("Error: SSL bundle has no 'state_dict' key (unsupported "
+              "pre-0.2.1 bundle format)", file=sys.stderr)
         sys.exit(1)
+    backbone.load_state_dict(extract_backbone_state_dict(bundle["state_dict"], method))
 
 
 def load_ssl_backbone_from_bundle(bundle, device=None):

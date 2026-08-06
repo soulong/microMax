@@ -1,8 +1,18 @@
 """Datasets backed by microBase.CellDataset / microBase.ImageDataset.
 
-Pipeline: load (raw HWC) -> extract mask (pixel != 0) -> augment (ToFloat +
-geometric + resize; mask co-transformed) -> normalize (z-score with mask) ->
-CHW tensor.
+Pipeline: load (raw HWC) -> convert to float [0, 1] by data.max_value ->
+extract mask (pixel != 0) -> augment (geometric + resize; mask co-transformed)
+-> normalize (z-score with mask) -> CHW tensor.
+
+Integer images (8/12/16-bit) are divided by max_value on load, so every
+view pipeline and the fixed-reference stats share one [0, 1] domain (no
+ToFloat steps in augmentation specs).
+
+Normalization has two modes: per-view self-normalization (default) and
+fixed-reference (normalize.fixed_reference: true), where clip bounds +
+z-score stats are computed once on the RAW image and applied as a fixed
+transform to every (augmented) view — preserving linear photometric
+augmentation that self-normalization would cancel (affine-equivariance).
 
 For SSL pretraining, SSLMultiViewDataset generates N augmented views per image
 by building N separate augmentation pipelines (one per view spec).
@@ -26,20 +36,112 @@ from microBase import (
 from microBase.cells import get_labels
 
 
+def _to_float_max(img_hwc, max_value):
+    """Convert an integer image to float32 in [0, 1] by dividing by max_value.
+
+    max_value=None leaves the image untouched (raw units). The domain of the
+    fixed-reference stats and every augmented view is the pipeline's leading
+    transform — with ToFloat removed from all specs, the conversion here IS
+    the domain definition, so stats and views always match.
+    """
+    if max_value is None:
+        return img_hwc
+    return img_hwc.astype(np.float32) / float(max_value)
+
+
 # ----------------------------------------------------------------------------
 # Shared pipeline helper — used by all datasets.
 # ----------------------------------------------------------------------------
 
+def _compute_ref_stats(img_hwc, channels, with_masking, clip_low, clip_high,
+                       method):
+    """Compute FIXED clip + z-score statistics on the RAW image (pre-augment).
+
+    Per-view self-normalization is affine-equivariant: any linear brightness/
+    contrast augmentation is mathematically canceled by recomputing percentiles
+    + mean/std on the augmented image. Computing the stats once on the raw cell
+    and applying them as a fixed transform preserves photometric augmentation.
+
+    Returns a list of per-channel dicts {lo, hi, mean, std} mirroring
+    microBase.normalize semantics: per-channel stats for method='per_channel',
+    pooled stats (same values in every channel dict) for method='global'.
+    Degenerate channels (empty region, hi <= lo, std ~ 0) collapse to zeros,
+    matching normalize's behavior.
+    """
+    if channels is not None:
+        ch_idx = [c - 1 for c in channels]
+        img_hwc = img_hwc[:, :, ch_idx]
+    mask_b = (img_hwc != 0).any(axis=2).astype(bool) if with_masking else None
+
+    n_ch = img_hwc.shape[2]
+    ch_stats = []
+    for c in range(n_ch):
+        ch = img_hwc[:, :, c]
+        region = ch[mask_b] if mask_b is not None else ch.reshape(-1)
+        if region.size == 0:
+            ch_stats.append({"lo": 0.0, "hi": 0.0, "mean": 0.0, "std": 0.0})
+            continue
+        lo = float(np.percentile(region, clip_low)) if clip_low > 0 else float(region.min())
+        hi = float(np.percentile(region, clip_high)) if clip_high < 100 else float(region.max())
+        if hi <= lo:
+            ch_stats.append({"lo": 0.0, "hi": 0.0, "mean": 0.0, "std": 0.0})
+            continue
+        clipped = np.clip(ch, lo, hi)
+        cregion = clipped[mask_b] if mask_b is not None else clipped.reshape(-1)
+        ch_stats.append({"lo": lo, "hi": hi,
+                         "mean": float(cregion.mean()), "std": float(cregion.std())})
+
+    if method == "global":
+        pooled = img_hwc[mask_b] if mask_b is not None else img_hwc.reshape(-1, n_ch)
+        if pooled.size > 0:
+            plo = float(np.percentile(pooled, clip_low)) if clip_low > 0 else float(pooled.min())
+            phi = float(np.percentile(pooled, clip_high)) if clip_high < 100 else float(pooled.max())
+            if phi > plo:
+                pclipped = np.clip(pooled, plo, phi)
+                pmean, pstd = float(pclipped.mean()), float(pclipped.std())
+                if pstd > 1e-6:
+                    for s in ch_stats:
+                        s["lo"], s["hi"], s["mean"], s["std"] = plo, phi, pmean, pstd
+    return ch_stats
+
+
+def _normalize_fixed(img_hwc, mask, ref_stats):
+    """Apply a fixed clip + z-score transform (stats from _compute_ref_stats).
+
+    Identical background-zeroing semantics to microBase.normalize.
+    """
+    out = np.empty_like(img_hwc, dtype=np.float32)
+    for c, s in enumerate(ref_stats):
+        if s["hi"] > s["lo"] and s["std"] > 1e-6:
+            clipped = np.clip(img_hwc[:, :, c].astype(np.float32), s["lo"], s["hi"])
+            out[:, :, c] = (clipped - s["mean"]) / s["std"]
+        else:
+            out[:, :, c] = 0.0
+    if mask is not None:
+        m = mask.astype(bool) if mask.dtype != bool else mask
+        out[~m] = 0.0
+    return out
+
+
 def _cell_to_tensor(img_hwc, channels, aug_pipeline,
-                    normalize_method, clip_low, clip_high, with_masking):
-    """Common single-cell pipeline: channel subset -> mask -> augment -> normalize -> CHW tensor."""
+                    normalize_method, clip_low, clip_high, with_masking,
+                    ref_stats=None):
+    """Common single-cell pipeline: channel subset -> mask -> augment -> normalize -> CHW tensor.
+
+    ref_stats=None uses per-view self-normalization (microBase.normalize);
+    a ref_stats list (from _compute_ref_stats on the raw image) applies the
+    fixed transform instead (normalize.fixed_reference: true).
+    """
     if channels is not None:
         ch_idx = [c - 1 for c in channels]
         img_hwc = img_hwc[:, :, ch_idx]
     mask = (img_hwc != 0).any(axis=2).astype(np.uint8) if with_masking else None
     img_hwc, mask = apply(aug_pipeline, img_hwc, mask)
-    img_hwc = normalize(img_hwc, mask=mask, method=normalize_method,
-                        clip_low=clip_low, clip_high=clip_high)
+    if ref_stats is not None:
+        img_hwc = _normalize_fixed(img_hwc, mask, ref_stats)
+    else:
+        img_hwc = normalize(img_hwc, mask=mask, method=normalize_method,
+                            clip_low=clip_low, clip_high=clip_high)
     return torch.from_numpy(np.transpose(img_hwc, (2, 0, 1)).astype(np.float32))
 
 
@@ -155,7 +257,8 @@ class SSLMultiViewDataset(Dataset):
 
     def __init__(self, cell_dataset, indices, channels,
                  augmentation_specs,              # list of N view specs
-                 normalize_method, clip_low, clip_high, with_masking):
+                 normalize_method, clip_low, clip_high, with_masking,
+                 fixed_reference=False, max_value=None):
         self.cell_dataset = cell_dataset
         self.indices = list(indices)
         self.channels = list(channels) if channels is not None else None
@@ -163,6 +266,8 @@ class SSLMultiViewDataset(Dataset):
         self.clip_low = clip_low
         self.clip_high = clip_high
         self.with_masking = with_masking
+        self.fixed_reference = fixed_reference
+        self.max_value = max_value
         self.aug_pipelines = [build_pipeline(spec) for spec in augmentation_specs]
 
     def __len__(self):
@@ -170,10 +275,17 @@ class SSLMultiViewDataset(Dataset):
 
     def __getitem__(self, idx):
         cell_idx = self.indices[idx]
-        img_hwc = self.cell_dataset.get_cell(cell_idx)
+        img_hwc = _to_float_max(self.cell_dataset.get_cell(cell_idx), self.max_value)
+        # Fixed-reference mode: stats computed ONCE on the raw cell, then
+        # applied as a fixed transform to every view (photometric aug survives).
+        ref_stats = None
+        if self.fixed_reference:
+            ref_stats = _compute_ref_stats(
+                img_hwc, self.channels, self.with_masking,
+                self.clip_low, self.clip_high, self.normalize_method)
         views = [_cell_to_tensor(img_hwc, self.channels, pipe,
                                   self.normalize_method, self.clip_low,
-                                  self.clip_high, self.with_masking)
+                                  self.clip_high, self.with_masking, ref_stats)
                  for pipe in self.aug_pipelines]
         return views
 
@@ -192,6 +304,8 @@ class SingleCellDataset(Dataset):
                  normalize_method="per_channel",
                  clip_low=0.05, clip_high=99.95,
                  with_masking=False,
+                 fixed_reference=False,
+                 max_value=None,
                  label_column="directory"):
         self.pairs = list(pairs)
         self.label_to_idx = label_to_idx
@@ -200,6 +314,8 @@ class SingleCellDataset(Dataset):
         self.normalize_method = normalize_method
         self.clip_low = clip_low
         self.clip_high = clip_high
+        self.fixed_reference = fixed_reference
+        self.max_value = max_value
         self.label_column = label_column
         self.aug_pipeline = build_pipeline(augmentation_spec) if augmentation_spec else None
 
@@ -208,10 +324,16 @@ class SingleCellDataset(Dataset):
 
     def __getitem__(self, idx):
         cell_ds, cell_idx = self.pairs[idx]
-        img_hwc = cell_ds.get_cell(cell_idx)
+        img_hwc = _to_float_max(cell_ds.get_cell(cell_idx), self.max_value)
+        ref_stats = None
+        if self.fixed_reference:
+            ref_stats = _compute_ref_stats(
+                img_hwc, self.channels, self.with_masking,
+                self.clip_low, self.clip_high, self.normalize_method)
         tensor = _cell_to_tensor(
             img_hwc, self.channels, self.aug_pipeline,
-            self.normalize_method, self.clip_low, self.clip_high, self.with_masking)
+            self.normalize_method, self.clip_low, self.clip_high, self.with_masking,
+            ref_stats)
         meta = cell_ds.metadata.iloc[cell_idx]
         label = meta.get(self.label_column)
         if label is not None:
@@ -236,7 +358,8 @@ class WholeImageCellDataset(Dataset):
                  augmentation_spec=None,
                  normalize_method="per_channel",
                  clip_low=0.05, clip_high=99.95,
-                 with_masking=False, padding=4):
+                 with_masking=False, fixed_reference=False, padding=4,
+                 max_value=None):
         self.image_dataset = image_dataset
         self.mask_name = mask_name
         self.channels = list(channels) if channels is not None else None
@@ -244,7 +367,9 @@ class WholeImageCellDataset(Dataset):
         self.normalize_method = normalize_method
         self.clip_low = clip_low
         self.clip_high = clip_high
+        self.fixed_reference = fixed_reference
         self.padding = padding
+        self.max_value = max_value
         if augmentation_spec:
             self.aug_pipeline = build_pipeline(augmentation_spec)
         else:
@@ -285,9 +410,13 @@ class WholeImageCellDataset(Dataset):
                 f"Degenerate cell {label} has no pixels in mask (row {row_idx}); "
                 f"mask may be corrupted or changed since indexing ({e})"
             ) from e
+        crop_hwc = _to_float_max(crop_hwc, self.max_value)
         tensor = _cell_to_tensor(
             crop_hwc, self.channels, self.aug_pipeline,
-            self.normalize_method, self.clip_low, self.clip_high, self.with_masking)
+            self.normalize_method, self.clip_low, self.clip_high, self.with_masking,
+            _compute_ref_stats(crop_hwc, self.channels, self.with_masking,
+                               self.clip_low, self.clip_high, self.normalize_method)
+            if self.fixed_reference else None)
         stem = self._field_stems[idx]
         return tensor, int(label), stem, bbox
 

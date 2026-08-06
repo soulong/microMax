@@ -19,7 +19,7 @@ microMax/
 | microBase | 0.6.0 | — (library) |
 | microProfiler | 1.3.0 | `microprofiler` |
 | microVis | 1.1.0 | `microvis` |
-| microModel | 0.2.0 | `micromodel` |
+| microModel | 0.2.2 | `micromodel` |
 
 - `microBase` is the only shared dependency — the three consumers never
   import each other.
@@ -223,6 +223,6 @@ verbatim from extraction to the profiling DB, CSV exports, and `infer.db`.
 | Cellpose masks | `<stem>_cp_masks_<name>.png` next to images | microProfiler |
 | BaSiC shading models | `<dataset>/.microprofiler/BaSiC_model/` | microProfiler |
 | Exported cells | `<dataset>/objects_exported/<class>/` + `{mask_name}.csv` | microVis |
-| SSL bundles | `runs/ssl_model.pt`, `ssl_model_<epoch>.pt` | microModel pretrain |
+| SSL bundles | `runs/model.pt`, `model_<epoch>.pt` | microModel pretrain |
 | Train bundles | `runs/model.pt`, `model_<epoch>.pt` | microModel train |
 | Reports & logs | `runs/*.pdf`, `runs/*.txt`, `runs/micromodel.log` | microModel |

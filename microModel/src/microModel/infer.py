@@ -2,13 +2,14 @@
 
 The bundle determines the model mode, and inference.pred_class /
 inference.feature control what is written:
-  - features: load SSL bundle (ssl_model.pt), extract backbone features only.
+  - features: load SSL bundle (model.pt; no num_classes in meta), extract
+      backbone features only.
       pred_class/pred_prob = NULL (requesting pred_class logs a warning).
   - classify: load train bundle (model.pt), predict + extract features.
 
 Model mode is detected from the bundle: train bundles carry "state_dict" +
 "num_classes" in meta; SSL bundles carry a full "state_dict" without
-"num_classes" (legacy SSL bundles carry only "backbone_state_dict").
+"num_classes".
 
 DB schema — single `inference` table + 3 lazily-created reduction tables.
 No _meta, no migrations.
@@ -27,8 +28,9 @@ from tqdm import tqdm
 from microBase import CellDataset, ImageDataset, build_pipeline, apply, normalize
 
 from .utils import (logger, set_seed, load_label_csv, resolve_output_paths, copy_config_file,
-                    add_file_logging)
-from .dataset import WholeImageCellDataset, subsample, _cell_to_tensor
+                    add_file_logging, resolve_max_value)
+from .dataset import (WholeImageCellDataset, subsample, _cell_to_tensor,
+                      _compute_ref_stats, _to_float_max)
 from .backbone import load_model_from_bundle, load_ssl_backbone_from_bundle
 
 
@@ -182,7 +184,8 @@ class _SingleCellInferDataset(Dataset):
 
     def __init__(self, cell_dataset, indices, channels,
                  augmentation_spec,
-                 normalize_method, clip_low, clip_high, with_masking):
+                 normalize_method, clip_low, clip_high, with_masking,
+                 fixed_reference=False, max_value=None):
         self.cell_dataset = cell_dataset
         self.indices = list(indices)
         self.channels = list(channels) if channels is not None else None
@@ -190,6 +193,8 @@ class _SingleCellInferDataset(Dataset):
         self.clip_low = clip_low
         self.clip_high = clip_high
         self.with_masking = with_masking
+        self.fixed_reference = fixed_reference
+        self.max_value = max_value
         self.aug_pipeline = build_pipeline(augmentation_spec) if augmentation_spec else None
 
     def __len__(self):
@@ -197,10 +202,17 @@ class _SingleCellInferDataset(Dataset):
 
     def __getitem__(self, idx):
         cell_idx = self.indices[idx]
+        img_hwc = _to_float_max(self.cell_dataset.get_cell(cell_idx), self.max_value)
+        ref_stats = None
+        if self.fixed_reference:
+            ref_stats = _compute_ref_stats(
+                img_hwc, self.channels, self.with_masking,
+                self.clip_low, self.clip_high, self.normalize_method)
         tensor = _cell_to_tensor(
-            self.cell_dataset.get_cell(cell_idx),
+            img_hwc,
             self.channels, self.aug_pipeline,
-            self.normalize_method, self.clip_low, self.clip_high, self.with_masking)
+            self.normalize_method, self.clip_low, self.clip_high, self.with_masking,
+            ref_stats)
         return tensor, idx
 
 
@@ -263,7 +275,7 @@ def _validate_channel_count(n_avail, channels, meta, data_dir):
 def _run_single_cell(data_dir, meta, model, device,
                      batch_size, db_path, write_features, write_pred_class,
                      label_map, label_from_dir,
-                     channels, channel_layout, image_pattern,
+                     channels, channel_layout, image_pattern, max_value,
                      classify_mode, pool_fn,
                      dl_num_workers=4, dl_prefetch_factor=2,
                      dl_persistent_workers=True,
@@ -278,7 +290,7 @@ def _run_single_cell(data_dir, meta, model, device,
     _validate_channel_count(len(cell_ds.intensity_colnames), channels, meta, data_dir)
 
     _required_meta = ("augmentation_infer", "normalize_method", "normalize_with_masking",
-                      "clip_low", "clip_high")
+                      "clip_low", "clip_high", "normalize_fixed_reference")
     _missing = [k for k in _required_meta if k not in meta]
     if _missing:
         print(f"Error: bundle meta missing required keys: {_missing}", file=sys.stderr)
@@ -288,6 +300,7 @@ def _run_single_cell(data_dir, meta, model, device,
     with_masking = meta["normalize_with_masking"]
     clip_low = meta["clip_low"]
     clip_high = meta["clip_high"]
+    fixed_reference = bool(meta["normalize_fixed_reference"])
 
     md = cell_ds.metadata
     _exclude = {"stem", "path", "directory", "channel", "ext", "mask_name"}
@@ -323,7 +336,8 @@ def _run_single_cell(data_dir, meta, model, device,
     dataset = _SingleCellInferDataset(
         cell_ds, [e["idx"] for e in entries], channels,
         augmentation_spec,
-        normalize_method, clip_low, clip_high, with_masking)
+        normalize_method, clip_low, clip_high, with_masking,
+        fixed_reference=fixed_reference, max_value=max_value)
     loader_kwargs = dict(batch_size=batch_size, shuffle=False,
                          num_workers=dl_num_workers,
                          persistent_workers=dl_persistent_workers)
@@ -354,7 +368,7 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
                      model, device, batch_size, db_path,
                      write_features, write_pred_class, image_subdir_pattern,
                      channel_layout, channels, label_from_dir, label_map,
-                     mask_name_cfg,
+                     mask_name_cfg, max_value,
                      classify_mode, pool_fn,
                      dl_num_workers=4, dl_prefetch_factor=2,
                      dl_persistent_workers=True,
@@ -362,7 +376,7 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
     logger.info("Running whole-image inference on %s", data_dir)
 
     _required_meta = ("augmentation_infer", "normalize_method", "normalize_with_masking",
-                      "clip_low", "clip_high")
+                      "clip_low", "clip_high", "normalize_fixed_reference")
     _missing = [k for k in _required_meta if k not in meta]
     if _missing:
         print(f"Error: bundle meta missing required keys: {_missing}", file=sys.stderr)
@@ -372,6 +386,7 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
     with_masking = meta["normalize_with_masking"]
     clip_low = meta["clip_low"]
     clip_high = meta["clip_high"]
+    fixed_reference = bool(meta["normalize_fixed_reference"])
 
     image_ds = ImageDataset(
         data_dir, image_pattern, mask_pattern,
@@ -404,7 +419,8 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
         image_ds, mask_name, channels=channels,
         augmentation_spec=augmentation_spec,
         normalize_method=normalize_method, clip_low=clip_low, clip_high=clip_high,
-        with_masking=with_masking, padding=4)
+        with_masking=with_masking, fixed_reference=fixed_reference, padding=4,
+        max_value=max_value)
 
     logger.info("Whole-image: %d cells across %d fields", len(ds), len(image_ds))
 
@@ -485,8 +501,12 @@ def run_inference(config, config_path=None):
     data_cfg = config["data"]
     inf_cfg = config["inference"]
 
-    model_path = config["model"]["path"]
-    if not model_path or not os.path.exists(model_path):
+    model_path = config["model"]
+    if not isinstance(model_path, str) or not model_path:
+        print("Error: config 'model' must be a string path to a model bundle "
+              "(train model.pt or SSL model.pt)", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(model_path):
         print(f"Error: model not found: {model_path}", file=sys.stderr)
         sys.exit(1)
 
@@ -498,18 +518,19 @@ def run_inference(config, config_path=None):
 
     # Determine model mode: classify (train bundle) vs features (SSL bundle).
     # Train bundle: "state_dict" + "num_classes" in meta.
-    # SSL bundle: full "state_dict" without "num_classes" (legacy: "backbone_state_dict").
+    # SSL bundle: full "state_dict" without "num_classes".
     if "state_dict" in bundle and "num_classes" in meta:
         classify_mode = True
         model = load_model_from_bundle(bundle, device)
         pool_fn = None  # Model.forward handles pooling
         logger.info("Classify mode: %d classes", meta["num_classes"])
-    elif "state_dict" in bundle or "backbone_state_dict" in bundle:
+    elif "state_dict" in bundle:
         classify_mode = False
         model, feat_dim, pool_fn, meta = load_ssl_backbone_from_bundle(bundle, device)
         logger.info("Features-only mode: feat_dim=%d", feat_dim)
     else:
-        print("Error: bundle has neither 'state_dict' nor 'backbone_state_dict'", file=sys.stderr)
+        print("Error: bundle has no 'state_dict' key (unsupported pre-0.2.1 "
+              "bundle format)", file=sys.stderr)
         sys.exit(1)
 
     # What to write (defaults: pred_class = bundle capability, feature = true).
@@ -525,7 +546,7 @@ def run_inference(config, config_path=None):
 
     # All data.* settings must be explicit
     required_data_keys = [
-        "root", "channels", "channel_layout", "image_pattern",
+        "root", "channels", "channel_layout", "image_pattern", "max_value",
         "label_from_dir", "label_csv", "sample_max", "sample_by",
     ]
     if mode == "whole_image":
@@ -545,6 +566,7 @@ def run_inference(config, config_path=None):
     channels_cfg = data_cfg["channels"]
     channel_layout_cfg = data_cfg["channel_layout"]
     image_pattern_cfg = data_cfg["image_pattern"]
+    max_value = resolve_max_value(data_cfg)
     label_csv = data_cfg["label_csv"]
     label_from_dir = data_cfg["label_from_dir"]
     sample_max = data_cfg["sample_max"]
@@ -590,7 +612,7 @@ def run_inference(config, config_path=None):
                     data_dir, meta, model, device,
                     batch_size, db_path, write_features, write_pred_class,
                     label_map, label_from_dir,
-                    channels_cfg, channel_layout_cfg, image_pattern_cfg,
+                    channels_cfg, channel_layout_cfg, image_pattern_cfg, max_value,
                     classify_mode, pool_fn,
                     dl_num_workers=dl_num_workers, dl_prefetch_factor=dl_prefetch_factor,
                     dl_persistent_workers=dl_persistent_workers,
@@ -603,7 +625,7 @@ def run_inference(config, config_path=None):
                     data_cfg["image_subdir_pattern"],
                     channel_layout_cfg, channels_cfg,
                     label_from_dir, label_map,
-                    data_cfg["mask_name"],
+                    data_cfg["mask_name"], max_value,
                     classify_mode, pool_fn,
                     dl_num_workers=dl_num_workers, dl_prefetch_factor=dl_prefetch_factor,
                     dl_persistent_workers=dl_persistent_workers,

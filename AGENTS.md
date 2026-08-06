@@ -1,4 +1,4 @@
-﻿# AGENTS.md — Microscopy Suite
+# AGENTS.md — Microscopy Suite
 
 This file is the single map for the four-package suite under `microMax/`.
 Read it before adding, removing, or changing features — it explains what each
@@ -67,8 +67,8 @@ Heavy external stack used across the suite: `numpy`, `pandas`, `tifffile`,
    │  pipeline + DB  │       │  viewer + DB    │        │  pretrain/      │
    └────────┬────────┘       └────────┬────────┘        │  train/         │
             │                         │                 │  infer          │
-            │  writes result.db       │  reads result.db│  writes ssl_model.pt (pretrain)
-            │  writes session.yml     │  writes session.yml│  writes model.pt (train)
+             │  writes result.db       │  reads result.db│  writes model.pt (pretrain)
+             │  writes session.yml     │  writes session.yml│  writes model.pt (train)
             │                         │                 │  writes infer.db (infer)
             │                         │                 │
             └─────── shared on-disk artifacts ──────────┘
@@ -898,7 +898,7 @@ without restarting the process:
 ## 7. microModel — SSL pretrain + train + infer
 
 **Path:** `microMax/microModel/`
-**Version:** `0.2.0`  •  **Entry:** `micromodel` (CLI: `pretrain`, `train`,
+**Version:** `0.2.2`  •  **Entry:** `micromodel` (CLI: `pretrain`, `train`,
 `infer`, `vis-augment`, `vis-reduction`, `vis-reduction-interactive`)
 **Deps on microBase:** `CellDataset`, `ImageDataset`, `build_pipeline`,
 `apply`, `normalize`, `read_mask`, `cells.get_labels`, `load_yaml`.
@@ -951,11 +951,26 @@ There are two dataset types with different chains:
 - **`SSLMultiViewDataset`** (pretrain): for each cell, builds N augmentation
   pipelines from `augmentation_views` (a list of view specs) and returns a
   list of N view tensors. Each view applies:
-  `load (raw HWC) → extract mask (pixel != 0) → augment (one view pipeline; mask co-transformed) → normalize (z-score with mask) → torch.from_numpy(CHW)`
+  `load (raw HWC) → convert to float [0, 1] by data.max_value → extract mask (pixel != 0) → augment (one view pipeline; mask co-transformed) → normalize (z-score with mask) → torch.from_numpy(CHW)`
+  The float conversion happens once at load: integer images (8/12/16-bit)
+  are divided by the REQUIRED `data.max_value` (65535 for 16-bit, 255 for
+  8-bit), so every view pipeline and the fixed-reference stats share one
+  [0, 1] domain. There are NO `ToFloat` steps in augmentation specs (they
+  were removed in 0.2.1 — the conversion is the domain definition).
+  Normalization has two modes: per-view self-normalization (default) and
+  fixed-reference (`normalize.fixed_reference: true`), where clip bounds +
+  z-score stats are computed ONCE on the raw cell (pre-augmentation, in the
+  [0, 1] domain) and applied as a fixed transform to every view. Fixed stats
+  are the DINOv2 convention — per-view re-normalization is
+  affine-equivariant, so it mathematically cancels linear photometric
+  augmentation (brightness/contrast), leaving only gamma/noise/blur as
+  photometric diversity.
 - **`SingleCellDataset`** (train) and **`WholeImageCellDataset`** (infer
   whole-image): identical chain — single view, deterministic
   `augmentation_infer` for validation/inference, random `augmentation_train`
-  for training. Cropping failures inside `WholeImageCellDataset.__getitem__`
+  for training. Both honor `normalize.fixed_reference` (train reads its own
+  config; infer reads the required bundle meta key — there is no default).
+  Cropping failures inside `WholeImageCellDataset.__getitem__`
   (mask corrupted or changed between indexing and cropping) raise
   `ValueError` instead of hard-exiting, so DataLoader workers fail with a
   clear message rather than a cryptic "worker died" error.
@@ -982,14 +997,14 @@ pretrain_ssl(config)
    ├─► get_criterion(method, ...) + get_train_step(method)
    ├─► optimizer: sgd (BYOL default) | adamw (DINOv2 default)
    │
-   └─► save <output_dir>/{ssl_model_{epoch}.pt (every save_interval),
-                          ssl_model.pt (final), <config>.yml}
+   └─► save <output_dir>/{model_{epoch}.pt (every save_interval),
+                          model.pt (final), <config>.yml}
 ```
 
-**SSL bundles (`ssl_model.pt` / `ssl_model_{epoch}.pt`)** — saved by
+**SSL bundles (`model.pt` / `model_{epoch}.pt`)** — saved by
 `pretrain_ssl`. Interval bundles (every `training.save_interval` epochs, named
-1-based without zero padding, e.g. `ssl_model_9.pt` for the 9th epoch) and the
-final `ssl_model.pt` share one schema, and every
+1-based without zero padding, e.g. `model_9.pt` for the 9th epoch) and the
+final `model.pt` share one schema, and every
 saved bundle is complete — usable for exact resume, train transfer, and
 feature extraction:
 
@@ -1003,9 +1018,11 @@ feature extraction:
         "in_chans": int,
         "channels": [1-based indices],
         "channel_layout": "CHW" | "HWC" | None,
+        "max_value": float,
         "feat_dim": int,
         "augmentation_infer": <deterministic view spec>,
-        "normalize_method", "normalize_with_masking", "clip_low", "clip_high",
+        "normalize_method", "normalize_with_masking", "normalize_fixed_reference",
+        "clip_low", "clip_high",
         "image_pattern": <regex or None>,
     },
     "config": <full config dict>,
@@ -1020,8 +1037,9 @@ Bundles are written atomically (`*.pt.tmp` + `os.replace`) so an interrupted
 run never leaves a corrupt file. `train`/`infer` pull the student/online
 backbone out of `state_dict` via `backbone.extract_backbone_state_dict`
 (prefix `student_backbone.vit.*` for DINOv2 — the `mask_token` param is
-excluded by the prefix — `backbone.*` for BYOL/conv); old bundles with only
-`backbone_state_dict` still load (heads re-initialized, warning).
+excluded by the prefix — `backbone.*` for BYOL/conv). Pre-0.2.1 bundles
+(`backbone_state_dict`-only) are unsupported — the legacy loading branches
+were removed.
 
 **BYOL** (`models/byol.py`): online backbone + `BYOLProjectionHead` +
 `BYOLPredictionHead`, with a momentum target network (deepcopy + freeze).
@@ -1051,7 +1069,7 @@ on CUDA, and `train_step` (both methods) takes an optional `scaler`
 the loss is scaled before backward and gradients are globally clipped
 (`training.grad_clip`, default 10.0). If the loss is ever non-finite,
 `pretrain_ssl` hard-exits (`print` + `sys.exit(1)`) instead of silently
-writing a corrupted `ssl_model.pt`.
+writing a corrupted `model.pt`.
 
 **Gradient accumulation (pretrain)**: `training.grad_accum_steps` (default
 `1` = no accumulation) accumulates gradients over K micro-batches — effective
@@ -1139,7 +1157,7 @@ teacher's BN buffers are kept in sync via the buffer-aware momentum update,
 since lightly's `update_momentum` only EMAs parameters.
 
 **Resume** (`resume.ssl_model`, `resume.type`): may point at any saved bundle
-(`ssl_model_{epoch}.pt` or `ssl_model.pt`). `resume.type` (default
+(`model_{epoch}.pt` or `model.pt`). `resume.type` (default
 `continue`) selects the resume semantics:
 - **`continue`** — exact same-data extension: the full model state (incl.
   heads + momentum/teacher nets), optimizer state, epoch counter (1-based),
@@ -1159,12 +1177,18 @@ bundle's `meta.in_chans` is used, and a mismatch with the resolved
 visual monitoring. A fixed random image subset (picked ONCE at run start with
 the training seed; max `training.n_image_umap` images; disabled when 0/null)
 is re-embedded with a FRESH `UMAP(random_state=seed)` at every
-`save_interval` epoch (right after `ssl_model_{epoch}.pt`) and at the final
-epoch (unless it was already the last interval save). Features come from the
+`save_interval` epoch (right after `model_{epoch}.pt`) and at the final
+epoch (unless it was already the last interval save). A pre-training
+baseline is also written before the first epoch as `umap_check_epoch_0.pdf`
+(0-based; the model BEFORE any training — fresh pretrained init or transfer
+weights); it is skipped when actually resuming with `resume.type=continue`
+(the run is an exact extension of a previous one, so the baseline belongs to
+that run). Features come from the
 online/student backbone (BYOL: mean-pooled conv; DINOv2: cls token) under the
 deterministic `augmentation_infer` pipeline, so per-epoch PDFs are directly
 comparable. Output: `<output_dir>/umap_check_epoch_{epoch}.pdf` (single
-gray scatter; 1-based epoch, no zero padding). A failed check is logged
+gray scatter; 0 for the pre-training baseline, else 1-based, no zero
+padding). A failed check is logged
 (`logger.error`) and skipped — it never aborts training.
 
 ### 7.4 Training flow
@@ -1208,7 +1232,8 @@ mode:
         "backbone": <timm name>,
         "ssl_method": "byol" | "dinov2" | None,   # None if from scratch
         "augmentation_train", "augmentation_infer",
-        "normalize_method", "normalize_with_masking", "clip_low", "clip_high",
+        "normalize_method", "normalize_with_masking", "normalize_fixed_reference",
+        "clip_low", "clip_high",
         "image_pattern": ...,
     },
     "config", "optimizer_state_dict", "epoch",
@@ -1256,10 +1281,10 @@ hard-exit on mismatch.
 ```
 run_inference(config)
    │
-   ├─► load bundle (model.path)
+   ├─► load bundle (model)
    ├─► dispatch on bundle keys:
    │     • "state_dict" + "num_classes" in meta -> classify model (train bundle)
-   │     • "state_dict" (no num_classes) or "backbone_state_dict" -> features-only (SSL bundle)
+   │     • "state_dict" (no num_classes) -> features-only (SSL bundle)
    │
    ├─► output flags from inference.pred_class / inference.feature:
    │     • pred_class (default = bundle is classify-capable): write pred/pred_prob.
@@ -1288,7 +1313,12 @@ In whole-image mode, `data.channel_layout: null` in the config takes
 precedence over the bundle's `channel_layout`, allowing one-channel-per-file
 inference even when the model was trained on multi-channel cell TIFFs.
 `augmentation_infer` and `normalize` are always loaded from the bundle meta
-— config files must not modify these.
+— config files must not modify these. `normalize.fixed_reference` (bundle
+meta `normalize_fixed_reference`) is a required meta key, honored by
+inference datasets. Images are converted to float [0, 1] by the REQUIRED
+`data.max_value` from the inference config (a data property of the new
+dataset, like `channels`/`channel_layout` — the bundle's `max_value` is
+provenance only).
 
 All `data.*` settings in the inference config must be explicitly set (null is
 allowed; missing is not).
@@ -1315,23 +1345,35 @@ is still required to change its schema (no migrations).
 
 Five YAML configs under `microModel/configs/`:
 
-- **`pretrain_byol.yml`** / **`pretrain_dinov2.yml`**: `method`, `data`
-  (root, channels, channel_layout, image_pattern, label_from_dir/label_csv
+- **`pretrain_byol.yml`** / **`pretrain_dinov2.yml`**: `mode` (single_cell
+  only; whole_image planned), `method`, `data`
+  (root, channels, channel_layout, image_pattern, `max_value` — REQUIRED,
+  max possible intensity of the input dtype (65535 for 16-bit, 255 for
+  8-bit); images are divided by it on load, label_from_dir/label_csv
   ignored, sample_max, sample_by), `backbone` (name — any timm model for
   BYOL, any timm ViT with a class token for DINOv2; `pretrained`, honored by
   both methods; `in_chans` is NOT a config key — derived from `data.channels`,
   stored in the bundle meta),
   `augmentation_views` (list of view specs; BYOL uses [0:2], DINOv2 uses
-  [0:2] global + [2:] local), `augmentation_infer`, `normalize`, `dataloader`,
+  [0:2] global + [2:] local — no `ToFloat` steps: the float [0, 1] conversion
+  happens at load via `data.max_value`), `augmentation_infer`, `normalize`
+  (method,
+  with_masking, clip_low, clip_high, `fixed_reference` — true = clip + z-score
+  stats computed once on the raw cell (in the [0, 1] domain) and applied as a
+  fixed transform to every view, preserving linear photometric augmentation),
+  `dataloader`,
   `output_dir`, `resume.ssl_model`, `resume.type` (continue | transfer, default
   continue — see §7.3 Resume), `vis_augment` (num_samples; pretrain previews
   auto-show ALL `augmentation_views` — an optional `num_views` caps the grid,
   `null`/absent = all views; train previews use `num_views` for the number
-  of augmented draws), `training` (optimizer, lr,
+  of augmented draws; the preview grid shares one global x/y frame across all
+  samples/views, so view size differences — e.g. 224 global vs 112 local — are
+  visually apparent), `training` (optimizer, lr,
   weight_decay, betas, grad_clip, grad_accum_steps, batch_size, epochs,
-  save_interval, n_image_umap, amp).
-  `training.save_interval` writes `ssl_model_{epoch}.pt` bundles; the final
-  epoch always writes `ssl_model.pt`.
+  save_interval, n_image_umap — periodic UMAP check incl. an
+  `umap_check_epoch_0.pdf` pre-training baseline (see §7.3), amp).
+  `training.save_interval` writes `model_{epoch}.pt` bundles; the final
+  epoch always writes `model.pt`.
   DINOv2 also has a `dinov2:` block (input_dim — null = derived from the ViT
   embed_dim, a non-null value must match or pretrain hard-exits —
   drop_path_rate, ibot_separate_head, head_batch_norm, warmup_epochs,
@@ -1339,26 +1381,35 @@ Five YAML configs under `microModel/configs/`:
   momentum_start/end, koleo_weight, lr_final). BYOL has a
   `byol:` block (proj_hidden_dim, proj_out_dim, pred_hidden_dim, pred_out_dim,
   warmup_epochs, transfer_warmup_epochs, momentum_start/end, lr_final).
-- **`train.yml`**: `mode: single_cell`, `data` (root, channels,
-  channel_layout, image_pattern, label_from_dir, label_csv, sample_max,
+- **`train.yml`**: `mode` (single_cell only; whole_image planned), `method`
+  (classification only; segmentation planned), `data` (root, channels,
+  channel_layout, image_pattern, `max_value` — REQUIRED (see pretrain),
+  label_from_dir, label_csv, sample_max,
   sample_by), `output_dir`, `resume.sl_model` (train checkpoint;
   mutually exclusive with `resume.ssl_model` — hard-exit if both set),
   `resume.ssl_model` (SSL bundle for backbone transfer; null = from scratch),
-  `augmentation_train`, `augmentation_infer`, `normalize`, `dataloader`,
+  `augmentation_train`, `augmentation_infer`, `normalize` (same keys as
+  pretrain, incl. `fixed_reference` — set true to match an SSL-pretrained
+  backbone's fixed-reference feature statistics), `dataloader`,
   `model` (backbone, pretrained, focal_gamma — `backbone`/`pretrained` used
   only in true from-scratch mode: ignored when either resume key is set),
   `vis_augment`, `training`
   (batch_size, epochs, save_interval, lr, weight_decay, betas, val_ratio,
   amp, patience).
 - **`infer_single_cell.yml`** / **`infer_whole_image.yml`**: `mode`,
-  `model.path` (SSL bundle OR train bundle), `data` (root, channels,
-  channel_layout, image_pattern[, mask_pattern, image_subdir_pattern,
+  `model` (string path — SSL bundle OR train bundle; the old
+  `{path: ...}` dict form is not supported), `data` (root, channels,
+  channel_layout, image_pattern, `max_value` — REQUIRED, a data property of
+  the new dataset (the bundle's `max_value` is provenance only)
+  [, mask_pattern, image_subdir_pattern,
   mask_name for whole_image], label_from_dir, label_csv, sample_max,
   sample_by), `output_dir`, `dataloader`, `inference` (pred_class —
   default = bundle is classify-capable; explicit true with an SSL bundle
   warns and writes features only, feature — default true, db_name,
-  batch_size), `reduction` (color_by, pca_components,
-  sample_per_class, reducer_pca, reducer_umap). `augmentation_infer` +
+  batch_size), `reduction` (color_by, var_threshold — 0.95 default,
+  auto-selected PCA dims covering this fraction of variance, floored at 2;
+  also the UMAP preprocessing dim, sample_per_class, reducer_pca,
+  reducer_umap). `augmentation_infer` +
   `normalize` are NOT in the config — they come from the bundle meta.
 
 ### 7.7 CLI usage
@@ -1479,8 +1530,8 @@ micromodel vis-reduction --config configs/infer_whole_image.yml
 micromodel vis-reduction-interactive --config configs/infer_whole_image.yml --port 5000
 ```
 
-Set `resume.ssl_model: runs/ssl_model.pt` in `train.yml` to transfer the
-SSL backbone into the classifier. Produces `runs/ssl_model.pt` (pretrain),
+Set `resume.ssl_model: runs/model.pt` in `train.yml` to transfer the
+SSL backbone into the classifier. Produces `runs/model.pt` (pretrain),
 `runs/model.pt` (train), `{output_dir}/infer.db` (infer + reduction),
 and a browser UI at `http://127.0.0.1:5000`.
 
@@ -1527,8 +1578,8 @@ dataset to smoke-test.
 | Inference DB (shared) | `{output_dir}/infer.db` |
 | microVis log | `%TEMP%/microVis.log` |
 | microModel training output | `<output_dir>/` (default `runs/`) |
-| microModel pretrain bundles | `<output_dir>/ssl_model.pt` (final) + `ssl_model_{epoch}.pt` (every `save_interval`; 1-based, no zero padding), default `runs/` |
-| microModel pretrain UMAP check | `<output_dir>/umap_check_epoch_{epoch}.pdf` (one per `save_interval` + final, 1-based, when `training.n_image_umap` > 0) |
+| microModel pretrain bundles | `<output_dir>/model.pt` (final) + `model_{epoch}.pt` (every `save_interval`; 1-based, no zero padding), default `runs/` |
+| microModel pretrain UMAP check | `<output_dir>/umap_check_epoch_{epoch}.pdf` (epoch 0 baseline + one per `save_interval` + final, 1-based, when `training.n_image_umap` > 0; no epoch 0 for `resume.type=continue`) |
 | microModel pretrain loss curve | `<output_dir>/loss_curve.pdf` (when `show_plots=true`, default) |
 | microModel train bundles | `<output_dir>/model.pt` (final) + `model_{epoch}.pt` (every `save_interval`; 1-based, no zero padding), default `runs/` |
 | microModel run log | `<output_dir>/micromodel.log` (append; also for infer/vis when `output_dir` is set) |

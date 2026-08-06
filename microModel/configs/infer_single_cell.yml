@@ -3,32 +3,34 @@
 # Each TIFF under data.root is treated as one pre-cropped single-cell image.
 # No masks are needed; results are written to a SQLite DB (infer.db).
 #
-# The bundle (model.path) determines classify vs features-only mode:
+# The bundle (model) determines classify vs features-only mode:
 #   - Train bundle (model.pt): pred_class/pred_prob + features
-#   - SSL bundle (ssl_model.pt): features only
+#   - SSL bundle (model.pt, no num_classes in meta): features only
 # augmentation_infer + normalize come from the bundle meta (not configurable).
 # All data.* keys are REQUIRED (null is allowed; missing is not).
 
 mode: single_cell
 
-model: runs_dino/runs_finetune_p53/model.pt  # train bundle (model.pt) or SSL bundle (ssl_model.pt)
+model: 20260806_train_p53_puncta/model.pt         # train bundle (model.pt) or SSL bundle (model.pt)
 
-output_dir: runs_dino/infer_p53_finetune_ssl_sl  # shared DB dir for all roots; null = per-dataset
+output_dir: 20260806_train_p53_puncta/infer_sc    # shared DB dir for all roots; null = per-dataset
 
 data:
   root:
-    # - 2026-07-10_63x__2026-07-10T09_27_38-Measurement 1/objects_exported_p53
-    # - 2026-07-11_63x__2026-07-11T18_11_55-Measurement 1/objects_exported_p53
-    # - 2026-07-14_63x_22_Reza__2026-07-14T18_33_00-Measurement 1/objects_exported_p53
-    - 2026-07-18_22-cmpd__2026-07-18T00_00_00-Measurement 1/objects_exported_p53
-    - 2026-07-18_37-ctrl__2026-07-18T00_00_00-Measurement 1/objects_exported_p53
+    - sc_dataset/p53/2026-07-10_63x
+    - sc_dataset/p53/2026-07-11_63x
+    - sc_dataset/p53/2026-07-14_63x
+    - sc_dataset/p53/2026-07-18_22_63x
+    - sc_dataset/p53/2026-07-18_37_63x
+    # - sc_dataset/opencell/single_cell
   image_pattern: null                 # regex for metadata extraction; null = none
+  max_value: 65535                    # max possible intensity of the input dtype (65535 for 16-bit, 255 for 8-bit); images are divided by it on load
   channels: [1]                       # 1-based indices; null = all; must match model
   channel_layout: null                # CHW | HWC | null (one-channel-per-file)
   label_from_dir: true                # label from parent dir name
   label_csv: null                     # CSV [path, label]; null = not used
-  sample_max: null                    # null = no limit
-  sample_by: per_class                # per_class | per_dataset
+  sample_max: 10000                   # null = no limit
+  sample_by: per_dataset              # per_class | per_dataset
 
 dataloader:
   num_workers: 4
@@ -45,7 +47,7 @@ inference:
 # Reducers are fit once on merged features from all DBs, then applied per-DB.
 reduction:
   color_by: [pred_class, pred_prob]   # first = stratification column; valid: pred_class, pred_prob, directory, ground_truth
-  pca_components: 50                  # also used as UMAP preprocessing dim
+  var_threshold: 0.95                 # auto PCA dims covering this fraction of variance (min 2); also used as UMAP preprocessing dim
   sample_per_class: 10000             # max points per class to fit reducers; 0 = all
   reducer_pca: null                   # path to pre-fitted PCA .pkl; null = fit new
   reducer_umap: null                  # path to pre-fitted UMAP .pkl; null = fit new

@@ -32,6 +32,8 @@ from microBase import (
     normalize,
 )
 
+from .dataset import _compute_ref_stats, _normalize_fixed, _to_float_max
+
 from .utils import (
     logger,
     resolve_output_paths,
@@ -41,6 +43,7 @@ from .utils import (
     validate_pca,
     validate_umap_pipeline,
     add_file_logging,
+    resolve_max_value,
     stratified_sample_indices,
 )
 
@@ -72,6 +75,8 @@ def show_augmentation(config):
     with_masking = norm_cfg.get("with_masking", False)
     clip_low = norm_cfg.get("clip_low", 0.05)
     clip_high = norm_cfg.get("clip_high", 99.95)
+    fixed_reference = norm_cfg.get("fixed_reference", False)
+    max_value = resolve_max_value(data_cfg)
     channel_layout = data_cfg.get("channel_layout", "CHW")
     image_pattern = data_cfg.get("image_pattern")
     channels = data_cfg.get("channels")
@@ -102,7 +107,7 @@ def show_augmentation(config):
         if aug_infer_cfg:
             raw_pipeline = build_pipeline(aug_infer_cfg)
         else:
-            _RESIZE_STEPS = {"ToFloat", "LongestMaxSize", "PadIfNeeded", "Resize"}
+            _RESIZE_STEPS = {"LongestMaxSize", "PadIfNeeded", "Resize"}
             resize_spec = [s for s in aug_views_cfg[0] if next(iter(s)) in _RESIZE_STEPS]
             raw_pipeline = build_pipeline(resize_spec) if resize_spec else None
         n_views_to_show = len(view_pipelines)
@@ -129,32 +134,54 @@ def show_augmentation(config):
     if n_rows == 1:
         axes = axes.reshape(1, -1)
 
+    # Shared frame: one global x/y window across all samples/views so that
+    # different view sizes (e.g. 224 global vs 112 local) are visually
+    # apparent instead of each subplot auto-fitting its own image.
+    max_h = max_w = 0
+
     sample_indices = random.sample(range(len(cell_ds)), min(num_samples, len(cell_ds)))
-    logger.info("Showing %d cells x %d views (pretrain=%s, norm=%s, mask=%s)",
-                len(sample_indices), n_views_to_show, is_pretrain, normalize_method, with_masking)
+    logger.info("Showing %d cells x %d views (pretrain=%s, norm=%s, mask=%s, fixed=%s)",
+                len(sample_indices), n_views_to_show, is_pretrain, normalize_method,
+                with_masking, fixed_reference)
 
     for s, sample_idx in enumerate(sample_indices):
-        cell_orig = cell_ds.get_cell(sample_idx)
+        cell_orig = _to_float_max(cell_ds.get_cell(sample_idx), max_value)
         if channels is not None:
             ch_idx = [c - 1 for c in channels]
             cell_orig = cell_orig[:, :, ch_idx]
         mask = (cell_orig != 0).any(axis=2).astype(np.uint8) if with_masking else None
+        # Fixed-reference mode mirrors the training datasets: stats computed on
+        # the raw cell, applied to every view (photometric aug survives).
+        ref_stats = None
+        if fixed_reference:
+            ref_stats = _compute_ref_stats(
+                cell_orig, None, with_masking, clip_low, clip_high, normalize_method)
 
         # Raw view: raw_pipeline + normalize
         raw_hwc, raw_mask = apply(raw_pipeline, cell_orig, mask)
-        raw_norm = normalize(raw_hwc, mask=raw_mask, method=normalize_method,
-                             clip_low=clip_low, clip_high=clip_high)
+        if ref_stats is not None:
+            raw_norm = _normalize_fixed(raw_hwc, raw_mask, ref_stats)
+        else:
+            raw_norm = normalize(raw_hwc, mask=raw_mask, method=normalize_method,
+                                 clip_low=clip_low, clip_high=clip_high)
 
         # Augmented views
         aug_views = []
         for pipe in view_pipelines_to_show:
             aug_hwc, aug_mask = apply(pipe, cell_orig, mask)
-            aug_hwc = normalize(aug_hwc, mask=aug_mask, method=normalize_method,
-                                clip_low=clip_low, clip_high=clip_high)
+            if ref_stats is not None:
+                aug_hwc = _normalize_fixed(aug_hwc, aug_mask, ref_stats)
+            else:
+                aug_hwc = normalize(aug_hwc, mask=aug_mask, method=normalize_method,
+                                    clip_low=clip_low, clip_high=clip_high)
             aug_views.append((aug_hwc, aug_mask))
 
         all_views = [(raw_norm, raw_mask)] + aug_views
         all_names = ["Raw"] + view_names
+
+        for img, _ in all_views:
+            max_h = max(max_h, img.shape[0])
+            max_w = max(max_w, img.shape[1])
 
         for c in range(n_ch):
             row = s * n_ch + c
@@ -180,8 +207,15 @@ def show_augmentation(config):
                 _imshow(axes[row][v_idx], ch_data, f"{name} ch{channels[c]}",
                         vmin=shared_min, vmax=shared_max, mask=view_mask)
 
+    # Shared frame across all samples/views — views keep aspect="equal", so a
+    # 112px local view renders visibly smaller than a 224px global view.
+    for ax in axes.flat:
+        ax.set_xlim(0, max_w)
+        ax.set_ylim(0, max_h)
+
     plt.suptitle(f"Augmentation Preview: {len(sample_indices)} cells "
-                 f"({'pretrain' if is_pretrain else 'train'})", fontsize=11)
+                 f"({'pretrain' if is_pretrain else 'train'}) — shared frame {max_w}x{max_h}",
+                 fontsize=11)
     fig.subplots_adjust(top=0.93)
     plt.tight_layout()
 
@@ -400,12 +434,7 @@ def show_reduction(config):
         return
 
     # Phase 3: fit (or load) PCA + UMAP
-    pca_components = min(red_cfg.get("pca_components", 50),
-                         feats_fit.shape[0], feats_fit.shape[1])
-    if pca_components < 2:
-        logger.error("Reduction needs at least 2 features and 2 samples, got "
-                     "features=%d samples=%d", feats_fit.shape[1], feats_fit.shape[0])
-        return
+    var_threshold = red_cfg.get("var_threshold", 0.95)
 
     if reducer_pca_path:
         if not os.path.exists(reducer_pca_path):
@@ -415,11 +444,13 @@ def show_reduction(config):
         validate_pca(pca_full, feats_merged.shape[1])
         logger.info("PCA: loaded reducer from %s", reducer_pca_path)
     else:
-        pca_full = PCA(n_components=pca_components)
+        pca_full = PCA(n_components=var_threshold)
         pca_full.fit(feats_fit)
+        if pca_full.n_components_ < 2:
+            pca_full = PCA(n_components=2).fit(feats_fit)
         save_reducer(pca_full, os.path.join(save_dir, "reducer_pca.pkl"))
         logger.info("PCA %dD: explained variance ratio = %.4f",
-                    pca_components, pca_full.explained_variance_ratio_.sum())
+                    pca_full.n_components_, pca_full.explained_variance_ratio_.sum())
 
     raw_var = pca_full.explained_variance_
     var_ratio = pca_full.explained_variance_ratio_
@@ -437,7 +468,7 @@ def show_reduction(config):
         reducer = umap_pipeline["umap"]
         logger.info("UMAP: loaded reducer from %s", reducer_umap_path)
     else:
-        n_pre = min(pca_components, feats_fit.shape[0], feats_fit.shape[1])
+        n_pre = pca_full.n_components_
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="n_jobs value", category=UserWarning)
             if n_pre > 2:
@@ -512,6 +543,11 @@ def show_reduction(config):
         conn.execute("PRAGMA journal_mode=MEMORY")
         conn.execute("PRAGMA synchronous=OFF")
         conn.execute("PRAGMA temp_store=MEMORY")
+
+        # The pc_1..pc_k schema depends on the auto-selected component count,
+        # which can change between runs — drop before recreating.
+        conn.execute("DROP TABLE IF EXISTS reduction_pca")
+        conn.execute("DROP TABLE IF EXISTS reduction_pca_variance")
 
         conn.execute(
             f"CREATE TABLE IF NOT EXISTS reduction_pca ("

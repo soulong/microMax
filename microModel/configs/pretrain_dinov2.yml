@@ -6,28 +6,31 @@
 #
 # Uses a ViT backbone rebuilt via timm with special init args (pos_embed,
 # dynamic_img_size, init_values). Any timm ViT with a class token works.
-# Bundles saved to {output_dir}/ssl_model.pt (final) and ssl_model_{epoch}.pt
+# Bundles saved to {output_dir}/model.pt (final) and model_{epoch}.pt
 # (every save_interval). Every bundle is complete — usable for exact resume,
 # train transfer, and feature extraction.
 
+mode: single_cell
+
 method: dinov2
 
-output_dir: runs_dino
+output_dir: 20260805_pretrain_dino
 
 data:
   root:
-    - 2026-07-10_63x__2026-07-10T09_27_38-Measurement 1/objects_exported_p53
-    - 2026-07-11_63x__2026-07-11T18_11_55-Measurement 1/objects_exported_p53
-    - 2026-07-14_63x_22_Reza__2026-07-14T18_33_00-Measurement 1/objects_exported_p53
-    - 2026-07-18_22-cmpd__2026-07-18T00_00_00-Measurement 1/objects_exported_p53
-    - 2026-07-18_37-ctrl__2026-07-18T00_00_00-Measurement 1/objects_exported_p53
-    - D:/single_cell_dataset/opencell/single_cell
+    - sc_dataset/p53/2026-07-10_63x
+    - sc_dataset/p53/2026-07-11_63x
+    - sc_dataset/p53/2026-07-14_63x
+    - sc_dataset/p53/2026-07-18_22_63x
+    - sc_dataset/p53/2026-07-18_37_63x
+    - sc_dataset/opencell/single_cell
   image_pattern: null                 # regex for metadata extraction; null = none
+  max_value: 65535                    # max possible intensity of the input dtype (65535 for 16-bit, 255 for 8-bit); images are divided by it on load
   channels: [1]                       # 1-based indices; null = all
   channel_layout: null                # CHW | HWC | null (one-channel-per-file)
   label_from_dir: true                # ignored by pretrain (label-free)
   label_csv: null                     # ignored by pretrain (label-free)
-  sample_max: 60000                   # null = no limit
+  sample_max: null                    # null = no limit
   sample_by: per_dataset              # per_dataset | per_class
 
 # resume.ssl_model and resume.type:
@@ -40,7 +43,7 @@ resume:
   type: continue                      # continue | transfer
 
 backbone:
-  name: vit_small_patch14_dinov2.lvd142m  # any timm ViT with a class token
+  name: vit_small_patch14_dinov2.lvd142m    # any timm ViT with a class token
   pretrained: true                    # ImageNet weights; loaded into teacher+student
 
 # DINOv2-specific settings.
@@ -51,12 +54,12 @@ dinov2:
   drop_path_rate: 0.1                 # stochastic depth (student only)
   ibot_separate_head: false           # false = shared DINO/iBOT head; true = separate
   head_batch_norm: true               # critical anti-collapse mechanism; keep on
-  warmup_epochs: 10                   # LR + teacher temp warmup; then cosine -> lr_final
+  warmup_epochs: 8                    # LR + teacher temp warmup; then cosine -> lr_final
   transfer_warmup_epochs: 2           # shorter warmup for transfer resume
   teacher_temp_start: 0.04            # sharp teacher (fast early learning)
   teacher_temp_end: 0.07
   weight_decay_start: 0.04            # cosine -> weight_decay_end
-  weight_decay_end: 0.4
+  weight_decay_end: 0.6
   momentum_start: 0.992               # teacher EMA; cosine -> momentum_end
   momentum_end: 1.0
   koleo_weight: 0.1                   # KoLeo regularizer on student cls token
@@ -71,77 +74,91 @@ dinov2:
 #               degenerates to a rescaled full cell)
 augmentation_views:
   # ---- Global view 1 (mild aug) ----
-  - - ToFloat: {max_value: 65535, p: 1.0}
-    - HorizontalFlip: {p: 0.5}
+  - - HorizontalFlip: {p: 0.5}
     - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
-    - RandomScale: {scale_range: [-0.1, 0.2], p: 0.7}
-    - RandomBrightnessContrast: {brightness_range: [0, 0.02], contrast_range: [-0.1, 0.2], p: 0.7}
+    - LongestMaxSize: {max_size: 224, p: 1.0}
+    - RandomScale: {scale_range: [-0.2, 0.1], p: 0.7}
+    - RandomResizedCrop: {size: [224, 224], scale: [0.9, 1.0], ratio: [0.8, 1.2], mask_interpolation: 0, p: 1.0}
+    # - PadIfNeeded: {min_height: 224, min_width: 224, position: random, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.01], contrast_range: [-0.1, 0.2], ensure_safe_output: True, p: 0.7}
     - RandomGamma: {gamma_range: [80, 120], p: 0.7}
-    - GaussNoise: {std_range: [0.002, 0.005], p: 0.7}
+    - GaussNoise: {std_range: [0.0005, 0.001], p: 0.5}
     - GaussianBlur: {blur_range: [3, 7], sigma_range: [0.5, 2.0], p: 0.5}
-    - LongestMaxSize: {max_size: 224, p: 1.0}
-    - PadIfNeeded: {min_height: 224, min_width: 224, p: 1.0}
   # ---- Global view 2 (distinct scale/contrast) ----
-  - - ToFloat: {max_value: 65535, p: 1.0}
-    - HorizontalFlip: {p: 0.5}
+  - - HorizontalFlip: {p: 0.5}
     - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
-    - RandomScale: {scale_range: [-0.3, 0.1], p: 0.7}
-    - RandomBrightnessContrast: {brightness_range: [0, 0.03], contrast_range: [-0.15, 0.25], p: 0.7}
-    - RandomGamma: {gamma_range: [80, 120], p: 0.7}
-    - GaussNoise: {std_range: [0.002, 0.005], p: 0.7}
-    - GaussianBlur: {blur_range: [3, 7], sigma_range: [0.5, 3.0], p: 0.6}
     - LongestMaxSize: {max_size: 224, p: 1.0}
-    - PadIfNeeded: {min_height: 224, min_width: 224, p: 1.0}
+    - RandomScale: {scale_range: [-0.1, 0.2], p: 0.7}
+    - RandomResizedCrop: {size: [224, 224], scale: [0.7, 1.0], ratio: [0.8, 1.2], mask_interpolation: 0, p: 1.0}
+    # - PadIfNeeded: {min_height: 224, min_width: 224, position: random, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.03], contrast_range: [-0.15, 0.25], ensure_safe_output: True, p: 0.7}
+    - RandomGamma: {gamma_range: [80, 120], p: 0.7}
+    - GaussNoise: {std_range: [0.001, 0.004], p: 0.5}
+    - GaussianBlur: {blur_range: [1, 5], sigma_range: [0.5, 3.0], p: 0.6}
   # ---- Local view 1 (112x112 sub-region, stronger aug) ----
-  - - ToFloat: {max_value: 65535, p: 1.0}
-    - HorizontalFlip: {p: 0.5}
+  - - HorizontalFlip: {p: 0.5}
     - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
-    - RandomResizedCrop: {size: [112, 112], scale: [0.35, 0.6], ratio: [0.75, 1.3333], mask_interpolation: 0, p: 1.0}
-    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.2, 0.2], p: 0.8}
-    - RandomGamma: {gamma_range: [70, 130], p: 0.8}
-    - GaussNoise: {std_range: [0.003, 0.008], p: 0.7}
-    - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 4.0], p: 0.7}
-    - Downscale: {scale_range: [0.35, 0.65], p: 0.4}
+    - RandomResizedCrop: {size: [98, 98], scale: [0.35, 0.7], ratio: [0.75, 1.3333], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.2, 0.2], ensure_safe_output: True, p: 0.8}
+    # - RandomGamma: {gamma_range: [70, 130], p: 0.8}
+    - GaussNoise: {std_range: [0.001, 0.004], p: 0.7}
+    - GaussianBlur: {blur_range: [1, 5], sigma_range: [1.0, 4.0], p: 0.7}
+    - Downscale: {scale_range: [0.5, 0.9], p: 0.4}
   # ---- Local view 2 ----
-  - - ToFloat: {max_value: 65535, p: 1.0}
-    - HorizontalFlip: {p: 0.5}
+  - - HorizontalFlip: {p: 0.5}
     - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
-    - RandomResizedCrop: {size: [112, 112], scale: [0.35, 0.6], ratio: [0.75, 1.3333], mask_interpolation: 0, p: 1.0}
-    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.2, 0.2], p: 0.8}
-    - RandomGamma: {gamma_range: [70, 130], p: 0.8}
-    - GaussNoise: {std_range: [0.003, 0.008], p: 0.7}
+    - RandomResizedCrop: {size: [98, 98], scale: [0.25, 0.6], ratio: [0.75, 1.3333], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.2, 0.2], ensure_safe_output: True, p: 0.8}
+    # - RandomGamma: {gamma_range: [70, 130], p: 0.8}
+    - GaussNoise: {std_range: [0.001, 0.004], p: 0.7}
     - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 4.0], p: 0.7}
-    - Downscale: {scale_range: [0.35, 0.65], p: 0.4}
+    - Downscale: {scale_range: [0.5, 0.9], p: 0.4}
   # ---- Local view 3 ----
-  - - ToFloat: {max_value: 65535, p: 1.0}
-    - HorizontalFlip: {p: 0.5}
+  - - HorizontalFlip: {p: 0.5}
     - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
-    - RandomResizedCrop: {size: [112, 112], scale: [0.35, 0.6], ratio: [0.75, 1.3333], mask_interpolation: 0, p: 1.0}
-    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.2, 0.2], p: 0.8}
-    - RandomGamma: {gamma_range: [70, 130], p: 0.8}
-    - GaussNoise: {std_range: [0.003, 0.008], p: 0.7}
+    - RandomResizedCrop: {size: [98, 98], scale: [0.35, 0.7], ratio: [0.75, 1.3333], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.2, 0.2], ensure_safe_output: True, p: 0.8}
+    # - RandomGamma: {gamma_range: [70, 130], p: 0.8}
+    - GaussNoise: {std_range: [0.001, 0.004], p: 0.7}
     - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 4.0], p: 0.7}
-    - Downscale: {scale_range: [0.35, 0.65], p: 0.4}
+    - Downscale: {scale_range: [0.5, 0.9], p: 0.4}
   # ---- Local view 4 ----
-  - - ToFloat: {max_value: 65535, p: 1.0}
-    - HorizontalFlip: {p: 0.5}
+  - - HorizontalFlip: {p: 0.5}
     - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
-    - RandomResizedCrop: {size: [112, 112], scale: [0.35, 0.6], ratio: [0.75, 1.3333], mask_interpolation: 0, p: 1.0}
-    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.2, 0.2], p: 0.8}
-    - RandomGamma: {gamma_range: [70, 130], p: 0.8}
-    - GaussNoise: {std_range: [0.003, 0.008], p: 0.7}
+    - RandomResizedCrop: {size: [98, 98], scale: [0.25, 0.6], ratio: [0.75, 1.3333], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.2, 0.2], ensure_safe_output: True, p: 0.8}
+    - RandomGamma: {gamma_range: [80, 120], p: 0.8}
+    - GaussNoise: {std_range: [0.001, 0.004], p: 0.7}
     - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 4.0], p: 0.7}
-    - Downscale: {scale_range: [0.35, 0.65], p: 0.4}
-
+    - Downscale: {scale_range: [0.5, 0.9], p: 0.4}
+  # ---- Local view 5 (hard: stronger photometric, heavier blur/downscale) ----
+  - - HorizontalFlip: {p: 0.5}
+    - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
+    - RandomResizedCrop: {size: [98, 98], scale: [0.25, 0.6], ratio: [0.75, 1.3333], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.3, 0.3], p: 0.8}
+    - RandomGamma: {gamma_range: [80, 120], p: 0.8}
+    - GaussNoise: {std_range: [0.001, 0.006], p: 0.7}
+    - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 5.0], p: 0.8}
+    - Downscale: {scale_range: [0.4, 0.8], p: 0.6}
+  # ---- Local view 6 (hard: stronger photometric, heavier blur/downscale) ----
+  - - HorizontalFlip: {p: 0.5}
+    - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
+    - RandomResizedCrop: {size: [98, 98], scale: [0.35, 0.7], ratio: [0.75, 1.3333], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.3, 0.3], p: 0.8}
+    - RandomGamma: {gamma_range: [80, 120], p: 0.8}
+    - GaussNoise: {std_range: [0.001, 0.006], p: 0.7}
+    - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 5.0], p: 0.8}
+    - Downscale: {scale_range: [0.4, 0.8], p: 0.6}
+    
 # Deterministic augmentation for inference + UMAP check. REQUIRED.
 augmentation_infer:
-  - ToFloat: {max_value: 65535, p: 1.0}
   - LongestMaxSize: {max_size: 224, p: 1.0}
   - PadIfNeeded: {min_height: 224, min_width: 224, p: 1.0}
 
 normalize:
   method: global                      # global | per_channel | null
   with_masking: false                 # true = stats from cell foreground only
+  fixed_reference: true               # stats on RAW cell, fixed transform per view; preserves brightness/contrast aug
   clip_low: 0.05
   clip_high: 99.95
 
@@ -159,8 +176,8 @@ training:
   weight_decay: 0.04                  # initial; scheduled -> weight_decay_end
   betas: [0.9, 0.999]
   grad_clip: 10.0                     # global gradient norm clip; null = no clipping
-  grad_accum_steps: 10                # accumulate K micro-batches; effective batch = batch_size x K
-  batch_size: 32
+  grad_accum_steps: 20                # accumulate K micro-batches; effective batch = batch_size x K
+  batch_size: 30
   epochs: 100
   save_interval: 20
   n_image_umap: 10000                 # max images for periodic UMAP check; 0/null = off
