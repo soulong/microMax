@@ -13,7 +13,6 @@ import os
 import sys
 from collections import Counter
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -87,6 +86,17 @@ def _try_resume(config, device):
 
     ckpt = torch.load(resume_path, map_location=device, weights_only=False)
     logger.info("Loaded train checkpoint from epoch %d", ckpt.get("epoch", -1))
+
+    meta = ckpt.get("meta") or {}
+    if "num_classes" not in meta and "class_names" not in meta:
+        print(
+            f"Error: {resume_path} is not a train bundle (meta has no "
+            f"'num_classes'/'class_names') — resume.sl_model expects a "
+            f"classification checkpoint, not an SSL bundle. Use "
+            f"resume.ssl_model for SSL backbone transfer.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     saved_cfg = ckpt.get("config")
     if saved_cfg is None:
@@ -262,10 +272,10 @@ def train(config, config_path=None):
 
     datasets = build_cell_datasets(roots, channel_layout, image_pattern)
     all_records = []
-    resolved_channels = channels
+    resolved_per_root = {}
     for r, cell_ds in datasets:
         n_avail = len(cell_ds.intensity_colnames)
-        resolved_channels = resolve_channels(channels, n_avail, r)
+        resolved_per_root[r] = resolve_channels(channels, n_avail, r)
         recs = _build_records_from_cell_dataset(
             cell_ds, r, label_from_dir, label_csv, label_column)
         for rec in recs:
@@ -275,6 +285,21 @@ def train(config, config_path=None):
     if not all_records:
         print(f"Error: no records found in {roots}", file=sys.stderr)
         sys.exit(1)
+
+    # All roots must resolve to the same channel set — one bundle carries a
+    # single `channels` meta, so a heterogeneous resolution would silently
+    # train on the wrong channels for some roots (last-root-wins bug).
+    unique_resolved = {tuple(v) for v in resolved_per_root.values()}
+    if len(unique_resolved) > 1:
+        print(
+            f"Error: data roots resolve to different channel sets: "
+            f"{ {r: v for r, v in resolved_per_root.items()} }. "
+            f"Give every root the same channel count or set data.channels "
+            f"explicitly.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    resolved_channels = list(next(iter(unique_resolved))) if unique_resolved else channels
 
     # Drop unlabeled
     n_unlabeled = sum(1 for r in all_records if r["label"] is None)
@@ -312,10 +337,20 @@ def train(config, config_path=None):
         all_records, train_cfg.get("val_ratio", 0.25), seed)
     logger.info("Train: %d  Val: %d", len(train_records), len(val_records))
 
+    if not val_records:
+        print(
+            "Error: validation split is empty — every class needs at least "
+            "two samples for a non-empty val set (val_ratio "
+            f"{train_cfg.get('val_ratio', 0.25)}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # ---- Build train/val datasets ----
     train_ds = SingleCellDataset(
         [(r["cell_dataset"], r["idx"]) for r in train_records],
         label_to_idx,
+        labels=[r["label"] for r in train_records],
         channels=resolved_channels,
         augmentation_spec=aug_train_cfg,
         normalize_method=normalize_method,
@@ -327,6 +362,7 @@ def train(config, config_path=None):
     val_ds = SingleCellDataset(
         [(r["cell_dataset"], r["idx"]) for r in val_records],
         label_to_idx,
+        labels=[r["label"] for r in val_records],
         channels=resolved_channels,
         augmentation_spec=aug_infer_cfg,
         normalize_method=normalize_method,

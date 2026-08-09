@@ -437,12 +437,11 @@ class VisInteractiveServer:
                 img_hwc = _to_float_max(img_hwc, self.max_value)
                 img_hwc, mask = apply(self.aug_infer_pipeline, img_hwc, mask)
             else:
-                if img_hwc.dtype == np.uint16:
-                    img_hwc = img_hwc.astype(np.float32) / 65535.0
-                elif img_hwc.dtype == np.uint8:
-                    img_hwc = img_hwc.astype(np.float32) / 255.0
-                else:
-                    img_hwc = img_hwc.astype(np.float32)
+                # size="original": only the float conversion (no resize, no
+                # pad) — divide by the CONFIGURED data.max_value (e.g. 4095
+                # for 12-bit), not the dtype's hardcoded max, so both display
+                # modes agree on the [0, 1] domain.
+                img_hwc = _to_float_max(img_hwc, self.max_value)
 
             # If mask ON, zero background pixels (non-cell within bbox).
             mask_bool = mask.astype(bool) if mask is not None else None

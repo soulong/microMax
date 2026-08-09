@@ -19,9 +19,13 @@ class ChannelControls(QWidget):
 
     config_changed = Signal(str)
 
-    def __init__(self, ch_name: str, cfg: dict, parent: QWidget | None = None):
+    def __init__(self, ch_name: str, cfg: dict, max_value: float | None = None, parent: QWidget | None = None):
         super().__init__(parent)
         self._ch_name = ch_name
+        # Spin-box range follows the dataset dtype (e.g. 0..4294967295 for
+        # uint32, 0..1 for float) — a hardcoded 16-bit range would clamp
+        # vmax and silently corrupt the display of wider data.
+        self._max_value = float(max_value) if max_value is not None else 65535.0
 
         self.setStyleSheet("""
             QDoubleSpinBox, QComboBox {
@@ -67,10 +71,12 @@ class ChannelControls(QWidget):
 
         bottom.addWidget(QLabel("vmin"))
         self._vmin = NoScrollDoubleSpinBox()
-        self._vmin.setRange(0, 65535)
+        self._vmin.setRange(0, self._max_value)
         # Decimals >= 1 so auto-range percentiles (e.g. 1234.7) round-trip
-        # without truncation drift across reloads.
-        self._vmin.setDecimals(2)
+        # without truncation drift across reloads. Float datasets (max 1.0)
+        # get finer decimals + step so [0, 1] contrast is adjustable.
+        self._vmin.setDecimals(4 if self._max_value <= 1.0 else 2)
+        self._vmin.setSingleStep(0.0001 if self._max_value <= 1.0 else 1.0)
         self._vmin.setValue(cfg.get("vmin", 0))
         self._vmin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self._vmin.valueChanged.connect(lambda: self.config_changed.emit(self._ch_name))
@@ -79,9 +85,10 @@ class ChannelControls(QWidget):
 
         bottom.addWidget(QLabel("vmax"))
         self._vmax = NoScrollDoubleSpinBox()
-        self._vmax.setRange(0, 65535)
-        self._vmax.setDecimals(2)
-        self._vmax.setValue(cfg.get("vmax", 65535))
+        self._vmax.setRange(0, self._max_value)
+        self._vmax.setDecimals(4 if self._max_value <= 1.0 else 2)
+        self._vmax.setSingleStep(0.0001 if self._max_value <= 1.0 else 1.0)
+        self._vmax.setValue(cfg.get("vmax", self._max_value))
         self._vmax.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self._vmax.valueChanged.connect(lambda: self.config_changed.emit(self._ch_name))
         self._vmax.setContextMenuPolicy(Qt.NoContextMenu)

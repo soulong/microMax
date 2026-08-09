@@ -571,7 +571,9 @@ class ImageProfilingStepPanel(BaseStepPanel):
                 elif saved_image:
                     cb.setChecked(ch in saved_image)
                 else:
-                    cb.setChecked(True)
+                    # Fresh default: NOTHING checked — the user picks the
+                    # channels explicitly (Run is blocked with no selection).
+                    cb.setChecked(False)
                 self._image_grid_layout.addWidget(cb, 0, col)
                 self._image_ch_cbs.append(cb)
                 self._wire_param_signal(cb)

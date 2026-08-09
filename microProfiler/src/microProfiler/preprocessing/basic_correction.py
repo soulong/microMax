@@ -118,19 +118,15 @@ def transform_images(
     metadata = ds.metadata
     root = Path(root_dir) if root_dir else ds.root
 
-    total_items = sum(
-        1 for chan in channels
-        if (root / ".microprofiler" / "BaSiC_model" / f"{chan}.pkl").exists()
-    )
-    item_idx = 0
+    for ci, chan in enumerate(channels):
+        # Channel-level progress (2/4 style), mirroring fit_models — reported
+        # for every channel (skipped ones still advance the counter). The
+        # per-image tqdm below keeps the fine-grained view in the terminal.
+        progress.report("BaSiC Transform", ci, len(channels), f"Channel {chan}")
 
-    for chan in channels:
         model_path = root / ".microprofiler" / "BaSiC_model" / f"{chan}.pkl"
         if not model_path.exists():
             continue
-
-        progress.report("BaSiC Transform", item_idx, total_items, f"Channel {chan}")
-        item_idx += 1
 
         with open(model_path, "rb") as f:
             model = pickle.load(f)
@@ -145,8 +141,7 @@ def transform_images(
             logger.warning("Skipping %d missing file(s) for channel %s", len(missing), chan)
         paths = [p for p in paths if p.exists()]
 
-        for idx, src in enumerate(tqdm(paths, desc=f"BaSiC transform {chan}", unit="img")):
-            progress.report("BaSiC Transform", idx, len(paths), f"Channel {chan}")
+        for src in tqdm(paths, desc=f"BaSiC transform {chan}", unit="img"):
             img = read_image(src)
             corrected = model.transform(img[None, ...])[0]
             dtype_in = img.dtype
@@ -157,7 +152,7 @@ def transform_images(
             corrected = corrected.astype(dtype_in)
             write_image(src, corrected)
 
-    progress.report("BaSiC Transform", total_items, total_items, "Transform complete")
+    progress.report("BaSiC Transform", len(channels), len(channels), "Transform complete")
 
     return rebuild_dataset(ds)
 

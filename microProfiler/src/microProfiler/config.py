@@ -26,13 +26,13 @@ class FilterEntry:
 
 @dataclass
 class ResizeConfig:
-    run: bool = True
+    run: bool = False
     scale_factor: float = 1.0
 
 
 @dataclass
 class BasicConfig:
-    run: bool = True
+    run: bool = False
     mode: str = "fit-transform"
     n_image: int = 100
     working_size: int = 64
@@ -41,13 +41,13 @@ class BasicConfig:
 
 @dataclass
 class ZProjectConfig:
-    run: bool = True
+    run: bool = False
     method: ProjectionMethod = ProjectionMethod.max
 
 
 @dataclass
 class TileConfig:
-    run: bool = True
+    run: bool = False
     tile_width: int = 1024
     tile_height: int = 1024
 
@@ -70,13 +70,13 @@ class SegmentEntry:
 
 @dataclass
 class SegmentConfig:
-    run: bool = True
+    run: bool = False
     configs: List[SegmentEntry] = field(default_factory=list)
 
 
 @dataclass
 class ImageProfileConfig:
-    run: bool = True
+    run: bool = False
     n_workers: int = field(
         default_factory=lambda: max(1, (os.cpu_count() or 1) // 2)
     )
@@ -159,11 +159,55 @@ class ResolvedProfiling:
 
 @dataclass
 class ObjectProfileConfig:
-    run: bool = True
+    run: bool = False
     n_workers: int = field(
         default_factory=lambda: max(1, (os.cpu_count() or 1) // 2)
     )
     configs: List[ObjectProfileEntry] = field(default_factory=list)
+
+
+@dataclass
+class InferenceReductionConfig:
+    """Optional PCA + UMAP reduction after inference (per inference block).
+
+    var_threshold selects PCA components covering this fraction of the
+    variance (0.95 default). When reducer_pca/reducer_umap are provided the
+    fitted reducers are used to transform directly (no refit).
+    """
+
+    enabled: bool = False
+    var_threshold: float = 0.95
+    color_by: str = "pred_class"
+    sample_per_class: int = 10000
+    reducer_pca: Optional[str] = None
+    reducer_umap: Optional[str] = None
+
+
+@dataclass
+class InferenceEntry:
+    """One inference block: a trained microModel bundle applied per object.
+
+    feature/pred_class/pred_prob are output toggles; SSL bundles only support
+    features (pred_class/pred_prob are gated in the GUI). max_value is the
+    maximum possible intensity of the input dtype (65535 for 16-bit, 255 for
+    8-bit) and is always read from config — it is trusted as-is.
+    """
+
+    model: str = ""
+    mask_name: Optional[str] = None
+    channels: Optional[List[str]] = None
+    feature: bool = True
+    pred_class: bool = True
+    pred_prob: bool = True
+    output_db: str = "infer.db"
+    max_value: Optional[float] = None
+    reduction: Optional[InferenceReductionConfig] = None
+
+
+@dataclass
+class InferenceConfig:
+    run: bool = False
+    configs: List[InferenceEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -183,6 +227,8 @@ class PipelineConfig:
 
     image_profile: Optional[ImageProfileConfig] = None
     object_profile: Optional[ObjectProfileConfig] = None
+
+    inference: Optional[InferenceConfig] = None
 
 
 def load_config(
@@ -219,7 +265,8 @@ def _dict_to_config(d: Dict) -> PipelineConfig:
         cfg.filter = [FilterEntry(**f) for f in d["filter"]]
 
     for attr in ("resize", "basic", "zproject", "tile",
-                 "segment", "image_profile", "object_profile"):
+                 "segment", "image_profile", "object_profile",
+                 "inference"):
         section = d.get(attr)
         if section:
             setattr(cfg, attr, section_to_dataclass(attr, section))
@@ -231,32 +278,69 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
     """Convert a single section dict to its corresponding dataclass instance.
 
     attr is one of: resize, basic, zproject, tile, segment,
-    image_profile, object_profile.
+    image_profile, object_profile, inference.
+    Unknown keys raise ValueError with a clear message (no silent dropping).
     """
     if attr == "resize":
-        return ResizeConfig(**section)
+        return _dataclass_from_section(attr, ResizeConfig, section)
     if attr == "basic":
-        return BasicConfig(**section)
+        return _dataclass_from_section(attr, BasicConfig, section)
     if attr == "zproject":
         zpd = section
         if "method" in zpd and isinstance(zpd["method"], str):
             zpd = {**zpd, "method": ProjectionMethod(zpd["method"])}
-        return ZProjectConfig(**zpd)
+        return _dataclass_from_section(attr, ZProjectConfig, zpd)
     if attr == "tile":
-        return TileConfig(**section)
+        return _dataclass_from_section(attr, TileConfig, section)
     if attr == "segment":
-        entries = [SegmentEntry(**e) for e in section.get("configs", [])]
-        return SegmentConfig(run=section.get("run", True), configs=entries)
+        entries = [_entry_from_section(attr, SegmentEntry, e)
+                   for e in section.get("configs", [])]
+        return SegmentConfig(run=section.get("run", False), configs=entries)
     if attr == "image_profile":
-        return ImageProfileConfig(**section)
+        return _dataclass_from_section(attr, ImageProfileConfig, section)
     if attr == "object_profile":
-        entries = [ObjectProfileEntry(**e) for e in section.get("configs", [])]
+        entries = [_entry_from_section(attr, ObjectProfileEntry, e)
+                   for e in section.get("configs", [])]
         n_workers = section.get("n_workers")
         if n_workers is None:
             n_workers = max(1, (os.cpu_count() or 1) // 2)
         return ObjectProfileConfig(
-            run=section.get("run", True), n_workers=n_workers, configs=entries)
+            run=section.get("run", False), n_workers=n_workers, configs=entries)
+    if attr == "inference":
+        entries = []
+        for e in section.get("configs", []):
+            red = e.get("reduction")
+            red_obj = (
+                _dataclass_from_section(attr, InferenceReductionConfig, red)
+                if red else None
+            )
+            entries.append(InferenceEntry(**{**e, "reduction": red_obj}))
+        return InferenceConfig(run=section.get("run", False), configs=entries)
     raise ValueError(f"Unknown config section: {attr!r}")
+
+
+def _dataclass_from_section(attr: str, cls, section: Dict):
+    """Instantiate a dataclass from a section dict, rejecting unknown keys."""
+    known = set(cls.__dataclass_fields__)
+    unknown = set(section) - known
+    if unknown:
+        raise ValueError(
+            f"Unknown keys in '{attr}' section: {sorted(unknown)}. "
+            f"Valid keys: {sorted(known)}"
+        )
+    return cls(**section)
+
+
+def _entry_from_section(attr: str, cls, entry: Dict):
+    """Instantiate a block-list entry dataclass, rejecting unknown keys."""
+    known = set(cls.__dataclass_fields__)
+    unknown = set(entry) - known
+    if unknown:
+        raise ValueError(
+            f"Unknown keys in '{attr}.configs' entry: {sorted(unknown)}. "
+            f"Valid keys: {sorted(known)}"
+        )
+    return cls(**entry)
 
 
 def config_to_dict(cfg: PipelineConfig) -> Dict:
@@ -270,11 +354,13 @@ def config_to_dict(cfg: PipelineConfig) -> Dict:
     if cfg.image_subdir_pattern is not None:
         result["image_subdir_pattern"] = cfg.image_subdir_pattern
 
-    if cfg.filter:
-        result["filter"] = [dataclasses.asdict(f) for f in cfg.filter]
+    # `filter` is always written (even as []): SessionFile.save deep-merges,
+    # so an absent key would leave a stale GUI-written filter in session.yml.
+    result["filter"] = [dataclasses.asdict(f) for f in cfg.filter] if cfg.filter else []
 
     for attr in ("resize", "basic", "zproject", "tile",
-                 "segment", "image_profile", "object_profile"):
+                 "segment", "image_profile", "object_profile",
+                 "inference"):
         val = getattr(cfg, attr)
         if val is not None:
             d = dataclasses.asdict(val)

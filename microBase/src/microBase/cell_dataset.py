@@ -150,7 +150,7 @@ class CellDataset:
         self._intensity_colnames = [f"ch{i}" for i in range(1, n_channels + 1)]
 
     def get_cell(self, idx):
-        """Read one cell TIFF. Returns (img_HWC, ) tuple for forward-compat.
+        """Read one cell TIFF.
 
         Args:
             idx: integer index into metadata.

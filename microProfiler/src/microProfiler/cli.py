@@ -44,6 +44,9 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
     Table existence is required, and the `image` table must additionally
     contain one row per dataset image — a partial table (e.g. from an
     interrupted or failed run) must not be treated as complete.
+    When inference is enabled, each block's output DB must also exist with
+    its `inference` table (plus the reduction tables when reduction is on) —
+    table existence only, no row-count guard (masks can change between runs).
     """
     db_path = dataset_dir / "result.db"
     if not db_path.exists():
@@ -112,7 +115,39 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
         logger.warning("Could not check DB tables in %s: %s", db_path, e)
         return False
 
+    if cfg.inference and cfg.inference.run and cfg.inference.configs:
+        for entry in cfg.inference.configs:
+            if not entry.model:
+                continue
+            infer_db = dataset_dir / (entry.output_db or "infer.db")
+            tables = {"inference"}
+            if entry.reduction and entry.reduction.enabled:
+                tables |= {"reduction_pca", "reduction_umap", "reduction_pca_variance"}
+            missing = tables - _existing_tables(infer_db)
+            if missing:
+                logger.info(
+                    "Incomplete inference DB %s for %s (missing %s) — reprocessing",
+                    infer_db, dataset_dir, sorted(missing),
+                )
+                return False
+
     return True
+
+
+def _existing_tables(db_path: Path) -> set[str]:
+    if not db_path.exists():
+        return set()
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+            return {row[0] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+    except Exception:
+        return set()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -162,9 +197,28 @@ def main(argv: list[str] | None = None) -> int:
     logger.debug("Debug logging enabled")
 
     if args.command == "run":
-        cfg = load_config(args.config)
+        try:
+            cfg = load_config(args.config)
+        except ValueError as e:
+            # Unknown config keys / invalid values — clean hard-exit, not a
+            # raw traceback.
+            print(f"Error: invalid config {args.config}: {e}", file=sys.stderr)
+            sys.exit(1)
         dataset_dir = Path(args.dataset_dir)
         dataset_pattern = args.dataset_pattern
+
+        # A config that requests inference must have its tooling present —
+        # silently skipping would fake a completed run (§2 no-guessing).
+        if cfg.inference and cfg.inference.run and cfg.inference.configs:
+            import importlib.util
+            if importlib.util.find_spec("microModel") is None:
+                print(
+                    "Error: inference is enabled in the config but the "
+                    "'microModel' package is not installed. Install microModel "
+                    "or disable the 'inference' section.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
         datasets = resolve_datasets(dataset_dir, dataset_pattern)
         if not datasets:
@@ -206,6 +260,14 @@ def main(argv: list[str] | None = None) -> int:
             except MetadataValidationError as e:
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
+            except SystemExit as e:
+                # microBase hard-exits (sys.exit) on bad dataset state (missing
+                # files, invalid filter column, corrupt TIFF). Treat it as a
+                # per-dataset failure so one bad dataset never aborts a plate
+                # scan — the same policy _is_dataset_complete applies above.
+                logger.error("Dataset failed: %s — %s", dataset_dir, e)
+                logger.info("Continuing to next dataset...")
+                print()
             except Exception as e:
                 logger.error("Dataset failed: %s — %s", dataset_dir, e)
                 logger.info("Continuing to next dataset...")

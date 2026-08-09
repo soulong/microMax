@@ -42,7 +42,7 @@ from microProfiler.gui.workers.dataset_load_worker import DatasetLoadWorker
 from microProfiler.gui.sidebar import Sidebar
 from microProfiler.gui.panels import (
     BaSiCStepPanel, FilterPanel,
-    ImageProfilingStepPanel, ObjectProfilingStepPanel,
+    ImageProfilingStepPanel, InferenceStepPanel, ObjectProfilingStepPanel,
     ResizeStepPanel, SegmentStepPanel, TileStepPanel, ZProjectStepPanel,
 )
 from microProfiler.gui.panels.base_step_panel import BaseStepPanel
@@ -105,7 +105,6 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._ctrl = PipelineController(self)
         self._connect_signals()
-        self._restore_session()
         self._apply_compact_widths()
         self.setFocus()
 
@@ -168,7 +167,12 @@ class MainWindow(QMainWindow):
         return f"[{step}] {bar} {current}/{total} ({pct*100:.0f}%)"
 
     def _on_log_progress(self, step: str, current: int, total: int, message: str) -> None:
-        self._progress_label.setText(self._tqdm_bar(step, current, total))
+        if total <= 0 and message:
+            # Status line (e.g. microModel's "Fitting PCA + UMAP...") —
+            # show the text instead of a meaningless 0/1 bar.
+            self._progress_label.setText(f"[{step}] {message}")
+        else:
+            self._progress_label.setText(self._tqdm_bar(step, current, total))
         self._progress_label.setVisible(True)
 
     def get_all_step_panels(self):
@@ -186,6 +190,7 @@ class MainWindow(QMainWindow):
             "segment": self._segment_panel,
             "image_profile": self._image_profile_panel,
             "object_profile": self._object_profile_panel,
+            "inference": self._inference_panel,
             "filter": self._filter_panel,
         }
         return mapping.get(name)
@@ -240,13 +245,14 @@ class MainWindow(QMainWindow):
         self._segment_panel = SegmentStepPanel(self._state)
         self._image_profile_panel = ImageProfilingStepPanel(self._state)
         self._object_profile_panel = ObjectProfilingStepPanel(self._state)
+        self._inference_panel = InferenceStepPanel(self._state)
         self._filter_panel = FilterPanel(self._state)
 
         self._all_step_panels = [
             self._resize_panel, self._basic_panel,
             self._zproject_panel, self._tile_panel,
             self._segment_panel, self._image_profile_panel,
-            self._object_profile_panel,
+            self._object_profile_panel, self._inference_panel,
         ]
 
         self._preprocessing_steps = [
@@ -390,6 +396,27 @@ class MainWindow(QMainWindow):
         prof_layout.addWidget(self._prof_scroll, 1)
         self._stack.addWidget(prof_page)
 
+        # ── Page 4: Inference ──────────────────────────────────────────
+        infer_page = QWidget()
+        infer_layout = QVBoxLayout(infer_page)
+        infer_layout.setContentsMargins(4, 4, 4, 4)
+
+        self._infer_scroll = QScrollArea()
+        self._infer_scroll.setWidgetResizable(True)
+        infer_scroll_inner = QWidget()
+        infer_scroll_layout = QVBoxLayout(infer_scroll_inner)
+        infer_scroll_layout.setContentsMargins(0, 0, 0, 0)
+        infer_scroll_layout.setSpacing(12)
+        infer_scroll_layout.addWidget(self._inference_panel)
+        self._run_infer_btn = QPushButton("Run Inference")
+        self._run_infer_btn.setProperty("class", "primary")
+        self._run_infer_btn.setFixedHeight(dp(32))
+        infer_scroll_layout.addWidget(self._run_infer_btn)
+        infer_scroll_layout.addStretch()
+        self._infer_scroll.setWidget(infer_scroll_inner)
+        infer_layout.addWidget(self._infer_scroll, 1)
+        self._stack.addWidget(infer_page)
+
         # ── Progress bar at bottom ─────────────────────────────────────
         self._progress_label = QLabel("")
         self._progress_label.setVisible(False)
@@ -426,6 +453,7 @@ class MainWindow(QMainWindow):
         self._run_pre_btn.clicked.connect(self._ctrl.run_preprocessing)
         self._run_seg_btn.clicked.connect(self._ctrl.run_segmentation)
         self._run_prof_btn.clicked.connect(self._ctrl.run_profiling)
+        self._run_infer_btn.clicked.connect(self._ctrl.run_inference)
         self._sidebar.cancel_clicked.connect(self._ctrl._cancel_current_worker)
 
         self._ctrl._preview_worker = PreviewWorker()
@@ -449,10 +477,13 @@ class MainWindow(QMainWindow):
         self._segment_panel.parameter_changed.connect(self._ctrl._sync_seg_masks_to_profiling)
 
     def _on_navigation_changed(self, page_id: str) -> None:
-        index_map = {"input": 0, "preprocess": 1, "segment": 2, "profile": 3}
+        index_map = {
+            "input": 0, "preprocess": 1, "segment": 2,
+            "profile": 3, "inference": 4,
+        }
         if page_id in index_map:
             self._stack.setCurrentIndex(index_map[page_id])
-            if page_id == "profile":
+            if page_id in ("profile", "inference"):
                 self._ctrl._sync_seg_masks_to_profiling()
 
     def _on_thread_count_changed(self, value: int) -> None:
@@ -641,9 +672,27 @@ class MainWindow(QMainWindow):
             self._image_profile_panel.populate_channels(ds.intensity_colnames)
             self._object_profile_panel.populate_channels(ds.intensity_colnames)
             self._object_profile_panel.populate_masks(ds.mask_colnames)
+            self._inference_panel.populate_channels(ds.intensity_colnames)
+            self._inference_panel.populate_masks(ds.mask_colnames)
             self._ctrl._sync_seg_masks_to_profiling()
             if hasattr(self._basic_panel, "set_preview_channels"):
                 self._basic_panel.set_preview_channels(ds.intensity_colnames)
+
+            # max_value is read from config and always trusted; a mismatch
+            # against the dataset dtype is a non-blocking warning (§Q12) so the
+            # user can check the yml — the configured value is still used.
+            try:
+                mismatches = self._inference_panel.max_value_mismatches(ds.img_dtype)
+            except Exception:
+                mismatches = []
+            if mismatches:
+                QMessageBox.warning(
+                    self, "max_value Mismatch",
+                    "Configured max_value does not match the dataset dtype:\n\n"
+                    + "\n".join(mismatches)
+                    + "\n\nThe configured value is used as-is — check the "
+                      "config/session.yml if unexpected.")
+            self._inference_panel.set_dataset_dtype(ds.img_dtype)
 
             self._update_dataset_info(ds)
 
@@ -667,10 +716,13 @@ class MainWindow(QMainWindow):
                     "Failed to persist patterns to session.yml", exc_info=True)
 
             self._loaded_dataset_dir = output_path
+            self._update_window_title()
             self._update_tab_status()
         except Exception as e:
             self._state.dataset = None
             self._state.original_dataset = None
+            self._loaded_dataset_dir = None
+            self._update_window_title()
             self._update_tab_status()
             QMessageBox.warning(self, "Load Failed", f"Could not load dataset:\n{e}")
 
@@ -691,6 +743,8 @@ class MainWindow(QMainWindow):
 
         self._state.dataset = None
         self._state.original_dataset = None
+        self._loaded_dataset_dir = None
+        self._update_window_title()
         self._update_tab_status()
         QMessageBox.warning(self, "Load Failed", f"Could not load dataset:\n{msg}")
 
@@ -702,35 +756,19 @@ class MainWindow(QMainWindow):
         self._loaded_dataset_dir = None
         self._loaded_input_dir = None
         self._pending_filters = None
+        self._update_window_title()
         # Structured configs restored from a previous directory must not
         # leak into the next dataset's object-profile blocks.
         obj_panel = getattr(self, "_object_profile_panel", None)
         if obj_panel is not None:
             obj_panel._pending_block_configs = []
+        inf_panel = getattr(self, "_inference_panel", None)
+        if inf_panel is not None:
+            inf_panel._pending_block_configs = []
         self._clear_dataset_info()
         if hasattr(self, '_filter_panel') and self._filter_panel is not None:
             self._filter_panel._reset_filters()
         self._update_tab_status()
-
-    # ── Session restore ─────────────────────────────────────────────────
-
-    def _restore_session(self) -> None:
-        session_root = self._output_dir.text() or self._input_dir.text()
-        if not session_root:
-            return
-        sf = SessionFile(Path(session_root))
-        data = sf.load()
-        if not data:
-            return
-        params = {k: v for k, v in data.items() if not k.startswith("_")}
-        applied = data.get("applied_steps", [])
-        if params:
-            for step in self._all_step_panels:
-                step.from_config(params.get(step.step_name, {}))
-        for step in self._all_step_panels:
-            if step.step_name in applied:
-                step.setChecked(True)
-        logging.getLogger("microProfiler").info("Session restored from session.yml")
 
     # ── Compact widths ──────────────────────────────────────────────────
 
@@ -744,12 +782,19 @@ class MainWindow(QMainWindow):
         txt = self._output_dir.text() or self._input_dir.text()
         return Path(txt)
 
+    def _update_window_title(self) -> None:
+        if self._loaded_dataset_dir:
+            self.setWindowTitle(f"microProfiler — {self._loaded_dataset_dir}")
+        else:
+            self.setWindowTitle("microProfiler")
+
     def _update_tab_status(self) -> None:
         ds = self._state.dataset
         has_ds = ds is not None and len(ds) > 0
         self._run_pre_btn.setEnabled(has_ds)
         self._run_seg_btn.setEnabled(has_ds)
         self._run_prof_btn.setEnabled(has_ds)
+        self._run_infer_btn.setEnabled(has_ds)
 
     def _on_filter_changed(self) -> None:
         ds = self._state.dataset
@@ -761,6 +806,7 @@ class MainWindow(QMainWindow):
                 self._segment_panel.populate_channels(ds.intensity_colnames)
                 self._image_profile_panel.populate_channels(ds.intensity_colnames)
                 self._object_profile_panel.populate_channels(ds.intensity_colnames)
+                self._inference_panel.populate_channels(ds.intensity_colnames)
                 self._last_filter_channels = ch
             if masks != getattr(self, "_last_filter_masks", None):
                 self._ctrl._sync_seg_masks_to_profiling()
@@ -850,6 +896,8 @@ class MainWindow(QMainWindow):
             self._image_profile_panel.populate_channels(ch)
             self._object_profile_panel.populate_channels(ch)
             self._object_profile_panel.populate_masks(mk)
+            self._inference_panel.populate_channels(ch)
+            self._inference_panel.populate_masks(mk)
         applied = data.get("applied_steps", [])
         for step in self._all_step_panels:
             if step.step_name in applied:
@@ -872,6 +920,9 @@ class MainWindow(QMainWindow):
         obj_panel = getattr(self, "_object_profile_panel", None)
         if obj_panel is not None:
             obj_panel._pending_block_configs = []
+        inf_panel = getattr(self, "_inference_panel", None)
+        if inf_panel is not None:
+            inf_panel._pending_block_configs = []
         self._filter_panel._reset_filters()
         if hasattr(self._basic_panel, "_clear_preview"):
             self._basic_panel._clear_preview()
@@ -882,10 +933,13 @@ class MainWindow(QMainWindow):
         self._image_profile_panel.populate_channels([])
         self._object_profile_panel.populate_channels([])
         self._object_profile_panel.populate_masks([])
+        self._inference_panel.populate_channels([])
+        self._inference_panel.populate_masks([])
         self._input_dir.clear()
         self._output_dir.clear()
         self._output_manually_set = False
         self._clear_dataset_info()
+        self._update_window_title()
         self._update_tab_status()
         logging.getLogger("microProfiler").info("Pipeline reset complete.")
 
@@ -908,9 +962,23 @@ class MainWindow(QMainWindow):
         if loader is not None:
             workers.append(loader)
         for w in workers:
-            if w is not None and hasattr(w, "_thread") and w._thread is not None and w._thread.isRunning():
-                if hasattr(w, "_cancel_event"):
-                    w._cancel_event.set()
-                w._thread.quit()
-                w._thread.wait(5000)
+            if w is None or not hasattr(w, "_thread"):
+                continue
+            # A finished worker's QThread is scheduled for deletion via
+            # deleteLater; its C++ wrapper may already be gone, in which case
+            # isRunning() raises RuntimeError. Guard so closing the window
+            # after a completed run doesn't crash.
+            try:
+                thread = w._thread
+                if thread is None or not thread.isRunning():
+                    continue
+            except RuntimeError:
+                continue
+            if hasattr(w, "_cancel_event"):
+                w._cancel_event.set()
+            try:
+                thread.quit()
+                thread.wait(5000)
+            except RuntimeError:
+                pass
         super().closeEvent(event)

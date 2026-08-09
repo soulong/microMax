@@ -3,6 +3,12 @@
 Independent of dataset and augmentation. Accepts (H, W, C) float arrays
 (usually after augmentation, before tensorization). Returns float32 (H, W, C).
 
+Clipping is per-channel and always applied: each channel is percentile-clipped
+and min-max rescaled to [0, 1] ((clipped - lo) / (hi - lo)). The z-score then
+runs on the rescaled values: per-channel for method="per_channel", pooled
+across channels for method="global"; method="null" returns the rescaled array
+as-is.
+
 If a mask is provided, statistics are computed only over foreground pixels.
 """
 
@@ -12,8 +18,10 @@ import numpy as np
 
 
 def _clip_channel(channel, clip_low, clip_high, mask=None):
-    """Clip a single 2D channel by percentile. Returns clipped float32 array.
+    """Clip a single 2D channel by percentile and min-max rescale to [0, 1].
 
+    Returns float32 array: (clip(channel, lo, hi) - lo) / (hi - lo), or zeros
+    for degenerate channels (empty region or hi <= lo).
     If mask is given, percentiles are computed over foreground pixels only.
     """
     region = _get_region(channel, mask)
@@ -39,7 +47,7 @@ def _get_region(channel, mask):
 
 def normalize(image, mask=None, method="per_channel",
               clip_low=0.05, clip_high=99.95):
-    """Normalize a (H, W, C) array via z-score after percentile clipping.
+    """Normalize a (H, W, C) array via z-score after percentile clip + rescale.
 
     Args:
         image: (H, W, C) array, any numeric dtype.
@@ -47,7 +55,7 @@ def normalize(image, mask=None, method="per_channel",
                on foreground (mask truthy). Background is zeroed after norm.
         method: "per_channel" — independent z-score per channel
                 "global"     — single z-score across all channels
-                "null" / None — no normalization (still applies clipping)
+                "null" / None — no z-score (still applies clip + rescale)
         clip_low, clip_high: percentile bounds in [0, 100].
 
     Returns:

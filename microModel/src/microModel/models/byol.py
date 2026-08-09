@@ -25,11 +25,12 @@ from ..utils import logger
 class BYOL(nn.Module):
     """BYOL model: online backbone + projection + prediction, with momentum target."""
 
-    def __init__(self, backbone, feat_dim,
+    def __init__(self, backbone, feat_dim, pool_fn,
                  proj_hidden=1024, proj_out=256,
                  pred_hidden=1024, pred_out=256):
         super().__init__()
         self.backbone = backbone
+        self.pool_fn = pool_fn
         self.projection_head = BYOLProjectionHead(feat_dim, proj_hidden, proj_out)
         self.prediction_head = BYOLPredictionHead(proj_out, pred_hidden, pred_out)
         # Momentum (target) network — deepcopy + freeze
@@ -39,13 +40,17 @@ class BYOL(nn.Module):
         deactivate_requires_grad(self.projection_head_momentum)
 
     def forward(self, x):
-        """Online forward: backbone -> flatten -> projection -> prediction -> p.
+        """Online forward: backbone -> pool -> projection -> prediction -> p.
 
+        Pooling (via the build_backbone pool_fn) makes BYOL work with ANY
+        timm backbone — conv (B, C, H, W), ViT token (B, N, C), or
+        already-pooled (B, C) outputs — a raw flatten only supported the
+        already-pooled case.
         The MLP heads run in fp32 (autocast disabled) — fp16 matmul
         accumulation in the heads produced rare NaN on some GPUs even with
         small, finite activations (cuBLAS reduced-precision reduction).
         """
-        y = self.backbone(x).flatten(start_dim=1).float()
+        y = self.pool_fn(self.backbone(x)).float()
         with torch.amp.autocast(device_type=x.device.type, enabled=False):
             z = self.projection_head(y)
             p = self.prediction_head(z)
@@ -53,7 +58,7 @@ class BYOL(nn.Module):
 
     def forward_momentum(self, x):
         """Target forward: momentum backbone -> momentum projection -> z (detached)."""
-        y = self.backbone_momentum(x).flatten(start_dim=1).float()
+        y = self.pool_fn(self.backbone_momentum(x)).float()
         with torch.amp.autocast(device_type=x.device.type, enabled=False):
             z = self.projection_head_momentum(y)
         return z.detach()
@@ -68,13 +73,13 @@ def build_byol(backbone_cfg, method_cfg, device):
                  warmup_epochs, transfer_warmup_epochs, momentum_start,
                  momentum_end, lr_final}
     """
-    backbone, feat_dim, _ = build_backbone(
+    backbone, feat_dim, pool_fn = build_backbone(
         backbone_cfg["name"],
         backbone_cfg["in_chans"],
-        backbone_cfg.get("pretrained", True),
+        backbone_cfg.get("pretrained", False),
     )
     model = BYOL(
-        backbone, feat_dim,
+        backbone, feat_dim, pool_fn,
         proj_hidden=method_cfg.get("proj_hidden_dim", 1024),
         proj_out=method_cfg.get("proj_out_dim", 256),
         pred_hidden=method_cfg.get("pred_hidden_dim", 1024),

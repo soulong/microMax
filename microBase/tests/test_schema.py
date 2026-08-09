@@ -36,6 +36,14 @@ def test_derive_well_basic():
     assert derive_well(27, 1) == "AA1"
 
 
+def test_derive_well_non_numeric_col_raises():
+    """Non-numeric column values must raise a clear ValueError (metadata is TEXT)."""
+    with pytest.raises(ValueError, match="not numeric"):
+        derive_well("A", "1.5")
+    with pytest.raises(ValueError, match="not numeric"):
+        derive_well("A", "A")
+
+
 # ---- normalize_capture ----
 # normalize_capture is a verbatim pass-through: all metadata is stored as TEXT
 # from extraction through DB storage, so '01' stays '01', 'blue' stays 'blue'.

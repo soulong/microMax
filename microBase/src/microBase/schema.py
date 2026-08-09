@@ -33,8 +33,19 @@ def _row_to_letter(row_val):
 
 
 def derive_well(row_val, col_val):
-    """Build a well label like 'A1' from row+col values."""
-    return f"{_row_to_letter(row_val)}{int(col_val)}"
+    """Build a well label like 'A1' from row+col values.
+
+    Raises ValueError with a clear message if the column value is not
+    numeric (metadata is TEXT, so e.g. '1.5' or 'A' reach this point).
+    """
+    try:
+        col_int = int(col_val)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"derive_well: column value {col_val!r} is not numeric — "
+            f"row/col captures must be integers to derive a well label."
+        ) from None
+    return f"{_row_to_letter(row_val)}{col_int}"
 
 
 def normalize_capture(_col_name, value):

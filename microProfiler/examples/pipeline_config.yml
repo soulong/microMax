@@ -15,8 +15,12 @@ image_subdir_pattern: Images
 # filter:
 #   - column: well
 #     pattern: "^(A01|A02|A03)$"     # exact well match
-#   - column: channel
-#     pattern: "ch1$"                 # exact channel match (avoids ch10, ch11, …)
+#   - column: field
+#     pattern: "^(1|2|3)$"            # exact field match
+#
+# NOTE: the `channel` capture is consumed into intensity columns (ch1, ch2, …)
+# and does NOT exist as a metadata column — filter on `well`/`field`/`stack`/
+# `timepoint`/extra columns instead.
 filter: null
 
 # pre-processing
@@ -71,6 +75,8 @@ segment:
       gpu_batch_size: 32
 
 # image profiling
+# image_channels: null/absent/[] skips the step entirely (like the GUI's
+# blocked Run with no selection). To profile channels, list them explicitly.
 image_profile:
   run: false
   n_workers: 6
@@ -107,3 +113,27 @@ object_profile:
       gran_channels: null
       glcm_channels: null
       correlation_pairs: null
+
+# per-object inference with trained microModel bundles (optional; requires
+# microModel to be installed). Each block writes <dataset>/<output_db> with
+# the microModel CLI table format (`inference` + optional reduction tables).
+# max_value is REQUIRED per block (65535 for 16-bit, 255 for 8-bit) and is
+# always trusted as configured. For SSL bundles only `feature` applies —
+# pred_class/pred_prob are ignored (microModel downgrades with a warning).
+# inference:
+#   run: true
+#   configs:
+#     - model: D:\models\runs\model.pt
+#       mask_name: cell
+#       channels: null            # ORDERED channel names; top-to-bottom = model input order; null = all
+#       feature: true
+#       pred_class: true
+#       pred_prob: true
+#       output_db: infer.db
+#       max_value: 65535
+#       reduction:                # omit/null = no dimension reduction
+#         enabled: true           # runs BOTH pca (0.95 var) + umap
+#         color_by: pred_class    # pred_class | directory | pred_prob | ground_truth
+#         sample_per_class: 10000
+#         reducer_pca: null       # provided -> transform only, else fit+save
+#         reducer_umap: null

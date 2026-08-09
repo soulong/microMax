@@ -71,6 +71,7 @@ def rebuild_dataset(ds: ImageDataset) -> ImageDataset:
         image_pattern=ds._image_pattern,
         mask_pattern=ds._mask_pattern,
         image_subdir_pattern=ds.image_subdir_pattern,
+        channel_layout=ds.channel_layout,
         filters=dict(ds._filters) if ds._filters else None,
     )
 

@@ -538,7 +538,9 @@ def profile_objects(
                     )
                     if result is not None:
                         writer.add(result)
-                        completed += 1
+                    # Skips (missing mask) also advance the counter so the
+                    # progress bar reaches n_total exactly.
+                    completed += 1
             else:
                 pbar = tqdm(total=n_total, desc=f"Profiling {mask_name}", unit="img")
                 # Process in chunks to avoid pre-loading all images into RAM
@@ -554,6 +556,7 @@ def profile_objects(
                         mask_col = f"mask_{mask_name}"
                         if mask_col not in row or pd.isna(row[mask_col]):
                             pbar.update(1)
+                            completed += 1
                             continue
                         meta = {
                             k: v for k, v in row.to_dict().items()

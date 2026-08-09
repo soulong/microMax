@@ -136,14 +136,21 @@ class BlockContainerPanel(BaseStepPanel):
         }
 
     def from_config(self, section: Any) -> None:
-        if isinstance(section, dict):
-            run_val = section.get("run")
-            if run_val is not None:
-                self.setChecked(bool(run_val) if not isinstance(run_val, str) else run_val.lower() in ("1", "true", "yes"))
-            configs = section.get("configs", section)
-            if isinstance(configs, list):
-                self.load_config_section(configs)
-            elif isinstance(configs, dict):
-                self.load_config_section([configs])
-        elif isinstance(section, list):
+        if isinstance(section, list):
             self.load_config_section(section)
+            return
+        if not isinstance(section, dict):
+            return
+        run_val = section.get("run")
+        if run_val is not None:
+            self.setChecked(bool(run_val) if not isinstance(run_val, str) else run_val.lower() in ("1", "true", "yes"))
+        # A section without a `configs` list carries no block state (e.g.
+        # session.yml written by another tool, or a bare {"run": ...}) — keep
+        # the existing blocks so their widget defaults survive the restore.
+        if "configs" not in section:
+            return
+        configs = section["configs"]
+        if isinstance(configs, list):
+            self.load_config_section(configs)
+        elif isinstance(configs, dict):
+            self.load_config_section([configs])

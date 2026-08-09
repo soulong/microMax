@@ -427,15 +427,19 @@ class ImageControls(QScrollArea):
         # Object range selection dropdown
         self._export_object_combo = NoScrollComboBox()
         self._export_object_combo.addItems([
-            "All selected",
-            "All images",
-            "All annotated",
+            "Selected images",
+            "Selected wells",
+            "Annotated",
+            "All",
         ])
         self._export_object_combo.setCurrentIndex(0)
         self._export_object_combo.setToolTip(
-            "All selected: objects from currently selected wells/fields/stacks/timepoints\n"
-            "All images: all objects from the entire dataset\n"
-            "All annotated: only manually class-labeled objects"
+            "Selected images: objects from currently selected wells, passing the "
+            "Image Filters (fields/stacks/timepoints/extra cols)\n"
+            "Selected wells: all objects from the currently selected wells, "
+            "ignoring the Image Filters\n"
+            "Annotated: only manually class-labeled objects\n"
+            "All: all objects from the entire dataset"
         )
         _row("Obj range", self._export_object_combo, export_layout)
 
@@ -578,7 +582,7 @@ class ImageControls(QScrollArea):
     def get_extra_widgets(self) -> dict[str, _MultiSelectCombo]:
         return self._extra_widgets
 
-    def set_channels(self, ch_config: dict) -> None:
+    def set_channels(self, ch_config: dict, max_value: float | None = None) -> None:
         for w in self._channel_widgets.values():
             w.deleteLater()
         self._channel_widgets.clear()
@@ -588,7 +592,7 @@ class ImageControls(QScrollArea):
                 item.widget().deleteLater()
 
         for ch_name, cfg in ch_config.items():
-            row = ChannelControls(ch_name, cfg)
+            row = ChannelControls(ch_name, cfg, max_value=max_value)
             row.config_changed.connect(lambda ch=ch_name: self.channel_config_changed.emit())
             self._ch_container.addWidget(row)
             self._channel_widgets[ch_name] = row
@@ -799,12 +803,15 @@ class ImageControls(QScrollArea):
         self._export_well_subdir.setEnabled(enabled)
 
     def update_export_annotated_option(self, has_annotations: bool) -> None:
-        """Enable/disable the 'All annotated' option based on annotation state."""
-        # Index 2 = "All annotated"
+        """Enable/disable the 'Annotated' option based on annotation state."""
         model = self._export_object_combo.model()
-        item = model.item(2)
+        item = model.item(self._export_object_combo.findText("Annotated"))
         if item:
             item.setEnabled(has_annotations)
-        # If current selection is "All annotated" but no annotations, switch to "All selected"
-        if not has_annotations and self._export_object_combo.currentIndex() == 2:
-            self._export_object_combo.setCurrentIndex(1)
+        # If current selection is "Annotated" but no annotations, switch to
+        # "Selected images" — NOT "All" or "Selected wells", which would
+        # silently export every object in the dataset.
+        if not has_annotations and self._export_object_combo.currentText() == "Annotated":
+            self._export_object_combo.setCurrentIndex(
+                self._export_object_combo.findText("Selected images")
+            )

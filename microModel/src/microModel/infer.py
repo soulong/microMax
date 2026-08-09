@@ -20,12 +20,11 @@ import sys
 import json
 import sqlite3
 
-import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from microBase import CellDataset, ImageDataset, build_pipeline, apply, normalize
+from microBase import CellDataset, ImageDataset, build_pipeline
 
 from .utils import (logger, set_seed, load_label_csv, resolve_output_paths, copy_config_file,
                     add_file_logging, resolve_max_value)

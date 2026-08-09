@@ -16,7 +16,6 @@ import warnings
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 import matplotlib
 matplotlib.rcParams['pdf.fonttype'] = 42
 matplotlib.rcParams['ps.fonttype'] = 42
@@ -346,7 +345,17 @@ def _plot_reduction_scatter(X, labels, label_names, title, xlabel, ylabel,
     plt.close(fig)
 
 
-def show_reduction(config):
+def show_reduction(config, save_plots=True, raise_on_error=False):
+    """Fit/load PCA + UMAP on infer.db features and write reduction tables.
+
+    save_plots=False skips the PDF scatter outputs (tables are still written) —
+    used by microProfiler, which is a data-only analysis suite.
+    raise_on_error=True converts logged-error abort paths into raised
+    RuntimeError/ValueError (the CLI keeps its print + sys.exit semantics).
+    Save location: output_dir when set, otherwise every processed dataset's
+    own directory (reducer pickles + plots are written once per dataset dir so
+    each dataset folder is self-contained).
+    """
     inf_cfg = config["inference"]
     red_cfg = config.get("reduction", {})
 
@@ -366,14 +375,11 @@ def show_reduction(config):
         logger.warning("Unknown color_by %s; dropping (valid: %s)", dropped, sorted(valid_color_by))
     color_by_vals = filtered
     if not color_by_vals:
+        if raise_on_error:
+            raise ValueError("No valid color_by values; aborting reduction.")
         logger.error("No valid color_by values; aborting reduction.")
         return
     first_cb = color_by_vals[0]
-
-    save_dir = base_output_dir if base_output_dir else os.getcwd()
-    os.makedirs(save_dir, exist_ok=True)
-    if base_output_dir:
-        add_file_logging(save_dir)
 
     # Phase 1: load all DBs and merge features
     out_pairs = resolve_output_paths(data_roots, base_output_dir)
@@ -395,8 +401,21 @@ def show_reduction(config):
         db_entries.append((db_path, feats, dicts))
 
     if not db_entries:
+        if raise_on_error:
+            raise RuntimeError("No data loaded from any DB; aborting reduction.")
         logger.error("No data loaded from any DB; aborting reduction.")
         return
+
+    # Save location: output_dir when set, else every processed dataset's own
+    # directory (reducer pickles + plots are written once per dataset dir).
+    if base_output_dir:
+        save_dirs = [base_output_dir]
+    else:
+        save_dirs = sorted({os.path.dirname(db_path) for db_path, _, _ in db_entries})
+    for d in save_dirs:
+        os.makedirs(d, exist_ok=True)
+    if base_output_dir:
+        add_file_logging(save_dirs[0])
 
     feats_merged = np.concatenate([e[1] for e in db_entries], axis=0)
     dicts_merged = []
@@ -409,13 +428,17 @@ def show_reduction(config):
     sample_per_class = red_cfg.get("sample_per_class", 1000)
     reducer_pca_path = red_cfg.get("reducer_pca")
     reducer_umap_path = red_cfg.get("reducer_umap")
-    has_prefitted = bool(reducer_pca_path or reducer_umap_path)
+    # Sampling gates whichever reducer still needs FITTING — a pre-fitted
+    # reducer is validated/transformed on all data; an unfitted one must not
+    # silently fit on the full dataset when only the other is pre-fitted.
+    needs_pca_fit = not reducer_pca_path
+    needs_umap_fit = not reducer_umap_path
 
     dirs_merged = [d["directory"] for d in dicts_merged]
     probs_merged = [d.get("pred_prob") or 0.0 for d in dicts_merged]
     first_labels_merged, _ = _extract_color_data(first_cb, dicts_merged, dirs_merged, probs_merged)
 
-    if sample_per_class > 0 and not has_prefitted:
+    if sample_per_class > 0 and (needs_pca_fit or needs_umap_fit):
         fit_indices = _sample_fit_indices(
             len(dicts_merged), first_labels_merged, first_cb, sample_per_class, seed)
         feats_fit = feats_merged[fit_indices]
@@ -430,6 +453,9 @@ def show_reduction(config):
         dirs_fit, probs_fit = dirs_merged, probs_merged
 
     if len(dicts_fit) < 2:
+        if raise_on_error:
+            raise RuntimeError(
+                f"Too few samples for reduction view (< 2), got {len(dicts_fit)}")
         logger.error("Too few samples for reduction view (< 2), got %d", len(dicts_fit))
         return
 
@@ -448,7 +474,8 @@ def show_reduction(config):
         pca_full.fit(feats_fit)
         if pca_full.n_components_ < 2:
             pca_full = PCA(n_components=2).fit(feats_fit)
-        save_reducer(pca_full, os.path.join(save_dir, "reducer_pca.pkl"))
+        for d in save_dirs:
+            save_reducer(pca_full, os.path.join(d, "reducer_pca.pkl"))
         logger.info("PCA %dD: explained variance ratio = %.4f",
                     pca_full.n_components_, pca_full.explained_variance_ratio_.sum())
 
@@ -480,29 +507,33 @@ def show_reduction(config):
                 pca_pre = None
             reducer = umap.UMAP(random_state=seed)
             reducer.fit(pca_pre.transform(feats_fit) if pca_pre is not None else feats_fit)
-            save_reducer({"pca_pre": pca_pre, "umap": reducer},
-                         os.path.join(save_dir, "reducer_umap.pkl"))
+            for d in save_dirs:
+                save_reducer({"pca_pre": pca_pre, "umap": reducer},
+                             os.path.join(d, "reducer_umap.pkl"))
         logger.info("UMAP: fitted on %d points", feats_fit.shape[0])
 
-    # Phase 4: transform fit subset + plot
+    # Phase 4: transform fit subset + plot (plots optional — microProfiler is
+    # a data-only suite and leaves plotting to later visualization)
     X_pca_fit = pca_full.transform(feats_fit)
     X_pca_pre_fit = pca_pre.transform(feats_fit) if pca_pre is not None else feats_fit
     X_umap_fit = reducer.transform(X_pca_pre_fit)
 
-    for cb in color_by_vals:
-        labels, label_names = _extract_color_data(cb, dicts_fit, dirs_fit, probs_fit)
-        continuous = (cb == "pred_prob")
-        _plot_reduction_scatter(
-            X_pca_fit[:, :2], labels, label_names,
-            f"PCA of feature vectors (colored by {cb})",
-            pc_axis_labels[0], pc_axis_labels[1],
-            os.path.join(save_dir, f"feature_pca_{cb}.pdf"),
-            pred_probs=probs_fit, continuous=continuous)
-        _plot_reduction_scatter(
-            X_umap_fit, labels, label_names,
-            f"UMAP of feature vectors (colored by {cb})", "UMAP 1", "UMAP 2",
-            os.path.join(save_dir, f"feature_umap_{cb}.pdf"),
-            pred_probs=probs_fit, continuous=continuous)
+    if save_plots:
+        for cb in color_by_vals:
+            labels, label_names = _extract_color_data(cb, dicts_fit, dirs_fit, probs_fit)
+            continuous = (cb == "pred_prob")
+            for d in save_dirs:
+                _plot_reduction_scatter(
+                    X_pca_fit[:, :2], labels, label_names,
+                    f"PCA of feature vectors (colored by {cb})",
+                    pc_axis_labels[0], pc_axis_labels[1],
+                    os.path.join(d, f"feature_pca_{cb}.pdf"),
+                    pred_probs=probs_fit, continuous=continuous)
+                _plot_reduction_scatter(
+                    X_umap_fit, labels, label_names,
+                    f"UMAP of feature vectors (colored by {cb})", "UMAP 1", "UMAP 2",
+                    os.path.join(d, f"feature_umap_{cb}.pdf"),
+                    pred_probs=probs_fit, continuous=continuous)
 
     # Phase 5: batch-transform all DBs + write tables
     pc_cols = ", ".join(f"pc_{i+1} REAL NOT NULL" for i in range(n_pca))
@@ -588,7 +619,7 @@ def show_reduction(config):
 
     logger.info("Reduction complete: fitted on %d samples, transformed %d DB(s), "
                 "reducers+plots saved to %s",
-                feats_fit.shape[0], len(db_entries), save_dir)
+                feats_fit.shape[0], len(db_entries), save_dirs)
 
 
 def _load_inference_features(db_path):

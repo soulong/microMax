@@ -71,6 +71,19 @@ def test_crop_cell_no_pixels():
         crop_cell(volume, mask, 999)
 
 
+def test_crop_cell_label_zero_exits():
+    """Label 0 (background) must hard-exit, not crop the whole image."""
+    volume, mask = _make_volume_mask(n_cells=1)
+    with pytest.raises(SystemExit):
+        crop_cell(volume, mask, 0)
+
+
+def test_crop_cell_negative_label_exits():
+    volume, mask = _make_volume_mask(n_cells=1)
+    with pytest.raises(SystemExit):
+        crop_cell(volume, mask, -3)
+
+
 def test_crop_cell_background_zeroed_all_channels():
     """Background zeroing should apply to all channels."""
     volume, mask = _make_volume_mask(n_cells=1, h=30, w=30, c=3)

@@ -86,6 +86,7 @@ class Sidebar(QWidget):
         ("preprocess", "Pre-process"),
         ("segment", "Segment"),
         ("profile", "Profile"),
+        ("inference", "Inference"),
     ]
 
     def __init__(self, parent=None):
@@ -112,6 +113,7 @@ class Sidebar(QWidget):
         layout.addWidget(_make_section_header("ANALYSIS"))
         self._add_item("segment")
         self._add_item("profile")
+        self._add_item("inference")
 
         layout.addStretch()
 

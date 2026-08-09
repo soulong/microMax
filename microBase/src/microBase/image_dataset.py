@@ -1,7 +1,8 @@
 """ImageDataset: whole-image dataset loader.
 
 Two file layouts supported:
-- channel_layout=None  : one-channel-per-file (regex must have `channel` group)
+- channel_layout=None  : one-channel-per-file (with a `channel` group, each
+  file is one channel; without one, every file is the implicit channel `ch1`)
 - channel_layout="CHW" : multi-channel-per-file (regex no `channel` group)
 - channel_layout="HWC" : multi-channel-per-file (regex no `channel` group)
 
@@ -35,10 +36,12 @@ from .schema import MetadataSchema, normalize_capture
 logger = logging.getLogger(__name__)
 
 
-# Row-sort priority for the metadata DataFrame: row → col → field → stack →
-# timepoint. Columns absent from the regex are simply skipped — if none of
-# these columns exist, the row order is left as-is (insertion order).
-_ROW_SORT_PRIORITY = ["row", "col", "field", "stack", "timepoint"]
+# Row-sort priority for the metadata DataFrame: row → col → well → field →
+# stack → timepoint (well covers explicit-`well` datasets; row+col-derived
+# wells are sorted via row/col before derivation). Columns absent from the
+# regex are simply skipped — if none of these columns exist, the row order
+# is the deterministic sorted-key order of the shared merge keys.
+_ROW_SORT_PRIORITY = ["row", "col", "well", "field", "stack", "timepoint"]
 
 
 class _LRUCache:
@@ -48,11 +51,28 @@ class _LRUCache:
     workers (microVis dispatches ImageWorker/FullResWorker/ObjectExportWorker
     QRunnables that all call get_imageset), so mutations are guarded by a
     lock (the LRU reorder ops are multi-step and not atomic under the GIL).
+
+    Picklable: the lock is recreated on unpickle and the cached entries are
+    dropped on pickle (a cold cache — workers spawned by a DataLoader start
+    with an empty cache instead of shipping the parent's cached arrays).
+    This makes ImageDataset (and therefore WholeImageCellDataset) spawnable
+    by torch DataLoader worker processes on Windows, where multiprocessing
+    pickles the dataset into each worker.
     """
 
     def __init__(self, maxsize=8):
         self.maxsize = maxsize
         self._d = OrderedDict()
+        self._lock = threading.Lock()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_d"] = OrderedDict()
+        state["_lock"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
         self._lock = threading.Lock()
 
     def get(self, key):
@@ -80,8 +100,10 @@ class ImageDataset:
 
     Args:
         root: dataset root directory.
-        image_pattern: regex with named groups. If channel_layout is None,
-            must contain a `channel` group. Otherwise no `channel` group expected.
+        image_pattern: regex with named groups. With channel_layout None, a
+            `channel` group makes each file one channel; without one, each
+            file is the implicit channel `ch1`. With "CHW"/"HWC", no
+            `channel` group is expected.
         mask_pattern: optional regex matching mask files. Must have a
             `mask_name` group plus whatever structural groups image_pattern has.
         channel_layout: None (default, one-channel-per-file), "CHW", or "HWC".
@@ -366,7 +388,6 @@ class ImageDataset:
         # Auto-detect image shape/dtype + channel count for multi-channel-per-file
         self._auto_detect_image_properties()
 
-        # Re-apply filters on the rebuilt metadata (preserves prior filters)
         return self
 
     def _auto_detect_image_properties(self):
@@ -417,7 +438,19 @@ class ImageDataset:
         mask_paths = {}
         if self.channel_layout is None:
             for ch in self._intensity_colnames:
-                img_paths[ch] = row[ch]
+                p = row[ch]
+                if pd.isna(p):
+                    # Mask-only rows (or a site missing a channel file) have
+                    # NaN image paths — reading one would crash with a raw
+                    # TypeError. Hard-exit with a clear message instead.
+                    print(
+                        f"Error: row {row_idx} is missing the image file for "
+                        f"channel '{ch}' — the file referenced by the metadata "
+                        f"does not exist (mask-only or deleted file).",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                img_paths[ch] = p
         else:
             # multi-channel-per-file: the file path is stored under "__file__"
             # (kept as a private column, never re-parsed).
@@ -494,8 +527,23 @@ class ImageDataset:
                 file=sys.stderr,
             )
             sys.exit(1)
+        if row_idx < 0 or row_idx >= len(self._metadata):
+            print(
+                f"Error: row_idx {row_idx} out of range (0..{len(self)-1})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         row = self._metadata.iloc[row_idx]
-        return Path(row[channel])
+        p = row[channel]
+        if pd.isna(p):
+            print(
+                f"Error: row {row_idx} is missing the image file for "
+                f"channel '{channel}' — the file referenced by the metadata "
+                f"does not exist (mask-only or deleted file).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return Path(p)
 
     def filter_metadata(self, column, pattern):
         """Filter rows by regex on a column. Mutates metadata."""

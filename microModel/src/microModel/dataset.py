@@ -55,18 +55,24 @@ def _to_float_max(img_hwc, max_value):
 
 def _compute_ref_stats(img_hwc, channels, with_masking, clip_low, clip_high,
                        method):
-    """Compute FIXED clip + z-score statistics on the RAW image (pre-augment).
+    """Compute FIXED clip + rescale + z-score statistics on the RAW image (pre-augment).
 
     Per-view self-normalization is affine-equivariant: any linear brightness/
     contrast augmentation is mathematically canceled by recomputing percentiles
     + mean/std on the augmented image. Computing the stats once on the raw cell
     and applying them as a fixed transform preserves photometric augmentation.
 
-    Returns a list of per-channel dicts {lo, hi, mean, std} mirroring
-    microBase.normalize semantics: per-channel stats for method='per_channel',
-    pooled stats (same values in every channel dict) for method='global'.
-    Degenerate channels (empty region, hi <= lo, std ~ 0) collapse to zeros,
-    matching normalize's behavior.
+    Mirrors microBase.normalize exactly — per-channel percentile clip +
+    min-max rescale to [0, 1], then z-score — so with an empty augmentation
+    pipeline fixed_reference=True and per-view normalization are identical:
+      - clip bounds are always per-channel (foreground percentiles;
+        clip_low <= 0 -> min, clip_high >= 100 -> max)
+      - "per_channel": per-channel mean/std of the rescaled foreground
+      - "global": pooled mean/std over ALL channels' rescaled foreground
+      - "null": mean=0, std=1 (rescale only, no z-score)
+    Degenerate channels (empty region, hi <= lo) are rescaled to zeros,
+    matching microBase._clip_channel; under "global" their zeros still
+    contribute to the pooled stats, also matching microBase.
     """
     if channels is not None:
         ch_idx = [c - 1 for c in channels]
@@ -74,47 +80,56 @@ def _compute_ref_stats(img_hwc, channels, with_masking, clip_low, clip_high,
     mask_b = (img_hwc != 0).any(axis=2).astype(bool) if with_masking else None
 
     n_ch = img_hwc.shape[2]
+    rescaled = np.empty_like(img_hwc, dtype=np.float32)
     ch_stats = []
     for c in range(n_ch):
         ch = img_hwc[:, :, c]
         region = ch[mask_b] if mask_b is not None else ch.reshape(-1)
         if region.size == 0:
+            rescaled[:, :, c] = 0.0
             ch_stats.append({"lo": 0.0, "hi": 0.0, "mean": 0.0, "std": 0.0})
             continue
         lo = float(np.percentile(region, clip_low)) if clip_low > 0 else float(region.min())
         hi = float(np.percentile(region, clip_high)) if clip_high < 100 else float(region.max())
         if hi <= lo:
+            rescaled[:, :, c] = 0.0
             ch_stats.append({"lo": 0.0, "hi": 0.0, "mean": 0.0, "std": 0.0})
             continue
-        clipped = np.clip(ch, lo, hi)
-        cregion = clipped[mask_b] if mask_b is not None else clipped.reshape(-1)
-        ch_stats.append({"lo": lo, "hi": hi,
-                         "mean": float(cregion.mean()), "std": float(cregion.std())})
+        rescaled[:, :, c] = (np.clip(ch, lo, hi) - lo) / (hi - lo)
+        ch_stats.append({"lo": lo, "hi": hi, "mean": 0.0, "std": 0.0})
 
-    if method == "global":
-        pooled = img_hwc[mask_b] if mask_b is not None else img_hwc.reshape(-1, n_ch)
+    if method == "per_channel":
+        for c, s in enumerate(ch_stats):
+            if s["hi"] > s["lo"]:
+                cregion = (rescaled[:, :, c][mask_b] if mask_b is not None
+                           else rescaled[:, :, c].reshape(-1))
+                s["mean"], s["std"] = float(cregion.mean()), float(cregion.std())
+    elif method == "global":
+        pooled = rescaled[mask_b] if mask_b is not None else rescaled.reshape(-1)
         if pooled.size > 0:
-            plo = float(np.percentile(pooled, clip_low)) if clip_low > 0 else float(pooled.min())
-            phi = float(np.percentile(pooled, clip_high)) if clip_high < 100 else float(pooled.max())
-            if phi > plo:
-                pclipped = np.clip(pooled, plo, phi)
-                pmean, pstd = float(pclipped.mean()), float(pclipped.std())
-                if pstd > 1e-6:
-                    for s in ch_stats:
-                        s["lo"], s["hi"], s["mean"], s["std"] = plo, phi, pmean, pstd
+            pmean, pstd = float(pooled.mean()), float(pooled.std())
+            for s in ch_stats:
+                if s["hi"] > s["lo"]:
+                    s["mean"], s["std"] = pmean, pstd
+    elif method == "null":
+        for s in ch_stats:
+            s["mean"], s["std"] = 0.0, 1.0
     return ch_stats
 
 
 def _normalize_fixed(img_hwc, mask, ref_stats):
-    """Apply a fixed clip + z-score transform (stats from _compute_ref_stats).
+    """Apply a fixed clip + rescale + z-score transform (stats from _compute_ref_stats).
 
-    Identical background-zeroing semantics to microBase.normalize.
+    Identical semantics to microBase.normalize: per-channel percentile clip,
+    min-max rescale to [0, 1], then z-score (per-channel for "per_channel",
+    pooled for "global", rescale-only for "null"), background zeroed.
     """
     out = np.empty_like(img_hwc, dtype=np.float32)
     for c, s in enumerate(ref_stats):
         if s["hi"] > s["lo"] and s["std"] > 1e-6:
             clipped = np.clip(img_hwc[:, :, c].astype(np.float32), s["lo"], s["hi"])
-            out[:, :, c] = (clipped - s["mean"]) / s["std"]
+            rescaled = (clipped - s["lo"]) / (s["hi"] - s["lo"])
+            out[:, :, c] = (rescaled - s["mean"]) / s["std"]
         else:
             out[:, :, c] = 0.0
     if mask is not None:
@@ -296,9 +311,14 @@ class SSLMultiViewDataset(Dataset):
 
 class SingleCellDataset(Dataset):
     """Single-view dataset for train. Supports (cell_dataset, cell_idx) pairs
-    spanning multiple CellDataset roots."""
+    spanning multiple CellDataset roots.
 
-    def __init__(self, pairs, label_to_idx,
+    Labels come from the `labels` list (parallel to `pairs`), built by train
+    from label_csv or label_from_dir resolution — the dataset never re-derives
+    a label from the file path, so label_csv labels are honored verbatim.
+    """
+
+    def __init__(self, pairs, label_to_idx, labels=None,
                  channels=None,
                  augmentation_spec=None,
                  normalize_method="per_channel",
@@ -308,6 +328,7 @@ class SingleCellDataset(Dataset):
                  max_value=None,
                  label_column="directory"):
         self.pairs = list(pairs)
+        self.labels = list(labels) if labels is not None else None
         self.label_to_idx = label_to_idx
         self.channels = list(channels) if channels is not None else None
         self.with_masking = with_masking
@@ -334,6 +355,17 @@ class SingleCellDataset(Dataset):
             img_hwc, self.channels, self.aug_pipeline,
             self.normalize_method, self.clip_low, self.clip_high, self.with_masking,
             ref_stats)
+        if self.labels is not None:
+            label = self.labels[idx]
+            label_idx = self.label_to_idx.get(label, -1)
+            if label_idx < 0:
+                raise ValueError(
+                    f"Label {label!r} is not in label_to_idx "
+                    f"{sorted(self.label_to_idx)} — check label_csv/label_from_dir "
+                    f"resolution for row {idx} ({cell_ds.metadata.iloc[cell_idx].get('path')})."
+                )
+            return tensor, label_idx
+        # Fallback (no labels list): derive from the metadata label_column.
         meta = cell_ds.metadata.iloc[cell_idx]
         label = meta.get(self.label_column)
         if label is not None:

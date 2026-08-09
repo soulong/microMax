@@ -29,7 +29,12 @@ class PipelineWorker(QObject):
         self._thread: QThread = QThread()
         self.moveToThread(self._thread)
         self._thread.started.connect(self._execute)
-        self._thread.finished.connect(self._thread.deleteLater)
+        # NOTE: do NOT auto-connect thread.finished -> thread.deleteLater.
+        # The worker is replaced on every run (PipelineController._ensure_worker
+        # calls cancel()/wait() on the previous worker), and an auto-deleted
+        # QThread leaves a dangling wrapper whose isRunning()/quit()/wait()
+        # raise "libshiboken: Internal C++ object already deleted". Cleanup is
+        # done explicitly in _ensure_worker when the worker is replaced.
         self._result_ds = None
         self._applied_steps = None
 
@@ -74,6 +79,7 @@ class PipelineWorker(QObject):
     def _execute(self) -> None:
         collector = SubscribableProgressCollector()
         collector.subscribe(self._on_progress)
+        collector.cancel_check = lambda: self._cancel_event.is_set()
         try:
             if self._step_name:
                 self._result_ds = run_step(

@@ -53,8 +53,8 @@ def setup_logging(
         logger.handlers.clear()
 
     fmt = logging.Formatter(
-        "[%(asctime)s] %(levelname)-5s | %(message)s",
-        datefmt="%H:%M:%S",
+        "[%(asctime)s] %(levelname)s | %(message)s",
+        datefmt="%H:%M",
     )
 
     if clear_existing or not logger.hasHandlers():

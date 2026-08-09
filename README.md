@@ -16,13 +16,14 @@ microMax/
 
 | Package | Version | Console script |
 |---|---|---|
-| microBase | 0.6.0 | — (library) |
-| microProfiler | 1.3.0 | `microprofiler` |
-| microVis | 1.1.0 | `microvis` |
-| microModel | 0.2.2 | `micromodel` |
+| microBase | 0.7.0 | — (library) |
+| microProfiler | 1.5.0 | `microprofiler` |
+| microVis | 1.2.0 | `microvis` |
+| microModel | 0.4.0 | `micromodel` |
 
 - `microBase` is the only shared dependency — the three consumers never
-  import each other.
+  import each other (the one documented exception: microProfiler lazily
+  imports microModel for its optional per-object inference step).
 - The three tools talk to each other through on-disk artifacts: TIFFs,
   masks, `result.db`, `infer.db`, and per-dataset `session.yml`.
 
@@ -48,9 +49,9 @@ Install the four packages in dependency order:
 
 ```powershell
 python -m pip install -e c:\Users\haohe\GitHub\microMax\microBase
+python -m pip install -e c:\Users\haohe\GitHub\microMax\microModel
 python -m pip install -e c:\Users\haohe\GitHub\microMax\microProfiler
 python -m pip install -e c:\Users\haohe\GitHub\microMax\microVis
-python -m pip install -e c:\Users\haohe\GitHub\microMax\microModel
 ```
 
 ### Cellpose with DINOv3 models
@@ -85,13 +86,15 @@ Notes:
 microprofiler
 ```
 
-Four-page flow: **Input → Pre-process → Segment → Profile**.
+Five-page flow: **Input → Pre-process → Segment → Profile → Inference**.
 
 1. **Input** — Browse to a dataset folder, then press **Load Dataset**.
    The image/mask filename patterns are matched against your file naming.
+   Optional filters narrow the dataset by metadata column (e.g. well).
 2. **Pre-process** (optional) — enable any of: resize, BaSiC illumination
    correction, Z-projection (needs a `stack` metadata column), tiling
-   (needs a `field` column). Run with **Run Preprocessing**.
+   (needs a `field` column). Run with **Run Preprocessing**. Steps run only
+   when enabled — nothing runs by default.
 3. **Segment** — configure one or more Cellpose runs (object name, model,
    channels, diameter, thresholds), then **Run Segmentation**. Masks are
    written next to the images as `<stem>_cp_masks_<name>.png`.
@@ -99,12 +102,22 @@ Four-page flow: **Input → Pre-process → Segment → Profile**.
    features (shape, intensity, radial profiles, granularity, GLCM,
    correlations), then **Run Profiling**. Results go into
    `<dataset>/result.db` (tables `image`, plus one table per object type).
+   The image-profiling step requires at least one selected channel — an
+   empty selection skips the step.
+5. **Inference** (optional, needs `microModel` installed) — add one block
+   per trained model bundle, select the mask and channels, then **Run
+   Inference**. Writes `<dataset>/<output_db>` (e.g. `infer.db`) with
+   predictions/features, plus optional PCA/UMAP reduction tables.
 
 **CLI** (same pipeline, headless — useful for batch/plate processing):
 
 ```powershell
 microprofiler run --config pipeline_config.yml --dataset-dir D:\data\plate1
 ```
+
+The CLI config mirrors the GUI exactly: every step section has a `run`
+flag (default `false`), so a minimal YAML never silently runs a destructive
+in-place step.
 
 ### 3.2 microVis — interactive viewer & annotation
 
@@ -218,7 +231,7 @@ verbatim from extraction to the profiling DB, CSV exports, and `infer.db`.
 | Artifact | Location | Produced by |
 |---|---|---|
 | Profiling DB | `<dataset>/result.db` | microProfiler (image + object tables) |
-| Inference DB | `<dataset>/infer.db` or `{output_dir}/infer.db` | microModel |
+| Inference DB | `<dataset>/infer.db` or `{output_dir}/infer.db` | microModel (CLI); microProfiler inference step (always `<dataset>/<output_db>`) |
 | Per-dataset state | `<dataset>/session.yml` | microProfiler / microVis |
 | Cellpose masks | `<stem>_cp_masks_<name>.png` next to images | microProfiler |
 | BaSiC shading models | `<dataset>/.microprofiler/BaSiC_model/` | microProfiler |

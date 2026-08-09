@@ -22,7 +22,8 @@ from .models import build_ssl_model, get_train_step, get_criterion
 
 
 def _save_bundle(output_dir, epoch, model, opt, loss_history, config, meta, method,
-                 final=False):
+                 final=False, dino_loss_history=None, ibot_loss_history=None,
+                 koleo_loss_history=None):
     """Save a complete SSL bundle: full model state (backbone + heads +
     momentum nets), meta, config, optimizer state, epoch, loss history.
 
@@ -40,6 +41,14 @@ def _save_bundle(output_dir, epoch, model, opt, loss_history, config, meta, meth
         "loss_history": loss_history,
         "method": method,
     }
+    # DINOv2 component histories (dino/ibot/koleo) are persisted so a
+    # 'continue' resume restores them (absent in old bundles -> [] fallback).
+    if dino_loss_history is not None:
+        bundle["dino_loss_history"] = dino_loss_history
+    if ibot_loss_history is not None:
+        bundle["ibot_loss_history"] = ibot_loss_history
+    if koleo_loss_history is not None:
+        bundle["koleo_loss_history"] = koleo_loss_history
     fname = "model.pt" if final else f"model_{epoch}.pt"
     path = os.path.join(output_dir, fname)
     atomic_torch_save(bundle, path)
@@ -93,6 +102,15 @@ def _load_checkpoint_state(model, ckpt):
     if "state_dict" not in ckpt:
         print("Error: bundle has no 'state_dict' key (unsupported pre-0.2.1 "
               "bundle format)", file=sys.stderr)
+        sys.exit(1)
+    meta = ckpt.get("meta") or {}
+    if "method" not in meta:
+        print(
+            "Error: bundle is not an SSL bundle (meta has no 'method') — "
+            "resume.ssl_model expects a pretrain checkpoint, not a train "
+            "bundle.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     model.load_state_dict(ckpt["state_dict"])
 
@@ -265,15 +283,33 @@ def pretrain_ssl(config, config_path=None):
 
     datasets = build_cell_datasets(roots, channel_layout, image_pattern)
     all_pairs = []
-    resolved_channels = channels
+    root_of_pair = []
+    resolved_per_root = {}
     for r, cell_ds in datasets:
         n_avail = len(cell_ds.intensity_colnames)
-        resolved_channels = resolve_channels(channels, n_avail, r)
-        all_pairs.extend(_build_records(cell_ds))
+        resolved_per_root[r] = resolve_channels(channels, n_avail, r)
+        recs = _build_records(cell_ds)
+        all_pairs.extend(recs)
+        root_of_pair.extend([r] * len(recs))
 
     if not all_pairs:
         print(f"Error: no records found in {roots}", file=sys.stderr)
         sys.exit(1)
+
+    # All roots must resolve to the same channel set — one bundle carries a
+    # single `channels` meta, so a heterogeneous resolution would silently
+    # train on the wrong channels for some roots (last-root-wins bug).
+    unique_resolved = {tuple(v) for v in resolved_per_root.values()}
+    if len(unique_resolved) > 1:
+        print(
+            f"Error: data roots resolve to different channel sets: "
+            f"{ {r: v for r, v in resolved_per_root.items()} }. "
+            f"Give every root the same channel count or set data.channels "
+            f"explicitly.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    resolved_channels = list(next(iter(unique_resolved))) if unique_resolved else channels
 
     logger.info("Found %d records, channels=%s", len(all_pairs), resolved_channels)
     logger.info("SSL method: %s, views: %d", method, len(aug_views_cfg))
@@ -282,8 +318,9 @@ def pretrain_ssl(config, config_path=None):
     sample_max = data_cfg.get("sample_max")
     sample_by = data_cfg.get("sample_by", "per_dataset")
     if sample_max is not None:
-        # Wrap pairs as dicts for subsample (uses root_key, label_key defaults)
-        items = [{"pair": p, "root": "__root__"} for p in all_pairs]
+        # Wrap pairs as dicts for subsample; the real root is carried along so
+        # sample_by='per_dataset' caps per data root (not across all roots).
+        items = [{"pair": p, "root": r} for p, r in zip(all_pairs, root_of_pair)]
         items = subsample(items, sample_max, sample_by, seed,
                           label_key="__unlabeled__", root_key="root")
         all_pairs = [it["pair"] for it in items]
@@ -322,6 +359,12 @@ def pretrain_ssl(config, config_path=None):
     prefetch_factor = dl_cfg.get("prefetch_factor", 2)
     persistent_workers = dl_cfg.get("persistent_workers", True) and num_workers > 0
     batch_size = train_cfg.get("batch_size", 128)
+    if method == "dinov2" and batch_size % 2 != 0:
+        # dinov2.train_step chunks the teacher's global-view outputs in pairs
+        # (views[0:2]) — an odd batch crashes lightly's DINOLoss stack.
+        print(f"Error: DINOv2 requires an EVEN training.batch_size "
+              f"(global views are paired); got {batch_size}", file=sys.stderr)
+        sys.exit(1)
     loader_kwargs = dict(
         batch_size=batch_size, shuffle=True, drop_last=True,
         num_workers=num_workers,
@@ -442,6 +485,10 @@ def pretrain_ssl(config, config_path=None):
             if "optimizer_state_dict" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             loss_history = checkpoint.get("loss_history", [])
+            # DINOv2 component histories (absent in old bundles -> []).
+            dino_loss_history = checkpoint.get("dino_loss_history", [])
+            ibot_loss_history = checkpoint.get("ibot_loss_history", [])
+            koleo_loss_history = checkpoint.get("koleo_loss_history", [])
         else:
             # Transfer: domain-transfer / pretrained-weight init. The run
             # restarts at epoch 0 with fresh schedules and a fresh optimizer
@@ -576,7 +623,10 @@ def pretrain_ssl(config, config_path=None):
 
         if save_interval and (epoch + 1) % save_interval == 0:
             _save_bundle(output_dir, epoch + 1, model, optimizer, loss_history,
-                         config, meta, method)
+                         config, meta, method,
+                         dino_loss_history=dino_loss_history if method == "dinov2" else None,
+                         ibot_loss_history=ibot_loss_history if method == "dinov2" else None,
+                         koleo_loss_history=koleo_loss_history if method == "dinov2" else None)
             if umap_check_loader is not None:
                 try:
                     _run_umap_check(model, method, umap_check_loader, device, epoch + 1, seed,
@@ -593,7 +643,10 @@ def pretrain_ssl(config, config_path=None):
     # (resume past epochs), save the loaded checkpoint state as-is.
     last_epoch = epochs if start_epoch < epochs else start_epoch
     _save_bundle(output_dir, last_epoch, model, optimizer, loss_history,
-                 config, meta, method, final=True)
+                 config, meta, method, final=True,
+                 dino_loss_history=dino_loss_history if method == "dinov2" else None,
+                 ibot_loss_history=ibot_loss_history if method == "dinov2" else None,
+                 koleo_loss_history=koleo_loss_history if method == "dinov2" else None)
     if umap_check_loader is not None and last_umap_epoch != last_epoch:
         try:
             _run_umap_check(model, method, umap_check_loader, device, last_epoch, seed,

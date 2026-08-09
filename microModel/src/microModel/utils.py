@@ -17,8 +17,8 @@ logger = logging.getLogger("microModel")
 def setup_logging(level=logging.INFO):
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        "[%(asctime)s] %(levelname)s | %(message)s",
+        datefmt="%H:%M",
     ))
     root_logger = logging.getLogger("microModel")
     root_logger.setLevel(level)
@@ -43,8 +43,8 @@ def add_file_logging(log_dir):
             return
     handler = logging.FileHandler(path, encoding="utf-8")
     handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        "[%(asctime)s] %(levelname)s | %(message)s",
+        datefmt="%H:%M",
     ))
     root_logger.addHandler(handler)
     logger.info("Logging to %s", path)
@@ -187,6 +187,13 @@ def resolve_channels(channels, n_avail, root):
     if not resolved:
         print("Error: data.channels is an empty list; "
               "use null to select all channels", file=sys.stderr)
+        sys.exit(1)
+    if min(resolved) < 1:
+        print(
+            f"Error: requested channels {resolved} must be 1-based positive "
+            f"integers (got {min(resolved)})",
+            file=sys.stderr,
+        )
         sys.exit(1)
     if max(resolved) > n_avail:
         print(

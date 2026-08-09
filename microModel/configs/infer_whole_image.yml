@@ -11,7 +11,7 @@
 
 mode: whole_image
 
-model: runs_dino/ssl_model.pt         # train bundle (model.pt) or SSL bundle (model.pt)
+model: runs_dino/model.pt         # train bundle (model.pt) or SSL bundle (model.pt)
 
 output_dir: runs_dino/infer           # shared DB dir for all roots; null = per-dataset
 

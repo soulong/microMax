@@ -453,6 +453,12 @@ class _DatasetLoadWorker(QObject):
                 image_subdir_pattern=self._image_subdir_pattern,
             )
             self.finished.emit(dm)
+        except SystemExit as e:
+            # microBase hard-exits (print + sys.exit) on bad dataset state
+            # (missing root, invalid pattern) — SystemExit is not an
+            # Exception, so without this the modal dialog never closes.
+            logger.exception("Dataset load failed (microBase hard-exit)")
+            self.error.emit(str(e) or "Dataset load failed")
         except Exception as e:
             logger.exception("Dataset load failed")
             self.error.emit(str(e))
@@ -563,7 +569,7 @@ class ObjectExportWorker(QRunnable):
             # Build annotation lookup if needed. Keyed by (row_idx, label) so
             # it works for non-standard datasets lacking well/field/stack/timepoint.
             key_to_class: dict[tuple, str] = {}
-            if self._annotations and self._object_mode == "All annotated":
+            if self._annotations and self._object_mode == "Annotated":
                 for cls_name, keys in self._annotations.items():
                     for key in keys:
                         lookup = (key.row_idx, key.label)
@@ -585,10 +591,15 @@ class ObjectExportWorker(QRunnable):
             all_channels = list(dataset.intensity_colnames)
             # Indices of the requested (enabled) channels within the full stack,
             # so we can subset the crop to what the user actually wants exported.
+            # A missing channel is a hard error — never silently substitute
+            # the first N channels (no-guessing rule).
             try:
                 ch_indices = [all_channels.index(ch) for ch in self._channel_names]
             except ValueError:
-                ch_indices = list(range(len(self._channel_names)))
+                self.signals.error.emit(
+                    f"Export channels {self._channel_names} not found in dataset "
+                    f"channels {all_channels}. Re-enable channels and retry.")
+                return
 
             img_shape = dataset.img_shape
             if img_shape is not None and len(img_shape) >= 2:
@@ -632,10 +643,10 @@ class ObjectExportWorker(QRunnable):
                     logger.debug("Row %d (%s_f%s_z%s_t%s): %d cells",
                                  row_idx, well, field, stack, timepoint, len(cells))
 
-                    # Filter by annotation class for "All annotated" mode.
+                    # Filter by annotation class for "Annotated" mode.
                     # Lookup key is (row_idx, label) — independent of which
                     # structural metadata columns exist.
-                    if self._object_mode == "All annotated":
+                    if self._object_mode == "Annotated":
                         cells = [
                             (crop, cell_mask, bbox, label)
                             for (crop, cell_mask, bbox, label) in cells
@@ -663,14 +674,14 @@ class ObjectExportWorker(QRunnable):
                         label_int = int(label)
                         lookup = (row_idx, label_int)
 
-                        # Determine class name (only for "All annotated")
+                        # Determine class name (only for "Annotated")
                         class_name = ""
-                        if self._object_mode == "All annotated" and lookup in key_to_class:
+                        if self._object_mode == "Annotated" and lookup in key_to_class:
                             class_name = key_to_class[lookup]
 
                         # Determine save directory (class subfolder for annotated, well subdir)
                         obj_save_dir = save_path
-                        if self._object_mode == "All annotated" and class_name:
+                        if self._object_mode == "Annotated" and class_name:
                             obj_save_dir = obj_save_dir / class_name
                         if self._well_subdir:
                             obj_save_dir = obj_save_dir / well

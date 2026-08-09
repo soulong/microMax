@@ -11,10 +11,12 @@ from microProfiler.gui.panels.step_profile import (
     ImageProfilingStepPanel,
     ObjectProfilingStepPanel,
 )
+from microProfiler.gui.panels.step_inference import InferenceStepPanel
 
 __all__ = [
     "BaseStepPanel", "BlockContainerPanel", "ResizeStepPanel",
     "BaSiCStepPanel", "ZProjectStepPanel", "TileStepPanel",
     "FilterPanel", "SegmentStepPanel",
     "ImageProfilingStepPanel", "ObjectProfilingStepPanel",
+    "InferenceStepPanel",
 ]

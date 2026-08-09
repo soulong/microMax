@@ -1,6 +1,7 @@
 """Tests for microBase.ImageDataset: whole-image dataset loader + cropping."""
 
 import re
+import pickle
 import numpy as np
 import pytest
 from pathlib import Path
@@ -361,6 +362,42 @@ def test_get_imageset_caches(tmp_path):
     assert img1 is img2
 
 
+def test_image_dataset_pickle_roundtrip(tmp_path):
+    """ImageDataset must survive a pickle round-trip (DataLoader worker spawn).
+
+    Regression: _LRUCache held a threading.Lock, which is unpicklable — a
+    torch DataLoader with num_workers>0 crashed with "cannot pickle
+    '_thread.lock' object" on Windows (multiprocessing spawn).
+    """
+    _make_one_channel_per_file_dataset_with_masks(tmp_path, n_sites=1)
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)\.tiff"
+        ),
+        mask_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)_cp_masks_(?P<mask_name>.+)\.png"
+        ),
+        channel_layout=None,
+    )
+    # Warm the cache so the pickle must drop cached arrays, not ship them.
+    img0, _ = ds.get_imageset(0)
+
+    ds2 = pickle.loads(pickle.dumps(ds))
+
+    # Unpickled copy is fully functional: images, masks, cropping.
+    img, masks = ds2.get_imageset(0, masks=["mask_cell"])
+    assert img.shape == (64, 64, 2)
+    assert set(np.unique(masks["mask_cell"]).tolist()) - {0} == {1, 2, 3}
+    crop, cell_mask, bbox = ds2.get_cropped_cell(0, label=1, mask_name="mask_cell", padding=2)
+    assert crop.ndim == 3
+    assert cell_mask.ndim == 2
+
+    # Original is unaffected and its cache still works.
+    img_again, _ = ds.get_imageset(0)
+    assert img_again is img0
+
+
 def test_get_imageset_multi_channel_per_file(tmp_path):
     _make_multi_channel_per_file_dataset(tmp_path, n_sites=1, n_channels=3)
     ds = ImageDataset(
@@ -517,3 +554,20 @@ def test_image_dataset_mask_name_missing_raises_valueerror(tmp_path):
             ),
             channel_layout=None,
         )
+
+
+def test_image_dataset_explicit_well_natsorted(tmp_path):
+    """Explicit-`well` datasets sort natsorted (A2 before A10), not lexicographic."""
+    for well in ("A10", "A2", "A1"):
+        arr = np.zeros((32, 32), dtype=np.uint16)
+        arr[:] = 1000
+        imwrite(str(tmp_path / f"{well}-ch1.tiff"), arr)
+
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(r"(?P<well>A\d+)-ch(?P<channel>\d+)\.tiff"),
+        channel_layout=None,
+    )
+    wells = list(ds.metadata["well"])
+    # Lexicographic would give A1, A10, A2 — natsorted gives A1, A2, A10.
+    assert wells == ["A1", "A2", "A10"]

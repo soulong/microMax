@@ -127,7 +127,6 @@ class SegmentBlockWidget(QWidget):
         if self._channels:
             for ch in self._channels:
                 cb = QCheckBox(ch)
-                cb.setChecked(True)
                 self._chan1_checkboxes.append(cb)
                 row3.addWidget(cb)
         else:
@@ -291,13 +290,13 @@ class SegmentBlockWidget(QWidget):
                 checkbox_list.append(cb)
                 insert_at += 1
 
-        _rebuild_row(self._chan1_row, "_chan1_placeholder", self._chan1_checkboxes, True)
+        # Both Chan1 and Chan2 default unchecked; stored configs (session.yml)
+        # re-check their channels via populate_channels/_set_checked_states.
+        _rebuild_row(self._chan1_row, "_chan1_placeholder", self._chan1_checkboxes, False)
         _rebuild_row(self._chan2_row, "_chan2_placeholder", self._chan2_checkboxes, False)
 
     def build_config_section(self) -> dict:
         chan1 = self.get_chan1()
-        if not chan1:
-            chan1 = self._channels[:1] if self._channels else []
         chan2 = self.get_chan2() or None
         return {
             "object_name": self._object_name.text().strip(),
@@ -429,7 +428,11 @@ class SegmentStepPanel(BlockContainerPanel):
         self.parameter_changed.emit()
 
     def _apply_block_config(self, block: SegmentBlockWidget, cfg: dict) -> None:
-        BaseStepPanel._set_widget(block._object_name, cfg.get("object_name", ""), "object_name")
+        # Only set the object name when the config carries one — never clear
+        # the widget's "cell" default (empty configs wipe it otherwise).
+        obj_name = cfg.get("object_name")
+        if obj_name:
+            block._object_name.setText(str(obj_name))
         model_name = cfg.get("model_name", "")
         if model_name:
             idx = block._model_name.findText(str(model_name))
@@ -437,11 +440,11 @@ class SegmentStepPanel(BlockContainerPanel):
                 block._model_name.setCurrentIndex(idx)
             else:
                 block._model_name.setCurrentText(str(model_name))
-        BaseStepPanel._set_widget(block._resize_factor, cfg.get("resize_factor", 1.0), "resize_factor")
+        BaseStepPanel._set_widget(block._resize_factor, cfg.get("resize_factor", 0.5), "resize_factor")
         BaseStepPanel._set_widget(block._diameter, cfg.get("diameter", 0), "diameter")
         BaseStepPanel._set_widget(block._flow_threshold, cfg.get("flow_threshold", 0.4), "flow_threshold")
         BaseStepPanel._set_widget(block._cellprob_threshold, cfg.get("cellprob_threshold", 0.0), "cellprob_threshold")
-        BaseStepPanel._set_widget(block._gpu_batch_size, cfg.get("gpu_batch_size", 16), "gpu_batch_size")
+        BaseStepPanel._set_widget(block._gpu_batch_size, cfg.get("gpu_batch_size", 32), "gpu_batch_size")
         merge1 = cfg.get("merge1", "")
         if merge1:
             idx = block._merge1.findText(str(merge1))
@@ -471,6 +474,21 @@ class SegmentStepPanel(BlockContainerPanel):
             if name in names:
                 return f"Duplicate object name: '{name}'. Each block must have a unique name."
             names.append(name)
+        return None
+
+    def validate_channels(self) -> Optional[str]:
+        """Every block needs at least one checked Chan1 channel.
+
+        Channels default unchecked — a run with no selection would otherwise
+        silently fall back to the first dataset channel.
+        """
+        for block in self._blocks:
+            if not block.get_chan1():
+                name = block._object_name.text().strip() or block.block_index
+                return (
+                    f"Select at least one Chan1 channel in segmentation block "
+                    f"'{name}'. Channels default unchecked."
+                )
         return None
 
     def get_object_names(self) -> List[str]:

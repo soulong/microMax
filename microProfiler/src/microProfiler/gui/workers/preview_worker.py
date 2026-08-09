@@ -134,6 +134,11 @@ class PreviewWorker(QObject):
 
         except InterruptedError:
             pass
+        except SystemExit as e:
+            # microBase hard-exits (print + sys.exit) on missing/deleted
+            # files. Without this, on_preview_error never fires, the wait
+            # cursor stays and _preview_running is never reset.
+            self.error.emit(str(e) or "Preview failed (missing image file)")
         except Exception as e:
             self.error.emit(str(e))
         finally:

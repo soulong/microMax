@@ -43,6 +43,15 @@ def crop_cell(volume, mask, label, padding=4):
         )
         sys.exit(1)
 
+    if label < 1:
+        # Label 0 is background — np.where(mask == 0) would match the whole
+        # image and the zero-pixel guard below would never fire.
+        print(
+            f"Error: label must be a positive integer, got {label}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     ys, xs = np.where(mask == label)
     if len(ys) == 0:
         print(

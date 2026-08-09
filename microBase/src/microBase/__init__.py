@@ -13,7 +13,7 @@ Provides:
 - derive_well, MetadataSchema
 """
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 import os as _os
 _os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")

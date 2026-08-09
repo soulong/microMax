@@ -12,8 +12,6 @@ dependencies = [
     "pandas",
     "tifffile",
     "Pillow",
-    "scikit-image",
-    "scipy",
     "pyyaml",
     "albumentationsx",
     "natsort",

@@ -169,19 +169,6 @@ class FilterPanel(BaseStepPanel):
 
     # ── Config persistence ─────────────────────────────────────────────
 
-    def save_to_settings(self, settings) -> dict:
-        filters = []
-        for combo, edit, _btn in self._filter_widgets:
-            # currentData carries the real column for "(missing: ...)" marker
-            # rows, so the marker never round-trips into the saved column.
-            col = combo.currentData() or combo.currentText()
-            pat = edit.text().strip()
-            if col:
-                filters.append({"column": col, "pattern": pat})
-        params = {"filters": filters}
-        settings[self.step_name] = params
-        return params
-
     def load_from_settings(self, settings) -> None:
         stored = settings.get(self.step_name, {})
         if not stored:

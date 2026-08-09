@@ -190,6 +190,12 @@ class MainWindow(QMainWindow):
         self._thread_pool = QThreadPool.globalInstance()
         self._pending_workers: int = 0
         self._shutting_down: bool = False
+        # Retention registry for QRunnables: the workers run with
+        # setAutoDelete(False), so a reference must be kept until the
+        # finished/error signal fires (otherwise the C++ wrapper could be
+        # garbage-collected mid-run) and deleteLater() must run afterwards
+        # (otherwise every refresh leaks one C++ object per worker).
+        self._active_workers: set = set()
 
         # Metadata
         self._metadata_df: pd.DataFrame | None = None
@@ -439,6 +445,13 @@ class MainWindow(QMainWindow):
             self._dm.close()
             self._dm = None
         self._loaded_dataset_dir = None
+        self._update_window_title()
+
+    def _update_window_title(self) -> None:
+        if self._loaded_dataset_dir:
+            self.setWindowTitle(f"microVis — {self._loaded_dataset_dir}")
+        else:
+            self.setWindowTitle("microVis")
 
     def _on_dataset_browse(self) -> None:
         """Select a dataset directory and read session.yml.
@@ -573,8 +586,10 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
         if thread is not None:
             thread.quit()
-        if worker is not None:
-            worker.deleteLater()
+            if worker is not None:
+                # deleteLater must be delivered after the loader thread's
+                # event loop stops — post it from thread.finished.
+                thread.finished.connect(worker.deleteLater)
 
         p = Path(p_str)
         try:
@@ -633,12 +648,20 @@ class MainWindow(QMainWindow):
             # by _on_load_dataset_clicked before starting the scan. This
             # phase 2 callback only populates the UI.
             self._loaded_dataset_dir = str(p)
+            self._update_window_title()
 
             # Initial render
             self._update_grid()
             self._schedule_image_refresh()
         except Exception:
             logger.exception("Failed to initialize UI for dataset %s", p)
+            import traceback
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Dataset Load Incomplete",
+                f"The dataset was scanned but the UI could not be fully "
+                f"initialized:\n{traceback.format_exc(limit=5)}",
+            )
 
     def _on_dataset_load_error(self, msg: str) -> None:
         """Phase 2 error: clean up loader state and notify the user."""
@@ -656,8 +679,8 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
         if thread is not None:
             thread.quit()
-        if worker is not None:
-            worker.deleteLater()
+            if worker is not None:
+                thread.finished.connect(worker.deleteLater)
 
         logger.warning("Failed to load dataset from %s — %s", p_str, msg)
         from PySide6.QtWidgets import QMessageBox
@@ -696,6 +719,17 @@ class MainWindow(QMainWindow):
                 mask_pattern=mask_pat,
                 image_subdir_pattern=subdir_pat,
             )
+        except SystemExit:
+            # SessionFile.save hard-exits (print + sys.exit) on YAML write
+            # failure — SystemExit is a BaseException, so a bare
+            # `except Exception` would kill the whole app.
+            logger.exception("Failed to persist session.yml")
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Session Save Failed",
+                "Could not write session.yml (disk full or permission denied). "
+                "The dataset was not loaded.",
+            )
         except Exception:
             logger.exception("Failed to load dataset")
 
@@ -731,6 +765,12 @@ class MainWindow(QMainWindow):
                 "vmin": saved.get("vmin", 0),
                 "vmax": saved.get("vmax", DTYPE_MAX.get(str(self._dm.img_dtype), 65535.0)),
             }
+
+    def _channel_max_value(self) -> float:
+        """Dataset dtype max for the channel vmin/vmax spin-box range."""
+        if self._dm is not None and self._dm.img_dtype is not None:
+            return DTYPE_MAX.get(str(self._dm.img_dtype), 65535.0)
+        return 65535.0
 
     def _persist_channel_colors(self) -> None:
         """Write current channel color/vmin/vmax to <dataset>/session.yml."""
@@ -832,7 +872,7 @@ class MainWindow(QMainWindow):
             widget.selection_changed.connect(self._on_image_filter_changed)
 
         # Channel controls
-        ic.set_channels(self._ch_config)
+        ic.set_channels(self._ch_config, max_value=self._channel_max_value())
 
         # Overlay column (DB-dependent) + cmap
         self._populate_overlay_columns()
@@ -891,7 +931,7 @@ class MainWindow(QMainWindow):
         # Object Overlay panel — Select object dropdown (display/hover/drag/crop).
         self._image_controls.set_object_masks(self._dm.mask_names)
         self._label_panel.clear_all()
-        # Initialize export "All annotated" option as disabled
+        # Initialize export "Annotated" option as disabled
         self._image_controls.update_export_annotated_option(False)
 
     # ── Metadata ─────────────────────────────────────────────────────────────
@@ -959,7 +999,18 @@ class MainWindow(QMainWindow):
                     merged = self._join_metadata(df)
                     self._dm.write_merged_table(tname, merged)
             self._dm.invalidate_table_cache()
-
+            # Write-to-DB is an action button — persist patterns + channel
+            # colors to session.yml (write-on-action contract).
+            if self._session is not None:
+                image_pat, mask_pat, subdir_pat = self._data_view.get_patterns()
+                self._session.set_patterns(
+                    image_pattern=image_pat,
+                    mask_pattern=mask_pat,
+                    image_subdir_pattern=subdir_pat,
+                )
+                self._persist_channel_colors()
+        except SystemExit:
+            logger.exception("Failed to persist session.yml")
         except Exception:
             logger.exception("Failed to write metadata to database")
 
@@ -1265,7 +1316,7 @@ class MainWindow(QMainWindow):
         ic.auto_high.blockSignals(False)
         # Re-init channel config to defaults
         self._init_channel_config(use_saved=False)
-        ic.set_channels(self._ch_config)
+        ic.set_channels(self._ch_config, max_value=self._channel_max_value())
         self._persist_channel_colors()
         # Reset image zoom
         self._image_display.reset_all_zoom()
@@ -1308,6 +1359,23 @@ class MainWindow(QMainWindow):
 
     def _schedule_image_refresh(self) -> None:
         self._debounce.start()
+
+    def _start_worker(self, worker) -> None:
+        """Track and start a QRunnable; release it when it finishes or errors."""
+        self._active_workers.add(worker)
+
+        def _release(*_args, w=worker):
+            self._active_workers.discard(w)
+            # QRunnables are not QObjects and have no deleteLater — dropping
+            # the registry reference lets Python GC free the wrapper (the
+            # pool only touches the runnable during run(), and it is never
+            # auto-deleted: setAutoDelete(False)).
+            if hasattr(w, "deleteLater"):
+                w.deleteLater()
+
+        worker.signals.finished.connect(_release)
+        worker.signals.error.connect(_release)
+        self._thread_pool.start(worker)
 
     def _cancel_workers(self) -> None:
         """Invalidate all pending background workers."""
@@ -1511,6 +1579,9 @@ class MainWindow(QMainWindow):
                                 channel_toggle: bool = False) -> None:
         """Load images and dispatch background workers for processing."""
         self._cancel_workers()
+        # Discard any partially accumulated toggle results — a non-toggle
+        # dispatch supersedes them (they hold full RGB arrays per row).
+        self._channel_toggle_results = []
         self._ch_config = self._image_controls.get_channel_config()
         self._saved_state = saved_state
 
@@ -1632,7 +1703,7 @@ class MainWindow(QMainWindow):
                 lambda msg, g=gen: self._on_worker_error(msg, g),
                 Qt.QueuedConnection,
             )
-            self._thread_pool.start(worker)
+            self._start_worker(worker)
 
     def _compute_overlay_data(self) -> tuple:
         """Pre-compute overlay values, object counts, and per-object values."""
@@ -1938,7 +2009,7 @@ class MainWindow(QMainWindow):
                 int(total * 0.50),
                 int(total * 0.25),
             ])
-        # Update export "All annotated" option availability
+        # Update export "Annotated" option availability
         self._image_controls.update_export_annotated_option(True)
 
     def _on_label_class_removed(self, class_name: str) -> None:
@@ -1949,7 +2020,7 @@ class MainWindow(QMainWindow):
             self._label_panel.setVisible(False)
             total = sum(self._v_splitter.sizes())
             self._v_splitter.setSizes([int(total * 0.30), int(total * 0.70), 0])
-            # Update export "All annotated" option availability
+            # Update export "Annotated" option availability
             self._image_controls.update_export_annotated_option(False)
 
     def _on_label_class_selection_changed(self) -> None:
@@ -1964,14 +2035,19 @@ class MainWindow(QMainWindow):
 
         # Write-to-DB is an action button — persist current GUI state
         # (patterns + channel colors) to session.yml.
-        if self._session is not None:
-            image_pat, mask_pat, subdir_pat = self._data_view.get_patterns()
-            self._session.set_patterns(
-                image_pattern=image_pat,
-                mask_pattern=mask_pat,
-                image_subdir_pattern=subdir_pat,
-            )
-            self._persist_channel_colors()
+        try:
+            if self._session is not None:
+                image_pat, mask_pat, subdir_pat = self._data_view.get_patterns()
+                self._session.set_patterns(
+                    image_pattern=image_pat,
+                    mask_pattern=mask_pat,
+                    image_subdir_pattern=subdir_pat,
+                )
+                self._persist_channel_colors()
+        except SystemExit:
+            # SessionFile.save hard-exits on YAML write failure — never let
+            # it kill the app.
+            logger.exception("Failed to persist session.yml")
 
         mask_name = self._image_controls.get_selected_object_mask()
         if not mask_name:
@@ -2122,14 +2198,19 @@ class MainWindow(QMainWindow):
 
         # Export is an action button — persist current GUI state (patterns +
         # channel colors) to session.yml before starting the export work.
-        if self._session is not None:
-            image_pat, mask_pat, subdir_pat = self._data_view.get_patterns()
-            self._session.set_patterns(
-                image_pattern=image_pat,
-                mask_pattern=mask_pat,
-                image_subdir_pattern=subdir_pat,
-            )
-            self._persist_channel_colors()
+        try:
+            if self._session is not None:
+                image_pat, mask_pat, subdir_pat = self._data_view.get_patterns()
+                self._session.set_patterns(
+                    image_pattern=image_pat,
+                    mask_pattern=mask_pat,
+                    image_subdir_pattern=subdir_pat,
+                )
+                self._persist_channel_colors()
+        except SystemExit:
+            # SessionFile.save hard-exits on YAML write failure — never let
+            # it kill the app.
+            logger.exception("Failed to persist session.yml")
 
         ic = self._image_controls
         object_mode = ic.get_export_object_mode()
@@ -2150,7 +2231,7 @@ class MainWindow(QMainWindow):
 
         # Get annotations if needed
         annotations = None
-        if object_mode == "All annotated":
+        if object_mode == "Annotated":
             annotations = self._label_panel.get_annotations()
             if not annotations:
                 from PySide6.QtWidgets import QMessageBox
@@ -2161,21 +2242,29 @@ class MainWindow(QMainWindow):
                 return
 
         # Get wells/fields based on mode
-        annotated_keys = None  # set of row_idx for "All annotated"
+        annotated_keys = None  # set of row_idx for "Annotated"
         extra_filters: dict[str, list[str]] = {}
-        if object_mode == "All selected":
+        if object_mode == "Selected images":
             wells = sorted(self._selected_wells) if self._selected_wells else self._dm.get_wells()
             fields = list(ic.get_selected_fields())
             stacks = list(ic.get_selected_stacks())
             timepoints = list(ic.get_selected_timepoints())
-            # Extra-col filters only apply to "All selected" — "All images"
-            # exports everything by user intent, "All annotated" is scoped
-            # to annotated images.
+            # Extra-col filters only apply to "Selected images" — "Selected
+            # wells" exports all images in the wells by user intent, "All"
+            # exports everything, "Annotated" is scoped to annotated images.
             for col, widget in ic.get_extra_widgets().items():
                 selected = widget.get_selected()
                 if selected:
                     extra_filters[col] = selected
-        elif object_mode == "All annotated" and annotations:
+        elif object_mode == "Selected wells":
+            # Selected wells only — the Image Filters (fields/stacks/
+            # timepoints/extra cols) are intentionally ignored. Empty
+            # wells/fields/stacks/timepoints means "no filter" in the worker.
+            wells = sorted(self._selected_wells) if self._selected_wells else self._dm.get_wells()
+            fields = []
+            stacks = []
+            timepoints = []
+        elif object_mode == "Annotated" and annotations:
             # Only scan images that contain annotated objects. annotated_keys
             # is a set of row_idx values — the worker uses it to filter rows
             # after lookup_row_indices. Empty wells/fields/stacks/timepoints
@@ -2189,7 +2278,7 @@ class MainWindow(QMainWindow):
             fields = []
             stacks = []
             timepoints = []
-        else:  # "All images"
+        else:  # "All"
             wells = self._dm.get_wells()
             fields = self._dm.get_fields()
             stacks = self._dm.get_stacks()
@@ -2331,6 +2420,7 @@ class MainWindow(QMainWindow):
         self._dataset_dir = None
         self._session = None
         self._loaded_dataset_dir = None
+        self._update_window_title()
         self._metadata_df = None
         self._metadata_merged = None
         self._current_table = None

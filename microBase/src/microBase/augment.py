@@ -39,7 +39,7 @@ import albumentations as A
 def build_pipeline(spec):
     """Build an albumentations Compose from a YAML spec list.
 
-    spec: list of single-key dicts, e.g. [{"Rotate": {"limit": 180, "p": 0.5}}].
+    spec: list of single-key dicts, e.g. [{"Rotate": {"angle_range": 180, "p": 0.5}}].
           Key is an albumentations class name; value is its kwargs dict.
           None / empty list -> returns None (no augmentation).
     """

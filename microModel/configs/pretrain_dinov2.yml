@@ -156,7 +156,7 @@ augmentation_infer:
   - PadIfNeeded: {min_height: 224, min_width: 224, p: 1.0}
 
 normalize:
-  method: global                      # global | per_channel | null
+  method: per_channel                 # global | per_channel | null
   with_masking: false                 # true = stats from cell foreground only
   fixed_reference: true               # stats on RAW cell, fixed transform per view; preserves brightness/contrast aug
   clip_low: 0.05

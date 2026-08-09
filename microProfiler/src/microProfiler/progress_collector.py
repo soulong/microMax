@@ -27,10 +27,15 @@ class SubscribableProgressCollector(ProgressCollector):
 
     Used by the GUI: the PipelineWorker attaches a progress-signal emitter,
     and the CLI attaches a print function.
+
+    ``cancel_check`` is an optional ``Callable[[], bool]`` the worker sets so
+    long-running black-box calls (e.g. microModel inference) can distinguish
+    "aborted because the user cancelled" from "genuinely failed".
     """
 
     def __init__(self) -> None:
         self._subscribers: List[Callable[[str, int, int, str], None]] = []
+        self.cancel_check: Callable[[], bool] | None = None
 
     def subscribe(self, fn: Callable[[str, int, int, str], None]) -> None:
         self._subscribers.append(fn)

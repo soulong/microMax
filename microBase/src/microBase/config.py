@@ -49,7 +49,7 @@ def load_yaml(path):
     except yaml.YAMLError as e:
         print(f"Error: failed to parse YAML {path}: {e}", file=sys.stderr)
         sys.exit(1)
-    return normalize_null_strings(data or {})
+    return normalize_null_strings(data if isinstance(data, dict) else {})
 
 
 def save_yaml(path, data):
@@ -130,14 +130,16 @@ class SessionFile:
             self.save(updates)
 
     def get_applied_steps(self):
-        return self.load().get("applied_steps", [])
+        # `or []`: the key may exist with a null value (load_yaml normalizes
+        # 'null'/'none' strings to None) — treat null as "no steps".
+        return self.load().get("applied_steps") or []
 
     def set_applied_steps(self, steps):
         self.save({"applied_steps": list(steps)})
 
     def get_channel_colors(self):
         """Return per-channel color/contrast config dict, or {} if absent."""
-        return self.load().get("channel_colors", {})
+        return self.load().get("channel_colors") or {}
 
     def set_channel_colors(self, colors):
         """Update channel_colors section. colors: {ch_name: {color, vmin, vmax}}"""
