@@ -485,8 +485,8 @@ def _run_inference(
 
 _STEP_FUNCTIONS = {
     "resize": _run_resize,
-    "basic": _run_basic,
     "zproject": _run_zproject,
+    "basic": _run_basic,
     "tile": _run_tile,
     "segment": _run_segment,
     "profile": _run_profile,
@@ -524,7 +524,7 @@ def run_step(
             f"Unknown step: {step_name!r}. Must be one of {list(_STEP_FUNCTIONS)}"
         )
 
-    _PREPROC_STEPS = {"resize", "basic", "zproject", "tile"}
+    _PREPROC_STEPS = {"resize", "zproject", "basic", "tile"}
     if step_name in _PREPROC_STEPS:
         sf = SessionFile(dataset_dir)
         prev_applied = set(sf.get_applied_steps())
@@ -592,14 +592,6 @@ def run_pipeline(
             logger.info("Resize step done")
             applied_steps.append("resize")
 
-    if "basic" in prev_applied:
-        logger.info("Skipping BaSiC — already applied in previous run")
-    else:
-        ds_new = _run_basic(cfg, ds_new, root_dir, progress)
-        if cfg.basic and cfg.basic.run:
-            logger.info("BaSiC step done")
-            applied_steps.append("basic")
-
     if "zproject" in prev_applied:
         logger.info("Skipping Z-projection — already applied in previous run")
     else:
@@ -607,6 +599,14 @@ def run_pipeline(
         if cfg.zproject and cfg.zproject.run:
             logger.info("Z-projection step done")
             applied_steps.append("zproject")
+
+    if "basic" in prev_applied:
+        logger.info("Skipping BaSiC — already applied in previous run")
+    else:
+        ds_new = _run_basic(cfg, ds_new, root_dir, progress)
+        if cfg.basic and cfg.basic.run:
+            logger.info("BaSiC step done")
+            applied_steps.append("basic")
 
     if "tile" in prev_applied:
         logger.info("Skipping tiling — already applied in previous run")

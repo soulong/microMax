@@ -28,16 +28,16 @@ resize:
   run: false
   scale_factor: 0.5
 
+zproject:
+  run: false
+  method: max
+
 basic:
   run: false
   mode: fit-transform
   n_image: 100
   working_size: 64
   enable_darkfield: false
-
-zproject:
-  run: false
-  method: max
 
 tile:
   run: false

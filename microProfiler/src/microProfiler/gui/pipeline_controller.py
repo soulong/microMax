@@ -203,7 +203,7 @@ class PipelineController(QObject):
         sf = SessionFile(dataset_dir)
         sf.save(settings)
         # applied_steps must never shrink: gated in-place preprocessing steps
-        # (resize/basic/zproject/tile) stay marked once actually applied
+        # (resize/zproject/basic/tile) stay marked once actually applied
         # (run_pipeline itself unions prev_applied), so unchecking a checkbox
         # later can't cause a destructive re-run on already-processed files.
         prev_applied = set(sf.get_applied_steps())
@@ -462,7 +462,7 @@ class PipelineController(QObject):
         cfg = self._build_pipeline_config()
         has_steps = any(
             getattr(cfg, attr)
-            for attr in ("resize", "basic", "zproject", "tile",
+            for attr in ("resize", "zproject", "basic", "tile",
                          "segment", "image_profile", "object_profile",
                          "inference")
         )
@@ -518,15 +518,28 @@ class PipelineController(QObject):
         if step.step_name == "basic" and hasattr(cfg, "basic") and cfg.basic is not None:
             root = self._output_path()
             model_dir = root / ".microprofiler" / "BaSiC_model"
-            if model_dir.exists() and any(model_dir.glob("*.pkl")):
+            marker = model_dir / ".fit_order"
+            try:
+                marker_ok = marker.exists() and marker.read_text(encoding="utf-8").strip() == "zproject_first"
+            except OSError:
+                marker_ok = False
+            if model_dir.exists() and any(model_dir.glob("*.pkl")) and marker_ok:
                 # Only "fit-transform" is shortened to transform-only when
-                # pre-fitted models exist; an explicit "fit" request is
+                # pre-fitted models exist (and were fit under the current
+                # zproject-first order); an explicit "fit" request is
                 # honored as-is (fit-only).
                 if cfg.basic.mode == "fit-transform":
                     cfg.basic.mode = "transform"
                     logging.getLogger("microProfiler").info(
                         "Pre-fitted BaSiC models detected — running transform only"
                     )
+            elif model_dir.exists() and any(model_dir.glob("*.pkl")) and not marker_ok:
+                # Stale models fit under the old (basic-before-zproject) order
+                # must not be applied to z-projected images — force a fresh fit.
+                logging.getLogger("microProfiler").info(
+                    "Stale BaSiC models (fit under old pre-processing order) detected — "
+                    "forcing a fresh fit before transform"
+                )
 
         self._ensure_worker()
         run_gen = self._worker_gen

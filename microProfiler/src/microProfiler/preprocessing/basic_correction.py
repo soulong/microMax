@@ -7,6 +7,7 @@ The actual BaSiC algorithm lives in ``microProfiler.preprocessing.basic``
 from __future__ import annotations
 
 import logging
+import os
 import pickle
 import random
 from pathlib import Path
@@ -18,7 +19,15 @@ from tqdm import tqdm
 
 from microBase import ImageDataset
 from microProfiler.io import read_image, write_image, rebuild_dataset
+
+# Force JAX onto CPU for BaSiC fit/transform. Must run before importing the
+# vendored basic package (which imports jax) so the GPU backend never
+# initialises and no VRAM is preallocated. setdefault keeps an escape hatch:
+# a user who exports JAX_PLATFORMS=gpu still gets GPU.
+os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 from microProfiler.preprocessing.basic.basic import BaSiC
+
 from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
 
 logger = logging.getLogger(__name__)
@@ -105,6 +114,10 @@ def fit_models(
             )
 
     progress.report("BaSiC Fit", len(channels), len(channels), "Fit complete")
+    # Mark that these models were fit under the zproject-first preprocessing
+    # order, so the GUI "Apply" downgrade path can refuse to reuse stale
+    # models that were fit under the old (basic-before-zproject) order.
+    (model_dir / ".fit_order").write_text("zproject_first", encoding="utf-8")
     return model_dir
 
 

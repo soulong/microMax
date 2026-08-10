@@ -249,15 +249,15 @@ class MainWindow(QMainWindow):
         self._filter_panel = FilterPanel(self._state)
 
         self._all_step_panels = [
-            self._resize_panel, self._basic_panel,
-            self._zproject_panel, self._tile_panel,
+            self._resize_panel, self._zproject_panel,
+            self._basic_panel, self._tile_panel,
             self._segment_panel, self._image_profile_panel,
             self._object_profile_panel, self._inference_panel,
         ]
 
         self._preprocessing_steps = [
-            self._resize_panel, self._basic_panel,
-            self._zproject_panel, self._tile_panel,
+            self._resize_panel, self._zproject_panel,
+            self._basic_panel, self._tile_panel,
         ]
 
         # ── QStackedWidget ─────────────────────────────────────────────

@@ -3,8 +3,7 @@
 `microMax` is a four-package Python suite for end-to-end microscopy image
 analysis: preprocessing, cell segmentation, feature profiling, interactive
 viewing/annotation, self-supervised pretraining, classification, and feature
-extraction. It is developed and tested on Windows 10/11 with Python >= 3.10
-(3.12 in CI).
+extraction.
 
 ```
 microMax/
@@ -29,60 +28,67 @@ microMax/
 
 ---
 
-## 1. Environment
+## Installation
+
+### Environment
 
 The suite is installed into a conda environment named `micro`.
 
-```powershell
+```
 conda create -n micro python=3.12
 conda activate micro
 ```
 
-If you plan to use a GPU (segmentation, pretraining, training), install a
-CUDA-enabled PyTorch build and make sure your NVIDIA drivers are up to date.
+install a CUDA-enabled PyTorch build and make sure your NVIDIA drivers are up to date.
 
----
+```
+# for windows
+pip install torch --index-url https://download.pytorch.org/whl/cu130
 
-## 2. Installation
-
-Install the four packages in dependency order:
-
-```powershell
-python -m pip install -e c:\Users\haohe\GitHub\microMax\microBase
-python -m pip install -e c:\Users\haohe\GitHub\microMax\microModel
-python -m pip install -e c:\Users\haohe\GitHub\microMax\microProfiler
-python -m pip install -e c:\Users\haohe\GitHub\microMax\microVis
+# for linux 
+pip install torch torchvision
 ```
 
-### Cellpose with DINOv3 models
+### Install Cellpose and dependent DINOv3
 
 `microProfiler` segmentation is built on [Cellpose](https://github.com/MouseLand/cellpose).
-Cellpose is installed automatically as a dependency, but the DINOv3-based
-models (`cpdino`, `cpdino-vitb`) require one extra package straight from
-the upstream repo (Cellpose v4.2+, June 2026):
+The DINOv3-based models (`cpdino`, `cpdino-vitb`) require extra DINOv3 (Cellpose v4.2+, June 2026)
 
-```powershell
-python -m pip install cellpose --upgrade
+```
+pip install cellpose[gui]
 python -m pip install git+https://github.com/facebookresearch/dinov3
 ```
 
+### Installation
+
+Install the meta packages in dependency order:
+
+```
+git clone https://github.com/soulong/microMax.git
+cd microMax
+
+python -m pip install -e microBase
+python -m pip install -e microModel
+python -m pip install -e microProfiler
+python -m pip install -e microVis
+```
+
+
 Notes:
 
-- Model weights download automatically on first use (from HuggingFace).
-- All Cellpose models are trained on data licensed **CC-BY-NC** — check the
-  license before commercial use.
-- See the Cellpose docs (https://cellpose.readthedocs.io) for GPU setup,
-  fine-tuning, and troubleshooting.
+- Cellpose model weights download automatically on first use (from HuggingFace).
+- All Cellpose models are trained on data licensed **CC-BY-NC** — check the license before commercial use.
+- See the Cellpose docs (https://cellpose.readthedocs.io) for GPU setup, fine-tuning, and troubleshooting.
 
 ---
 
-## 3. Typical usage
+## Typical usage
 
-### 3.1 microProfiler — profiling pipeline
+### microProfiler — profiling pipeline
 
 **GUI** (recommended for interactive work):
 
-```powershell
+```
 microprofiler
 ```
 
@@ -91,10 +97,10 @@ Five-page flow: **Input → Pre-process → Segment → Profile → Inference**.
 1. **Input** — Browse to a dataset folder, then press **Load Dataset**.
    The image/mask filename patterns are matched against your file naming.
    Optional filters narrow the dataset by metadata column (e.g. well).
-2. **Pre-process** (optional) — enable any of: resize, BaSiC illumination
-   correction, Z-projection (needs a `stack` metadata column), tiling
-   (needs a `field` column). Run with **Run Preprocessing**. Steps run only
-   when enabled — nothing runs by default.
+2. **Pre-process** (optional) — enable any of: resize, Z-projection (needs a
+   `stack` metadata column), BaSiC illumination correction, tiling (needs a
+   `field` column). Run with **Run Preprocessing**. Steps run only when
+   enabled — nothing runs by default.
 3. **Segment** — configure one or more Cellpose runs (object name, model,
    channels, diameter, thresholds), then **Run Segmentation**. Masks are
    written next to the images as `<stem>_cp_masks_<name>.png`.
@@ -111,7 +117,7 @@ Five-page flow: **Input → Pre-process → Segment → Profile → Inference**.
 
 **CLI** (same pipeline, headless — useful for batch/plate processing):
 
-```powershell
+```
 microprofiler run --config pipeline_config.yml --dataset-dir D:\data\plate1
 ```
 
@@ -119,9 +125,9 @@ The CLI config mirrors the GUI exactly: every step section has a `run`
 flag (default `false`), so a minimal YAML never silently runs a destructive
 in-place step.
 
-### 3.2 microVis — interactive viewer & annotation
+### microVis — interactive viewer & annotation
 
-```powershell
+```
 microvis            # then select a dataset folder in the UI
 microvis D:\data\plate1
 ```
@@ -141,11 +147,11 @@ Typical flow:
    TIFFs (ImageJ-compatible, one file per cell) plus a `{mask_name}.csv`
    manifest — ready to feed `microModel` training.
 
-### 3.3 microModel — SSL pretrain / train / infer
+### microModel — SSL pretrain / train / infer
 
 All commands are config-driven (`micromodel <subcommand> --config <file>`):
 
-```powershell
+```
 micromodel pretrain --config configs/pretrain_dinov2.yml    # SSL backbone (BYOL or DINOv2)
 micromodel vis-augment --config configs/pretrain_dinov2.yml # preview the augmentation views
 micromodel train --config configs/train.yml                 # classifier (from SSL backbone or scratch)
@@ -162,7 +168,7 @@ segmentation masks.
 
 ---
 
-## 4. Important things to know for accurate use
+## Important things to know for accurate use
 
 ### Filename patterns are regexes — get them right
 
@@ -175,13 +181,22 @@ pattern are simply missing — they are never defaulted. Pattern edits require
 
 ### Preprocessing overwrites your source files
 
-Resize, BaSiC correction, Z-projection, and tiling modify TIFFs **in place**.
+Resize, Z-projection, BaSiC correction, and tiling modify TIFFs **in place**.
 The suite remembers which steps already ran (per-dataset `applied_steps`) and
 skips them on re-runs — you cannot accidentally double-apply a step. If an
 in-place step is interrupted, restore the original raw files before
 re-running. Tiling writes only complete tiles: right/bottom remainders (and
 images smaller than the tile size) are intentionally dropped — pick tile
 sizes that divide your image dimensions, or that data is lost.
+
+### Upgrading from the old pre-processing order
+
+Older versions ran BaSiC **before** Z-projection. If a dataset was already
+processed under the old order and only `basic` was recorded in
+`applied_steps`, upgrading will run Z-projection on the already-BaSiC-corrected
+z-stacks and skip BaSiC — a different result from a fresh run of both steps
+in the new order. To get the new-order behavior cleanly on such a dataset,
+restore the original raw files and re-run preprocessing from scratch.
 
 ### session.yml — per-dataset state
 
@@ -226,7 +241,7 @@ verbatim from extraction to the profiling DB, CSV exports, and `infer.db`.
 
 ---
 
-## 5. Artifact quick-reference
+## Artifact quick-reference
 
 | Artifact | Location | Produced by |
 |---|---|---|

@@ -126,7 +126,7 @@ Dataset", which is distinct from "Browse").
 | `image_pattern`, `mask_pattern`, `image_subdir_pattern` | microProfiler (Load Dataset via `set_patterns`, Run/Apply via `_save_session_yml`), microVis (Load Dataset, Export, Write-to-DB, Write Label to DB) | microProfiler, microVis |
 | `applied_steps` | microProfiler (Run/Apply via `_save_session_yml`) | microProfiler (skip logic) |
 | `channel_colors` (`{ch: {color, vmin, vmax}}`) | microVis (Load Dataset, Export, Write-to-DB, Write Label to DB, Auto, ImageControls Reset) | microVis (first load only; never re-read on reload) |
-| step params (`resize`, `basic`, `zproject`, `tile`, `segment`, `image_profile`, `object_profile`, `inference`) | microProfiler (Run/Apply via `_save_session_yml`) | microProfiler |
+| step params (`resize`, `zproject`, `basic`, `tile`, `segment`, `image_profile`, `object_profile`, `inference`) | microProfiler (Run/Apply via `_save_session_yml`) | microProfiler |
 | `filter` | microProfiler (Run/Apply via `_save_session_yml`; always written, even `[]`, so cleared filters never resurrect) | microProfiler |
 
 ---
@@ -454,7 +454,7 @@ src/microProfiler/
 │   ├── image_widgets.py   QGraphicsView viewer + ChannelTile
 │   ├── interfaces.py      IControllerView Protocol
 │   ├── panels/            BaseStepPanel + BlockContainerPanel + 9 panels
-│   │                      (resize, basic, zproject, tile, segment,
+│   │                      (resize, zproject, basic, tile, segment,
 │   │                      image_profile, object_profile, inference, filter)
 │   └── workers/           PipelineWorker + PreviewWorker + DatasetLoadWorker (QThread)
 └── resources/             icon.ico, style.qss
@@ -469,14 +469,14 @@ src/microProfiler/
                      │
                      ▼
    ┌──────────────────────────────────────────────────────────┐
-   │  resize → basic → zproject → tile → segment → profile → infer │
+   │  resize → zproject → basic → tile → segment → profile → infer │
    └──────────────────────────────────────────────────────────┘
                      │
         ┌────────────┴────────────┐
         ▼                         ▼
    source TIFFs              result.db
    (overwritten in-place      session.yml (applied_steps)
-   by resize/basic/zproject) <dataset>/.microprofiler/BaSiC_model/
+   by resize/zproject/basic) <dataset>/.microprofiler/BaSiC_model/
                               <stem>_cp_masks_<obj>.png
                               <dataset>/<output_db> (inference, e.g. infer.db)
                               <dataset>/reducer_{pca,umap}.pkl (fitted reduction)
@@ -486,7 +486,7 @@ src/microProfiler/
   and the GUI checkboxes agree). A step runs only when its config sets
   `run: true` / its checkbox is checked — a minimal YAML never silently runs
   a destructive in-place step.
-- The four preprocessing steps (`resize`, `basic`, `zproject`, `tile`) are
+- The four preprocessing steps (`resize`, `zproject`, `basic`, `tile`) are
   gated by `SessionFile.get_applied_steps()`; rerunning skips already-applied
   steps. `segment`, `profile`, and `infer` always run when enabled (not
   gated) — they are non-destructive and intended to re-run. **`applied_steps`
@@ -506,6 +506,16 @@ src/microProfiler/
   input stacks can map to the same projection filename, so write-then-delete
   would delete freshly written projections. A failed write therefore loses
   the stack — keep raw backups of the originals.
+- **Pre-processing order is `resize → zproject → basic → tile`.** Z-projection
+  runs **before** BaSiC illumination correction, so BaSiC fits its shading
+  model on the z-projected images (one per group), not on raw z-stack slices.
+  This is a scientifically different result from fitting on raw slices then
+  projecting: for `max` projection `max(corrected) ≠ corrected(max)` in
+  general. Fit sample count also shrinks (one image per group vs. one per
+  z-slice × groups); `n_image` is clamped to `min(n_image, len(paths))`
+  automatically. The GUI "Apply" BaSiC button reuses cached models only when
+  a `.fit_order` marker confirms they were fit under this order — stale
+  old-order models force a fresh fit.
 - **Profiling failure semantics.** Per-row and per-channel feature failures
   are logged and skipped by design (one bad row/channel never aborts the
   run). A run-level profiling failure is re-raised: batches flushed before

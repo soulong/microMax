@@ -219,8 +219,8 @@ class PipelineConfig:
     filter: Optional[List[FilterEntry]] = None
 
     resize: Optional[ResizeConfig] = None
-    basic: Optional[BasicConfig] = None
     zproject: Optional[ZProjectConfig] = None
+    basic: Optional[BasicConfig] = None
     tile: Optional[TileConfig] = None
 
     segment: Optional[SegmentConfig] = None
@@ -264,7 +264,7 @@ def _dict_to_config(d: Dict) -> PipelineConfig:
     if d.get("filter"):
         cfg.filter = [FilterEntry(**f) for f in d["filter"]]
 
-    for attr in ("resize", "basic", "zproject", "tile",
+    for attr in ("resize", "zproject", "basic", "tile",
                  "segment", "image_profile", "object_profile",
                  "inference"):
         section = d.get(attr)
@@ -277,7 +277,7 @@ def _dict_to_config(d: Dict) -> PipelineConfig:
 def section_to_dataclass(attr: str, section: Dict) -> Any:
     """Convert a single section dict to its corresponding dataclass instance.
 
-    attr is one of: resize, basic, zproject, tile, segment,
+    attr is one of: resize, zproject, basic, tile, segment,
     image_profile, object_profile, inference.
     Unknown keys raise ValueError with a clear message (no silent dropping).
     """
@@ -358,7 +358,7 @@ def config_to_dict(cfg: PipelineConfig) -> Dict:
     # so an absent key would leave a stale GUI-written filter in session.yml.
     result["filter"] = [dataclasses.asdict(f) for f in cfg.filter] if cfg.filter else []
 
-    for attr in ("resize", "basic", "zproject", "tile",
+    for attr in ("resize", "zproject", "basic", "tile",
                  "segment", "image_profile", "object_profile",
                  "inference"):
         val = getattr(cfg, attr)
