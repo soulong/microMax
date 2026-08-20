@@ -127,6 +127,7 @@ class SegmentBlockWidget(QWidget):
         if self._channels:
             for ch in self._channels:
                 cb = QCheckBox(ch)
+                cb.toggled.connect(self._on_chan1_toggled)
                 self._chan1_checkboxes.append(cb)
                 row3.addWidget(cb)
         else:
@@ -151,6 +152,7 @@ class SegmentBlockWidget(QWidget):
         if self._channels:
             for ch in self._channels:
                 cb = QCheckBox(ch)
+                cb.toggled.connect(self._on_chan2_toggled)
                 self._chan2_checkboxes.append(cb)
                 row4.addWidget(cb)
         else:
@@ -249,13 +251,25 @@ class SegmentBlockWidget(QWidget):
     def get_chan2(self) -> List[str]:
         return [cb.text() for cb in self._chan2_checkboxes if cb.isChecked()]
 
+    def _on_chan1_toggled(self, *_) -> None:
+        if self._chan1_checkboxes and not any(
+            cb.isChecked() for cb in self._chan1_checkboxes
+        ):
+            self._c1_view.clear_image()
+
+    def _on_chan2_toggled(self, *_) -> None:
+        if self._chan2_checkboxes and not any(
+            cb.isChecked() for cb in self._chan2_checkboxes
+        ):
+            self._c2_view.clear_image()
+
     def rebuild_channels(self, channels: List[str]) -> None:
         self._channels = channels
         self._chan1_checkboxes.clear()
         self._chan2_checkboxes.clear()
 
         # Helper to rebuild one channel row
-        def _rebuild_row(row, placeholder_attr, checkbox_list, checked_default):
+        def _rebuild_row(row, placeholder_attr, checkbox_list, checked_default, toggled_handler):
             placeholder = getattr(self, placeholder_attr, None)
             if placeholder is not None:
                 for i in range(row.count() - 1, -1, -1):
@@ -286,14 +300,15 @@ class SegmentBlockWidget(QWidget):
             for ch in channels:
                 cb = QCheckBox(ch)
                 cb.setChecked(checked_default)
+                cb.toggled.connect(toggled_handler)
                 row.insertWidget(insert_at, cb)
                 checkbox_list.append(cb)
                 insert_at += 1
 
         # Both Chan1 and Chan2 default unchecked; stored configs (session.yml)
         # re-check their channels via populate_channels/_set_checked_states.
-        _rebuild_row(self._chan1_row, "_chan1_placeholder", self._chan1_checkboxes, False)
-        _rebuild_row(self._chan2_row, "_chan2_placeholder", self._chan2_checkboxes, False)
+        _rebuild_row(self._chan1_row, "_chan1_placeholder", self._chan1_checkboxes, False, self._on_chan1_toggled)
+        _rebuild_row(self._chan2_row, "_chan2_placeholder", self._chan2_checkboxes, False, self._on_chan2_toggled)
 
     def build_config_section(self) -> dict:
         chan1 = self.get_chan1()
@@ -497,15 +512,32 @@ class SegmentStepPanel(BlockContainerPanel):
     def build_config_section(self) -> List[dict]:
         return [block.build_config_section() for block in self._blocks]
 
-    def set_preview_c1(self, block_index: int, img: np.ndarray) -> None:
+    def set_preview_c1(self, block_index: int, img: Optional[np.ndarray]) -> None:
         if 0 <= block_index < len(self._blocks):
-            self._blocks[block_index]._c1_view.set_image(img)
-            self._blocks[block_index].show_preview()
+            block = self._blocks[block_index]
+            if img is None:
+                block._c1_view.clear_image()
+            else:
+                block._c1_view.set_image(img)
+            block.show_preview()
 
-    def set_preview_c2(self, block_index: int, img: np.ndarray) -> None:
+    def set_preview_c2(self, block_index: int, img: Optional[np.ndarray]) -> None:
         if 0 <= block_index < len(self._blocks):
-            self._blocks[block_index]._c2_view.set_image(img)
-            self._blocks[block_index].show_preview()
+            block = self._blocks[block_index]
+            if img is None:
+                block._c2_view.clear_image()
+            else:
+                block._c2_view.set_image(img)
+            block.show_preview()
+
+    def clear_preview(self) -> None:
+        for block in self._blocks:
+            block._c1_view.clear_image()
+            block._c2_view.clear_image()
+            block._mask_toggle_btn.setChecked(False)
+            block._mask_toggle_btn.setText("Show Mask")
+            block._mask_toggle_btn.setEnabled(False)
+            block._preview_container.setVisible(False)
 
     def set_preview_mask(self, block_index: int, mask: np.ndarray) -> None:
         if 0 <= block_index < len(self._blocks):

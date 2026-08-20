@@ -610,7 +610,6 @@ class PipelineController(QObject):
         if ds is not None and len(ds) > 0:
             self._random_row_idx = self._ds_service.pick_random_row(ds)
             idx = self._random_row_idx
-            logging.getLogger("microProfiler").info(f"Picked random row {idx}")
             for panel in self._view.get_all_step_panels():
                 if hasattr(panel, "clear_preview") and callable(panel.clear_preview):
                     panel.clear_preview()
@@ -631,9 +630,6 @@ class PipelineController(QObject):
             return
         self._random_row_idx = self._ds_service.pick_random_row(ds)
         idx = self._random_row_idx
-        logging.getLogger("microProfiler").info(
-            f"Segment block {block_index}: picked random row {idx}"
-        )
         seg_panel = self._view.get_step_panel("segment")
         if seg_panel is None or not hasattr(seg_panel, "_blocks"):
             return
@@ -650,6 +646,8 @@ class PipelineController(QObject):
                 seg_panel.set_preview_c1(block_index, c1_img)
             except Exception:
                 pass
+        else:
+            seg_panel.set_preview_c1(block_index, None)
         if chan2:
             ch = chan2[0]
             try:
@@ -657,6 +655,8 @@ class PipelineController(QObject):
                 seg_panel.set_preview_c2(block_index, c2_img)
             except Exception:
                 pass
+        else:
+            seg_panel.set_preview_c2(block_index, None)
 
     def on_segment_preview(self, block_index: int) -> None:
         if self._preview_running:
@@ -735,10 +735,8 @@ class PipelineController(QObject):
                 c1 = extra.get("c1_img")
                 c2 = extra.get("c2_img")
                 mask = extra.get("mask")
-                if c1 is not None:
-                    seg_panel.set_preview_c1(block_idx, c1)
-                if c2 is not None:
-                    seg_panel.set_preview_c2(block_idx, c2)
+                seg_panel.set_preview_c1(block_idx, c1)
+                seg_panel.set_preview_c2(block_idx, c2)
                 if mask is not None:
                     seg_panel.set_preview_mask(block_idx, mask)
         self._preview_pending_step = None

@@ -104,6 +104,20 @@ class ImageViewer(QGraphicsView):
         self._zoom_level = 0
         self._reloading = False
 
+    def clear_image(self) -> None:
+        self._base_array = None
+        self._base_pixmap = None
+        self._composited_pixmap = None
+        self._overlay_mask = None
+        self._overlay_visible = False
+        self._last_pixel_value = None
+        self._fit_to_view = True
+        self._zoom_level = 0
+        self._reloading = True
+        self._scene.clear()
+        self._pixmap_item = None
+        self._reloading = False
+
     def overlay_mask(self, mask: np.ndarray, alpha: float = 0.7) -> None:
         if self._base_array is None:
             return
