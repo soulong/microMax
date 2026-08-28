@@ -202,8 +202,8 @@ Dataset", which is distinct from "Browse").
     (`LongestMaxSize + PadIfNeeded + Resize`). There is no separate
     `model.input_size` parameter or `resize_to_target` function.
 13. **All metadata is TEXT from extraction to DB storage.**
-    `normalize_capture` is a verbatim pass-through — no leading-zero
-    stripping, no int coercion. `'01'` stays `'01'`, `'blue'` stays `'blue'`.
+    Regex captures are used verbatim — no leading-zero stripping, no int
+    coercion. `'01'` stays `'01'`, `'blue'` stays `'blue'`.
     `derive_well` is the only exception: it computes well labels (e.g. `'A1'`)
     from `row`+`col` by doing its own `int()` internally. Structural columns
     (`well`, `field`, `stack`, `timepoint`) absent from the regex are simply
@@ -271,7 +271,7 @@ Dataset", which is distinct from "Browse").
 ## 4. microBase — shared foundation
 
 **Path:** `microMax/microBase/`
-**Version:** `0.8.0`  •  **Layout:** flat, 10 modules under `src/microBase/`
+**Version:** `0.9.0`  •  **Layout:** flat, 10 modules under `src/microBase/`
 **Dependencies:** `numpy`, `pandas`, `tifffile`, `Pillow`, `pyyaml`,
 `albumentationsx`, `natsort`.
 
@@ -279,9 +279,9 @@ Dataset", which is distinct from "Browse").
 
 | Module | Purpose | Public API |
 |---|---|---|
-| `__init__.py` | Re-exports 23 public names; sets `NO_ALBUMENTATIONS_UPDATE=1` + `ALBUMENTATIONS_NO_TELEMETRY=1`; defines `__version__`. | all of the below |
-| `schema.py` | Classify regex-captured columns; derive `well` from `row+col`; `normalize_capture` is a verbatim pass-through. `derive_well` raises `ValueError` on non-numeric col. | `MetadataSchema`, `derive_well`, `normalize_capture` |
-| `io.py` | TIFF/mask readers/writers; normalizes to `(H, W, C)`. Accepts `channel_layout` of `None` / `"CHW"` / `"HWC"`. | `read_tiff`, `read_tiff_channels`, `read_mask`, `write_tiff`, `write_mask` |
+| `__init__.py` | Re-exports 20 public names; sets `NO_ALBUMENTATIONS_UPDATE=1` + `ALBUMENTATIONS_NO_TELEMETRY=1`; defines `__version__`. | all of the below |
+| `schema.py` | Classify regex-captured columns; derive `well` from `row+col`. Captures are used verbatim (all metadata stays TEXT). `derive_well` raises `ValueError` on non-numeric col. | `MetadataSchema`, `derive_well` |
+| `io.py` | TIFF/mask readers; normalizes to `(H, W, C)`. Accepts `channel_layout` of `None` / `"CHW"` / `"HWC"`. No writers — microProfiler writes with its own zlib writer. | `read_tiff`, `read_tiff_channels`, `read_mask` |
 | `cells.py` | Pure functions for cropping single cells from labeled masks. `crop_cell` hard-exits on `label < 1` and on zero-pixel labels. | `get_labels`, `crop_cell`, `crop_all_cells` |
 | `config.py` | YAML load/save + per-dataset `SessionFile`. `load_yaml` recursively normalizes string spellings of `null`/`None`/`none` (case-insensitive) to Python `None`. | `load_yaml`, `save_yaml`, `SessionFile`, `normalize_null_strings` |
 | `augment.py` | Registry-driven augmentation pipeline on top of AlbumentationsX (import name `albumentations`). | `build_pipeline`, `apply` |
@@ -360,7 +360,8 @@ CellDataset(root, channel_layout="CHW", image_pattern=None)
 - `channel_layout`: `None` (each TIFF is 2D single-channel, returned as
   `(H, W, 1)`), `"CHW"` (pages along C axis), or `"HWC"` (last axis is C).
 - If `image_pattern` has a `channel` group, it is silently skipped.
-- Properties: `metadata`, `intensity_colnames`, `img_shape`, `img_dtype`, `schema`.
+- Properties: `metadata`, `intensity_colnames`, `img_shape`, `img_dtype`,
+  `schema`, `image_pattern` (original string, None when never set).
 - **Sorting.** Files are iterated in `natsorted` order (`cell_1.tiff` →
   `cell_2.tiff` → `cell_10.tiff`), which determines `metadata` row order.
 - Methods: `build_metadata()`, `get_cell(idx) -> (H, W, C)`.
@@ -438,7 +439,7 @@ or setting them in `session.yml`.
 **Version:** `1.6.0`  •  **Entry:** `microprofiler` (CLI: `run`; GUI: no args)
 **Deps on microBase:** `ImageDataset`, `SessionFile`, `load_yaml`,
 `normalize_null_strings`,
-`read_tiff`, `write_tiff`, `read_mask`, `write_mask`,
+`read_tiff`, `read_mask`,
 `DEFAULT_IMAGE_PATTERN`, `DEFAULT_MASK_PATTERN`, `DEFAULT_IMAGE_SUBDIR_PATTERN`.
 
 ### 5.1 Package layout

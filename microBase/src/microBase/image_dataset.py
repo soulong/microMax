@@ -28,7 +28,9 @@ import numpy as np
 import pandas as pd
 from natsort import natsorted, natsort_keygen
 
+from . import cells as _cells
 from . import io as _io
+from .schema import MetadataSchema
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +40,19 @@ def _pattern_string(pattern):
     if pattern is None:
         return None
     return pattern.pattern if hasattr(pattern, "pattern") else str(pattern)
-from . import cells as _cells
-from .schema import MetadataSchema, normalize_capture
 
 
-logger = logging.getLogger(__name__)
+def _apply_filter(df, col, pat):
+    """Filter a metadata frame by regex on a column, hard-exiting on an
+    unknown column. Shared by build_metadata and filter_metadata."""
+    if col not in df.columns:
+        print(
+            f"Error: filter column '{col}' not in metadata columns: "
+            f"{list(df.columns)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return df[df[col].astype(str).str.contains(pat, regex=True, na=False)]
 
 
 # Row-sort priority for the metadata DataFrame: row → col → well → field →
@@ -305,13 +315,14 @@ class ImageDataset:
             else:
                 # multi-channel-per-file: one file per site
                 rec["__file__"] = str(self.root / reldir / fname)
-            # Store structural + extra meta from regex captures (verbatim).
+            # Store structural + extra meta from regex captures (verbatim —
+            # all metadata stays TEXT from extraction through DB storage).
             for k, v in gd.items():
                 if k == "channel":
                     continue
                 if k == "mask_name":
                     continue
-                rec[k] = normalize_capture(k, v)
+                rec[k] = v
 
         if self._mask_pattern is not None:
             for reldir, fname in self._iter_mask_files():
@@ -331,7 +342,7 @@ class ImageDataset:
                 for k, v in gd.items():
                     if k in ("channel", "mask_name"):
                         continue
-                    rec.setdefault(k, normalize_capture(k, v))
+                    rec.setdefault(k, v)
 
         # Group 2: merge image + mask records on shared_key
         all_keys = sorted(set(image_records) | set(mask_records))
@@ -393,14 +404,7 @@ class ImageDataset:
 
         # Apply filters
         for col, pat in self._filters:
-            if col not in df.columns:
-                print(
-                    f"Error: filter column '{col}' not in metadata columns: "
-                    f"{list(df.columns)}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            df = df[df[col].astype(str).str.contains(pat, regex=True, na=False)]
+            df = _apply_filter(df, col, pat)
 
         df = df.reset_index(drop=True)
 
@@ -432,7 +436,7 @@ class ImageDataset:
             # multi-channel-per-file: open first TIFF, count channels
             if "__file__" not in row:
                 return
-            self._img_shape, self._img_dtype, n_channels = _io.detect_tiff_properties(
+            self._img_shape, n_channels, self._img_dtype = _io.detect_tiff_properties(
                 row["__file__"], self.channel_layout)
             self._intensity_colnames = [f"ch{i}" for i in range(1, n_channels + 1)]
 
@@ -571,16 +575,7 @@ class ImageDataset:
 
     def filter_metadata(self, column, pattern):
         """Filter rows by regex on a column. Mutates metadata."""
-        if column not in self._metadata.columns:
-            print(
-                f"Error: filter column '{column}' not in metadata columns: "
-                f"{list(self._metadata.columns)}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        self._metadata = self._metadata[
-            self._metadata[column].astype(str).str.contains(pattern, regex=True, na=False)
-        ].reset_index(drop=True)
+        self._metadata = _apply_filter(self._metadata, column, pattern).reset_index(drop=True)
         self._filters.append((column, pattern))
         self._cache.clear()
 

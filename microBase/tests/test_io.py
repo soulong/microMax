@@ -1,4 +1,4 @@
-"""Tests for microBase.io: TIFF and mask readers/writers."""
+"""Tests for microBase.io: TIFF and mask readers."""
 
 import numpy as np
 import pytest
@@ -64,29 +64,6 @@ def test_read_mask_png(tmp_path):
     Image.fromarray(arr).save(str(tmp_path / "mask.png"))
     out = mio.read_mask(tmp_path / "mask.png")
     assert out.shape == (2, 3)
-    np.testing.assert_array_equal(out, arr)
-
-
-def test_write_tiff_single_channel(tmp_path):
-    arr = np.random.randint(0, 65535, size=(64, 64), dtype=np.uint16)
-    mio.write_tiff(tmp_path / "out.tif", arr)
-    out = mio.read_tiff(tmp_path / "out.tif")
-    np.testing.assert_array_equal(out, arr)
-
-
-def test_write_tiff_chw_roundtrip(tmp_path):
-    """Write multi-channel as CHW, read back as CHW."""
-    arr = np.random.randint(0, 255, size=(32, 32, 3), dtype=np.uint8)
-    mio.write_tiff(tmp_path / "out.tif", arr, channel_layout="CHW")
-    out = mio.read_tiff_channels(tmp_path / "out.tif", [1, 2, 3], channel_layout="CHW")
-    assert out.shape == (32, 32, 3)  # (H, W, C)
-    np.testing.assert_array_equal(out, arr)
-
-
-def test_write_mask(tmp_path):
-    arr = np.array([[0, 1, 2], [3, 0, 1]], dtype=np.uint16)
-    mio.write_mask(tmp_path / "out.png", arr)
-    out = mio.read_mask(tmp_path / "out.png")
     np.testing.assert_array_equal(out, arr)
 
 
@@ -162,16 +139,16 @@ def test_compile_pattern_invalid_exits():
 def test_detect_tiff_properties_chw(tmp_path):
     arr = np.random.randint(0, 65535, size=(3, 32, 32), dtype=np.uint16)
     _make_tiff(tmp_path, "img.tif", arr)
-    shape, dtype, n_ch = mio.detect_tiff_properties(tmp_path / "img.tif", "CHW")
+    shape, n_ch, dtype = mio.detect_tiff_properties(tmp_path / "img.tif", "CHW")
     assert shape == (32, 32)
-    assert dtype == arr.dtype
     assert n_ch == 3
+    assert dtype == arr.dtype
 
 
 def test_detect_tiff_properties_hwc(tmp_path):
     arr = np.random.randint(0, 255, size=(32, 32, 2), dtype=np.uint8)
     _make_tiff(tmp_path, "img.tif", arr)
-    shape, dtype, n_ch = mio.detect_tiff_properties(tmp_path / "img.tif", "HWC")
+    shape, n_ch, dtype = mio.detect_tiff_properties(tmp_path / "img.tif", "HWC")
     assert shape == (32, 32)
-    assert dtype == arr.dtype
     assert n_ch == 2
+    assert dtype == arr.dtype

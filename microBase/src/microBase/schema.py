@@ -2,6 +2,12 @@
 
 The row/col auto-merge rule: if both `row` and `col` are captured,
 derive `well` and drop `row`/`col`.
+
+All metadata is stored as TEXT from extraction through DB storage: regex
+captures are used verbatim (no leading-zero stripping, no int coercion —
+'01' stays '01', 'blue' stays 'blue'). `derive_well` is the only exception:
+it computes well labels (e.g. 'A1') from row/col by doing its own int()
+internally.
 """
 
 from dataclasses import dataclass
@@ -46,19 +52,6 @@ def derive_well(row_val, col_val):
             f"row/col captures must be integers to derive a well label."
         ) from None
     return f"{_row_to_letter(row_val)}{col_int}"
-
-
-def normalize_capture(_col_name, value):
-    """Return a regex-captured value verbatim.
-
-    Kept as a pass-through for API compatibility. All metadata is stored
-    as TEXT from extraction through DB storage, so no value normalization
-    is applied: '01' stays '01', 'blue' stays 'blue', '000a6c98-...' stays
-    '000a6c98-...'. `derive_well` still computes well labels (e.g. 'A1')
-    from row/col by doing its own int() internally.
-    None is passed through.
-    """
-    return value
 
 
 @dataclass(frozen=True)

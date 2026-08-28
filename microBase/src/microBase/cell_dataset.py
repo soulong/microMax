@@ -18,7 +18,7 @@ import pandas as pd
 from natsort import natsorted
 
 from . import io as _io
-from .schema import MetadataSchema, normalize_capture
+from .schema import MetadataSchema
 
 
 class CellDataset:
@@ -82,6 +82,16 @@ class CellDataset:
         return self._img_dtype
 
     @property
+    def image_pattern(self):
+        """The original image_pattern string (None if never set).
+
+        Mirrors ImageDataset.image_pattern — the compiled regex stays private.
+        """
+        if self._image_pattern is None:
+            return None
+        return self._image_pattern.pattern
+
+    @property
     def schema(self):
         return self._schema
 
@@ -118,7 +128,8 @@ class CellDataset:
                         # Single-cell files shouldn't have a channel group
                         # (channels are inside the file). Skip if present.
                         continue
-                    rec[k] = normalize_capture(k, v)
+                    # Captures are used verbatim — metadata stays TEXT.
+                    rec[k] = v
             records.append(rec)
 
         if not records:
@@ -145,7 +156,7 @@ class CellDataset:
         if len(self._metadata) == 0:
             return
         path = self._metadata.iloc[0]["path"]
-        self._img_shape, self._img_dtype, n_channels = _io.detect_tiff_properties(
+        self._img_shape, n_channels, self._img_dtype = _io.detect_tiff_properties(
             path, self.channel_layout)
         self._intensity_colnames = [f"ch{i}" for i in range(1, n_channels + 1)]
 

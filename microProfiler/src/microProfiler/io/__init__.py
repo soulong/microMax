@@ -3,7 +3,7 @@
 Image reading/writing delegates to microBase. Database wraps sqlite3.
 """
 
-from microBase import read_tiff, write_tiff, read_mask, write_mask
+from microBase import read_tiff, read_mask
 from microBase import ImageDataset
 
 from microProfiler.io.database import Database
@@ -79,6 +79,6 @@ def rebuild_dataset(ds: ImageDataset) -> ImageDataset:
 __all__ = [
     "Database",
     "read_image", "write_image", "read_image_shape",
-    "read_tiff", "write_tiff", "read_mask", "write_mask",
+    "read_tiff", "read_mask",
     "clone_dataset", "rebuild_dataset",
 ]

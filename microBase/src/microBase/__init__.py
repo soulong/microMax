@@ -6,14 +6,14 @@ Provides:
 - crop_cell       : pure function for cropping a single cell
 - crop_all_cells  : convenience wrapper to crop every cell in a mask
 - get_labels      : pure function for listing cell labels in a mask
-- read_tiff, read_tiff_channels, read_mask, write_tiff, write_mask
+- read_tiff, read_tiff_channels, read_mask
 - load_yaml, save_yaml, SessionFile
 - build_pipeline, apply (augmentation)
 - normalize
 - derive_well, MetadataSchema
 """
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 import os as _os
 _os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -22,14 +22,11 @@ _os.environ.setdefault("ALBUMENTATIONS_NO_TELEMETRY", "1")
 from .schema import (
     MetadataSchema,
     derive_well,
-    normalize_capture,
 )
 from .io import (
     read_tiff,
     read_tiff_channels,
     read_mask,
-    write_tiff,
-    write_mask,
 )
 from .cells import (
     crop_cell,
@@ -65,8 +62,6 @@ __all__ = [
     "read_tiff",
     "read_tiff_channels",
     "read_mask",
-    "write_tiff",
-    "write_mask",
     "load_yaml",
     "save_yaml",
     "SessionFile",
@@ -75,7 +70,6 @@ __all__ = [
     "apply",
     "normalize",
     "derive_well",
-    "normalize_capture",
     "MetadataSchema",
     "DEFAULT_IMAGE_PATTERN",
     "DEFAULT_MASK_PATTERN",
