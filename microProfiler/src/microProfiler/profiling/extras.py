@@ -12,7 +12,6 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt, map_coordinates, mean as nd_mean
 from skimage.feature import graycomatrix, graycoprops
 from skimage.morphology import disk, dilation, erosion, reconstruction
-from skimage.transform import resize
 
 logger = logging.getLogger(__name__)
 

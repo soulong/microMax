@@ -7,7 +7,7 @@ from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp
 
 class ZProjectStepPanel(BaseStepPanel):
     step_name = "zproject"
-    _FIELD_MAP = {"_method": ("method", str, "max")}
+    _FIELD_MAP = {"_method": "method"}
 
     def __init__(self, state, parent=None):
         super().__init__(state, parent)

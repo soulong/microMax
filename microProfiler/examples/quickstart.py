@@ -33,7 +33,7 @@ ds = ImageDataset(DATA_DIR, image_pattern=IMAGE_PATTERN, mask_pattern=MASK_PATTE
 ds = resize_dataset(ds, scale_factor=0.5)
 ds = z_project_dataset(ds, method="max")
 ds = apply_basic(ds, mode="fit-transform")
-ds = tile_dataset(ds, tile_w=1024, tile_h=1024)
+ds = tile_dataset(ds, tile_width=1024, tile_height=1024)
 print(ds)
 
 ds = segment_dataset(ds, object_name="cell", chan1=ds.intensity_colnames[:1])
@@ -109,4 +109,4 @@ if __name__ == "__main__":
             )
         ],
     )
-    ds, applied_steps = run_pipeline(cfg, dataset_dir=DATA_DIR)
+    ds, applied_steps = run_pipeline(cfg, root_dir=DATA_DIR)

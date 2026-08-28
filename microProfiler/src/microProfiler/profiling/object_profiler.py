@@ -13,7 +13,6 @@ import numpy as np
 import pandas as pd
 from scipy.ndimage import find_objects
 from skimage.measure import regionprops_table
-from tqdm import tqdm
 
 from microBase import ImageDataset
 from microProfiler.profiling.batch_writer import BatchWriter
@@ -25,6 +24,7 @@ from microProfiler.profiling.extras import (
     measure_channel_correlation,
 )
 from microProfiler.config import ObjectProfileEntry
+from microProfiler.progress import StepProgress
 from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
 
 logger = logging.getLogger(__name__)
@@ -284,7 +284,10 @@ def measure_objects(
         raise ValueError(f"Got {len(channel_names)} names for {img.shape[2]} channels")
 
     if intensity_channels is None:
-        intensity_channels = list(channel_names)
+        raise ValueError(
+            "measure_objects requires intensity_channels "
+            "(empty channels are skipped by the pipeline, never 'all')."
+        )
 
     intensity_idx = _resolve_indices(intensity_channels, channel_names, "intensity_channels")
     radial_idx = _resolve_indices(radial_channels, channel_names, "radial_channels")
@@ -490,6 +493,11 @@ def profile_objects(
     mask_name = resolved.mask_name or mask_name
     parent_mask_name = resolved.parent_mask_name or parent_mask_name
     intensity_channels = resolved.intensity_channels or intensity_channels
+    if not intensity_channels:
+        raise ValueError(
+            "profile_objects requires intensity_channels "
+            "(empty channels are skipped by the pipeline, never 'all')."
+        )
     correlation_pairs = resolved.correlation_pairs
     if correlation_pairs is not None:
         correlation_pairs = [tuple(p) if isinstance(p, list) else p for p in correlation_pairs]
@@ -529,72 +537,70 @@ def profile_objects(
 
     with BatchWriter(db_path, table_name, BATCH) as writer:
         try:
-            if n_workers == 1:
-                for idx in tqdm(range(n_total), desc=f"Profiling {mask_name}", unit="img"):
-                    progress.report(f"Profile {mask_name}", idx, n_total, "")
-                    result = _process_one_object(
-                        ds, idx, mask_name, parent_mask_name,
-                        intensity_channels, correlation_pairs, measure_kwargs,
-                    )
-                    if result is not None:
-                        writer.add(result)
-                    # Skips (missing mask) also advance the counter so the
-                    # progress bar reaches n_total exactly.
-                    completed += 1
-            else:
-                pbar = tqdm(total=n_total, desc=f"Profiling {mask_name}", unit="img")
-                # Process in chunks to avoid pre-loading all images into RAM
-                for chunk_start in range(0, n_total, BATCH):
-                    chunk_end = min(chunk_start + BATCH, n_total)
-                    tasks = []
-                    for idx in range(chunk_start, chunk_end):
-                        row = ds.metadata.iloc[idx]
-                        # Skip rows where the mask file is missing (e.g.
-                        # Cellpose found no cells → no mask saved → mask
-                        # column is NaN). Without this check, get_imageset
-                        # would try to read_mask(NaN) and crash.
-                        mask_col = f"mask_{mask_name}"
-                        if mask_col not in row or pd.isna(row[mask_col]):
-                            pbar.update(1)
-                            completed += 1
-                            continue
-                        meta = {
-                            k: v for k, v in row.to_dict().items()
-                            if k not in ds.intensity_colnames and k not in ds.mask_colnames
-                        }
-                        meta["directory"] = _resolve_source_directory(row, ds.intensity_colnames)
-                        image_data, mask_data = ds.get_imageset(idx)
-                        tasks.append((
-                            image_data, mask_data, ds.intensity_colnames, meta,
-                            mask_name, parent_mask_name, intensity_channels,
-                            correlation_pairs, measure_kwargs,
-                        ))
-
-                    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                        futures = {
-                            executor.submit(_profile_object_worker, t): idx
-                            for idx, t in enumerate(tasks)
-                        }
-                        chunk_completed = 0
-                        for future in as_completed(futures):
-                            task_idx = futures[future]
-                            try:
-                                result = future.result()
-                                if result is not None:
-                                    writer.add(result)
+            with StepProgress(f"Profile {mask_name}", n_total, progress, desc=f"Profiling {mask_name}", unit="img") as sp:
+                if n_workers == 1:
+                    for idx in range(n_total):
+                        sp.report(idx, "")
+                        result = _process_one_object(
+                            ds, idx, mask_name, parent_mask_name,
+                            intensity_channels, correlation_pairs, measure_kwargs,
+                        )
+                        if result is not None:
+                            writer.add(result)
+                        # Skips (missing mask) also advance the counter so the
+                        # progress bar reaches n_total exactly.
+                        completed += 1
+                else:
+                    # Process in chunks to avoid pre-loading all images into RAM
+                    for chunk_start in range(0, n_total, BATCH):
+                        chunk_end = min(chunk_start + BATCH, n_total)
+                        tasks = []
+                        for idx in range(chunk_start, chunk_end):
+                            row = ds.metadata.iloc[idx]
+                            # Skip rows where the mask file is missing (e.g.
+                            # Cellpose found no cells → no mask saved → mask
+                            # column is NaN). Without this check, get_imageset
+                            # would try to read_mask(NaN) and crash.
+                            mask_col = f"mask_{mask_name}"
+                            if mask_col not in row or pd.isna(row[mask_col]):
+                                sp.tick("")
                                 completed += 1
-                                chunk_completed += 1
-                                pbar.update(1)
-                                progress.report(f"Profile {mask_name}", completed, n_total, "")
-                            except InterruptedError:
-                                raise
-                            except BrokenProcessPool:
-                                lost = len(tasks) - chunk_completed
-                                logger.error("Worker process crashed — %d remaining task(s) in chunk skipped", lost)
-                                raise
-                            except Exception:
-                                logger.exception("Object profiling failed for row %d — skipping", chunk_start + task_idx)
-                pbar.close()
+                                continue
+                            meta = {
+                                k: v for k, v in row.to_dict().items()
+                                if k not in ds.intensity_colnames and k not in ds.mask_colnames
+                            }
+                            meta["directory"] = _resolve_source_directory(row, ds.intensity_colnames)
+                            image_data, mask_data = ds.get_imageset(idx)
+                            tasks.append((
+                                image_data, mask_data, ds.intensity_colnames, meta,
+                                mask_name, parent_mask_name, intensity_channels,
+                                correlation_pairs, measure_kwargs,
+                            ))
+
+                        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                            futures = {
+                                executor.submit(_profile_object_worker, t): idx
+                                for idx, t in enumerate(tasks)
+                            }
+                            chunk_completed = 0
+                            for future in as_completed(futures):
+                                task_idx = futures[future]
+                                try:
+                                    result = future.result()
+                                    if result is not None:
+                                        writer.add(result)
+                                    completed += 1
+                                    chunk_completed += 1
+                                    sp.tick("")
+                                except InterruptedError:
+                                    raise
+                                except BrokenProcessPool:
+                                    lost = len(tasks) - chunk_completed
+                                    logger.error("Worker process crashed — %d remaining task(s) in chunk skipped", lost)
+                                    raise
+                                except Exception:
+                                    logger.exception("Object profiling failed for row %d — skipping", chunk_start + task_idx)
         except InterruptedError:
             logger.info("Object profiling interrupted by user")
         except Exception:
@@ -608,7 +614,9 @@ def profile_objects(
             logger.exception("Object profiling failed")
             raise
         finally:
-            progress.step_end(f"Profile {mask_name}", f"Profiled {completed} objects")
+            # step_start/step_end are emitted by the orchestrator
+            # (pipeline.steps._run_profile) — emitting step_end here too would
+            # double-report the same step key to the progress collector.
             result_df = writer.close()
 
     return result_df

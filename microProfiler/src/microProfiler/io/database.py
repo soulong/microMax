@@ -55,10 +55,33 @@ class Database:
         """Write a DataFrame to an SQLite table."""
         logger.debug("save_table: %s (%d rows, %d cols)", table_name, len(df), len(df.columns))
         conn = self._get_conn()
-        # Convert Path objects to strings in-place (no copy — caller doesn't reuse df)
+        # Copy so the caller's DataFrame is never mutated in place.
+        df = df.copy()
+        # Convert Path objects to strings.
         for col in df.columns:
             if df[col].dtype == "object" and len(df) > 0:
                 sample = df[col].iloc[0]
                 if isinstance(sample, Path):
                     df[col] = df[col].astype(str)
         df.to_sql(table_name, conn, if_exists=if_exists, index=False)
+
+    def list_tables(self) -> "set[str]":
+        """Return the set of table names in the database."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def drop_table(self, name: str) -> None:
+        """Drop a table if it exists (bracket-quoted name for safety)."""
+        conn = self._get_conn()
+        conn.execute(f"DROP TABLE IF EXISTS [{name}]")
+        conn.commit()
+        logger.info("Dropped table '%s'", name)
+
+    def row_count(self, name: str) -> int:
+        """Return the number of rows in a table."""
+        conn = self._get_conn()
+        cur = conn.execute(f"SELECT COUNT(*) FROM [{name}]")
+        return int(cur.fetchone()[0])

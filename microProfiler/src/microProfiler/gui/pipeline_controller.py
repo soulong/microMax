@@ -16,17 +16,6 @@ from microProfiler.io import clone_dataset
 
 logger = logging.getLogger(__name__)
 
-_STEP_MAPPING = {
-    "resize": "resize",
-    "basic": "basic",
-    "zproject": "zproject",
-    "tile": "tile",
-    "segment": "segment",
-    "image_profile": "image_profile",
-    "object_profile": "object_profile",
-    "inference": "inference",
-}
-
 
 class PipelineController(QObject):
 
@@ -61,34 +50,23 @@ class PipelineController(QObject):
         for step in self._view.get_all_step_panels():
             section = step.to_config()
             if section is not None and step.is_enabled():
-                attr = _STEP_MAPPING.get(step.step_name, step.step_name)
+                attr = step.step_name
                 setattr(cfg, attr, section_to_dataclass(attr, section))
         return cfg
 
-    def _image_profile_channel_error(self) -> Optional[str]:
-        """Error message when Image Profiling is enabled with no channel
-        selected (channels are unchecked by default; image_channels=None
-        would silently profile ALL channels). Returns None when OK."""
-        img_panel = self._view.get_step_panel("image_profile")
-        if img_panel is None or not img_panel.is_enabled():
-            return None
-        if not hasattr(img_panel, "build_config_section"):
-            return None
-        section = img_panel.build_config_section() or {}
-        if section.get("image_channels"):
-            return None
-        return (
-            "Select at least one channel for Image Profiling. "
-            "All channels are unchecked by default."
-        )
-
     def _collect_profiling_table_names(self, cfg) -> set:
-        """Collect table names that microProfiler will create from the config."""
+        """Collect table names that microProfiler will create from the config.
+
+        Sections/blocks whose channel list is empty are skipped at runtime —
+        their tables are neither written nor dropped.
+        """
         names = set()
-        if cfg.image_profile:
+        if cfg.image_profile and cfg.image_profile.image_channels:
             names.add("image")
         if cfg.object_profile and getattr(cfg.object_profile, "configs", None):
             for entry in cfg.object_profile.configs:
+                if not entry.intensity_channels:
+                    continue
                 name = getattr(entry, "output_table_name", None) or entry.mask_name
                 if name:
                     names.add(name)
@@ -105,17 +83,17 @@ class PipelineController(QObject):
                 conn.execute(f"DROP TABLE IF EXISTS [{name}]")
             conn.commit()
             conn.close()
-            logging.getLogger("microProfiler").info(
+            logger.info(
                 "Dropped profiling tables: %s", ", ".join(sorted(table_names)))
         except Exception:
-            logging.getLogger("microProfiler").warning(
+            logger.warning(
                 "Failed to drop profiling tables", exc_info=True)
 
     def _build_step_config(self, step) -> PipelineConfig:
         cfg = self._build_base_config()
         section = step.to_config()
         if section and step.is_enabled():
-            attr = _STEP_MAPPING.get(step.step_name, step.step_name)
+            attr = step.step_name
             setattr(cfg, attr, section_to_dataclass(attr, section))
         return cfg
 
@@ -232,7 +210,7 @@ class PipelineController(QObject):
         if self._view.running or self._missing_input():
             return
         if self._view.dataset is None:
-            logging.getLogger("microProfiler").info("No dataset loaded - load a dataset.")
+            logger.info("No dataset loaded - load a dataset.")
             return
         self._view.set_running(True)
 
@@ -241,7 +219,7 @@ class PipelineController(QObject):
         for step in self._view.get_preprocessing_steps():
             section = step.to_config()
             if section and step.is_enabled():
-                attr = _STEP_MAPPING.get(step.step_name, step.step_name)
+                attr = step.step_name
                 setattr(cfg, attr, section_to_dataclass(attr, section))
                 executed_steps.append(step)
 
@@ -268,14 +246,14 @@ class PipelineController(QObject):
         self._view.progress_finished()
         self._view.set_running(False)
         self._update_dataset_after_step("preprocessing")
-        logging.getLogger("microProfiler").info("Preprocessing complete.")
+        logger.info("Preprocessing complete.")
         self._save_session_yml(executed_steps=self._worker._applied_steps)
 
     def run_segmentation(self) -> None:
         if self._view.running or self._missing_input():
             return
         if self._view.dataset is None:
-            logging.getLogger("microProfiler").info("No dataset loaded - load a dataset.")
+            logger.info("No dataset loaded - load a dataset.")
             return
         seg_panel = self._view.get_step_panel("segment")
         if seg_panel is None or not hasattr(seg_panel, "validate_object_names"):
@@ -284,11 +262,8 @@ class PipelineController(QObject):
         if name_error:
             QMessageBox.warning(self._view.widget(), "Invalid Names", name_error)
             return
-        if hasattr(seg_panel, "validate_channels"):
-            chan_error = seg_panel.validate_channels()
-            if chan_error:
-                QMessageBox.warning(self._view.widget(), "No Channel Selected", chan_error)
-                return
+        # NOTE: blocks with no checked Chan1 channels are NOT an error — they
+        # are skipped at runtime (empty channels = skip, never "all").
 
         self._view.set_running(True)
         cfg = self._build_step_config(seg_panel)
@@ -296,22 +271,24 @@ class PipelineController(QObject):
         run_gen = self._worker_gen
         self._pending_finished = (self._on_segmentation_finished, run_gen)
         self._view.progress_reset()
-        self._worker.run_step(cfg, "segment", dataset_dir=self._output_path(), ds=self._view.dataset)
+        # run_pipeline with a config that only carries the segment section —
+        # the unified data-driven loop runs exactly the enabled entries.
+        self._worker.run(cfg, dataset_dir=self._output_path(), ds=self._view.dataset)
 
     def _on_segmentation_finished(self, run_gen: int) -> None:
         if run_gen != self._worker_gen:
             return
         self._view.progress_finished()
         self._view.set_running(False)
-        logging.getLogger("microProfiler").info("Segmentation complete.")
-        self._save_session_yml(executed_steps=["segment"])
+        logger.info("Segmentation complete.")
+        self._save_session_yml(executed_steps=self._worker._applied_steps)
         self._update_dataset_after_step("segment")
 
     def run_profiling(self) -> None:
         if self._view.running or self._missing_input():
             return
         if not self._view.dataset:
-            logging.getLogger("microProfiler").info("No dataset loaded - load a dataset.")
+            logger.info("No dataset loaded - load a dataset.")
             return
 
         obj_panel = self._view.get_step_panel("object_profile")
@@ -333,12 +310,6 @@ class PipelineController(QObject):
         cfg = self._build_base_config()
         image_panel = self._view.get_step_panel("image_profile")
         obj_panel = self._view.get_step_panel("object_profile")
-
-        channel_err = self._image_profile_channel_error()
-        if channel_err:
-            QMessageBox.warning(
-                self._view.widget(), "No Channels Selected", channel_err)
-            return
 
         if image_panel and image_panel.is_enabled():
             section = image_panel.to_config()
@@ -372,31 +343,25 @@ class PipelineController(QObject):
         run_gen = self._worker_gen
         self._pending_finished = (self._on_profiling_finished, run_gen)
         self._view.progress_reset()
-        self._worker.run_step(cfg, "profile", dataset_dir=self._output_path(), ds=self._view.dataset)
+        # run_pipeline with a config that only carries the profiling sections.
+        self._worker.run(cfg, dataset_dir=self._output_path(), ds=self._view.dataset)
 
     def _on_profiling_finished(self, run_gen: int) -> None:
         if run_gen != self._worker_gen:
             return
         self._view.progress_finished()
         self._view.set_running(False)
-        logging.getLogger("microProfiler").info("Profiling complete.")
-        # Persist only the profiling steps that were actually enabled/run
-        # (mirrors run_profiling's config construction); a step that was never
-        # run must not enter applied_steps.
-        executed = []
-        image_panel = self._view.get_step_panel("image_profile")
-        if image_panel is not None and image_panel.is_enabled():
-            executed.append("image_profile")
-        obj_panel = self._view.get_step_panel("object_profile")
-        if obj_panel is not None and obj_panel.is_enabled():
-            executed.append("object_profile")
-        self._save_session_yml(executed_steps=executed)
+        logger.info("Profiling complete.")
+        # Only the profiling sections that actually executed are recorded
+        # (run_pipeline computes this from the config's channel selections —
+        # a section with no channels is skipped and never marked applied).
+        self._save_session_yml(executed_steps=self._worker._applied_steps)
 
     def run_inference(self) -> None:
         if self._view.running or self._missing_input():
             return
         if not self._view.dataset:
-            logging.getLogger("microProfiler").info("No dataset loaded - load a dataset.")
+            logger.info("No dataset loaded - load a dataset.")
             return
         panel = self._view.get_step_panel("inference")
         if panel is None:
@@ -419,20 +384,20 @@ class PipelineController(QObject):
         run_gen = self._worker_gen
         self._pending_finished = (self._on_inference_finished, run_gen)
         self._view.progress_reset()
-        self._worker.run_step(cfg, "infer", dataset_dir=self._output_path(), ds=self._view.dataset)
+        # run_pipeline with a config that only carries the inference section.
+        self._worker.run(cfg, dataset_dir=self._output_path(), ds=self._view.dataset)
 
     def _on_inference_finished(self, run_gen: int) -> None:
         if run_gen != self._worker_gen:
             return
         self._view.progress_finished()
         self._view.set_running(False)
-        logging.getLogger("microProfiler").info("Inference complete.")
+        logger.info("Inference complete.")
         # Inference is non-destructive and never gates a re-run, but a
-        # COMPLETED inference is recorded in applied_steps (entry 'infer')
-        # like the other steps. The worker emits finished on cancel too, so
-        # only record infer when the run was not cancelled.
-        cancelled = bool(self._worker._cancel_event.is_set())
-        self._save_session_yml(executed_steps=[] if cancelled else ["infer"])
+        # COMPLETED inference is recorded in applied_steps ('inference') like
+        # the other steps. run_pipeline raises InterruptedError on cancel, so
+        # the worker's _applied_steps is None then and nothing is recorded.
+        self._save_session_yml(executed_steps=self._worker._applied_steps)
 
     def run_all(self) -> None:
         if self._view.running or self._missing_input():
@@ -452,12 +417,6 @@ class PipelineController(QObject):
                 QMessageBox.warning(
                     self._view.widget(), "Invalid Inference Configuration", err)
                 return
-
-        channel_err = self._image_profile_channel_error()
-        if channel_err:
-            QMessageBox.warning(
-                self._view.widget(), "No Channels Selected", channel_err)
-            return
 
         cfg = self._build_pipeline_config()
         has_steps = any(
@@ -502,7 +461,7 @@ class PipelineController(QObject):
             return
         self._view.progress_finished()
         self._view.set_running(False)
-        logging.getLogger("microProfiler").info("Pipeline complete - all steps finished.")
+        logger.info("Pipeline complete - all steps finished.")
         self._save_session_yml(executed_steps=self._worker._applied_steps)
         self._update_dataset_after_step("pipeline")
 
@@ -510,7 +469,7 @@ class PipelineController(QObject):
         if self._view.running:
             return
         if self._view.dataset is None:
-            logging.getLogger("microProfiler").info("No dataset loaded - load a dataset.")
+            logger.info("No dataset loaded - load a dataset.")
             return
         self._view.set_running(True)
 
@@ -530,13 +489,13 @@ class PipelineController(QObject):
                 # honored as-is (fit-only).
                 if cfg.basic.mode == "fit-transform":
                     cfg.basic.mode = "transform"
-                    logging.getLogger("microProfiler").info(
+                    logger.info(
                         "Pre-fitted BaSiC models detected — running transform only"
                     )
             elif model_dir.exists() and any(model_dir.glob("*.pkl")) and not marker_ok:
                 # Stale models fit under the old (basic-before-zproject) order
                 # must not be applied to z-projected images — force a fresh fit.
-                logging.getLogger("microProfiler").info(
+                logger.info(
                     "Stale BaSiC models (fit under old pre-processing order) detected — "
                     "forcing a fresh fit before transform"
                 )
@@ -555,7 +514,7 @@ class PipelineController(QObject):
         self._view.progress_finished()
         self._view.set_running(False)
         step_name = step.step_name
-        logging.getLogger("microProfiler").info(f"{step_name} complete.")
+        logger.info(f"{step_name} complete.")
         self._save_session_yml(executed_steps=[step_name])
         self._update_dataset_after_step(step_name)
 
@@ -565,7 +524,7 @@ class PipelineController(QObject):
         if self._view.running:
             return
         if self._view.dataset is None:
-            logging.getLogger("microProfiler").info("No dataset loaded - load a dataset.")
+            logger.info("No dataset loaded - load a dataset.")
             return
         self._view.set_running(True)
         cfg = self._build_base_config()
@@ -593,7 +552,7 @@ class PipelineController(QObject):
             return
         self._view.progress_finished()
         self._view.set_running(False)
-        logging.getLogger("microProfiler").info("BaSiC model fit complete.")
+        logger.info("BaSiC model fit complete.")
         from PySide6.QtWidgets import QApplication
         QApplication.restoreOverrideCursor()
 
@@ -601,7 +560,7 @@ class PipelineController(QObject):
 
     def _ensure_random_row(self) -> bool:
         if self._random_row_idx is None:
-            logging.getLogger("microProfiler").info("Click 'Pick Random' first to select an image.")
+            logger.info("Click 'Pick Random' first to select an image.")
             return False
         return True
 
@@ -618,7 +577,7 @@ class PipelineController(QObject):
                     try:
                         img = self._ds_service.load_image(ds, idx, ch)
                     except FileNotFoundError:
-                        logging.getLogger("microProfiler").warning(
+                        logger.warning(
                             f"Row {idx} missing channel file '{ch}' — skipping tile"
                         )
                         continue
@@ -637,7 +596,7 @@ class PipelineController(QObject):
         if block_index >= len(blocks):
             return
         block = blocks[block_index]
-        chan1 = block.get_chan1() or ds.intensity_colnames[:1]
+        chan1 = block.get_chan1() or None
         chan2 = block.get_chan2() or None
         if chan1:
             ch = chan1[0]
@@ -751,7 +710,7 @@ class PipelineController(QObject):
             self._preview_pending_step.step_name
             if self._preview_pending_step else "unknown"
         )
-        logging.getLogger("microProfiler").error(f"Preview error ({step_name}): {message}")
+        logger.error(f"Preview error ({step_name}): {message}")
         self._preview_pending_step = None
         self._preview_block_index = None
         from PySide6.QtWidgets import QApplication
@@ -762,11 +721,10 @@ class PipelineController(QObject):
     def _update_dataset_after_step(self, step_name: str) -> None:
         updated_ds = getattr(self._worker, "_result_ds", None)
         if updated_ds is None:
-            logging.getLogger("microProfiler").warning(
+            logger.warning(
                 "No result dataset after step '%s'", step_name
             )
             return
-        logger = logging.getLogger("microProfiler")
         logger.info("Updating dataset after %s: %d rows, %d channels",
                  step_name, len(updated_ds), len(updated_ds.intensity_colnames))
         self._view.dataset = updated_ds
@@ -775,39 +733,17 @@ class PipelineController(QObject):
         if filter_panel is not None and hasattr(filter_panel, "_apply_filters"):
             filter_panel._apply_filters()
         self._view.update_dataset_info(updated_ds)
-        seg_panel = self._view.get_step_panel("segment")
-        if seg_panel is not None and hasattr(seg_panel, "populate_channels"):
-            seg_panel.populate_channels(updated_ds.intensity_colnames)
-        img_panel = self._view.get_step_panel("image_profile")
-        if img_panel is not None and hasattr(img_panel, "populate_channels"):
-            img_panel.populate_channels(updated_ds.intensity_colnames)
-        obj_panel = self._view.get_step_panel("object_profile")
-        if obj_panel is not None:
-            if hasattr(obj_panel, "populate_channels"):
-                obj_panel.populate_channels(updated_ds.intensity_colnames)
-            if hasattr(obj_panel, "populate_masks"):
-                self._sync_seg_masks_to_profiling()
-        inf_panel = self._view.get_step_panel("inference")
-        if inf_panel is not None:
-            if hasattr(inf_panel, "populate_channels"):
-                inf_panel.populate_channels(updated_ds.intensity_colnames)
-            if hasattr(inf_panel, "populate_masks"):
-                self._sync_seg_masks_to_profiling()
-        if hasattr(updated_ds, '_image_pattern'):
-            pat = updated_ds._image_pattern
-            pat_str = pat.pattern if hasattr(pat, 'pattern') else str(pat)
-            self._view.set_image_pattern(pat_str)
-        if hasattr(updated_ds, '_mask_pattern'):
-            pat = updated_ds._mask_pattern
-            pat_str = pat.pattern if hasattr(pat, 'pattern') else str(pat)
-            self._view.set_mask_pattern(pat_str)
+        self._view.refresh_step_panels(updated_ds.intensity_colnames)
+        self._view.set_image_pattern(updated_ds.image_pattern or "")
+        self._view.set_mask_pattern(updated_ds.mask_pattern or "")
         self._view.update_tab_status()
 
     def _sync_seg_masks_to_profiling(self) -> None:
         # Deterministic, deduped mask order: segment object names first
         # (so a fresh object-profile/inference block auto-selects the
         # segmentation's Object name, e.g. 'cell'), then the remaining
-        # dataset mask columns.
+        # dataset mask columns. Always applied (even when empty) so stale
+        # mask dropdowns are cleared.
         ordered = []
         seg_panel = self._view.get_step_panel("segment")
         seg_block_names = []
@@ -821,8 +757,6 @@ class PipelineController(QObject):
             for m in self._view.dataset.mask_colnames:
                 if m not in ordered:
                     ordered.append(m)
-        if not ordered:
-            return
         obj_panel = self._view.get_step_panel("object_profile")
         if obj_panel is not None and hasattr(obj_panel, "populate_masks"):
             obj_panel.populate_masks(list(ordered))

@@ -58,6 +58,9 @@ class IControllerView(Protocol):
     def update_tab_status(self) -> None:
         ...
 
+    def refresh_step_panels(self, channels=None, masks=None) -> None:
+        ...
+
     @property
     def dataset(self) -> Optional[ImageDataset]:
         ...

@@ -3,17 +3,18 @@ from __future__ import annotations
 import argparse
 import logging
 import re
-import sqlite3
 import sys
 from pathlib import Path
 
 from microBase import ImageDataset, SessionFile
 
-from microProfiler.config import config_to_dict, load_config, PipelineConfig
+from microProfiler.config import config_to_dict, load_config, PipelineConfig, resolve_inference_db
+from microProfiler.io import Database
+from microProfiler.log_utils import set_default_logging_level, setup_logging
+from microProfiler.pipeline import MetadataValidationError, apply_filters, run_pipeline
+from microProfiler.pipeline._micromodel_bridge import INFERENCE_TABLE, REDUCTION_TABLES
 
 logger = logging.getLogger(__name__)
-from microProfiler.logging_utils import set_default_logging_level, setup_logging
-from microProfiler.pipeline import MetadataValidationError, run_pipeline
 
 
 def resolve_datasets(dataset_dir: Path, pattern: str) -> list[Path]:
@@ -54,11 +55,17 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
 
     expected: set[str] = set()
 
-    if cfg.image_profile and cfg.image_profile.run:
+    if cfg.image_profile and cfg.image_profile.run and cfg.image_profile.image_channels:
+        # A section with empty image_channels is skipped entirely at runtime —
+        # its table is not expected.
         expected.add("image")
 
     if cfg.object_profile and cfg.object_profile.run:
         for entry in cfg.object_profile.configs:
+            if not entry.intensity_channels:
+                # An entry with empty intensity_channels is skipped entirely
+                # (shape features included) — its table is not expected.
+                continue
             name = entry.output_table_name or entry.mask_name
             if name:
                 expected.add(name)
@@ -67,62 +74,55 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
         return False
 
     count: int | None = None
+    db = Database(db_path)
     try:
-        conn = sqlite3.connect(str(db_path))
-        try:
-            cursor = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-            existing = {row[0] for row in cursor.fetchall()}
-            missing = expected - existing
-            if missing:
-                return False
-            if "image" in expected:
-                count = conn.execute(
-                    "SELECT COUNT(*) FROM image"
-                ).fetchone()[0]
-        finally:
-            conn.close()
+        existing = db.list_tables()
+        missing = expected - existing
+        if missing:
+            return False
         if "image" in expected:
-            try:
-                ds = ImageDataset(
-                    root=dataset_dir,
-                    image_pattern=cfg.image_pattern,
-                    mask_pattern=cfg.mask_pattern,
-                    image_subdir_pattern=cfg.image_subdir_pattern,
-                )
-                # The pipeline applies cfg.filter before profiling, so the
-                # image table only holds rows matching the filters — count
-                # the same way or filtered datasets would never be skipped.
-                if cfg.filter:
-                    for f in cfg.filter:
-                        ds.filter_metadata(f.column, f.pattern)
-                n_rows = len(ds)
-            except (Exception, SystemExit) as e:
-                # microBase hard-exits (sys.exit) on bad config/dataset
-                # (missing root, absent filter column, bad regex) — convert
-                # to "not complete" so the batch logs and continues instead
-                # of aborting the whole plate scan.
-                logger.warning("Could not count images for %s: %s", dataset_dir, e)
-                return False
-            if count != n_rows:
-                logger.warning(
-                    "Incomplete image table in %s: %d rows for %d images",
-                    dataset_dir, count, n_rows,
-                )
-                return False
-    except Exception as e:
-        logger.warning("Could not check DB tables in %s: %s", db_path, e)
+            count = db.row_count("image")
+    except Exception:
         return False
+    finally:
+        db.close()
 
+    if "image" in expected:
+        try:
+            ds = ImageDataset(
+                root=dataset_dir,
+                image_pattern=cfg.image_pattern,
+                mask_pattern=cfg.mask_pattern,
+                image_subdir_pattern=cfg.image_subdir_pattern,
+            )
+            # The pipeline applies cfg.filter before profiling, so the
+            # image table only holds rows matching the filters — count
+            # the same way or filtered datasets would never be skipped.
+            apply_filters(ds, cfg.filter or [])
+            n_rows = len(ds)
+        except (Exception, SystemExit) as e:
+            # microBase hard-exits (sys.exit) on bad config/dataset
+            # (missing root, absent filter column, bad regex) — convert
+            # to "not complete" so the batch logs and continues instead
+            # of aborting the whole plate scan.
+            logger.warning("Could not count images for %s: %s", dataset_dir, e)
+            return False
+        if count != n_rows:
+            logger.warning(
+                "Incomplete image table in %s: %d rows for %d images",
+                dataset_dir, count, n_rows,
+            )
+            return False
     if cfg.inference and cfg.inference.run and cfg.inference.configs:
         for entry in cfg.inference.configs:
-            if not entry.model:
+            if not entry.channels:
+                # A block with no channels is skipped at runtime — its DB is
+                # not expected.
                 continue
-            infer_db = dataset_dir / (entry.output_db or "infer.db")
-            tables = {"inference"}
+            infer_db = dataset_dir / resolve_inference_db(entry)
+            tables = {INFERENCE_TABLE}
             if entry.reduction and entry.reduction.enabled:
-                tables |= {"reduction_pca", "reduction_umap", "reduction_pca_variance"}
+                tables |= REDUCTION_TABLES
             missing = tables - _existing_tables(infer_db)
             if missing:
                 logger.info(
@@ -137,17 +137,13 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
 def _existing_tables(db_path: Path) -> set[str]:
     if not db_path.exists():
         return set()
+    db = Database(db_path)
     try:
-        conn = sqlite3.connect(str(db_path))
-        try:
-            cursor = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-            return {row[0] for row in cursor.fetchall()}
-        finally:
-            conn.close()
+        return db.list_tables()
     except Exception:
         return set()
+    finally:
+        db.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -193,8 +189,8 @@ def main(argv: list[str] | None = None) -> int:
 
     log_level = logging.DEBUG if args.debug else logging.INFO
     set_default_logging_level(log_level)
-    logger = setup_logging(level=log_level, log_file=args.log_file)
-    logger.debug("Debug logging enabled")
+    log = setup_logging(level=log_level, log_file=args.log_file)
+    log.debug("Debug logging enabled")
 
     if args.command == "run":
         try:
@@ -233,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("Found %d dataset(s) at %s", len(datasets), dataset_dir)
 
         if args.dry_run:
-            _dry_run(cfg, datasets, logger)
+            _dry_run(cfg, datasets, log)
             return 0
 
         processed = 0
@@ -248,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("Processing dataset: %s", dataset_dir)
             try:
                 ds, applied_steps = run_pipeline(
-                    cfg, dataset_dir=dataset_dir, log_file=args.log_file,
+                    cfg, root_dir=dataset_dir, log_file=args.log_file,
                 )
                 cfg_dict = config_to_dict(cfg)
                 sf = SessionFile(dataset_dir)
@@ -282,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
-def _dry_run(cfg: PipelineConfig, datasets: list[Path], logger: logging.Logger) -> None:
+def _dry_run(cfg: PipelineConfig, datasets: list[Path], log: logging.Logger) -> None:
     """Print dataset discovery + skip status without processing."""
     for i, dataset_dir in enumerate(datasets):
         complete = _is_dataset_complete(cfg, dataset_dir)
@@ -306,9 +302,9 @@ def _dry_run(cfg: PipelineConfig, datasets: list[Path], logger: logging.Logger) 
         else:
             info = "(load skipped — first 5 only)"
 
-        logger.info("[DRY RUN] %s → %s | %s", dataset_dir, status, info)
+        log.info("[DRY RUN] %s → %s | %s", dataset_dir, status, info)
 
-    logger.info("Dry run complete: %d dataset(s) found", len(datasets))
+    log.info("Dry run complete: %d dataset(s) found", len(datasets))
 
 if __name__ == "__main__":
     sys.exit(main())

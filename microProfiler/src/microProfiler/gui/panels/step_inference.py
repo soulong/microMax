@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import logging
-from typing import Any, Callable, List, Optional
+from typing import List, Optional
 
 import numpy as np
 
@@ -11,7 +10,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
-    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -23,50 +21,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from microProfiler.gui.panels.base_step_panel import BaseStepPanel
+from microProfiler.gui.panels.base_step_panel import BaseStepPanel, make_hsep
 from microProfiler.gui.panels._block_container import BlockContainerPanel
-
-logger = logging.getLogger(__name__)
+from microProfiler.pipeline._micromodel_bridge import read_bundle_meta
 
 DEFAULT_MAX_VALUE = 65535.0
 
+# Image dtype -> max possible intensity (matches microVis's DTYPE_MAX).
+_DTYPE_MAX = {
+    "uint8": 255.0,
+    "int8": 255.0,
+    "uint16": 65535.0,
+    "uint32": 4294967295.0,
+    "float32": 1.0,
+    "float64": 1.0,
+}
+
 _COLOR_BY_OPTIONS = ["pred_class", "directory", "pred_prob", "ground_truth"]
-
-
-def _hsep():
-    s = QFrame()
-    s.setFrameShape(QFrame.HLine)
-    s.setFrameShadow(QFrame.Sunken)
-    s.setProperty("class", "separator")
-    return s
-
-
-def read_bundle_meta(model_path: str) -> dict:
-    """Load a microModel bundle's meta dict (lazy torch import).
-
-    Raises ImportError when microModel/torch are missing and RuntimeError for
-    anything that is not a microModel bundle — callers surface these as popups.
-    """
-    import importlib.util
-    if importlib.util.find_spec("microModel") is None:
-        raise ImportError(
-            "Inference requires the 'microModel' package, which is not "
-            "installed. Install microModel and restart microProfiler."
-        )
-    try:
-        import torch
-    except ImportError as e:
-        raise ImportError(
-            "Inference requires 'torch' (installed with microModel), which is "
-            "not installed."
-        ) from e
-    bundle = torch.load(model_path, map_location="cpu", weights_only=False)
-    if not isinstance(bundle, dict) or "state_dict" not in bundle:
-        raise RuntimeError("Not a microModel bundle (missing 'state_dict').")
-    meta = bundle.get("meta") or {}
-    if not isinstance(meta, dict):
-        raise RuntimeError("Bundle 'meta' is not a dict.")
-    return meta
 
 
 class InferenceBlockWidget(QWidget):
@@ -75,12 +46,10 @@ class InferenceBlockWidget(QWidget):
         self,
         block_index: int,
         channels: List[str],
-        on_remove: Optional[Callable] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.block_index = block_index
-        self._on_remove = on_remove
         self._channels = list(channels)
         self.setProperty("class", "block-card")
         self._classify_capable: Optional[bool] = None
@@ -88,7 +57,6 @@ class InferenceBlockWidget(QWidget):
         self._color_by_auto = True
         self._max_value = DEFAULT_MAX_VALUE
         self._var_threshold = 0.95
-        self._stored_channels: Optional[List[str]] = None
         self._build_ui()
 
     # ── UI ──────────────────────────────────────────────────────────────
@@ -116,8 +84,6 @@ class InferenceBlockWidget(QWidget):
         self._remove_btn.setProperty("class", "danger")
         self._remove_btn.setToolTip("Remove this inference block")
         row_model.addWidget(self._remove_btn)
-        if self._on_remove:
-            self._remove_btn.clicked.connect(self._on_remove)
         layout.addLayout(row_model)
 
         # Row 1b: model info (from the bundle meta) — always visible between
@@ -180,7 +146,7 @@ class InferenceBlockWidget(QWidget):
         layout.addLayout(row_mask)
 
         # Row 3: outputs + DB + max_value
-        layout.addWidget(_hsep())
+        layout.addWidget(make_hsep())
         row_out = QHBoxLayout()
         self._feature_cb = QCheckBox("feature")
         self._feature_cb.setChecked(True)
@@ -211,7 +177,7 @@ class InferenceBlockWidget(QWidget):
         layout.addLayout(row_out)
 
         # Row 4: reduction group
-        layout.addWidget(_hsep())
+        layout.addWidget(make_hsep())
         self._reduction_group = QGroupBox("Dimension reduction (PCA + UMAP)")
         self._reduction_group.setCheckable(True)
         self._reduction_group.setChecked(False)
@@ -443,21 +409,17 @@ class InferenceBlockWidget(QWidget):
     # ── Population ──────────────────────────────────────────────────────
 
     def populate_channels(self, channels: List[str]) -> None:
+        """Rebuild the channel checkboxes, preserving the current order/checks.
+
+        Restored configs re-apply their ordered channel selection via
+        _apply_block_config after this runs (base-class deferred restore).
+        """
         self._channels = list(channels)
         if channels:
             BaseStepPanel._remove_placeholder(self._channels_row, "_chan_placeholder", self)
-            stored = self._stored_channels
-            self._stored_channels = None
-            if stored is not None:
-                # Config order wins: stored (ordered, checked) channels first,
-                # then dataset channels not covered by the stored list.
-                order = [c for c in stored if c in channels] + [c for c in channels if c not in stored]
-                checked = set(stored)
-            else:
-                # Repopulation: preserve the user's current order + checks.
-                current = [cb.text() for cb in self._ch_cbs]
-                checked = {cb.text() for cb in self._ch_cbs if cb.isChecked()}
-                order = [c for c in current if c in channels] + [c for c in channels if c not in current]
+            current = [cb.text() for cb in self._ch_cbs]
+            checked = {cb.text() for cb in self._ch_cbs if cb.isChecked()}
+            order = [c for c in current if c in channels] + [c for c in channels if c not in current]
             self.set_channel_state(order, checked)
         else:
             for cb in self._ch_cbs:
@@ -513,13 +475,12 @@ class InferenceStepPanel(BlockContainerPanel):
 
     step_name = "inference"
     _block_widget_class = InferenceBlockWidget
+    # These QLineEdits keep their natural width (model path / reducer paths).
+    _compact_excluded_object_names = frozenset({"checkpoint_path", "reducer_path"})
 
     def __init__(self, state, parent=None):
         super().__init__(state, parent)
         self.setTitle("Inference (microModel)")
-        self._last_channels: List[str] = []
-        self._last_masks: List[str] = []
-        self._pending_block_configs: List[dict] = []
         self._default_max_value = DEFAULT_MAX_VALUE
         self._build_block_container("+ Add New Inference Block")
         self._add_block_generic([])
@@ -570,65 +531,11 @@ class InferenceStepPanel(BlockContainerPanel):
             if src._ch_cbs:
                 src_order = [cb.text() for cb in src._ch_cbs]
                 block.set_channel_state(src_order, set(src.get_checked_channels()))
-            else:
-                # Dataset not loaded yet — carry the source's selection so it
-                # applies when populate_channels runs after the load.
-                block._stored_channels = src.get_checked_channels()
+            # NOTE: when the dataset is not loaded yet, the copied block has
+            # no checkboxes — the copy's selection is not carried over (the
+            # base-class deferred restore covers config-driven restores).
         else:
             block.set_max_value(self._default_max_value)
-
-    def populate_channels(self, channels: List[str]) -> None:
-        self._last_channels = list(channels)
-        self._channels = list(channels)
-        for block in self._blocks:
-            # The block preserves its current order + checked state across
-            # repopulation (and applies stored config order when restoring).
-            block.populate_channels(channels)
-            self._connect_block_signals(block)
-        self._pending_block_configs = []
-
-    def populate_masks(self, mask_names: List[str]) -> None:
-        self._last_masks = list(mask_names)
-        pending = getattr(self, "_pending_block_configs", None)
-        for i, block in enumerate(self._blocks):
-            block.populate_masks(mask_names)
-            if pending and i < len(pending):
-                saved = pending[i].get("mask_name")
-                if saved:
-                    block._mask_combo.setCurrentText(str(saved).removeprefix("mask_"))
-
-    def load_config_section(self, sections: Any) -> None:
-        if not sections:
-            return
-        if isinstance(sections, dict):
-            sections = [sections]
-        if not isinstance(sections, (list, tuple)):
-            return
-        self._pending_block_configs = [cfg for cfg in sections if isinstance(cfg, dict)]
-        self._remove_all_blocks()
-        self._blocks_layout.removeItem(self._add_btn_layout)
-
-        last_channels = self._last_channels or self._channels
-        last_masks = getattr(self, "_last_masks", [])
-
-        for cfg in sections:
-            if not isinstance(cfg, dict):
-                continue
-            if self._blocks:
-                self._blocks_layout.addSpacing(4)
-            block = self._block_widget_class(len(self._blocks), last_channels, parent=self._block_container)
-            self._connect_block_signals(block)
-            if last_masks:
-                block.populate_masks(last_masks)
-            self._apply_block_config(block, cfg)
-            self._compact_block(block)
-            self._blocks.append(block)
-            self._blocks_layout.addWidget(block)
-
-        self._blocks_layout.addLayout(self._add_btn_layout)
-        if last_channels:
-            self.populate_channels(last_channels)
-        self.parameter_changed.emit()
 
     def _apply_block_config(self, block: InferenceBlockWidget, cfg: dict) -> None:
         model = cfg.get("model", "")
@@ -638,7 +545,7 @@ class InferenceStepPanel(BlockContainerPanel):
         if db_name:
             block._output_db.setText(str(db_name))
         max_value = cfg.get("max_value")
-        if max_value:
+        if max_value is not None:
             block.set_max_value(float(max_value))
         BaseStepPanel._set_widget(block._feature_cb, cfg.get("feature", True), "feature")
         BaseStepPanel._set_widget(block._pred_class_cb, cfg.get("pred_class", True), "pred_class")
@@ -651,9 +558,16 @@ class InferenceStepPanel(BlockContainerPanel):
                 block._mask_combo.setCurrentIndex(idx)
             else:
                 block._mask_combo.setCurrentText(mask_name)
-        stored = cfg.get("channels")
-        if stored:
-            block._stored_channels = list(stored)
+        # Channel order is meaningful: config order wins, then the remaining
+        # dataset channels. Applied by the base-class deferred restore after
+        # populate_channels built the checkboxes.
+        channels_cfg = cfg.get("channels")
+        if channels_cfg and block._channels:
+            order = (
+                [c for c in channels_cfg if c in block._channels]
+                + [c for c in block._channels if c not in channels_cfg]
+            )
+            block.set_channel_state(order, set(channels_cfg))
         red = cfg.get("reduction") or {}
         block._reduction_group.setChecked(bool(red.get("enabled", False)))
         # var_threshold has no GUI widget — keep the config value verbatim so
@@ -666,9 +580,6 @@ class InferenceStepPanel(BlockContainerPanel):
         BaseStepPanel._set_widget(block._color_by, red.get("color_by", "pred_class"), "color_by")
         BaseStepPanel._set_widget(block._sample_per_class, red.get("sample_per_class", 10000), "sample_per_class")
         block._color_by_auto = False
-
-    def build_config_section(self) -> list:  # type: ignore[override]
-        return [b.build_config_section() for b in self._blocks]
 
     def set_dataset_dtype(self, dtype) -> None:
         """Refresh per-block max_value defaults from the dataset dtype.
@@ -718,12 +629,8 @@ class InferenceStepPanel(BlockContainerPanel):
                     "Dimension reduction requires the 'feature' output. "
                     "Check 'feature' in the block before running."
                 )
-            if block._ch_cbs and not block.get_checked_channels():
-                return (
-                    "Select at least one channel in every inference block. "
-                    "The channel order (click a channel, then ◀/▶) must match "
-                    "the trained model's input channel order."
-                )
+            # NOTE: a block with no checked channels is NOT an error — it is
+            # skipped at runtime (empty channels = skip, never "all").
             err = block.ensure_capability()
             if err:
                 return err
@@ -741,6 +648,4 @@ def _max_value_for_dtype(dtype) -> float:
         name = getattr(np.dtype(dtype), "name", None) or str(dtype)
     except Exception:
         name = str(dtype)
-    if name in ("uint8", "int8"):
-        return 255.0
-    return DEFAULT_MAX_VALUE
+    return _DTYPE_MAX.get(name, DEFAULT_MAX_VALUE)

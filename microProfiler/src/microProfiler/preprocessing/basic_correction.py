@@ -35,12 +35,15 @@ logger = logging.getLogger(__name__)
 
 def basic_fit(
     image_paths: List[Path],
-    n_image: int = 50,
+    n_image: int = 100,
     enable_darkfield: bool = False,
     working_size: int = 64,
     seed: int = 42,
 ) -> BaSiC:
     """Fit BaSiC model on a set of images.
+
+    Defaults match BasicConfig.n_image (100) and the GUI's default, so a
+    direct call and a config-driven run fit on the same sample size.
 
     When subsampling (len(image_paths) > n_image), a fixed seed keeps the
     fit reproducible across runs (the fitted flatfield/darkfield — and every
@@ -71,13 +74,16 @@ def basic_fit(
 def fit_models(
     ds: ImageDataset,
     channels: List[str] | None = None,
-    n_image: int = 50,
+    n_image: int = 100,
     working_size: int = 64,
     enable_darkfield: bool = False,
     root_dir: Union[str, Path, None] = None,
     progress: ProgressCollector = NullProgressCollector(),
 ) -> Path:
-    """Fit BaSiC models for specified channels."""
+    """Fit BaSiC models for specified channels.
+
+    Defaults match BasicConfig.n_image (100) and the GUI's default.
+    """
     channels = channels or ds.intensity_colnames
     metadata = ds.metadata
     root = Path(root_dir) if root_dir else ds.root
@@ -170,7 +176,7 @@ def transform_images(
     return rebuild_dataset(ds)
 
 
-def _validate_shapes(ds: ImageDataset, n_image: int = 50) -> None:
+def _validate_shapes(ds: ImageDataset, n_image: int = 100) -> None:
     """Validate that all channel images have consistent shapes."""
     channels = ds.intensity_colnames
     metadata = ds.metadata
@@ -200,12 +206,16 @@ def _validate_shapes(ds: ImageDataset, n_image: int = 50) -> None:
 def apply_basic(
     ds: ImageDataset,
     mode: str = "fit-transform",
-    n_image: int = 50,
+    n_image: int = 100,
     working_size: int = 64,
     enable_darkfield: bool = False,
     root_dir: Union[str, Path, None] = None,
     progress: ProgressCollector = NullProgressCollector(),
 ) -> ImageDataset:
+    """Apply BaSiC shading correction (fit and/or transform).
+
+    Defaults match BasicConfig.n_image (100) and the GUI's default.
+    """
     if mode in ("fit", "fit-transform"):
         _validate_shapes(ds, n_image)
         fit_models(

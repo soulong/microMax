@@ -12,10 +12,26 @@ from microBase import load_yaml
 logger = logging.getLogger(__name__)
 
 
+def default_n_workers() -> int:
+    """Default worker count for profiling steps: half the CPU count, min 1."""
+    return max(1, (os.cpu_count() or 1) // 2)
+
+
 class ProjectionMethod(str, Enum):
     max = "max"
     mean = "mean"
     min = "min"
+
+
+_BASIC_MODES = ("fit", "transform", "fit-transform")
+
+# Canonical pipeline step sections — single source of truth for the order in
+# which sections are parsed/serialized (must match _STEP_FUNCTIONS keys in
+# pipeline/steps.py).
+SECTION_ATTRS = (
+    "resize", "zproject", "basic", "tile",
+    "segment", "image_profile", "object_profile", "inference",
+)
 
 
 @dataclass
@@ -77,9 +93,7 @@ class SegmentConfig:
 @dataclass
 class ImageProfileConfig:
     run: bool = False
-    n_workers: int = field(
-        default_factory=lambda: max(1, (os.cpu_count() or 1) // 2)
-    )
+    n_workers: int = field(default_factory=default_n_workers)
     image_channels: Optional[List[str]] = None
     image_thresholds: Optional[Dict[str, float]] = None
 
@@ -112,7 +126,9 @@ class ObjectProfileEntry:
         glcm_distances = [2]
         glcm_levels: int = 256
 
-        if self.glcm_distances:
+        # null and [] both resolve to the documented default [2] — an empty
+        # distance list has no valid GLCM meaning.
+        if self.glcm_distances is not None and self.glcm_distances:
             glcm_distances = self.glcm_distances
         if self.glcm_levels is not None:
             glcm_levels = self.glcm_levels
@@ -160,9 +176,7 @@ class ResolvedProfiling:
 @dataclass
 class ObjectProfileConfig:
     run: bool = False
-    n_workers: int = field(
-        default_factory=lambda: max(1, (os.cpu_count() or 1) // 2)
-    )
+    n_workers: int = field(default_factory=default_n_workers)
     configs: List[ObjectProfileEntry] = field(default_factory=list)
 
 
@@ -210,6 +224,16 @@ class InferenceConfig:
     configs: List[InferenceEntry] = field(default_factory=list)
 
 
+def resolve_inference_db(entry: InferenceEntry) -> str:
+    """Resolve an inference block's output DB file name.
+
+    ``output_db`` may be null in YAML — the default name is ``infer.db``.
+    Single source of truth used by the pipeline (steps), the CLI
+    completeness check, and the microModel bridge (``db_name`` key).
+    """
+    return entry.output_db or "infer.db"
+
+
 @dataclass
 class PipelineConfig:
     image_pattern: Optional[str] = None
@@ -239,18 +263,14 @@ def load_config(
     if path is not None:
         path = Path(path)
         if not path.exists():
-            print(f"Error: config file not found: {path}")
-            import sys
-            sys.exit(1)
+            raise ValueError(f"config file not found: {path}")
         config_dict = load_yaml(path)
         logger.debug("load_config: loaded %s (%d keys)", path, len(config_dict))
     if overrides:
         logger.debug("load_config: applying %d override keys", len(overrides))
         _deep_merge(config_dict, overrides)
     if not config_dict:
-        print("Error: no configuration provided. Specify a YAML config file.")
-        import sys
-        sys.exit(1)
+        raise ValueError("no configuration provided. Specify a YAML config file.")
     return _dict_to_config(config_dict)
 
 
@@ -262,11 +282,9 @@ def _dict_to_config(d: Dict) -> PipelineConfig:
     cfg.image_subdir_pattern = d.get("image_subdir_pattern")
 
     if d.get("filter"):
-        cfg.filter = [FilterEntry(**f) for f in d["filter"]]
+        cfg.filter = [_entry_from_section("filter", FilterEntry, f) for f in d["filter"]]
 
-    for attr in ("resize", "zproject", "basic", "tile",
-                 "segment", "image_profile", "object_profile",
-                 "inference"):
+    for attr in SECTION_ATTRS:
         section = d.get(attr)
         if section:
             setattr(cfg, attr, section_to_dataclass(attr, section))
@@ -274,48 +292,125 @@ def _dict_to_config(d: Dict) -> PipelineConfig:
     return cfg
 
 
+def _coerce_bool(value: Any, attr: str) -> bool:
+    """Coerce a YAML 'run' flag to bool (rejects 'false' as a quoted string)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+    raise ValueError(f"'{attr}' must be a boolean (true/false), got {value!r}")
+
+
+def _check_keys(attr: str, section: Dict, known: set) -> None:
+    """Reject unknown keys in a section dict with a clear message."""
+    unknown = set(section) - known
+    if unknown:
+        raise ValueError(
+            f"Unknown keys in '{attr}' section: {sorted(unknown)}. "
+            f"Valid keys: {sorted(known)}"
+        )
+
+
+def _check(value: Any, message: str) -> None:
+    if not value:
+        raise ValueError(message)
+
+
 def section_to_dataclass(attr: str, section: Dict) -> Any:
     """Convert a single section dict to its corresponding dataclass instance.
 
-    attr is one of: resize, zproject, basic, tile, segment,
-    image_profile, object_profile, inference.
-    Unknown keys raise ValueError with a clear message (no silent dropping).
+    attr is one of the SECTION_ATTRS. Unknown keys raise ValueError with a
+    clear message (no silent dropping); numeric fields are range-validated.
     """
     if attr == "resize":
-        return _dataclass_from_section(attr, ResizeConfig, section)
+        cfg = _dataclass_from_section(attr, ResizeConfig, section)
+        _check(cfg.scale_factor > 0, f"'resize.scale_factor' must be > 0, got {cfg.scale_factor}")
+        return cfg
     if attr == "basic":
-        return _dataclass_from_section(attr, BasicConfig, section)
+        cfg = _dataclass_from_section(attr, BasicConfig, section)
+        _check(cfg.mode in _BASIC_MODES,
+               f"'basic.mode' must be one of {_BASIC_MODES}, got {cfg.mode!r}")
+        _check(cfg.n_image >= 1, f"'basic.n_image' must be >= 1, got {cfg.n_image}")
+        _check(cfg.working_size >= 1, f"'basic.working_size' must be >= 1, got {cfg.working_size}")
+        return cfg
     if attr == "zproject":
         zpd = section
         if "method" in zpd and isinstance(zpd["method"], str):
             zpd = {**zpd, "method": ProjectionMethod(zpd["method"])}
         return _dataclass_from_section(attr, ZProjectConfig, zpd)
     if attr == "tile":
-        return _dataclass_from_section(attr, TileConfig, section)
+        cfg = _dataclass_from_section(attr, TileConfig, section)
+        _check(cfg.tile_width > 0, f"'tile.tile_width' must be > 0, got {cfg.tile_width}")
+        _check(cfg.tile_height > 0, f"'tile.tile_height' must be > 0, got {cfg.tile_height}")
+        return cfg
     if attr == "segment":
-        entries = [_entry_from_section(attr, SegmentEntry, e)
-                   for e in section.get("configs", [])]
-        return SegmentConfig(run=section.get("run", False), configs=entries)
-    if attr == "image_profile":
-        return _dataclass_from_section(attr, ImageProfileConfig, section)
-    if attr == "object_profile":
-        entries = [_entry_from_section(attr, ObjectProfileEntry, e)
-                   for e in section.get("configs", [])]
-        n_workers = section.get("n_workers")
-        if n_workers is None:
-            n_workers = max(1, (os.cpu_count() or 1) // 2)
-        return ObjectProfileConfig(
-            run=section.get("run", False), n_workers=n_workers, configs=entries)
-    if attr == "inference":
+        _check_keys(attr, section, {"run", "configs"})
         entries = []
         for e in section.get("configs", []):
-            red = e.get("reduction")
+            entry = _entry_from_section(attr, SegmentEntry, e)
+            _check(entry.object_name, "'segment.configs[].object_name' must not be empty")
+            _check(entry.gpu_batch_size >= 1, "'segment.configs[].gpu_batch_size' must be >= 1")
+            _check(entry.resize_factor > 0, "'segment.configs[].resize_factor' must be > 0")
+            _check(entry.flow_threshold >= 0, "'segment.configs[].flow_threshold' must be >= 0")
+            _check(entry.cellprob_threshold >= 0, "'segment.configs[].cellprob_threshold' must be >= 0")
+            entries.append(entry)
+        return SegmentConfig(
+            run=_coerce_bool(section.get("run", False), "segment.run"),
+            configs=entries,
+        )
+    if attr == "image_profile":
+        cfg = _dataclass_from_section(attr, ImageProfileConfig, section)
+        if cfg.n_workers is None:
+            cfg.n_workers = default_n_workers()
+        _check(cfg.n_workers >= 1, f"'image_profile.n_workers' must be >= 1, got {cfg.n_workers}")
+        return cfg
+    if attr == "object_profile":
+        _check_keys(attr, section, {"run", "n_workers", "configs"})
+        entries = []
+        for e in section.get("configs", []):
+            entry = _entry_from_section(attr, ObjectProfileEntry, e)
+            _check(entry.mask_name, "'object_profile.configs[].mask_name' must not be empty")
+            _check(entry.radial_bins >= 1, "'object_profile.configs[].radial_bins' must be >= 1")
+            _check(entry.gran_spectrum_length is None or entry.gran_spectrum_length >= 1,
+                   "'object_profile.configs[].gran_spectrum_length' must be >= 1")
+            _check(entry.glcm_levels is None or entry.glcm_levels >= 2,
+                   "'object_profile.configs[].glcm_levels' must be >= 2")
+            entries.append(entry)
+        n_workers = section.get("n_workers")
+        if n_workers is None:
+            n_workers = default_n_workers()
+        _check(n_workers >= 1, f"'object_profile.n_workers' must be >= 1, got {n_workers}")
+        return ObjectProfileConfig(
+            run=_coerce_bool(section.get("run", False), "object_profile.run"),
+            n_workers=n_workers,
+            configs=entries,
+        )
+    if attr == "inference":
+        _check_keys(attr, section, {"run", "configs"})
+        entries = []
+        for e in section.get("configs", []):
+            entry_dict = dict(e)
+            red = entry_dict.pop("reduction", None)
+            entry = _entry_from_section(attr, InferenceEntry, entry_dict)
+            if entry.model is None or not entry.model:
+                raise ValueError("'inference.configs[].model' must not be empty")
+            if entry.max_value is not None and entry.max_value <= 0:
+                raise ValueError(
+                    f"'inference.configs[].max_value' must be > 0, got {entry.max_value}")
             red_obj = (
                 _dataclass_from_section(attr, InferenceReductionConfig, red)
                 if red else None
             )
-            entries.append(InferenceEntry(**{**e, "reduction": red_obj}))
-        return InferenceConfig(run=section.get("run", False), configs=entries)
+            entry.reduction = red_obj
+            entries.append(entry)
+        return InferenceConfig(
+            run=_coerce_bool(section.get("run", False), "inference.run"),
+            configs=entries,
+        )
     raise ValueError(f"Unknown config section: {attr!r}")
 
 
@@ -358,9 +453,7 @@ def config_to_dict(cfg: PipelineConfig) -> Dict:
     # so an absent key would leave a stale GUI-written filter in session.yml.
     result["filter"] = [dataclasses.asdict(f) for f in cfg.filter] if cfg.filter else []
 
-    for attr in ("resize", "zproject", "basic", "tile",
-                 "segment", "image_profile", "object_profile",
-                 "inference"):
+    for attr in SECTION_ATTRS:
         val = getattr(cfg, attr)
         if val is not None:
             d = dataclasses.asdict(val)

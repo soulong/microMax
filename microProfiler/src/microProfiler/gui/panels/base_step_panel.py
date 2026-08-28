@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -23,14 +24,22 @@ from microProfiler.gui.state import PipelineState
 
 logger = logging.getLogger(__name__)
 
-FieldMapEntry = Tuple[str, Type, Any]
+
+def make_hsep() -> QFrame:
+    """Horizontal separator line shared by step panels."""
+    s = QFrame()
+    s.setFrameShape(QFrame.HLine)
+    s.setFrameShadow(QFrame.Sunken)
+    s.setProperty("class", "separator")
+    return s
 
 
 class BaseStepPanel(QGroupBox):
 
     step_name: str = "step"
     parameter_changed = Signal()
-    _FIELD_MAP: Dict[str, FieldMapEntry] = {}
+    # widget attribute -> config key
+    _FIELD_MAP: Dict[str, str] = {}
 
     def __init__(self, state: PipelineState, parent=None):
         super().__init__(parent)
@@ -108,6 +117,7 @@ class BaseStepPanel(QGroupBox):
     @staticmethod
     def _compact_block(block: QWidget, max_width: int = 200) -> None:
         from PySide6.QtWidgets import QAbstractSpinBox
+        excluded = getattr(block, "_compact_excluded_object_names", ()) or ()
         for child in block.findChildren(QSpinBox):
             child.setMaximumWidth(max_width)
             child.setButtonSymbols(QAbstractSpinBox.NoButtons)
@@ -118,7 +128,7 @@ class BaseStepPanel(QGroupBox):
             child.setMaximumWidth(max_width)
         for child in block.findChildren(QLineEdit):
             name = child.objectName()
-            if name in ("checkpoint_path", "reducer_path"):
+            if name in excluded:
                 continue
             if child.maximumWidth() > max_width or child.maximumWidth() == 16777215:
                 child.setMaximumWidth(160)
@@ -127,17 +137,17 @@ class BaseStepPanel(QGroupBox):
         if not self._FIELD_MAP:
             return None
         config = {}
-        for widget_attr, (key, typ, default) in self._FIELD_MAP.items():
+        for widget_attr, key in self._FIELD_MAP.items():
             widget = getattr(self, widget_attr, None)
             if widget is None:
                 continue
-            config[key] = self._read_widget(widget, typ)
+            config[key] = self._read_widget(widget)
         return config
 
     def load_config_section(self, section: dict) -> None:
         if not section or not self._FIELD_MAP:
             return
-        for widget_attr, (key, typ, default) in self._FIELD_MAP.items():
+        for widget_attr, key in self._FIELD_MAP.items():
             if key in section:
                 widget = getattr(self, widget_attr, None)
                 if widget is not None:
@@ -160,7 +170,7 @@ class BaseStepPanel(QGroupBox):
             section["run"] = run_val
 
     @staticmethod
-    def _read_widget(widget: QObject, typ: Type) -> Any:
+    def _read_widget(widget: QObject) -> Any:
         if isinstance(widget, QCheckBox):
             return widget.isChecked()
         if isinstance(widget, QComboBox):

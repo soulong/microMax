@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 
-from microProfiler.logging_utils import _ensure_std_streams
+from microProfiler.log_utils import _ensure_std_streams
 
 
 def _alloc_console() -> None:
@@ -36,7 +36,7 @@ def main() -> int:
 
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and debug_mode):
         if debug_mode:
-            from microProfiler.logging_utils import set_default_logging_level
+            from microProfiler.log_utils import set_default_logging_level
             set_default_logging_level(logging.DEBUG)
         _alloc_console()
         from microProfiler.gui.app import main as gui_main

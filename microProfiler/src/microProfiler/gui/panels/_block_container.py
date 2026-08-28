@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Type
 
-from PySide6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
 from microProfiler.gui.panels.base_step_panel import BaseStepPanel
 
@@ -10,13 +10,24 @@ from microProfiler.gui.panels.base_step_panel import BaseStepPanel
 class BlockContainerPanel(BaseStepPanel):
     """Base class for step panels that manage a dynamic list of block widgets.
 
-    Provides shared layout management, block add/remove, and serialization
-    (load_config_section / to_config with the structured list-of-dicts format).
+    Provides shared layout management, block add/remove, deferred-restore
+    serialization, and channel/mask repopulation:
 
-    Subclasses must set:
-    - _block_widget_class: the widget class for blocks
+    - ``load_config_section`` builds blocks from structured config dicts and
+      stashes them as ``_pending_block_configs``. Widget state that depends on
+      a loaded dataset (channel checkboxes, mask combos) is applied by
+      re-running ``_apply_block_config`` after ``populate_channels`` /
+      ``populate_masks`` — the config dict is the single source of truth, so
+      panels never hand-roll comma-joined stash formats.
+    - ``_apply_block_config(block, cfg)`` is the ONLY config→widget mapping a
+      subclass writes. It must be idempotent and safe to call before the
+      dataset-driven widgets exist (empty checkbox lists are harmless).
+    - ``_extra_config_items()`` / ``_apply_extra_config_items()`` let a panel
+      carry extra top-level section keys (e.g. object_profile's ``n_workers``)
+      without overriding ``to_config``/``from_config``.
 
-    Subclasses should call _build_block_container() in their __init__.
+    Subclasses must set ``_block_widget_class`` and call
+    ``_build_block_container()`` in ``__init__``.
     """
 
     _block_widget_class: Optional[Type[QWidget]] = None
@@ -29,6 +40,11 @@ class BlockContainerPanel(BaseStepPanel):
         self._blocks_layout: Optional[QVBoxLayout] = None
         self._add_btn: Optional[QPushButton] = None
         self._add_btn_layout: Optional[QHBoxLayout] = None
+        # Deferred-restore state: structured configs waiting for a dataset to
+        # load, and the last-known channel/mask lists (kept across restores).
+        self._pending_block_configs: List[dict] = []
+        self._last_channels: List[str] = []
+        self._last_masks: List[str] = []
 
     def _build_block_container(self, add_btn_text: str = "+ Add New Block") -> None:
         """Set up the block container layout with add button."""
@@ -82,7 +98,11 @@ class BlockContainerPanel(BaseStepPanel):
             b.block_index = i
 
     def _connect_block_signals(self, block: QWidget) -> None:
-        """Wire the remove button and parameter signals. Override to add more."""
+        """Wire the remove button and parameter signals. Override to add more.
+
+        The remove button is connected HERE (once) — block widgets must NOT
+        connect it in their own constructors.
+        """
         block._remove_btn.clicked.connect(
             lambda checked, b=block: self._remove_block_generic(b)
         )
@@ -94,6 +114,21 @@ class BlockContainerPanel(BaseStepPanel):
             self._blocks_layout.removeWidget(block)
             block.deleteLater()
 
+    # ── Deferred restore ─────────────────────────────────────────────────
+
+    def _reapply_pending_configs(self) -> None:
+        """Re-run _apply_block_config for the stashed configs.
+
+        Called after populate_channels/populate_masks rebuild the
+        dataset-driven widgets — at that point the config can be applied to
+        real checkbox/mask widgets. The stash is consumed once.
+        """
+        pending = self._pending_block_configs
+        self._pending_block_configs = []
+        for i, block in enumerate(self._blocks):
+            if i < len(pending):
+                self._apply_block_config(block, pending[i])
+
     # ── Serialization: structured list-of-dicts format (load_config_section) ──
 
     def load_config_section(self, sections: Any) -> None:
@@ -103,15 +138,22 @@ class BlockContainerPanel(BaseStepPanel):
             sections = [sections]
         if not isinstance(sections, (list, tuple)):
             return
+        # Keep the structured configs so populate_channels/populate_masks can
+        # re-apply channel + mask selections when the dataset loads (at
+        # restore time those widgets don't exist yet).
+        self._pending_block_configs = [cfg for cfg in sections if isinstance(cfg, dict)]
         self._remove_all_blocks()
         self._blocks_layout.removeItem(self._add_btn_layout)
+
+        last_channels = self._last_channels or self._channels
+        last_masks = self._last_masks
 
         for cfg in sections:
             if not isinstance(cfg, dict):
                 continue
             if self._blocks:
                 self._blocks_layout.addSpacing(4)
-            block = self._block_widget_class(len(self._blocks), self._channels, parent=self._block_container)
+            block = self._block_widget_class(len(self._blocks), last_channels, parent=self._block_container)
             self._connect_block_signals(block)
             self._apply_block_config(block, cfg)
             self._compact_block(block)
@@ -119,21 +161,76 @@ class BlockContainerPanel(BaseStepPanel):
             self._blocks_layout.addWidget(block)
 
         self._blocks_layout.addLayout(self._add_btn_layout)
+        if last_channels:
+            self.populate_channels(last_channels)
+        elif last_masks:
+            self.populate_masks(last_masks)
         self.parameter_changed.emit()
 
     def _apply_block_config(self, block: QWidget, cfg: dict) -> None:
-        """Apply a structured config dict to a block. Override for per-panel logic."""
+        """Apply a structured config dict to a block. Override for per-panel logic.
 
-    # ── Helpers ──────────────────────────────────────────────────────
+        Must be idempotent and tolerant of dataset-driven widgets not existing
+        yet (empty channel lists / mask combos) — it is re-run after
+        populate_channels/populate_masks.
+        """
+
+    # ── Dataset-driven repopulation ─────────────────────────────────────
+
+    def populate_channels(self, channels: List[str]) -> None:
+        """Rebuild channel-driven widgets, then re-apply pending configs.
+
+        Subclass block widgets may implement ``populate_channels`` (called via
+        the ``_on_channels_changed`` hook) or rebuild their own rows.
+        """
+        self._last_channels = list(channels)
+        self._channels = list(channels)
+        self._on_channels_changed(channels)
+        self._reapply_pending_configs()
+        self.parameter_changed.emit()
+
+    def _on_channels_changed(self, channels: List[str]) -> None:
+        """Hook: distribute the channel list to block widgets.
+
+        Rebuilt checkboxes are re-wired to parameter_changed (UniqueConnection
+        makes the repeated wiring harmless).
+        """
+        for block in self._blocks:
+            fn = getattr(block, "populate_channels", None)
+            if fn is not None:
+                fn(channels)
+                for cb in block.findChildren(QCheckBox):
+                    self._wire_param_signal(cb)
+
+    def populate_masks(self, mask_names: List[str]) -> None:
+        """Rebuild mask-driven widgets, then re-apply pending configs."""
+        self._last_masks = list(mask_names)
+        for block in self._blocks:
+            fn = getattr(block, "populate_masks", None)
+            if fn is not None:
+                fn(mask_names)
+        self._reapply_pending_configs()
+        self.parameter_changed.emit()
+
+    # ── Extra top-level section keys ─────────────────────────────────────
+
+    def _extra_config_items(self) -> dict:
+        """Extra top-level keys merged into to_config()'s section dict."""
+        return {}
+
+    def _apply_extra_config_items(self, section: dict) -> None:
+        """Read extra top-level keys from a restored section dict."""
 
     def to_config(self) -> Optional[Any]:
         configs = self.build_config_section()
         if configs is None:
             return None
-        return {
+        section: dict = {
             "run": self.isChecked(),
             "configs": configs if isinstance(configs, list) else [configs],
         }
+        section.update(self._extra_config_items())
+        return section
 
     def from_config(self, section: Any) -> None:
         if isinstance(section, list):
@@ -144,6 +241,7 @@ class BlockContainerPanel(BaseStepPanel):
         run_val = section.get("run")
         if run_val is not None:
             self.setChecked(bool(run_val) if not isinstance(run_val, str) else run_val.lower() in ("1", "true", "yes"))
+        self._apply_extra_config_items(section)
         # A section without a `configs` list carries no block state (e.g.
         # session.yml written by another tool, or a bare {"run": ...}) — keep
         # the existing blocks so their widget defaults survive the restore.
@@ -154,3 +252,6 @@ class BlockContainerPanel(BaseStepPanel):
             self.load_config_section(configs)
         elif isinstance(configs, dict):
             self.load_config_section([configs])
+
+    def build_config_section(self) -> list:  # type: ignore[override]
+        return [b.build_config_section() for b in self._blocks]

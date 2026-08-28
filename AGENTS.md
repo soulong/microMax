@@ -133,7 +133,7 @@ Dataset", which is distinct from "Browse").
 
 ## 3. Cross-cutting design rules
 
-1. **Minimal interface, deep module.** `microBase` exposes 22 public names
+1. **Minimal interface, deep module.** `microBase` exposes 23 public names
    from a flat 10-module layout. Consumers reach for `microBase.X` first; a
    new function goes into `microBase` only if at least two consumers need it.
 2. **No guessing, hard-exit on bad input.** CLI error paths are
@@ -176,24 +176,26 @@ Dataset", which is distinct from "Browse").
    - `output_db` (never `db_name`/`database`) — the per-inference-block DB
      file name. Exception: microModel's inference config key is `db_name`
      (its CLI/YAML schema), which microProfiler translates to `output_db`.
-     microProfiler's profiling-DB parameter is `result_db`.
+     microProfiler's profiling-DB parameter is `result_db`. A null
+     `output_db` resolves to `infer.db` via `config.resolve_inference_db`
+     (single source of truth for the pipeline, CLI, and bridge).
+   - `root_dir` (never `dataset_dir`) — the pipeline step/run parameter.
+   - `tile_width`/`tile_height` (never `tile_w`/`tile_h`).
    - `max_value` — the trusted input-dtype maximum for inference (read from
      config, never derived silently)
 8. **Type hints on public interfaces only.** No `TypeVar`/generic gymnastics.
    `Protocol` is used for the `IControllerView` view-interface seam in
    `microProfiler/gui/interfaces.py`. Internal helpers may be untyped.
 9. **Per-module try/except + print + sys.exit.** No central exception
-   hierarchy. The one shared exception is `MetadataValidationError` in
-   `microProfiler.pipeline` (raised in `_run_zproject`/`_run_tile`, caught in
-   `cli.main`). `derive_well` raises `ValueError` (not SystemExit) on
-   non-numeric row/col — GUI dataset-load workers catch `Exception`; a
-   `SystemExit` there would strand the modal dialog. All GUI worker threads
-   that call microBase (dataset load, preview, microVis loaders) also catch
-   `SystemExit` explicitly, since microBase's error paths are `sys.exit`.
-10. **No schema versioning for DBs.** `result.db` and `infer.db` have no
-    `_meta` table and no migration path — old/dirty DBs must be deleted
-    manually.
-11. **`NO_ALBUMENTATIONS_UPDATE=1`** and **`ALBUMENTATIONS_NO_TELEMETRY=1`**
+    hierarchy. The one shared exception is `MetadataValidationError` in
+    `microProfiler.pipeline` (raised in `_run_zproject`/`_run_tile`, caught in
+    `cli.main`). `derive_well` raises `ValueError` (not SystemExit) on
+    non-numeric row/col — GUI dataset-load workers catch `Exception`; a
+    `SystemExit` there would strand the modal dialog. All GUI worker threads
+    that call microBase (dataset load, preview, pipeline, microVis loaders)
+    catch `SystemExit` explicitly and route it through the error signal,
+    since microBase's error paths are `sys.exit`.
+10. **`NO_ALBUMENTATIONS_UPDATE=1`** and **`ALBUMENTATIONS_NO_TELEMETRY=1`**
     are set in `microBase/__init__.py` (via `os.environ.setdefault`,
     respecting any pre-existing value) before any sub-module import.
 12. **Input image size is defined entirely by augmentation steps**
@@ -244,13 +246,32 @@ Dataset", which is distinct from "Browse").
     (`sys.exit`) on bad dataset state. Every GUI worker that calls microBase
     must catch `SystemExit` and route it through the error signal — otherwise
     the modal dialog never closes, the wait cursor stays, or the app dies.
+19. **Empty channels = skip (never "all").** A null or empty channel list in
+    the config means the measurement is skipped: `segment.configs[].chan1`
+    empty → that segmentation entry is skipped; `object_profile.configs[].
+    intensity_channels` empty → the whole block is skipped (shape features
+    included); `inference.configs[].channels` null/[] → that block is
+    skipped (checked BEFORE `max_value`, so an intentionally empty block
+    never aborts the run); `image_profile.image_channels` empty → the step
+    is skipped. Skipped units are reported via the progress collector as
+    status messages and in the log — never silent, and never a "use all
+    channels" fallback. At the library level (outside the pipeline), an
+    empty channel list raises `ValueError` instead.
+20. **Pipeline step keys are the config section names.** `_STEP_FUNCTIONS`
+    keys, the `applied_steps` entries, the GUI `step_name`, and the
+    `config.SECTION_ATTRS` order are ONE namespace: `resize`, `zproject`,
+    `basic`, `tile`, `segment`, `image_profile`, `object_profile`,
+    `inference` (no `profile`/`infer` aliases). `run_pipeline` is a single
+    data-driven loop over `STEP_ORDER` with one unified gate; the GUI's Run
+    buttons (preprocess/segment/profile/inference/all) all drive
+    `run_pipeline` with a config restricted to their sections.
 
 ---
 
 ## 4. microBase — shared foundation
 
 **Path:** `microMax/microBase/`
-**Version:** `0.7.0`  •  **Layout:** flat, 10 modules under `src/microBase/`
+**Version:** `0.8.0`  •  **Layout:** flat, 10 modules under `src/microBase/`
 **Dependencies:** `numpy`, `pandas`, `tifffile`, `Pillow`, `pyyaml`,
 `albumentationsx`, `natsort`.
 
@@ -258,11 +279,11 @@ Dataset", which is distinct from "Browse").
 
 | Module | Purpose | Public API |
 |---|---|---|
-| `__init__.py` | Re-exports 22 public names; sets `NO_ALBUMENTATIONS_UPDATE=1` + `ALBUMENTATIONS_NO_TELEMETRY=1`; defines `__version__`. | all of the below |
+| `__init__.py` | Re-exports 23 public names; sets `NO_ALBUMENTATIONS_UPDATE=1` + `ALBUMENTATIONS_NO_TELEMETRY=1`; defines `__version__`. | all of the below |
 | `schema.py` | Classify regex-captured columns; derive `well` from `row+col`; `normalize_capture` is a verbatim pass-through. `derive_well` raises `ValueError` on non-numeric col. | `MetadataSchema`, `derive_well`, `normalize_capture` |
 | `io.py` | TIFF/mask readers/writers; normalizes to `(H, W, C)`. Accepts `channel_layout` of `None` / `"CHW"` / `"HWC"`. | `read_tiff`, `read_tiff_channels`, `read_mask`, `write_tiff`, `write_mask` |
 | `cells.py` | Pure functions for cropping single cells from labeled masks. `crop_cell` hard-exits on `label < 1` and on zero-pixel labels. | `get_labels`, `crop_cell`, `crop_all_cells` |
-| `config.py` | YAML load/save + per-dataset `SessionFile`. `load_yaml` recursively normalizes string spellings of `null`/`None`/`none` (case-insensitive) to Python `None`. | `load_yaml`, `save_yaml`, `SessionFile` |
+| `config.py` | YAML load/save + per-dataset `SessionFile`. `load_yaml` recursively normalizes string spellings of `null`/`None`/`none` (case-insensitive) to Python `None`. | `load_yaml`, `save_yaml`, `SessionFile`, `normalize_null_strings` |
 | `augment.py` | Registry-driven augmentation pipeline on top of AlbumentationsX (import name `albumentations`). | `build_pipeline`, `apply` |
 | `normalize.py` | Per-channel percentile clip + min-max rescale to `[0, 1]`, then z-score (per-channel / pooled / none). | `normalize` |
 | `image_dataset.py` | Whole-image loader with regex metadata, masks, LRU cache, cell cropping. | `ImageDataset` |
@@ -302,6 +323,11 @@ ImageDataset(root, image_pattern, mask_pattern=None,
   `img_dtype`, `schema`, `captured_fields` (set of regex-captured metadata
   column names including `row`/`col` before well-derivation; `schema.
   captured_fields` excludes `row`/`col` — the two differ by design).
+  `image_pattern` / `mask_pattern` / `image_subdir_pattern` return the
+  ORIGINAL pattern STRINGS (None when never set) — the compiled regexes stay
+  private (`_image_pattern`/`_mask_pattern`); consumers that need the string
+  (config round-trips, `rebuild_dataset`, microModel configs) read these
+  public attributes instead of reaching into privates.
 - Methods: `build_metadata()`, `get_imageset(row_idx, masks=None) -> (img_HWC, mask_dict)`,
   `image_path(row_idx, channel)`, `filter_metadata(column, pattern)`,
   `get_cropped_cell(row_idx, label, mask_name, padding=4)`,
@@ -409,8 +435,9 @@ or setting them in `session.yml`.
 ## 5. microProfiler — pipeline + Qt GUI
 
 **Path:** `microMax/microProfiler/`
-**Version:** `1.5.0`  •  **Entry:** `microprofiler` (CLI: `run`; GUI: no args)
+**Version:** `1.6.0`  •  **Entry:** `microprofiler` (CLI: `run`; GUI: no args)
 **Deps on microBase:** `ImageDataset`, `SessionFile`, `load_yaml`,
+`normalize_null_strings`,
 `read_tiff`, `write_tiff`, `read_mask`, `write_mask`,
 `DEFAULT_IMAGE_PATTERN`, `DEFAULT_MASK_PATTERN`, `DEFAULT_IMAGE_SUBDIR_PATTERN`.
 
@@ -422,8 +449,13 @@ src/microProfiler/
 ├── __main__.py            dispatches CLI vs GUI
 ├── cli.py                 `microprofiler run` subcommand
 ├── config.py              PipelineConfig dataclasses + YAML load/save + validation
-├── pipeline.py            run_step / run_pipeline orchestration + inference step
-├── logging_utils.py       logger factory
+├── pipeline/             run_step / run_pipeline orchestration (headless)
+│   ├── __init__.py       MetadataValidationError, run_step, run_pipeline
+│   ├── steps.py          STEP_ORDER + _run_* step functions (_STEP_FUNCTIONS)
+│   └── _micromodel_bridge.py  microModel contract: lazy imports, inference
+│                              config, bundle meta, DB table-name constants
+├── log_utils.py           logger factory
+├── progress.py           StepProgress (single tqdm + collector progress mechanism)
 ├── progress_collector.py  pub-sub progress (CLI tqdm + GUI signals)
 ├── io/
 │   ├── __init__.py        re-exports microBase io + read_image/write_image/
@@ -469,7 +501,8 @@ src/microProfiler/
                      │
                      ▼
    ┌──────────────────────────────────────────────────────────┐
-   │  resize → zproject → basic → tile → segment → profile → infer │
+   │  resize → zproject → basic → tile → segment →            │
+   │  image_profile → object_profile → inference              │
    └──────────────────────────────────────────────────────────┘
                      │
         ┌────────────┴────────────┐
@@ -488,14 +521,18 @@ src/microProfiler/
   a destructive in-place step.
 - The four preprocessing steps (`resize`, `zproject`, `basic`, `tile`) are
   gated by `SessionFile.get_applied_steps()`; rerunning skips already-applied
-  steps. `segment`, `profile`, and `infer` always run when enabled (not
-  gated) — they are non-destructive and intended to re-run. **`applied_steps`
-  never shrinks**: the GUI persists the union of the previous applied steps
-  and the steps that actually executed, so unchecking a checkbox can never
-  cause a destructive re-run (double resize/zproject/tile) of
-  already-processed files. One exception: a **fit-only BaSiC run**
-  (`mode: "fit"`, the GUI "Fit Model" button) is never gated — it writes
-  shading models without touching images.
+  steps. `segment`, `image_profile`, `object_profile`, and `inference`
+  always run when enabled (not gated) — they are non-destructive and
+  intended to re-run. **`applied_steps` never shrinks**: the GUI persists
+  the union of the previous applied steps and the steps that actually
+  executed, so unchecking a checkbox can never cause a destructive re-run
+  (double resize/zproject/tile) of already-processed files. One exception: a
+  **fit-only BaSiC run** (`mode: "fit"`, the GUI "Fit Model" button) is
+  never gated AND never recorded in `applied_steps` — it writes shading
+  models without touching images. `run_pipeline` is a single data-driven
+  loop over `STEP_ORDER` with one unified gate; a step is recorded only when
+  it actually executed (`_step_will_execute` — a section whose channel list
+  is empty is skipped and never marked applied).
 - **Tiling design note.** `tile_splitter` writes only COMPLETE tiles;
   right/bottom remainder regions (and images smaller than the tile size,
   which produce zero tiles) are intentionally dropped, and
@@ -537,21 +574,23 @@ src/microProfiler/
     write anyway. The GUI additionally drops all expected profiling tables
     after a confirmation dialog when rerunning profiling — more destructive
     than the CLI's `overwrite_db` semantics, by design.
-- **Inference step (optional, needs microModel).** The `infer` step runs
+- **Inference step (optional, needs microModel).** The `inference` step runs
   per-object inference with trained microModel bundles (whole-image mode, one
   block per bundle) and is fully driven by the `inference` config section.
   It is non-destructive, always runs when enabled (NOT gated by
   `applied_steps`, though a COMPLETED inference is recorded in
-  `applied_steps` as `infer` — never on cancel, never via the checkbox
+  `applied_steps` as `inference` — never on cancel, never via the checkbox
   state), and runs LAST in `run_pipeline` (so Run All includes it).
-  microModel is imported lazily inside `pipeline._run_inference` (and the
-  GUI panel's bundle-meta reader); a missing install is a hard error only
+  microModel is imported lazily inside the bridge
+  (`_micromodel_bridge.run_mm_inference`/`run_mm_reduction` — the ONLY file
+  that imports microModel; the GUI panel's bundle-meta reader also goes
+  through the bridge); a missing install is a hard error only
   when inference is actually requested — CLI: `print + sys.exit(1)` pre-check
   before the batch loop; GUI: popup via the worker error signal, app keeps
-  working. Each block calls `microModel.infer.run_inference` (writes
+  working. Each block calls `run_inference` (writes
   `<dataset>/<output_db>` with the microModel CLI table format —
   `output_dir` is always null so the DB lands under the dataset dir) and,
-  when its `reduction` is enabled, `microModel.vis.show_reduction(
+  when its `reduction` is enabled, `show_reduction(
   save_plots=False, raise_on_error=True)` (writes `reduction_pca` /
   `reduction_umap` / `reduction_pca_variance` + fitted
   `reducer_{pca,umap}.pkl` under the dataset dir; pre-fitted reducers
@@ -577,7 +616,9 @@ src/microProfiler/
   analysis suite.
 - **Inference channels are explicit and ordered.** Each inference block's
   channel selection is a row of plain `QCheckBox` widgets that defaults to
-  NOTHING checked; a block with zero checked channels is blocked at Run.
+  NOTHING checked; a block with no checked channels is SKIPPED at runtime
+  (empty channels = skip, never "all" — checked before `max_value`, so an
+  intentionally empty block never aborts the run).
   The left-to-right order is the model's input channel order — `channels` in
   the config is an ORDERED list of names, mapped to 1-based indices in that
   order for microModel. ◀/▶ buttons reorder. Reordered order + checked state
@@ -623,9 +664,30 @@ src/microProfiler/
   checkbox state) — intentionally, so a later re-run never re-applies an
   in-place step onto half-processed files. After an interrupted in-place
   step, restore the original raw data and clear `applied_steps`
-  (`session.yml`) before re-running. Inference is the exception: `infer` is
-  recorded only when it actually completes (never on cancel, never via the
-  checked fallback).
+  (`session.yml`) before re-running. Inference is the exception: `inference`
+  is recorded only when it actually completes (never on cancel, never via
+  the checked fallback).
+- **Block panels share one deferred-restore base.** `BlockContainerPanel`
+  owns the full serialization lifecycle: `load_config_section` stashes the
+  structured configs as `_pending_block_configs` and rebuilds blocks;
+  `populate_channels`/`populate_masks` (dataset load / filter change / config
+  restore / reset) then RE-APPLY the stashed configs via the panel's single
+  `_apply_block_config(block, cfg)` mapping — the config dict is the only
+  source of truth, and the old comma-joined stash formats are gone.
+  Subclasses only write `_apply_block_config` and the block widget's own
+  `populate_channels`/`populate_masks`. Extra top-level section keys use
+  `_extra_config_items()`/`_apply_extra_config_items()` (e.g. object
+  profiling's `n_workers`); `_compact_excluded_object_names` keeps specific
+  QLineEdits at their natural width. The remove button is wired exactly once
+  by the base (`_connect_block_signals`); block widgets never connect it
+  themselves. `MainWindow.refresh_step_panels(channels, masks)` is the single
+  repopulation entry point; the controller's `_sync_seg_masks_to_profiling`
+  always applies the segment-first mask order (even when empty, so stale
+  dropdowns are cleared).
+- **Empty channel selection is allowed in the GUI** (skip semantics): Run
+  proceeds and the skipped unit reports a status-bar + log message. The
+  headless and GUI behaviour are identical — no more "GUI blocks, CLI
+  falls back" divergence.
 
 ### 5.3 Config schema (`PipelineConfig`)
 
@@ -644,11 +706,9 @@ tile:        {run: false, tile_width: 1024, tile_height: 1024}
 segment:
   run: false
   configs:
-    - object_name: cell
+    - object_name: cell       # REQUIRED, non-empty
       model_name: cpdino
-      chan1: [ch1]            # GUI: all channels unchecked by default; Run blocked
-                              # with no selection. CLI: absent/empty falls back
-                              # to the first dataset channel.
+      chan1: [ch1]            # REQUIRED, non-empty; null/[] => entry skipped
       chan2: [ch2]            # optional, null or list; unchecked by default (GUI)
       merge1: mean            # mean|sum|max
       merge2: mean
@@ -667,13 +727,13 @@ image_profile:
 
 object_profile:
   run: false
-  n_workers: auto             # default: max(1, cpu_count // 2)
+  n_workers: auto             # default: max(1, cpu_count // 2); null => default
   configs:
-    - mask_name: cell
+    - mask_name: cell         # REQUIRED, non-empty
       parent_mask_name: null
       output_table_name: cell
       overwrite_db: false     # true => DROP TABLE before profiling
-      intensity_channels: [ch1, ch2]
+      intensity_channels: [ch1, ch2]  # REQUIRED, non-empty; null/[] => whole block skipped
       radial_channels: [ch1]
       radial_bins: 4
       gran_channels: [ch1]
@@ -682,21 +742,21 @@ object_profile:
       gran_background_subsample_ratio: null  # null => 0.25
       gran_background_radius: null   # null => 10
       glcm_channels: [ch1]
-      glcm_distances: [2]
+      glcm_distances: [2]      # null/[] => [2]
       glcm_levels: 256
       correlation_pairs: [[ch1, ch2]]
 
 inference:                     # optional; needs microModel installed
   run: false
   configs:
-    - model: D:\models\runs\model.pt   # SSL bundle OR train bundle
+    - model: D:\models\runs\model.pt   # SSL bundle OR train bundle; REQUIRED
       mask_name: cell                  # dataset mask column (prefix stripped)
-      channels: null                   # ORDERED names; top-to-bottom = model input order; null => all
+      channels: null                   # ORDERED names; top-to-bottom = model input order; null/[] => block skipped
       feature: true                    # write features BLOB
       pred_class: true                 # write pred_class (SSL bundles: ignored)
       pred_prob: true                  # write pred_prob (requires pred_class)
-      output_db: infer.db              # DB file name under the dataset dir
-      max_value: 65535                 # REQUIRED; always trusted as configured
+      output_db: infer.db              # DB file name under the dataset dir; null => infer.db
+      max_value: 65535                 # REQUIRED (> 0); always trusted as configured
       reduction:                       # null/absent => no dimension reduction
         enabled: true                  # true => BOTH pca (var_threshold) + umap
         var_threshold: 0.95            # no GUI widget; preserved verbatim on round-trip
@@ -706,8 +766,22 @@ inference:                     # optional; needs microModel installed
         reducer_umap: null             # provided => transform-only (no refit)
 ```
 
-Unknown keys anywhere in the config raise `ValueError` listing the valid
-keys (the CLI turns it into `print + sys.exit(1)`).
+Validation is strict (all at config-parse time, `ValueError` with the valid
+keys listed — the CLI turns it into `print + sys.exit(1)`):
+
+- Unknown keys anywhere raise `ValueError` — sections, block entries, and
+  filter rows alike (no silent dropping, no bare `TypeError`).
+- `run` flags are bool-coerced (`run: "false"` — a quoted string — is `False`,
+  never truthy).
+- Enumerated/numeric validation: `basic.mode` ∈ {fit, transform,
+  fit-transform}; `zproject.method` ∈ {max, mean, min} (enum); positive
+  ranges for `scale_factor`, `tile_width`/`tile_height`, `n_image`,
+  `working_size`, `gpu_batch_size`, `radial_bins`, `gran_spectrum_length`,
+  `glcm_levels`, `n_workers`; `inference.max_value` > 0 when set.
+- `segment.configs[].object_name`, `object_profile.configs[].mask_name`, and
+  `inference.configs[].model` must be non-empty.
+- `n_workers: null` resolves to `default_n_workers()` (half the CPU count) for
+  BOTH profiling sections.
 
 ### 5.4 Outputs
 
@@ -730,7 +804,7 @@ microModel's `directory` column when both tools process the same dataset.
 
 | Module | CLI | GUI |
 |---|:--:|:--:|
-| `__main__`, `logging_utils`, `progress_collector`, `config`, `pipeline`, `io/*` | ✓ | ✓ |
+| `__main__`, `log_utils`, `progress`, `progress_collector`, `config`, `pipeline`, `io/*` | ✓ | ✓ |
 | `preprocessing/*`, `segmentation/*`, `profiling/*` | ✓ | ✓ |
 | `cli` | ✓ | — |
 | `gui/*` | — | ✓ |
@@ -740,17 +814,30 @@ microModel's `directory` column when both tools process the same dataset.
 1. Add a new module under `preprocessing/` (or `segmentation/`/`profiling/`
    as appropriate). Public function signature:
    `step_dataset(ds, **kwargs, progress=NullProgressCollector()) -> ImageDataset`.
-2. Add a `XxxConfig` dataclass in `config.py` and a field on `PipelineConfig`.
-3. Register a step function in `pipeline._STEP_FUNCTIONS` and add a
-   `_run_xxx` helper.
-4. Add a `XxxStepPanel(BaseStepPanel)` under `gui/panels/` with a `_FIELD_MAP`
-   entry per config field. The base class handles serialization automatically
-   (`to_config`/`from_config`); block-list panels (segment/profile/inference)
-   override `build_config_section` and use the structured
-   `load_config_section` list-of-dicts format via `BlockContainerPanel`.
+2. Add a `XxxConfig` dataclass in `config.py`, a field on `PipelineConfig`,
+   and register the section in `config.SECTION_ATTRS` (the single
+   parse/serialize order constant).
+3. Add a `_run_xxx(cfg, ds, root_dir, progress)` helper in
+   `pipeline/steps.py` and register it in `_STEP_FUNCTIONS` under the
+   section name (the key IS the config section name — see §3.20).
+   `run_pipeline`'s data-driven loop picks it up automatically; add the
+   name to `PREPROC_STEPS` when the step modifies files in place (gated by
+   applied_steps).
+4. Add a `XxxStepPanel(BaseStepPanel)` under `gui/panels/` with a
+   `_FIELD_MAP` entry per config field (widget attr -> config key). The
+   base class handles serialization automatically (`to_config`/
+   `from_config`); block-list panels (segment/profile/inference) subclass
+   `BlockContainerPanel`, set `_block_widget_class`, and only implement
+   `_apply_block_config` — the base owns `load_config_section` (deferred
+   restore), `populate_channels`/`populate_masks` (re-apply pending
+   configs), block add/remove, and signal wiring. Extra top-level section
+   keys use `_extra_config_items()`/`_apply_extra_config_items()`.
 5. Add the panel to `gui/panels/__init__.py` and `gui/__init__.py`, and a
    page to `Sidebar.PAGES` if it is a new top-level page.
-6. Add an entry to `PipelineController._STEP_MAPPING` so the GUI can run it.
+6. GUI run buttons all drive `run_pipeline` with a config restricted to
+   their sections — a new Run button only builds that config; the
+   `PipelineController` handlers follow the existing
+   `run_*`/`_on_*_finished` pattern (no step-name mapping table).
 
 ---
 

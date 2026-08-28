@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -8,29 +8,19 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFrame,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
-    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp
+from microProfiler.config import default_n_workers
+from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp, make_hsep
 from microProfiler.gui.panels._block_container import BlockContainerPanel
-
-
-def _hsep():
-    s = QFrame()
-    s.setFrameShape(QFrame.HLine)
-    s.setFrameShadow(QFrame.Sunken)
-    s.setProperty("class", "separator")
-    return s
 
 
 class ObjectProfileBlockWidget(QWidget):
@@ -39,12 +29,10 @@ class ObjectProfileBlockWidget(QWidget):
         self,
         block_index: int,
         channels: List[str],
-        on_remove: Optional[Callable] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.block_index = block_index
-        self._on_remove = on_remove
         self._channels = channels
         self.setProperty("class", "block-card")
         self._build_ui()
@@ -85,12 +73,10 @@ class ObjectProfileBlockWidget(QWidget):
         self._remove_btn.setProperty("class", "danger")
         self._remove_btn.setToolTip("Remove this object profiling block")
         row_top.addWidget(self._remove_btn)
-        if self._on_remove:
-            self._remove_btn.clicked.connect(self._on_remove)
         layout.addLayout(row_top)
 
         # -- Intensity --
-        layout.addWidget(_hsep())
+        layout.addWidget(make_hsep())
         self._intensity_ch_layout = QHBoxLayout()
         self._intensity_ch_layout.setContentsMargins(0, 0, 0, 0)
         _lbl = QLabel("Intensity:")
@@ -110,7 +96,7 @@ class ObjectProfileBlockWidget(QWidget):
         layout.addLayout(self._intensity_ch_layout)
 
         # -- Radial + Bins (single row) --
-        layout.addWidget(_hsep())
+        layout.addWidget(make_hsep())
         self._radial_layout = QHBoxLayout()
         self._radial_layout.setContentsMargins(0, 0, 0, 0)
         _lbl = QLabel("Radial:")
@@ -143,7 +129,7 @@ class ObjectProfileBlockWidget(QWidget):
         layout.addLayout(self._radial_layout)
 
         # -- Granularity + spectrum length + subsample + image_sample + background radius --
-        layout.addWidget(_hsep())
+        layout.addWidget(make_hsep())
         self._gran_layout = QHBoxLayout()
         self._gran_layout.setContentsMargins(0, 0, 0, 0)
         _lbl = QLabel("Granularity:")
@@ -216,7 +202,7 @@ class ObjectProfileBlockWidget(QWidget):
         layout.addLayout(self._gran_layout)
 
         # -- GLCM + Distances + Levels (single row, no Angles widget) --
-        layout.addWidget(_hsep())
+        layout.addWidget(make_hsep())
         self._glcm_layout = QHBoxLayout()
         self._glcm_layout.setContentsMargins(0, 0, 0, 0)
         _lbl = QLabel("GLCM:")
@@ -257,7 +243,7 @@ class ObjectProfileBlockWidget(QWidget):
         layout.addLayout(self._glcm_layout)
 
         # -- Correlation --
-        layout.addWidget(_hsep())
+        layout.addWidget(make_hsep())
         self._corr_layout = QHBoxLayout()
         self._corr_layout.setContentsMargins(0, 0, 0, 0)
         _lbl = QLabel("Correlation:")
@@ -325,18 +311,13 @@ class ObjectProfileBlockWidget(QWidget):
             self._table_synced = True
             self._output_table.setText(self._object_mask.currentText())
 
-    def populate_channels(self, channels: List[str], stored: Optional[dict] = None) -> None:
-        self._channels = channels
-        prefix = f"block_{self.block_index}_"
-        get_saved = lambda key: set(
-            (stored or {}).get(f"{prefix}{key}", "").split(",")
-        ) - {""} if stored else set()
+    def populate_channels(self, channels: List[str]) -> None:
+        """Rebuild the five channel rows (all unchecked by default).
 
-        saved_intensity = get_saved("intensity_channels")
-        saved_radial = get_saved("radial_channels")
-        saved_gran = get_saved("gran_channels")
-        saved_glcm = get_saved("glcm_channels")
-        saved_corr = get_saved("correlation_pairs")
+        Restored configs re-check their channels via _apply_block_config after
+        this runs (base-class deferred restore).
+        """
+        self._channels = channels
 
         # Remove placeholders and existing checkboxes
         BaseStepPanel._remove_placeholder(self._intensity_ch_layout, "_intensity_placeholder", self)
@@ -351,50 +332,40 @@ class ObjectProfileBlockWidget(QWidget):
         BaseStepPanel._clear_checkboxes(self._corr_layout, self._corr_cbs)
 
         if not channels:
-            self._intensity_placeholder = QLabel("Load a dataset to configure")
-            self._intensity_placeholder.setProperty("class", "placeholder")
-            self._intensity_ch_layout.insertWidget(1, self._intensity_placeholder)
-            self._radial_placeholder = QLabel("Load a dataset to configure")
-            self._radial_placeholder.setProperty("class", "placeholder")
-            self._radial_layout.insertWidget(1, self._radial_placeholder)
-            self._gran_placeholder = QLabel("Load a dataset to configure")
-            self._gran_placeholder.setProperty("class", "placeholder")
-            self._gran_layout.insertWidget(1, self._gran_placeholder)
-            self._glcm_placeholder = QLabel("Load a dataset to configure")
-            self._glcm_placeholder.setProperty("class", "placeholder")
-            self._glcm_layout.insertWidget(1, self._glcm_placeholder)
-            self._corr_placeholder = QLabel("Load a dataset to configure")
-            self._corr_placeholder.setProperty("class", "placeholder")
-            self._corr_layout.insertWidget(1, self._corr_placeholder)
+            for layout, attr in [
+                (self._intensity_ch_layout, "_intensity_placeholder"),
+                (self._radial_layout, "_radial_placeholder"),
+                (self._gran_layout, "_gran_placeholder"),
+                (self._glcm_layout, "_glcm_placeholder"),
+                (self._corr_layout, "_corr_placeholder"),
+            ]:
+                placeholder = QLabel("Load a dataset to configure")
+                placeholder.setProperty("class", "placeholder")
+                setattr(self, attr, placeholder)
+                layout.insertWidget(1, placeholder)
             self._left_align_content()
             return
 
-        has_saved = bool(stored)
         for i, ch in enumerate(channels):
             cb = QCheckBox(ch)
-            cb.setChecked(ch in saved_intensity if has_saved else False)
             self._intensity_ch_layout.insertWidget(1 + i, cb)
             self._intensity_cbs.append(cb)
 
             cb = QCheckBox(ch)
-            cb.setChecked(ch in saved_radial if has_saved else False)
             self._radial_layout.insertWidget(1 + i, cb)
             self._radial_cbs.append(cb)
 
             cb = QCheckBox(ch)
-            cb.setChecked(ch in saved_gran if has_saved else False)
             self._gran_layout.insertWidget(1 + i, cb)
             self._gran_cbs.append(cb)
 
             cb = QCheckBox(ch)
-            cb.setChecked(ch in saved_glcm if has_saved else False)
             self._glcm_layout.insertWidget(1 + i, cb)
             self._glcm_cbs.append(cb)
 
             for other in channels:
                 if other > ch:
                     pair_cb = QCheckBox(f"{ch}-{other}")
-                    pair_cb.setChecked(f"{ch}-{other}" in saved_corr if has_saved else False)
                     self._corr_layout.insertWidget(1 + len(self._corr_cbs), pair_cb)
                     self._corr_cbs.append(pair_cb)
 
@@ -460,8 +431,7 @@ class ImageProfilingStepPanel(BaseStepPanel):
     def __init__(self, state, parent=None):
         super().__init__(state, parent)
         self.setTitle("Image Profiling")
-        n_cpu = __import__("os").cpu_count() or 1
-        self._n_workers_value = max(1, n_cpu // 2)
+        self._n_workers_value = default_n_workers()
         self._image_ch_cbs: List[QCheckBox] = []
         self._threshold_spins: Dict[str, QDoubleSpinBox] = {}
         self._build_controls()
@@ -516,12 +486,6 @@ class ImageProfilingStepPanel(BaseStepPanel):
             layout.addWidget(placeholder)
         setattr(self, placeholder_attr, placeholder)
 
-    def _restore_channel_checks(self, stored, section_key):
-        if stored and section_key in stored:
-            raw = stored.get(section_key, "")
-            return {ch for ch in raw.split(",") if ch}
-        return set()
-
     def get_thresholds(self) -> Optional[Dict[str, float]]:
         result = {}
         for ch, w in self._threshold_spins.items():
@@ -550,7 +514,9 @@ class ImageProfilingStepPanel(BaseStepPanel):
             if cb.isChecked():
                 saved_image.add(cb.text())
 
-        stored = getattr(self, "_stored_channel_settings", {})
+        # A config restored before the dataset loaded (Browse/from_config) —
+        # re-apply it after rebuilding instead of stashing comma-joined text.
+        pending = getattr(self, "_pending_settings", None)
 
         BaseStepPanel._remove_placeholder(self._image_grid_layout, "_image_ch_placeholder", self)
         BaseStepPanel._remove_placeholder(self._image_grid_layout, "_threshold_placeholder", self)
@@ -561,18 +527,22 @@ class ImageProfilingStepPanel(BaseStepPanel):
             self._re_add_placeholder("_image_ch_placeholder", self._image_grid_layout, 0, 1, 1, -1)
             self._re_add_placeholder("_threshold_placeholder", self._image_grid_layout, 1, 1, 1, -1)
         else:
-            saved_from_stored = self._restore_channel_checks(stored, "image_channels")
-            use_stored = bool(stored and "image_channels" in stored)
+            if pending is not None:
+                saved_channels = {c for c in pending.get("image_channels") or []}
+                pending_thresholds = pending.get("image_thresholds") or {}
+            else:
+                saved_channels = saved_image
+                pending_thresholds = {}
             for col_idx, ch in enumerate(channels):
                 col = col_idx + 1
                 cb = QCheckBox(ch)
-                if use_stored:
-                    cb.setChecked(ch in saved_from_stored)
+                if pending is not None:
+                    cb.setChecked(ch in saved_channels)
                 elif saved_image:
                     cb.setChecked(ch in saved_image)
                 else:
                     # Fresh default: NOTHING checked — the user picks the
-                    # channels explicitly (Run is blocked with no selection).
+                    # channels explicitly (an empty selection skips the step).
                     cb.setChecked(False)
                 self._image_grid_layout.addWidget(cb, 0, col)
                 self._image_ch_cbs.append(cb)
@@ -586,8 +556,8 @@ class ImageProfilingStepPanel(BaseStepPanel):
                 th_widget.setMinimumWidth(70)
                 th_widget.setMaximumWidth(90)
                 th_key = f"threshold_{ch}"
-                if th_key in stored:
-                    th_widget.setValue(float(stored[th_key]))
+                if ch in pending_thresholds:
+                    th_widget.setValue(float(pending_thresholds[ch]))
                 elif ch in saved_thresholds:
                     th_widget.setValue(saved_thresholds[ch])
                 self._image_grid_layout.addWidget(th_widget, 1, col)
@@ -596,8 +566,8 @@ class ImageProfilingStepPanel(BaseStepPanel):
 
             self._image_grid_layout.setColumnStretch(len(channels) + 1, 1)
 
-        if hasattr(self, "_stored_channel_settings"):
-            del self._stored_channel_settings
+        if hasattr(self, "_pending_settings"):
+            del self._pending_settings
 
     # ── Config building ───────────────────────────────────────────────
 
@@ -621,20 +591,10 @@ class ImageProfilingStepPanel(BaseStepPanel):
         for ch, w in self._threshold_spins.items():
             if ch in thresholds:
                 w.setValue(float(thresholds[ch]))
-        # Stash the saved channel settings for populate_channels: at restore
-        # time (Browse) the channel grid doesn't exist yet, and when the
-        # dataset loads populate_channels rebuilds it — from these saved
-        # values instead of defaults (all channels checked).
-        stored = {}
-        img_ch = section.get("image_channels")
-        if img_ch:
-            if isinstance(img_ch, (list, tuple)):
-                stored["image_channels"] = ",".join(str(c) for c in img_ch)
-            else:
-                stored["image_channels"] = str(img_ch)
-        for ch, v in thresholds.items():
-            stored[f"threshold_{ch}"] = float(v)
-        self._stored_channel_settings = stored
+        # Keep the raw section for populate_channels: at restore time (Browse)
+        # the channel grid doesn't exist yet — when the dataset loads,
+        # populate_channels rebuilds it from this config instead of defaults.
+        self._pending_settings = dict(section)
 
 
 class ObjectProfilingStepPanel(BlockContainerPanel):
@@ -645,15 +605,11 @@ class ObjectProfilingStepPanel(BlockContainerPanel):
     def __init__(self, state, parent=None):
         super().__init__(state, parent)
         self.setTitle("Object Profiling")
-        n_cpu = __import__("os").cpu_count() or 1
-        self._n_workers_value = max(1, n_cpu // 2)
-        self._last_channels: List[str] = []
-        self._last_masks: List[str] = []
-        self._pending_block_configs: List[dict] = []
+        self._n_workers_value = default_n_workers()
         self._build_block_container("+ Add New Object Profiling")
         self._add_block_generic([])
 
-    def _wire_block_signals(self, block: ObjectProfileBlockWidget) -> None:
+    def _connect_block_signals(self, block: ObjectProfileBlockWidget) -> None:
         super()._connect_block_signals(block)
         self._wire_param_signal(block._object_mask)
         self._wire_param_signal(block._parent_mask)
@@ -670,11 +626,6 @@ class ObjectProfilingStepPanel(BlockContainerPanel):
                         block._glcm_cbs, block._corr_cbs):
             for cb in cb_list:
                 self._wire_param_signal(cb)
-
-    # Override to match connect_block_signals naming in base class
-    def _connect_block_signals(self, block: ObjectProfileBlockWidget) -> None:
-        super()._connect_block_signals(block)
-        self._wire_block_signals(block)
 
     def _on_add_block_clicked(self) -> None:
         channels = list(self._blocks[0]._channels) if self._blocks else []
@@ -717,108 +668,14 @@ class ObjectProfilingStepPanel(BlockContainerPanel):
         self._n_workers_value = value
         self.parameter_changed.emit()
 
-    def populate_channels(self, channels: List[str]) -> None:
-        self._last_channels = channels
-        self._channels = list(channels)
-        saved = {}
-        pending = getattr(self, "_pending_block_configs", None)
+    # n_workers is an extra top-level section key carried by this panel.
+    def _extra_config_items(self) -> dict:
+        return {"n_workers": self._n_workers_value}
 
-        def _cfg_join(cfg, key):
-            val = cfg.get(key)
-            if not val:
-                return ""
-            if isinstance(val, (list, tuple)):
-                return ",".join(str(v) for v in val)
-            return str(val)
-
-        for i, block in enumerate(self._blocks):
-            prefix = f"block_{block.block_index}_"
-            intensity = ",".join(cb.text() for cb in block._intensity_cbs if cb.isChecked())
-            radial = ",".join(cb.text() for cb in block._radial_cbs if cb.isChecked())
-            granularity = ",".join(cb.text() for cb in block._gran_cbs if cb.isChecked())
-            glcm = ",".join(cb.text() for cb in block._glcm_cbs if cb.isChecked())
-            corr = ",".join(cb.text() for cb in block._corr_cbs if cb.isChecked())
-            # Blocks restored from session/config before channels were known
-            # have no checkboxes yet — seed from the pending structured config.
-            if not (intensity or radial or granularity or glcm or corr) and pending and i < len(pending):
-                cfg = pending[i]
-                intensity = _cfg_join(cfg, "intensity_channels")
-                radial = _cfg_join(cfg, "radial_channels")
-                granularity = _cfg_join(cfg, "gran_channels")
-                glcm = _cfg_join(cfg, "glcm_channels")
-                corr = ""
-                for pair in (cfg.get("correlation_pairs") or []):
-                    if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                        corr += ("," if corr else "") + f"{pair[0]}-{pair[1]}"
-            if intensity: saved[f"{prefix}intensity_channels"] = intensity
-            if radial: saved[f"{prefix}radial_channels"] = radial
-            if granularity: saved[f"{prefix}gran_channels"] = granularity
-            if glcm: saved[f"{prefix}glcm_channels"] = glcm
-            if corr: saved[f"{prefix}correlation_pairs"] = corr
-
-        stored = getattr(self, "_stored_channel_settings", {})
-        if saved:
-            stored.update(saved)
-
-        for block in self._blocks:
-            block.populate_channels(channels, stored)
-            self._wire_block_signals(block)
-        if hasattr(self, "_stored_channel_settings"):
-            del self._stored_channel_settings
-        self._pending_block_configs = []
-
-    def load_config_section(self, sections: Any) -> None:
-        # Override to populate masks on each new block BEFORE applying config,
-        # so _apply_block_config can find the mask_name in the dropdown.
-        if not sections:
-            return
-        if isinstance(sections, dict):
-            sections = [sections]
-        if not isinstance(sections, (list, tuple)):
-            return
-        # Keep the structured configs so populate_channels/populate_masks can
-        # re-apply channel + mask selections when the dataset loads (at
-        # restore time the widgets don't exist yet).
-        self._pending_block_configs = [cfg for cfg in sections if isinstance(cfg, dict)]
-        self._remove_all_blocks()
-        self._blocks_layout.removeItem(self._add_btn_layout)
-
-        last_channels = self._last_channels or self._channels
-        last_masks = getattr(self, "_last_masks", [])
-
-        for cfg in sections:
-            if not isinstance(cfg, dict):
-                continue
-            if self._blocks:
-                self._blocks_layout.addSpacing(4)
-            block = self._block_widget_class(len(self._blocks), last_channels, parent=self._block_container)
-            self._connect_block_signals(block)
-            if last_masks:
-                block.populate_masks(last_masks)
-            self._apply_block_config(block, cfg)
-            self._compact_block(block)
-            self._blocks.append(block)
-            self._blocks_layout.addWidget(block)
-
-        self._blocks_layout.addLayout(self._add_btn_layout)
-        if last_channels:
-            self.populate_channels(last_channels)
-        self.parameter_changed.emit()
-
-    def populate_masks(self, mask_names: List[str]) -> None:
-        self._last_masks = list(mask_names)
-        pending = getattr(self, "_pending_block_configs", None)
-        for i, block in enumerate(self._blocks):
-            block.populate_masks(mask_names)
-            # Re-select the mask/parent saved in the restored config (the
-            # dropdown did not exist when from_config ran).
-            if pending and i < len(pending):
-                saved_mask = pending[i].get("mask_name")
-                if saved_mask:
-                    block._object_mask.setCurrentText(str(saved_mask))
-                saved_parent = pending[i].get("parent_mask_name")
-                if saved_parent:
-                    block._parent_mask.setCurrentText(str(saved_parent))
+    def _apply_extra_config_items(self, section: dict) -> None:
+        nw = section.get("n_workers")
+        if nw is not None:
+            self._n_workers_value = int(nw)
 
     def get_mask_name(self) -> str:
         if self._blocks:
@@ -829,32 +686,6 @@ class ObjectProfilingStepPanel(BlockContainerPanel):
         if self._blocks:
             return self._blocks[0].get_parent_mask_name()
         return None
-
-    def get_mask_names(self) -> List[str]:
-        return [b.get_mask_name() for b in self._blocks]
-
-    def get_parent_mask_names(self) -> List[Optional[str]]:
-        return [b.get_parent_mask_name() for b in self._blocks]
-
-    def build_config_section(self) -> list:  # type: ignore[override]
-        return [b.build_config_section() for b in self._blocks]
-
-    def to_config(self) -> Optional[dict]:
-        configs = self.build_config_section()
-        if configs is None:
-            return None
-        return {
-            "run": self.isChecked(),
-            "n_workers": self._n_workers_value,
-            "configs": configs,
-        }
-
-    def from_config(self, section: Any) -> None:
-        if isinstance(section, dict):
-            nw = section.get("n_workers")
-            if nw is not None:
-                self._n_workers_value = int(nw)
-        super().from_config(section)
 
     def _apply_block_config(self, block: ObjectProfileBlockWidget, cfg: dict) -> None:
         mask_name = cfg.get("mask_name", "")

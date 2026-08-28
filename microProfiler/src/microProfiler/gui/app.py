@@ -7,7 +7,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import QApplication
 
-from microProfiler.logging_utils import _ensure_std_streams, setup_logging
+from microProfiler.log_utils import _ensure_std_streams, setup_logging
 
 
 def _resource(name: str) -> str | None:

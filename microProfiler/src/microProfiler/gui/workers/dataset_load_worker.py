@@ -15,7 +15,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 from microBase import ImageDataset
 from microProfiler.io import clone_dataset
 
-logger = logging.getLogger("microProfiler")
+logger = logging.getLogger(__name__)
 
 
 class DatasetLoadWorker(QObject):

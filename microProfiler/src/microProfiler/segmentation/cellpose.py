@@ -11,7 +11,7 @@ import gc
 import sys
 import logging
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -186,9 +186,13 @@ def segment_dataset(
         "errors": [],
     }
 
-    chan1 = chan1 or ds.intensity_colnames[:1]
     if isinstance(chan1, str):
         chan1 = [chan1]
+    if not chan1:
+        raise ValueError(
+            "segment_dataset requires at least one chan1 channel "
+            "(empty channels are skipped by the pipeline, never 'all')."
+        )
     if isinstance(chan2, str):
         chan2 = [chan2]
 

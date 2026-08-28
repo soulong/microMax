@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -151,7 +153,7 @@ class Sidebar(QWidget):
         layout.addLayout(_make_spin_row("vmax", self._vmax_spin, "Upper percentile bound for display contrast"))
 
         # Thread count spinbox
-        n_cpu = __import__('os').cpu_count() or 1
+        n_cpu = os.cpu_count() or 1
         self._thread_spin = QSpinBox()
         self._thread_spin.setRange(1, 64)
         self._thread_spin.setValue(max(1, n_cpu // 2))
@@ -184,7 +186,6 @@ class Sidebar(QWidget):
         self._cancel_btn.clicked.connect(self.cancel_clicked.emit)
         layout.addWidget(self._cancel_btn)
 
-        self._current_page = "input"
         self._items["input"].set_active(True)
 
     def _add_item(self, page_id: str) -> None:
@@ -211,5 +212,4 @@ class Sidebar(QWidget):
     def _on_item_clicked(self, page_id: str) -> None:
         for key, item in self._items.items():
             item.set_active(key == page_id)
-        self._current_page = page_id
         self.navigation_changed.emit(page_id)

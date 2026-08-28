@@ -29,6 +29,15 @@ import pandas as pd
 from natsort import natsorted, natsort_keygen
 
 from . import io as _io
+
+logger = logging.getLogger(__name__)
+
+
+def _pattern_string(pattern):
+    """Convert a stored pattern (compiled regex, str, or None) to a string."""
+    if pattern is None:
+        return None
+    return pattern.pattern if hasattr(pattern, "pattern") else str(pattern)
 from . import cells as _cells
 from .schema import MetadataSchema, normalize_capture
 
@@ -206,6 +215,21 @@ class ImageDataset:
     def captured_fields(self):
         """Set of regex-captured metadata column names (structural + extra)."""
         return set(self._captured_fields)
+
+    @property
+    def image_pattern(self):
+        """The original image_pattern string (None if never set).
+
+        The compiled regex stays private (``_image_pattern``) — consumers that
+        need the string (config round-trips, rebuilding datasets, microModel
+        configs) read this public attribute instead of reaching into privates.
+        """
+        return _pattern_string(self._image_pattern)
+
+    @property
+    def mask_pattern(self):
+        """The original mask_pattern string (None if never set)."""
+        return _pattern_string(self._mask_pattern)
 
     def __len__(self):
         return 0 if self._metadata is None else len(self._metadata)

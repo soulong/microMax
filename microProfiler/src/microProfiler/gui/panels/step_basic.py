@@ -19,10 +19,10 @@ from microProfiler.gui.image_widgets import ChannelTile
 class BaSiCStepPanel(BaseStepPanel):
     step_name = "basic"
     _FIELD_MAP = {
-        "_mode": ("mode", str, "fit-transform"),
-        "_n_image": ("n_image", int, 100),
-        "_working_size": ("working_size", int, 64),
-        "_darkfield": ("enable_darkfield", bool, False),
+        "_mode": "mode",
+        "_n_image": "n_image",
+        "_working_size": "working_size",
+        "_darkfield": "enable_darkfield",
     }
 
     def __init__(self, state, parent=None):

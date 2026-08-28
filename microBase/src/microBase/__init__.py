@@ -13,7 +13,7 @@ Provides:
 - derive_well, MetadataSchema
 """
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 import os as _os
 _os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -40,6 +40,7 @@ from .config import (
     load_yaml,
     save_yaml,
     SessionFile,
+    normalize_null_strings,
 )
 from .augment import (
     build_pipeline,
@@ -69,6 +70,7 @@ __all__ = [
     "load_yaml",
     "save_yaml",
     "SessionFile",
+    "normalize_null_strings",
     "build_pipeline",
     "apply",
     "normalize",

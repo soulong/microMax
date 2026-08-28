@@ -1,0 +1,268 @@
+"""microModel bridge: concentrates every piece of microModel's contract.
+
+Everything that knows microModel's bundle schema or inference-config dict
+lives here, so a microModel schema change touches exactly one file. microModel
+is imported lazily (only when inference actually runs), keeping microProfiler
+importable without microModel installed.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import re
+import sys
+from pathlib import Path
+
+from microProfiler.config import PipelineConfig, resolve_inference_db
+
+logger = logging.getLogger(__name__)
+
+# microModel's inference DB schema — table names written by run_inference /
+# show_reduction. Kept here so the CLI completeness check and the pipeline
+# never hardcode microModel's schema in two places.
+INFERENCE_TABLE = "inference"
+REDUCTION_TABLES = frozenset({"reduction_pca", "reduction_umap", "reduction_pca_variance"})
+
+
+def run_mm_inference(mm_cfg, **kwargs):
+    """Lazily import and call microModel.infer.run_inference (see _call_micromodel)."""
+    from microModel.infer import run_inference
+    return run_inference(mm_cfg, **kwargs)
+
+
+def run_mm_reduction(mm_cfg, **kwargs):
+    """Lazily import and call microModel.vis.show_reduction (see _call_micromodel)."""
+    from microModel.vis import show_reduction
+    return show_reduction(mm_cfg, **kwargs)
+
+
+class _ProgressTee(io.TextIOBase):
+    """Tee microModel's stderr to three places at once:
+
+    - the real terminal (tqdm renders exactly like `micromodel infer`),
+    - the error buffer (kept for the failure message on SystemExit),
+    - the progress collector: tqdm lines (``Infer:  33%|██ 1/3 [..]``) become
+      ``report(step_key, cur, tot)`` (a real status-bar bar), any other text
+      line becomes ``report(step_key, 0, 0, text)`` (a status message).
+    """
+
+    _TQDM_RE = re.compile(r"^[^:\s]+:\s*\S")
+
+    def __init__(self, err_buf, real_stderr, progress, step_key):
+        super().__init__()
+        self._buf = err_buf
+        self._real = real_stderr
+        self._progress = progress
+        self._step_key = step_key
+        self._pending = ""
+
+    def _emit(self, seg: str) -> None:
+        seg = re.sub(r"\x1b\[[0-9;]*m", "", seg).strip()
+        if not seg:
+            return
+        if self._TQDM_RE.match(seg):
+            m = re.search(r"(\d+)\s*/\s*(\d+)", seg)
+            if m:
+                self._progress.report(
+                    self._step_key, int(m.group(1)), int(m.group(2)), "")
+                return
+        self._progress.report(self._step_key, 0, 0, seg[:200])
+
+    def write(self, s: str) -> int:
+        if self._real is not None:
+            try:
+                self._real.write(s)
+                self._real.flush()
+            except Exception:
+                pass
+        self._buf.write(s)
+        self._pending += s
+        parts = self._pending.replace("\r", "\n").split("\n")
+        self._pending = parts.pop()
+        for part in parts:
+            self._emit(part)
+        return len(s)
+
+    def flush(self) -> None:
+        if self._real is not None:
+            try:
+                self._real.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        return bool(self._real is not None and self._real.isatty())
+
+    def fileno(self):
+        if self._real is not None and hasattr(self._real, "fileno"):
+            return self._real.fileno()
+        raise io.UnsupportedOperation("fileno")
+
+
+class _MicroModelLogForwarder(logging.Handler):
+    """Forward microModel logger records (e.g. "Fitting PCA + UMAP...",
+    "Writing to <db>") to the real terminal with the CLI's format and to the
+    progress collector as status messages — so the reduction stage is visible
+    both in the terminal and in the GUI status bar.
+    """
+
+    def __init__(self, real_stderr, progress, step_key):
+        super().__init__(level=logging.INFO)
+        self._real = real_stderr
+        self._progress = progress
+        self._step_key = step_key
+        self.setFormatter(logging.Formatter(
+            "[%(asctime)s] %(levelname)s | %(message)s",
+            datefmt="%H:%M",
+        ))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = self.format(record) + "\n"
+            if self._real is not None:
+                self._real.write(line)
+                self._real.flush()
+            msg = record.getMessage().strip()
+            if msg:
+                self._progress.report(self._step_key, 0, 0, msg[:200])
+        except Exception:
+            self.handleError(record)
+
+
+def _call_micromodel(fn, mm_cfg, err_prefix: str, progress=None,
+                     step_key: str = "Inference", **kwargs):
+    """Call a microModel function, converting its print + sys.exit(1) error
+    paths (SystemExit) into RuntimeError with the captured stderr message, so
+    the GUI worker surfaces a popup and the CLI treats the dataset as failed.
+
+    When a progress collector is given, microModel's stderr is teed to the
+    real terminal AND forwarded to the collector (live tqdm progress + status
+    lines); microModel's INFO logs are forwarded the same way. When the run
+    was cancelled (progress.cancel_check), a SystemExit is re-raised as
+    InterruptedError — a cancel is not a failure.
+    """
+    import contextlib
+
+    real_stderr = sys.stderr
+    err_buf = io.StringIO()
+    log_handler = None
+    if progress is not None:
+        tee = _ProgressTee(err_buf, real_stderr, progress, step_key)
+        log_handler = _MicroModelLogForwarder(real_stderr, progress, step_key)
+        mm_logger = logging.getLogger("microModel")
+        mm_logger.setLevel(logging.INFO)
+        mm_logger.addHandler(log_handler)
+    else:
+        tee = err_buf
+    try:
+        with contextlib.redirect_stderr(tee):
+            fn(mm_cfg, **kwargs)
+    except SystemExit as e:
+        if (log_handler is not None
+                and getattr(progress, "cancel_check", None)
+                and progress.cancel_check()):
+            raise InterruptedError from e
+        msg = err_buf.getvalue().strip() or f"microModel failed ({e})"
+        raise RuntimeError(f"{err_prefix}: {msg}") from e
+    finally:
+        if log_handler is not None:
+            logging.getLogger("microModel").removeHandler(log_handler)
+
+
+def _build_mm_inference_config(entry, cfg: PipelineConfig, ds, root_dir: Path) -> dict:
+    """Build the microModel whole-image inference config dict for one block.
+
+    output_dir is always null so the inference DB (and, with reduction, the
+    fitted reducer pickles) land under the dataset dir itself.
+
+    ``entry.channels`` must be a non-empty ordered list — the pipeline skips
+    blocks with no channels before calling this bridge, and an empty/null
+    list must never reach microModel as "use all channels".
+    """
+    intensity_cols = ds.intensity_colnames
+    if not entry.channels:
+        raise RuntimeError(
+            "Inference channels must be configured for every block "
+            "(a block with no channels is skipped before inference)."
+        )
+    channels = []
+    for ch in entry.channels:
+        try:
+            channels.append(intensity_cols.index(ch) + 1)
+        except ValueError:
+            raise RuntimeError(
+                f"Inference channel {ch!r} not found in dataset channels "
+                f"{intensity_cols}."
+            )
+    mm_cfg = {
+        "mode": "whole_image",
+        "model": os.path.abspath(entry.model),
+        "output_dir": None,
+        # GUI inference uses 4 DataLoader worker processes (spawned thanks to
+        # the picklable ImageDataset cache — §4.3) with the same prefetch as
+        # microModel's CLI. persistent_workers=False tears the workers down
+        # after each inference pass (clean teardown on completion/cancel);
+        # tqdm/log output still comes from the pipeline worker thread and is
+        # teed to the terminal + GUI status bar.
+        "dataloader": {"num_workers": 4, "prefetch_factor": 2,
+                       "persistent_workers": False},
+        "data": {
+            "root": [str(root_dir)],
+            "channels": channels,
+            "channel_layout": None,
+            "image_pattern": cfg.image_pattern or ds.image_pattern,
+            "mask_pattern": cfg.mask_pattern or ds.mask_pattern,
+            "image_subdir_pattern": cfg.image_subdir_pattern or ds.image_subdir_pattern,
+            "mask_name": entry.mask_name,
+            "max_value": float(entry.max_value),
+            "label_from_dir": False,
+            "label_csv": None,
+            "sample_max": None,
+            "sample_by": "per_dataset",
+        },
+        "inference": {
+            "pred_class": bool(entry.pred_class),
+            "feature": bool(entry.feature),
+            "db_name": resolve_inference_db(entry),
+            "batch_size": 128,
+        },
+    }
+    if entry.reduction and entry.reduction.enabled:
+        mm_cfg["reduction"] = {
+            "var_threshold": entry.reduction.var_threshold if entry.reduction.var_threshold is not None else 0.95,
+            "color_by": entry.reduction.color_by if entry.reduction.color_by is not None else "pred_class",
+            "sample_per_class": entry.reduction.sample_per_class if entry.reduction.sample_per_class is not None else 10000,
+            "reducer_pca": entry.reduction.reducer_pca,
+            "reducer_umap": entry.reduction.reducer_umap,
+        }
+    return mm_cfg
+
+
+def read_bundle_meta(model_path: str) -> dict:
+    """Load a microModel bundle's meta dict (lazy torch import).
+
+    Raises ImportError when microModel/torch are missing and RuntimeError for
+    anything that is not a microModel bundle — callers surface these as popups.
+    """
+    import importlib.util
+    if importlib.util.find_spec("microModel") is None:
+        raise ImportError(
+            "Inference requires the 'microModel' package, which is not "
+            "installed. Install microModel and restart microProfiler."
+        )
+    try:
+        import torch
+    except ImportError as e:
+        raise ImportError(
+            "Inference requires 'torch' (installed with microModel), which is "
+            "not installed."
+        ) from e
+    bundle = torch.load(model_path, map_location="cpu", weights_only=False)
+    if not isinstance(bundle, dict) or "state_dict" not in bundle:
+        raise RuntimeError("Not a microModel bundle (missing 'state_dict').")
+    meta = bundle.get("meta") or {}
+    if not isinstance(meta, dict):
+        raise RuntimeError("Bundle 'meta' is not a dict.")
+    return meta

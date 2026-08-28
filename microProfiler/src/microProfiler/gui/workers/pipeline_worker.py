@@ -88,13 +88,20 @@ class PipelineWorker(QObject):
                 self._applied_steps = None
             else:
                 result_ds, applied = run_pipeline(
-                    self._cfg, dataset_dir=self._dataset_dir, progress=collector, ds=self._ds,
+                    self._cfg, root_dir=self._dataset_dir, progress=collector, ds=self._ds,
                 )
                 self._result_ds = result_ds
                 self._applied_steps = applied
             self.finished.emit()
         except InterruptedError:
             self.finished.emit()
+        except SystemExit as e:
+            # microBase hard-exits (print + sys.exit) on bad dataset state
+            # (missing image files, invalid filter column). Without this the
+            # error signal never fires and the UI stays stuck with
+            # set_running(True) — the modal dialog / wait cursor never clears.
+            logger.error("Pipeline failed (microBase hard-exit): %s", e)
+            self.error.emit(str(e) or "Pipeline failed (microBase hard-exit)")
         except Exception as e:
             logger.error("Pipeline error: %s\n%s", e, traceback.format_exc())
             self.error.emit(str(e))

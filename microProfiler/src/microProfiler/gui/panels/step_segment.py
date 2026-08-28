@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 import numpy as np
 from cellpose import models as cp_models
@@ -9,12 +9,10 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
-    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -32,12 +30,10 @@ class SegmentBlockWidget(QWidget):
         self,
         block_index: int,
         channels: List[str],
-        on_remove: Optional[Callable] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.block_index = block_index
-        self._on_remove = on_remove
         self._channels = channels
         self._syncing = False
         self.setProperty("class", "block-card")
@@ -70,8 +66,6 @@ class SegmentBlockWidget(QWidget):
         self._remove_btn.setProperty("class", "danger")
         self._remove_btn.setToolTip("Remove this segmentation block")
         row1.addWidget(self._remove_btn)
-        if self._on_remove:
-            self._remove_btn.clicked.connect(self._on_remove)
         layout.addLayout(row1)
 
         # Row 2: Resize factor + Diameter + thresholds
@@ -263,7 +257,12 @@ class SegmentBlockWidget(QWidget):
         ):
             self._c2_view.clear_image()
 
-    def rebuild_channels(self, channels: List[str]) -> None:
+    def populate_channels(self, channels: List[str]) -> None:
+        """Rebuild the Chan1/Chan2 checkbox rows (unchecked by default).
+
+        Stored configs (session.yml) re-check their channels via
+        _apply_block_config after this runs (base-class deferred restore).
+        """
         self._channels = channels
         self._chan1_checkboxes.clear()
         self._chan2_checkboxes.clear()
@@ -402,46 +401,6 @@ class SegmentStepPanel(BlockContainerPanel):
             lambda: (self.preview_requested.emit(block.block_index), block.show_preview())
         )
 
-    def _on_add_block_clicked(self) -> None:
-        self._add_block_generic(self._channels)
-
-    def populate_channels(self, channels: List[str]) -> None:
-        self._channels = channels
-        saved_chan1 = {}
-        saved_chan2 = {}
-        for block in self._blocks:
-            if block._channels:
-                saved_chan1[block] = [cb.text() for cb in block._chan1_checkboxes if cb.isChecked()]
-                saved_chan2[block] = [cb.text() for cb in block._chan2_checkboxes if cb.isChecked()]
-            else:
-                # Blocks restored from session/config before channels were
-                # known have no checkboxes yet — re-apply the config-derived
-                # channel lists instead of defaulting to all channels.
-                st1 = getattr(block, "_stored_chan1", None)
-                st2 = getattr(block, "_stored_chan2", None)
-                if st1:
-                    saved_chan1[block] = list(st1)
-                if st2:
-                    saved_chan2[block] = list(st2)
-
-        if not self._blocks:
-            self._add_block_generic(channels)
-        else:
-            for block in self._blocks:
-                block.rebuild_channels(channels)
-                for cb in block._chan1_checkboxes + block._chan2_checkboxes:
-                    self._wire_param_signal(cb)
-
-        for block in self._blocks:
-            if block in saved_chan1:
-                for cb in block._chan1_checkboxes:
-                    cb.setChecked(cb.text() in saved_chan1[block])
-            if block in saved_chan2:
-                for cb in block._chan2_checkboxes:
-                    cb.setChecked(cb.text() in saved_chan2[block])
-
-        self.parameter_changed.emit()
-
     def _apply_block_config(self, block: SegmentBlockWidget, cfg: dict) -> None:
         # Only set the object name when the config carries one — never clear
         # the widget's "cell" default (empty configs wipe it otherwise).
@@ -473,10 +432,8 @@ class SegmentStepPanel(BlockContainerPanel):
         # Restore overwrite_mask checkbox
         if hasattr(block, "_overwrite_mask"):
             block._overwrite_mask.setChecked(bool(cfg.get("overwrite_mask", False)))
-        # Stash channel lists so populate_channels can re-apply them when the
-        # dataset loads (the checkboxes don't exist at restore time).
-        block._stored_chan1 = cfg.get("chan1")
-        block._stored_chan2 = cfg.get("chan2")
+        # Channel checks are applied by the base-class deferred restore: this
+        # method is re-run after populate_channels built the checkboxes.
         BaseStepPanel._set_checked_states(block._chan1_checkboxes, cfg.get("chan1"))
         BaseStepPanel._set_checked_states(block._chan2_checkboxes, cfg.get("chan2"))
 
@@ -489,21 +446,6 @@ class SegmentStepPanel(BlockContainerPanel):
             if name in names:
                 return f"Duplicate object name: '{name}'. Each block must have a unique name."
             names.append(name)
-        return None
-
-    def validate_channels(self) -> Optional[str]:
-        """Every block needs at least one checked Chan1 channel.
-
-        Channels default unchecked — a run with no selection would otherwise
-        silently fall back to the first dataset channel.
-        """
-        for block in self._blocks:
-            if not block.get_chan1():
-                name = block._object_name.text().strip() or block.block_index
-                return (
-                    f"Select at least one Chan1 channel in segmentation block "
-                    f"'{name}'. Channels default unchecked."
-                )
         return None
 
     def get_object_names(self) -> List[str]:

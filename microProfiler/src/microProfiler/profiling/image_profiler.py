@@ -10,11 +10,11 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
 from skimage.measure import label, regionprops_table
-from tqdm import tqdm
 
 from microBase import ImageDataset
 from microProfiler.profiling.batch_writer import BatchWriter
 from microProfiler.profiling.object_profiler import _resolve_source_directory
+from microProfiler.progress import StepProgress
 from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,10 @@ def measure_single_image(
         )
 
     if intensity_channels is None:
-        intensity_channels = channel_names
+        raise ValueError(
+            "measure_single_image requires intensity_channels "
+            "(empty channels are skipped by the pipeline, never 'all')."
+        )
     thresholds = thresholds or {}
 
     result: Dict[str, Any] = {}
@@ -109,7 +112,11 @@ def profile_images(
     n_workers: int = 1,
 ) -> Optional[pd.DataFrame]:
     """Profile all images in a dataset at the whole-image level."""
-    channels = channels or ds.intensity_colnames
+    if not channels:
+        raise ValueError(
+            "profile_images requires at least one channel "
+            "(empty channels are skipped by the pipeline, never 'all')."
+        )
     logger.debug(
         "profile_images: channels=%s, thresholds=%s, db=%s, table=%s, count=%d, workers=%d",
         channels, thresholds, db_path, table_name, len(ds), n_workers,
@@ -121,45 +128,43 @@ def profile_images(
 
     with BatchWriter(db_path, table_name, BATCH) as writer:
         try:
-            if n_workers == 1:
-                for idx in tqdm(range(n_total), desc="Image profiling", unit="img"):
-                    progress.report("Profile image", idx, n_total, "")
-                    result = _process_one_image(ds, idx, channels, thresholds)
-                    writer.add(result)
-                    completed += 1
-            else:
-                pbar = tqdm(total=n_total, desc="Image profiling", unit="img")
-                # Process in chunks to avoid pre-loading all images into RAM
-                for chunk_start in range(0, n_total, BATCH):
-                    chunk_end = min(chunk_start + BATCH, n_total)
-                    tasks = []
-                    for idx in range(chunk_start, chunk_end):
-                        image_data, _ = ds.get_imageset(idx)
-                        row = ds.metadata.iloc[idx]
-                        excluded = set(ds.intensity_colnames) | set(ds.mask_colnames)
-                        meta = {k: v for k, v in row.to_dict().items() if k not in excluded}
-                        meta["directory"] = _resolve_source_directory(row, ds.intensity_colnames)
-                        tasks.append((image_data, ds.intensity_colnames, channels, thresholds, meta))
+            with StepProgress("Profile image", n_total, progress, desc="Image profiling", unit="img") as sp:
+                if n_workers == 1:
+                    for idx in range(n_total):
+                        sp.report(idx, "")
+                        result = _process_one_image(ds, idx, channels, thresholds)
+                        writer.add(result)
+                        completed += 1
+                else:
+                    # Process in chunks to avoid pre-loading all images into RAM
+                    for chunk_start in range(0, n_total, BATCH):
+                        chunk_end = min(chunk_start + BATCH, n_total)
+                        tasks = []
+                        for idx in range(chunk_start, chunk_end):
+                            image_data, _ = ds.get_imageset(idx)
+                            row = ds.metadata.iloc[idx]
+                            excluded = set(ds.intensity_colnames) | set(ds.mask_colnames)
+                            meta = {k: v for k, v in row.to_dict().items() if k not in excluded}
+                            meta["directory"] = _resolve_source_directory(row, ds.intensity_colnames)
+                            tasks.append((image_data, ds.intensity_colnames, channels, thresholds, meta))
 
-                    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                        futures = {
-                            executor.submit(_profile_image_worker, t): idx
-                            for idx, t in enumerate(tasks)
-                        }
-                        for future in as_completed(futures):
-                            task_idx = futures[future]
-                            try:
-                                result = future.result()
-                                writer.add(result)
-                                completed += 1
-                                pbar.update(1)
-                                progress.report("Profile image", completed, n_total, "")
-                            except InterruptedError:
-                                raise
-                            except Exception:
-                                logger.exception("Image profiling failed for row %d — aborting", chunk_start + task_idx)
-                                raise
-                pbar.close()
+                        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                            futures = {
+                                executor.submit(_profile_image_worker, t): idx
+                                for idx, t in enumerate(tasks)
+                            }
+                            for future in as_completed(futures):
+                                task_idx = futures[future]
+                                try:
+                                    result = future.result()
+                                    writer.add(result)
+                                    completed += 1
+                                    sp.tick("")
+                                except InterruptedError:
+                                    raise
+                                except Exception:
+                                    logger.exception("Image profiling failed for row %d — aborting", chunk_start + task_idx)
+                                    raise
         except InterruptedError:
             logger.info("Image profiling interrupted by user")
         except Exception:
@@ -172,7 +177,9 @@ def profile_images(
             logger.exception("Image profiling failed")
             raise
         finally:
-            progress.step_end("Profile image", f"Profiled {completed} images")
+            # step_start/step_end are emitted by the orchestrator
+            # (pipeline.steps._run_profile) — emitting step_end here too would
+            # double-report the same step key to the progress collector.
             result_df = writer.close()
 
     return result_df

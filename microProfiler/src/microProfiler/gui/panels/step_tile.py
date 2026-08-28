@@ -13,8 +13,8 @@ from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp
 class TileStepPanel(BaseStepPanel):
     step_name = "tile"
     _FIELD_MAP = {
-        "_tile_w": ("tile_width", int, 1024),
-        "_tile_h": ("tile_height", int, 1024),
+        "_tile_w": "tile_width",
+        "_tile_h": "tile_height",
     }
 
     def __init__(self, state, parent=None):

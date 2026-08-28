@@ -7,7 +7,7 @@ from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp
 
 class ResizeStepPanel(BaseStepPanel):
     step_name = "resize"
-    _FIELD_MAP = {"_scale_factor": ("scale_factor", float, 0.5)}
+    _FIELD_MAP = {"_scale_factor": "scale_factor"}
 
     def __init__(self, state, parent=None):
         super().__init__(state, parent)

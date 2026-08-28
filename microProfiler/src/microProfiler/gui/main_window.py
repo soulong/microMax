@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import logging
+import re
 from pathlib import Path
 from typing import Optional
+
+import yaml
+import warnings
 
 from PySide6.QtCore import Qt, QEvent, QObject
 from PySide6.QtWidgets import (
@@ -23,18 +28,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-import logging
-import yaml
-import warnings
-
 from microBase import (
     SessionFile,
     ImageDataset,
+    normalize_null_strings,
     DEFAULT_IMAGE_PATTERN,
     DEFAULT_MASK_PATTERN,
     DEFAULT_IMAGE_SUBDIR_PATTERN,
 )
-from microBase.config import normalize_null_strings
 from microProfiler.gui.pipeline_controller import PipelineController
 from microProfiler.gui.state import PipelineState
 from microProfiler.gui.workers.preview_worker import PreviewWorker
@@ -48,8 +49,7 @@ from microProfiler.gui.panels import (
 from microProfiler.gui.panels.base_step_panel import BaseStepPanel
 from microProfiler.gui.image_widgets import ImageViewer
 from microProfiler.gui.dpi import dp
-from microProfiler.io import clone_dataset
-from microProfiler.logging_utils import setup_logging
+from microProfiler.log_utils import setup_logging
 
 
 class WindowWheelFilter(QObject):
@@ -76,7 +76,6 @@ class WindowWheelFilter(QObject):
 
     @staticmethod
     def _page_scroll_area(window, page_idx: int):
-        from PySide6.QtWidgets import QScrollArea
         page = window._stack.widget(page_idx)
         if page is None:
             return None
@@ -200,6 +199,25 @@ class MainWindow(QMainWindow):
 
     def update_tab_status(self) -> None:
         self._update_tab_status()
+
+    def refresh_step_panels(self, channels=None, masks=None) -> None:
+        """Repopulate channel/mask-driven panels after dataset state changes.
+
+        Channels go to segment / image_profile / object_profile / inference
+        panels. Masks: pass an explicit list (e.g. [] on reset) to use it
+        verbatim, or leave None to use the controller's segment-first mask
+        ordering (segment Object names first, then dataset masks).
+        """
+        ch = list(channels) if channels is not None else []
+        self._segment_panel.populate_channels(ch)
+        self._image_profile_panel.populate_channels(ch)
+        self._object_profile_panel.populate_channels(ch)
+        self._inference_panel.populate_channels(ch)
+        if masks is None:
+            self._ctrl._sync_seg_masks_to_profiling()
+        else:
+            self._object_profile_panel.populate_masks(list(masks))
+            self._inference_panel.populate_masks(list(masks))
 
     @property
     def dataset(self):
@@ -604,7 +622,6 @@ class MainWindow(QMainWindow):
         mask_pattern = self.get_mask_pattern()
         raw_pattern = self.get_image_subdir_pattern()
 
-        import re
         try:
             img_pat = re.compile(image_pattern) if image_pattern else None
             msk_pat = re.compile(mask_pattern) if mask_pattern else None
@@ -668,15 +685,8 @@ class MainWindow(QMainWindow):
             else:
                 self._filter_panel._reset_filters()
 
-            self._segment_panel.populate_channels(ds.intensity_colnames)
-            self._image_profile_panel.populate_channels(ds.intensity_colnames)
-            self._object_profile_panel.populate_channels(ds.intensity_colnames)
-            self._object_profile_panel.populate_masks(ds.mask_colnames)
-            self._inference_panel.populate_channels(ds.intensity_colnames)
-            self._inference_panel.populate_masks(ds.mask_colnames)
-            self._ctrl._sync_seg_masks_to_profiling()
-            if hasattr(self._basic_panel, "set_preview_channels"):
-                self._basic_panel.set_preview_channels(ds.intensity_colnames)
+            self.refresh_step_panels(ds.intensity_colnames)
+            self._basic_panel.set_preview_channels(ds.intensity_colnames)
 
             # max_value is read from config and always trusted; a mismatch
             # against the dataset dtype is a non-blocking warning (§Q12) so the
@@ -803,10 +813,7 @@ class MainWindow(QMainWindow):
             ch = tuple(ds.intensity_colnames)
             masks = tuple(ds.mask_colnames)
             if ch != getattr(self, "_last_filter_channels", None):
-                self._segment_panel.populate_channels(ds.intensity_colnames)
-                self._image_profile_panel.populate_channels(ds.intensity_colnames)
-                self._object_profile_panel.populate_channels(ds.intensity_colnames)
-                self._inference_panel.populate_channels(ds.intensity_colnames)
+                self.refresh_step_panels(ds.intensity_colnames)
                 self._last_filter_channels = ch
             if masks != getattr(self, "_last_filter_masks", None):
                 self._ctrl._sync_seg_masks_to_profiling()
@@ -890,14 +897,10 @@ class MainWindow(QMainWindow):
         for step in self._all_step_panels:
             step.from_config(params.get(step.step_name, {}))
         if self._state.dataset is not None:
-            ch = self._state.dataset.intensity_colnames
-            mk = self._state.dataset.mask_colnames
-            self._segment_panel.populate_channels(ch)
-            self._image_profile_panel.populate_channels(ch)
-            self._object_profile_panel.populate_channels(ch)
-            self._object_profile_panel.populate_masks(mk)
-            self._inference_panel.populate_channels(ch)
-            self._inference_panel.populate_masks(mk)
+            self.refresh_step_panels(
+                self._state.dataset.intensity_colnames,
+                self._state.dataset.mask_colnames,
+            )
         applied = data.get("applied_steps", [])
         for step in self._all_step_panels:
             if step.step_name in applied:
@@ -924,17 +927,10 @@ class MainWindow(QMainWindow):
         if inf_panel is not None:
             inf_panel._pending_block_configs = []
         self._filter_panel._reset_filters()
-        if hasattr(self._basic_panel, "_clear_preview"):
-            self._basic_panel._clear_preview()
-            self._basic_panel.set_preview_channels([])
-        if hasattr(self._segment_panel, "clear_preview"):
-            self._segment_panel.clear_preview()
-            self._segment_panel.populate_channels([])
-        self._image_profile_panel.populate_channels([])
-        self._object_profile_panel.populate_channels([])
-        self._object_profile_panel.populate_masks([])
-        self._inference_panel.populate_channels([])
-        self._inference_panel.populate_masks([])
+        self._basic_panel._clear_preview()
+        self._basic_panel.set_preview_channels([])
+        self._segment_panel.clear_preview()
+        self.refresh_step_panels([], [])
         self._input_dir.clear()
         self._output_dir.clear()
         self._output_manually_set = False

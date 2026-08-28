@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import List
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 from microBase import ImageDataset
 from microProfiler.io import read_image, write_image, rebuild_dataset
+from microProfiler.progress import StepProgress
 from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
 
 logger = logging.getLogger(__name__)
@@ -53,39 +54,41 @@ def z_project_dataset(
 
     grouped = metadata.groupby(group_cols, sort=False)
     all_groups = list(grouped)
+    total = len(all_groups)
 
-    for gi, (group_key, group_df) in enumerate(tqdm(all_groups, desc="Z-projection", unit="group")):
-        progress.report("Z-projection", gi, len(all_groups), f"Group {group_key}")
-        if len(group_df) <= 1:
-            continue
-
-        for ch in ds.intensity_colnames:
-            paths = [Path(row[ch]) for _, row in group_df.iterrows() if pd.notna(row[ch])]
-            paths = [p for p in paths if p.exists()]
-            if not paths:
-                logger.warning("No existing files for channel %s in group, skipping", ch)
+    with StepProgress("Z-projection", total, progress, desc="Z-projection", unit="group") as sp:
+        for gi, (group_key, group_df) in enumerate(all_groups):
+            sp.report(gi, f"Group {group_key}")
+            if len(group_df) <= 1:
                 continue
 
-            projected = z_project_single(paths, method)
-            src_name = paths[0].name
-            m = ds._image_pattern.match(src_name)
-            if m:
-                try:
-                    s_start, s_end = m.span('stack')
-                    stem = src_name.rsplit('.', 1)[0]
-                    ext = src_name.rsplit('.', 1)[1] if '.' in src_name else 'tiff'
-                    out_name = stem[:s_start] + '0' + stem[s_end:] + '.' + ext
-                except (IndexError, ValueError):
+            for ch in ds.intensity_colnames:
+                paths = [Path(row[ch]) for _, row in group_df.iterrows() if pd.notna(row[ch])]
+                paths = [p for p in paths if p.exists()]
+                if not paths:
+                    logger.warning("No existing files for channel %s in group, skipping", ch)
+                    continue
+
+                projected = z_project_single(paths, method)
+                src_name = paths[0].name
+                m = re.compile(ds.image_pattern).match(src_name)
+                if m:
+                    try:
+                        s_start, s_end = m.span('stack')
+                        stem = src_name.rsplit('.', 1)[0]
+                        ext = src_name.rsplit('.', 1)[1] if '.' in src_name else 'tiff'
+                        out_name = stem[:s_start] + '0' + stem[s_end:] + '.' + ext
+                    except (IndexError, ValueError):
+                        out_name = src_name
+                else:
                     out_name = src_name
-            else:
-                out_name = src_name
 
-            out_path = paths[0].parent / out_name
-            if delete_original:
-                for p in paths:
-                    if p.exists():
-                        p.unlink()
-            write_image(out_path, projected)
+                out_path = paths[0].parent / out_name
+                if delete_original:
+                    for p in paths:
+                        if p.exists():
+                            p.unlink()
+                write_image(out_path, projected)
 
-    progress.report("Z-projection", len(all_groups), len(all_groups), "Z-projection complete")
+        sp.finish("Z-projection complete")
     return rebuild_dataset(ds)
