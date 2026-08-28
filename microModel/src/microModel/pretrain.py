@@ -164,13 +164,18 @@ def _try_resume(config, device, method):
     merge_locked_normalize(saved_cfg, config)
 
     # Method-specific block (e.g. byol/dinov2 head dims) — bundle wins so the
-    # saved model state (heads included) loads without shape mismatch.
-    sm = saved_cfg.get(method, {})
-    cm = config.get(method, {})
+    # saved model state (heads included) loads without shape mismatch. The
+    # block key must be the FINAL method: the ("method",) locked key above may
+    # have just replaced config["method"] with the bundle's method, and
+    # looking up the OLD name would both miss the bundle block AND zero out
+    # the user's (new-name) block.
+    final_method = (ckpt.get("meta") or {}).get("method", method)
+    sm = saved_cfg.get(final_method, {})
+    cm = config.get(final_method, {})
     if str(cm) != str(sm):
         logger.warning("Locked %s block differs: bundle=%s, config=%s; using bundle value",
-                       method, sm, cm)
-        config[method] = sm
+                       final_method, sm, cm)
+        config[final_method] = sm
 
     return ckpt, config
 
@@ -228,6 +233,14 @@ def pretrain_ssl(config, config_path=None):
         # activations. Force fp32 accumulation for fp16 matmuls.
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     checkpoint, config = _try_resume(config, device, method)
+    # _try_resume may have replaced config["method"] with the bundle's method
+    # (locked key, bundle wins) — re-read it so every downstream dispatch
+    # (method_cfg, build_ssl_model, meta, optimizer/criterion) uses the method
+    # the model was ACTUALLY built with.
+    method = config["method"]
+    if method not in ("byol", "dinov2"):
+        print(f"Error: unknown SSL method '{method}'. Available: byol, dinov2", file=sys.stderr)
+        sys.exit(1)
 
     # resume.type: 'continue' = exact same-data extension (schedules/optimizer/
     # epoch counter continue where the interrupted run left off); 'transfer' =
@@ -520,14 +533,21 @@ def pretrain_ssl(config, config_path=None):
     # final epoch, so per-epoch PDFs are directly comparable. Features use
     # the deterministic augmentation_infer pipeline. Disabled when 0/null.
     n_image_umap = train_cfg.get("n_image_umap")
+    if n_image_umap is not None:
+        try:
+            n_image_umap = int(n_image_umap)
+        except (TypeError, ValueError):
+            print(f"Error: training.n_image_umap must be an integer, got {n_image_umap!r}",
+                  file=sys.stderr)
+            sys.exit(1)
+        if n_image_umap < 0:
+            print("Error: training.n_image_umap must be >= 0 (0 = disabled)",
+                  file=sys.stderr)
+            sys.exit(1)
     umap_check_loader = None
     last_umap_epoch = None
-    if n_image_umap is not None and int(n_image_umap) < 0:
-        print("Error: training.n_image_umap must be >= 0 (0 = disabled)",
-              file=sys.stderr)
-        sys.exit(1)
     if n_image_umap:
-        n_pick = min(int(n_image_umap), len(all_pairs))
+        n_pick = min(n_image_umap, len(all_pairs))
         if n_pick < 5:
             logger.warning("n_image_umap=%s but only %d images available; "
                            "UMAP check disabled (< 5)", n_image_umap, len(all_pairs))

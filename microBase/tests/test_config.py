@@ -37,6 +37,14 @@ def test_load_yaml_empty_returns_empty_dict(tmp_path):
     assert load_yaml(path) == {}
 
 
+def test_load_yaml_non_dict_root_raises(tmp_path):
+    """A YAML root that is not a mapping must raise, never silently become {}."""
+    path = tmp_path / "list.yml"
+    path.write_text("- a\n- b\n")
+    with pytest.raises(ValueError, match="mapping"):
+        load_yaml(path)
+
+
 def test_save_yaml_creates_parent_dirs(tmp_path):
     path = tmp_path / "subdir" / "nested" / "config.yml"
     save_yaml(path, {"k": "v"})

@@ -18,6 +18,7 @@ LRU-caches raw (image, mask_dict) per row_idx so repeated crop calls don't
 re-read from disk.
 """
 
+import re
 import sys
 import logging
 import threading
@@ -44,13 +45,19 @@ def _pattern_string(pattern):
 
 def _apply_filter(df, col, pat):
     """Filter a metadata frame by regex on a column, hard-exiting on an
-    unknown column. Shared by build_metadata and filter_metadata."""
+    unknown column or invalid regex. Shared by build_metadata and
+    filter_metadata."""
     if col not in df.columns:
         print(
             f"Error: filter column '{col}' not in metadata columns: "
             f"{list(df.columns)}",
             file=sys.stderr,
         )
+        sys.exit(1)
+    try:
+        re.compile(pat)
+    except re.error as e:
+        print(f"Error: invalid regex for filter on '{col}': {e}", file=sys.stderr)
         sys.exit(1)
     return df[df[col].astype(str).str.contains(pat, regex=True, na=False)]
 
@@ -422,23 +429,30 @@ class ImageDataset:
         """Read the first image to get shape, dtype, and (for multi-channel-per-file) channels."""
         if len(self._metadata) == 0:
             return
-        row = self._metadata.iloc[0]
         if self.channel_layout is None:
             # one-channel-per-file: use intensity_colnames set by build_metadata
             ch_cols = self._intensity_colnames
             if not ch_cols:
                 return
-            first_path = row[ch_cols[0]]
-            arr = _io.read_tiff(first_path)
-            self._img_shape = arr.shape  # (H, W)
-            self._img_dtype = arr.dtype
+            # Skip mask-only rows (NaN image path) — the properties come from
+            # the first row that actually has an image file.
+            for _, row in self._metadata.iterrows():
+                first_path = row[ch_cols[0]]
+                if pd.isna(first_path):
+                    continue
+                arr = _io.read_tiff(first_path)
+                self._img_shape = arr.shape  # (H, W)
+                self._img_dtype = arr.dtype
+                return
         else:
             # multi-channel-per-file: open first TIFF, count channels
-            if "__file__" not in row:
+            for _, row in self._metadata.iterrows():
+                if "__file__" not in row or pd.isna(row["__file__"]):
+                    continue
+                self._img_shape, n_channels, self._img_dtype = _io.detect_tiff_properties(
+                    row["__file__"], self.channel_layout)
+                self._intensity_colnames = [f"ch{i}" for i in range(1, n_channels + 1)]
                 return
-            self._img_shape, n_channels, self._img_dtype = _io.detect_tiff_properties(
-                row["__file__"], self.channel_layout)
-            self._intensity_colnames = [f"ch{i}" for i in range(1, n_channels + 1)]
 
     def _shared_key(self, groupdict):
         """Build a hashable shared key from regex captures, ignoring channel/mask_name."""
@@ -482,9 +496,10 @@ class ImageDataset:
         else:
             # multi-channel-per-file: the file path is stored under "__file__"
             # (kept as a private column, never re-parsed).
-            if "__file__" not in row:
+            if "__file__" not in row or pd.isna(row["__file__"]):
                 print(
-                    "Error: multi-channel-per-file mode requires __file__ column. "
+                    "Error: multi-channel-per-file mode requires __file__ column "
+                    "(row has no image file — mask-only or deleted file). "
                     "Rebuild metadata.",
                     file=sys.stderr,
                 )
@@ -562,6 +577,13 @@ class ImageDataset:
             )
             sys.exit(1)
         row = self._metadata.iloc[row_idx]
+        if channel not in self._intensity_colnames or channel not in row:
+            print(
+                f"Error: channel '{channel}' not in metadata columns for row "
+                f"{row_idx} (available: {self._intensity_colnames})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         p = row[channel]
         if pd.isna(p):
             print(

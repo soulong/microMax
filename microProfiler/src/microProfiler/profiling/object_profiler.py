@@ -602,7 +602,11 @@ def profile_objects(
                                 except Exception:
                                     logger.exception("Object profiling failed for row %d — skipping", chunk_start + task_idx)
         except InterruptedError:
-            logger.info("Object profiling interrupted by user")
+            # A cancel must propagate so the pipeline treats the run as
+            # interrupted (never as a completed step): the GUI relies on
+            # InterruptedError to skip success handlers and applied_steps
+            # bookkeeping. The writer still flushes below in `finally`.
+            raise
         except Exception:
             # A run-level profiling failure re-raises so the dataset is NOT
             # reported complete. Batches flushed before the failure are

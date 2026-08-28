@@ -258,7 +258,12 @@ def _plot_reduction_scatter(X, labels, label_names, title, xlabel, ylabel,
     fig, ax = plt.subplots(figsize=(9, 6))
 
     if continuous:
-        prob_arr = np.array(pred_probs, dtype=np.float64) if pred_probs is not None else np.array(labels, dtype=np.float64)
+        # Continuous scatter is only used for pred_prob, whose values always
+        # come from the DB rows (probs_fit) — never fall back to `labels`
+        # (class-name strings would raise inside np.array(..., float64)).
+        if pred_probs is None:
+            raise ValueError("continuous scatter requires pred_probs")
+        prob_arr = np.array(pred_probs, dtype=np.float64)
         sort_idx = np.argsort(prob_arr)
         X_plot = X[sort_idx]
         sc = ax.scatter(X_plot[:, 0], X_plot[:, 1], c=prob_arr[sort_idx],
@@ -393,7 +398,7 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
         if not os.path.exists(db_path):
             logger.warning("Database not found: %s. Run inference first.", db_path)
             continue
-        feats, dicts = _load_inference_features(db_path)
+        feats, dicts = _load_inference_features(db_path, raise_on_error=raise_on_error)
         if feats is None:
             continue
         logger.info("Loaded %d feature vectors (dim=%d) from %s",
@@ -464,6 +469,8 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
 
     if reducer_pca_path:
         if not os.path.exists(reducer_pca_path):
+            if raise_on_error:
+                raise RuntimeError(f"reducer_pca not found: {reducer_pca_path}")
             print(f"Error: reducer_pca not found: {reducer_pca_path}", file=sys.stderr)
             sys.exit(1)
         pca_full = load_reducer(reducer_pca_path)
@@ -487,6 +494,8 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
 
     if reducer_umap_path:
         if not os.path.exists(reducer_umap_path):
+            if raise_on_error:
+                raise RuntimeError(f"reducer_umap not found: {reducer_umap_path}")
             print(f"Error: reducer_umap not found: {reducer_umap_path}", file=sys.stderr)
             sys.exit(1)
         umap_pipeline = load_reducer(reducer_umap_path)
@@ -622,8 +631,12 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                 feats_fit.shape[0], len(db_entries), save_dirs)
 
 
-def _load_inference_features(db_path):
-    """Load all rows from the inference table. Returns (feats, dicts) or (None, None)."""
+def _load_inference_features(db_path, raise_on_error=False):
+    """Load all rows from the inference table. Returns (feats, dicts) or (None, None).
+
+    raise_on_error=True converts the NULL-features abort into a raised
+    RuntimeError (microProfiler's bridge) instead of print + sys.exit (CLI).
+    """
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.execute(
@@ -645,11 +658,13 @@ def _load_inference_features(db_path):
         for d in dicts:
             f = d["features"]
             if f is None:
-                print(
-                    f"Error: row uid={d.get('uid')} has NULL features. "
-                    "Run inference with inference.feature: true",
-                    file=sys.stderr,
+                msg = (
+                    f"row uid={d.get('uid')} has NULL features. "
+                    "Run inference with inference.feature: true"
                 )
+                if raise_on_error:
+                    raise RuntimeError(f"{db_path}: {msg}")
+                print(f"Error: {msg}", file=sys.stderr)
                 sys.exit(1)
             feats_arr.append(np.frombuffer(f, dtype=np.float32))
         feats = np.stack(feats_arr, axis=0)
@@ -753,8 +768,8 @@ def plot_training_results(model, device, val_loader, num_classes, label_to_idx,
     plt.close(fig)
 
     from sklearn.metrics import accuracy_score, f1_score
-    final_acc = float(accuracy_score(yt_all, yp_all))
-    final_f1 = float(f1_score(yt_all, yp_all, average="macro", zero_division=0))
+    final_acc = float(accuracy_score(yt_all, yp_all)) if yt_all else 0.0
+    final_f1 = float(f1_score(yt_all, yp_all, average="macro", zero_division=0)) if yt_all else 0.0
     return {"cm": cm, "final_loss": train_loss_history[-1],
             "final_acc": val_acc_history[-1], "final_f1": final_f1,
             "final_val_acc": final_acc, "final_val_f1": final_f1}

@@ -38,7 +38,8 @@ def normalize_null_strings(obj):
 
 
 def load_yaml(path):
-    """Load a YAML file. Print + exit on missing file or parse error."""
+    """Load a YAML file. Print + exit on missing file or parse error;
+    raise ValueError when the root is not a mapping (no silent {} fallback)."""
     path = Path(path)
     if not path.exists():
         print(f"Error: YAML file not found: {path}", file=sys.stderr)
@@ -49,7 +50,13 @@ def load_yaml(path):
     except yaml.YAMLError as e:
         print(f"Error: failed to parse YAML {path}: {e}", file=sys.stderr)
         sys.exit(1)
-    return normalize_null_strings(data if isinstance(data, dict) else {})
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Error: YAML root must be a mapping, got {type(data).__name__} in {path}"
+        )
+    return normalize_null_strings(data)
 
 
 def save_yaml(path, data):

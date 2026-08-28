@@ -86,6 +86,13 @@ class _ThumbnailView(QGraphicsView):
         self._full_res_item = None
         self._fade_timer = None
         self._full_res_gen = 0  # generation counter to reject stale results
+        # Full-res overlay state — assigned by set_full_res_pixmap; preset to
+        # None so restyle_overlay/render_overlay never hit AttributeError in
+        # the window between wheelEvent (sets _is_full_res) and the result.
+        self._full_res_base_pixmap = None
+        self._full_res_polygons = None
+        self._full_res_alpha = None
+        self._full_res_cmap = None
 
         # Create QPixmap from numpy RGB
         self._base_rgb = rgb.copy()

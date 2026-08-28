@@ -424,10 +424,13 @@ class VisInteractiveServer:
             if img_hwc.ndim == 2:
                 img_hwc = img_hwc[:, :, None]
 
-            # Adjust requested_channels if image has fewer channels
+            # Adjust requested_channels if image has fewer channels. Filtering (not
+            # truncating) keeps the labels honest: truncating [1,3,5] to two
+            # entries would render channel-index 1's data under the label
+            # "ch3". Only in-range requests are kept (labels stay the true
+            # 1-based indices).
             actual_n = img_hwc.shape[2]
-            if len(requested_channels) > actual_n:
-                requested_channels = requested_channels[:actual_n]
+            requested_channels = [c for c in requested_channels if c <= actual_n]
 
             mask = (img_hwc != 0).any(axis=2).astype(np.uint8) if do_mask else None
             # size="model": convert to float [0, 1] by data.max_value, then

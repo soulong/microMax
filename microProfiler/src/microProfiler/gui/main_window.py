@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
 
 from microBase import (
     SessionFile,
-    ImageDataset,
     normalize_null_strings,
     DEFAULT_IMAGE_PATTERN,
     DEFAULT_MASK_PATTERN,
@@ -166,9 +165,10 @@ class MainWindow(QMainWindow):
         return f"[{step}] {bar} {current}/{total} ({pct*100:.0f}%)"
 
     def _on_log_progress(self, step: str, current: int, total: int, message: str) -> None:
-        if total <= 0 and message:
-            # Status line (e.g. microModel's "Fitting PCA + UMAP...") —
-            # show the text instead of a meaningless 0/1 bar.
+        if message and (total <= 0 or current == 0):
+            # Status/start lines (e.g. "Starting...", microModel's INFO logs) —
+            # show the text instead of a meaningless 0/N bar. step_start emits
+            # (0, 1, msg), so current==0 with a message is a text line too.
             self._progress_label.setText(f"[{step}] {message}")
         else:
             self._progress_label.setText(self._tqdm_bar(step, current, total))

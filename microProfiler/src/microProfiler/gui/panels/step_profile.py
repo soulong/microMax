@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRegularExpression, Qt
+from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QCheckBox,
@@ -223,6 +224,12 @@ class ObjectProfileBlockWidget(QWidget):
         self._glcm_layout.addWidget(QLabel("Distances:"))
         self._glcm_distances = QLineEdit("2")
         self._glcm_distances.setFixedWidth(50)
+        # Only digits/commas/spaces are accepted — build_config_section
+        # int-parses this text, so invalid characters would raise a raw
+        # ValueError inside the Qt slot.
+        self._glcm_distances.setValidator(
+            QRegularExpressionValidator(QRegularExpression(r"[0-9,\s]*"), self)
+        )
         self._glcm_distances.setToolTip(
             "Pixel offsets for Gray-Level Co-occurrence Matrix. "
             "Larger distances capture longer-range texture patterns. "

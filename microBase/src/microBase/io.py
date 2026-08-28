@@ -162,6 +162,10 @@ def read_tiff_channels(path, channels, channel_layout="CHW"):
             file=sys.stderr,
         )
         sys.exit(1)
+    if not channels:
+        # §3.19: at the library level an empty channel list is an error (the
+        # pipeline is the only place where empty channels mean "skip").
+        raise ValueError(f"channels list must not be empty at {path}")
     try:
         with TiffFile(path) as tif:
             arr = tif.asarray()

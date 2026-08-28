@@ -41,9 +41,28 @@ def _row_to_letter(row_val):
 def derive_well(row_val, col_val):
     """Build a well label like 'A1' from row+col values.
 
-    Raises ValueError with a clear message if the column value is not
-    numeric (metadata is TEXT, so e.g. '1.5' or 'A' reach this point).
+    row accepts integers, numeric strings, or pure alphabetic strings
+    (e.g. 'A' — _row_to_letter handles both); mixed values like '1.5' or
+    'A1' raise ValueError. col must be an integer (metadata is TEXT, so
+    e.g. '1.5' or 'A' reach this point).
     """
+    if isinstance(row_val, str):
+        if not (row_val.isalpha() or row_val.isdigit()):
+            raise ValueError(
+                f"derive_well: row value {row_val!r} is not numeric or alphabetic — "
+                f"row/col captures must be integers (or an alphabetic row) to "
+                f"derive a well label."
+            )
+    elif not isinstance(row_val, int) or isinstance(row_val, bool):
+        try:
+            if int(row_val) != row_val:
+                raise TypeError
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"derive_well: row value {row_val!r} is not numeric or alphabetic — "
+                f"row/col captures must be integers (or an alphabetic row) to "
+                f"derive a well label."
+            ) from None
     try:
         col_int = int(col_val)
     except (TypeError, ValueError):

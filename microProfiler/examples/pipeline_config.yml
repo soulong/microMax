@@ -125,7 +125,7 @@ object_profile:
 #   configs:
 #     - model: D:\models\runs\model.pt
 #       mask_name: cell
-#       channels: null            # ORDERED channel names; top-to-bottom = model input order; null = all
+#       channels: null            # ORDERED channel names; top-to-bottom = model input order; null/[] = block SKIPPED (never "all")
 #       feature: true
 #       pred_class: true
 #       pred_prob: true

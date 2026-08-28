@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from PySide6.QtCore import QObject, QRunnable, Signal
 from skimage.transform import resize as sk_resize
 

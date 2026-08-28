@@ -133,7 +133,7 @@ Dataset", which is distinct from "Browse").
 
 ## 3. Cross-cutting design rules
 
-1. **Minimal interface, deep module.** `microBase` exposes 23 public names
+1. **Minimal interface, deep module.** `microBase` exposes 20 public names
    from a flat 10-module layout. Consumers reach for `microBase.X` first; a
    new function goes into `microBase` only if at least two consumers need it.
 2. **No guessing, hard-exit on bad input.** CLI error paths are
@@ -190,7 +190,10 @@ Dataset", which is distinct from "Browse").
     hierarchy. The one shared exception is `MetadataValidationError` in
     `microProfiler.pipeline` (raised in `_run_zproject`/`_run_tile`, caught in
     `cli.main`). `derive_well` raises `ValueError` (not SystemExit) on
-    non-numeric row/col — GUI dataset-load workers catch `Exception`; a
+    non-numeric row/col — row accepts integers, numeric strings, or pure
+    alphabetic strings (e.g. `'A'`); mixed values like `'1.5'`/`'A1'` are
+    rejected, and col must be an integer. GUI dataset-load workers catch
+    `Exception`; a
     `SystemExit` there would strand the modal dialog. All GUI worker threads
     that call microBase (dataset load, preview, pipeline, microVis loaders)
     catch `SystemExit` explicitly and route it through the error signal,
@@ -271,7 +274,7 @@ Dataset", which is distinct from "Browse").
 ## 4. microBase — shared foundation
 
 **Path:** `microMax/microBase/`
-**Version:** `0.9.0`  •  **Layout:** flat, 10 modules under `src/microBase/`
+**Version:** `0.9.1`  •  **Layout:** flat, 10 modules under `src/microBase/`
 **Dependencies:** `numpy`, `pandas`, `tifffile`, `Pillow`, `pyyaml`,
 `albumentationsx`, `natsort`.
 
@@ -280,7 +283,7 @@ Dataset", which is distinct from "Browse").
 | Module | Purpose | Public API |
 |---|---|---|
 | `__init__.py` | Re-exports 20 public names; sets `NO_ALBUMENTATIONS_UPDATE=1` + `ALBUMENTATIONS_NO_TELEMETRY=1`; defines `__version__`. | all of the below |
-| `schema.py` | Classify regex-captured columns; derive `well` from `row+col`. Captures are used verbatim (all metadata stays TEXT). `derive_well` raises `ValueError` on non-numeric col. | `MetadataSchema`, `derive_well` |
+| `schema.py` | Classify regex-captured columns; derive `well` from `row+col`. Captures are used verbatim (all metadata stays TEXT). `derive_well` raises `ValueError` on non-numeric row/col (row: int/numeric-string/alphabetic only; col: integer only). | `MetadataSchema`, `derive_well` |
 | `io.py` | TIFF/mask readers; normalizes to `(H, W, C)`. Accepts `channel_layout` of `None` / `"CHW"` / `"HWC"`. No writers — microProfiler writes with its own zlib writer. | `read_tiff`, `read_tiff_channels`, `read_mask` |
 | `cells.py` | Pure functions for cropping single cells from labeled masks. `crop_cell` hard-exits on `label < 1` and on zero-pixel labels. | `get_labels`, `crop_cell`, `crop_all_cells` |
 | `config.py` | YAML load/save + per-dataset `SessionFile`. `load_yaml` recursively normalizes string spellings of `null`/`None`/`none` (case-insensitive) to Python `None`. | `load_yaml`, `save_yaml`, `SessionFile`, `normalize_null_strings` |
@@ -436,7 +439,7 @@ or setting them in `session.yml`.
 ## 5. microProfiler — pipeline + Qt GUI
 
 **Path:** `microMax/microProfiler/`
-**Version:** `1.6.0`  •  **Entry:** `microprofiler` (CLI: `run`; GUI: no args)
+**Version:** `1.6.1`  •  **Entry:** `microprofiler` (CLI: `run`; GUI: no args)
 **Deps on microBase:** `ImageDataset`, `SessionFile`, `load_yaml`,
 `normalize_null_strings`,
 `read_tiff`, `read_mask`,
@@ -538,7 +541,17 @@ src/microProfiler/
   right/bottom remainder regions (and images smaller than the tile size,
   which produce zero tiles) are intentionally dropped, and
   `delete_original=True` deletes the sources afterwards. Choose tile sizes
-  that divide the image dimensions, or the remainder is lost.
+  that divide the image dimensions, or the remainder is lost. Paths are
+  resolved from the source rows (absolute) and tiles are written next to
+  their sources (`src.parent`) — never relative to the process CWD, which
+  would orphan tiles (and then delete the real sources) when the CLI runs
+  from a different working directory.
+- **Profiling cancel semantics.** A GUI cancel during profiling raises
+  `InterruptedError` which propagates out of `profile_images`/`profile_objects`
+  (never logged as a completed run): the pipeline treats the step as
+  interrupted, so success handlers and `applied_steps` bookkeeping are
+  skipped. Batches flushed before the cancel are committed (the usual
+  partial-write caveat applies).
 - **Z-projection deletes sources BEFORE writing the projection**
   (`delete_original=True`, then write). This order is intentional: multiple
   input stacks can map to the same projection filename, so write-then-delete
@@ -608,13 +621,16 @@ src/microProfiler/
   terminal (tqdm renders exactly like `micromodel infer`) and to the progress
   collector: tqdm lines become live status-bar bars, microModel's INFO logs
   become status lines. `max_value` is REQUIRED per block and always trusted
-  as configured — the GUI derives the dtype max only to default new blocks
-  and to show a NON-blocking mismatch warning on dataset load.
+  as configured — the GUI derives the dtype max only to default NEW blocks
+  and to show a NON-blocking mismatch warning on dataset load. A max_value
+  that came from a config/session restore (or a block copy) is marked
+  explicit and is never overwritten by the dtype default, even when it
+  equals the default (65535).
   `feature`/`pred_class`/`pred_prob` are per-block toggles; SSL bundles (no
   `num_classes` in meta, read on model selection) force features-only in the
   GUI. `pred_prob` requires `pred_class`. Duplicate `output_db` names block
-  Run. No plots are produced for reduction — microProfiler is a data-only
-  analysis suite.
+  Run (GUI) and hard-exit the CLI with a clear message. No plots are
+  produced for reduction — microProfiler is a data-only analysis suite.
 - **Inference channels are explicit and ordered.** Each inference block's
   channel selection is a row of plain `QCheckBox` widgets that defaults to
   NOTHING checked; a block with no checked channels is SKIPPED at runtime
@@ -626,7 +642,9 @@ src/microProfiler/
   survive dataset reloads and session restores.
 - **Model info row.** Each inference block shows an always-visible info row
   between the model selection and the mask row, populated from the bundle
-  meta when a model is selected (Browse, config restore, or block copy):
+  meta when a model is selected (Browse or block copy; a config/session
+  restore sets the model path but the row stays `—` until Run/Browse reads
+  the bundle):
   `Model type: SL - Classify` (train bundle, `num_classes` in meta) /
   `Model type: SSL - Features` (pretrain bundle), and
   `Input Channel Number: {in_chans}` (`—` until a bundle is read).
@@ -689,6 +707,20 @@ src/microProfiler/
   proceeds and the skipped unit reports a status-bar + log message. The
   headless and GUI behaviour are identical — no more "GUI blocks, CLI
   falls back" divergence.
+- **Panel validation is enforced at the widget level.** `glcm_distances` is
+  a `QLineEdit` with a digit/comma/space validator, so `build_config_section`
+  can never int-parse garbage (an unvalidated edit would raise a raw
+  `ValueError` inside the Qt slot and the run would never start).
+  `image_profile.image_channels` is validated against
+  `ds.intensity_colnames` in `profile_images` (same clear error as object
+  profiling's `_resolve_indices`).
+- **Apply on a disabled panel is a no-op.** `PipelineController.apply_step`
+  refuses to start when the panel's Run box is unchecked — an unchecked
+  Apply would execute nothing yet record the step name in `applied_steps`,
+  gating the real step out forever.
+- **Logging is idempotent.** `setup_logging` skips adding a second
+  `FileHandler` for a file the logger already writes (CLI `--log-file` +
+  `run_pipeline`'s own setup call would otherwise duplicate every record).
 
 ### 5.3 Config schema (`PipelineConfig`)
 
@@ -845,7 +877,7 @@ microModel's `directory` column when both tools process the same dataset.
 ## 6. microVis — interactive Qt viewer
 
 **Path:** `microMax/microVis/`
-**Version:** `1.2.0`  •  **Entry:** `microvis` (GUI only — no CLI subcommands)
+**Version:** `1.2.1`  •  **Entry:** `microvis` (GUI only — no CLI subcommands)
 **Deps on microBase:** `ImageDataset` (via `DataModule`), `SessionFile`,
 `DEFAULT_IMAGE_PATTERN`, `DEFAULT_MASK_PATTERN`, `DEFAULT_IMAGE_SUBDIR_PATTERN`.
 
@@ -896,9 +928,11 @@ session.yml ←─ MainWindow (patterns + channel_colors)
   `result.db`. All GUI modules go through it.
 - `MainWindow` owns one `DataModule`, one `QThreadPool`, and the label
   annotation state.
-- Workers are `QRunnable` (kept in an `_active_workers` registry until their
-  finished/error signal fires, then `deleteLater`); they emit Qt signals
-  back to `MainWindow`.
+- Workers are `QRunnable` (all four — ImageWorker, FullResWorker, CropWorker,
+  ObjectExportWorker — go through `_start_worker`, which keeps each one in an
+  `_active_workers` registry until its finished/error signal fires, then
+  drops the reference so GC frees the wrapper; QRunnables are not QObjects,
+  so there is no `deleteLater`); they emit Qt signals back to `MainWindow`.
 - Worker results are guarded by a generation counter (`_gen`) so stale
   results from a previous dataset or after a reset are silently discarded.
 - **session.yml read-once, write-on-action** (see §3.16). "Select Dataset
@@ -954,7 +988,10 @@ non-standard ones (e.g. HPA `000a6c98-..._mask_cell`) where
   selected wells, ignoring the Image Filters / "Annotated" (index 2) /
   "All" (index 3) — every object in the dataset. When the last class is
   deleted, the mode falls back to "Selected images" — never "All" or
-  "Selected wells".
+  "Selected wells". For "Selected images"/"Selected wells", wells that
+  exist in the dataset but are NOT selected abort the export with a
+  warning (never a silent whole-plate export — "All" is the explicit
+  whole-plate mode).
 
 `{mask_name}.csv` columns — one CSV file per mask type (e.g. `cell.csv`),
 written in append mode on repeated exports. The schema is dynamic: the 9
@@ -1108,7 +1145,7 @@ corrupt the display of uint32/float datasets.
 ## 7. microModel — SSL pretrain + train + infer
 
 **Path:** `microMax/microModel/`
-**Version:** `0.4.0`  •  **Entry:** `micromodel` (CLI: `pretrain`, `train`,
+**Version:** `0.4.1`  •  **Entry:** `micromodel` (CLI: `pretrain`, `train`,
 `infer`, `vis-augment`, `vis-reduction`, `vis-reduction-interactive`)
 **Deps on microBase:** `CellDataset`, `ImageDataset`, `build_pipeline`,
 `apply`, `normalize`, `read_mask`, `cells.get_labels`, `load_yaml`.
@@ -1357,7 +1394,8 @@ bundle (meta has `method`) — a train bundle hard-exits with a clear message.
 **UMAP check (`training.n_image_umap`, pretrain only)**: optional
 per-interval visual monitoring. A fixed random image subset (picked ONCE at
 run start with the training seed; max `training.n_image_umap` images;
-disabled when 0/null) is re-embedded with a FRESH `UMAP(random_state=seed)`
+disabled when 0/null; a non-integer value hard-exits) is re-embedded with a
+FRESH `UMAP(random_state=seed)`
 at every `save_interval` epoch (right after `model_{epoch}.pt`) and at the
 final epoch (unless it was already the last interval save). A pre-training
 baseline is also written before the first epoch as `umap_check_epoch_0.pdf`
@@ -1378,15 +1416,20 @@ train(config)
    │       _build_records_from_cell_dataset(...)   # one record per cell + label
    │
    ├─► resolve labels (label_from_dir | label_csv)   # labels honored verbatim
+   │       label_csv configured but missing -> hard-exit (no silent dir fallback)
    ├─► validate: all roots must resolve to the SAME channel set (hard-exit)
    ├─► subsample(records, sample_max, sample_by, seed)
-   ├─► stratified_split(records, val_ratio, seed)   # hard-exit on empty val split
+   ├─► stratified_split(records, val_ratio, seed)   # val_ratio: 0 disables
+   │       validation (val = [], evaluation skipped); > 0 requires a non-empty
+   │       val split (hard-exit otherwise); >= 1 hard-exits
    │
    ├─► if resume.ssl_model: _build_model_from_ssl(ssl_bundle, ...)
-   │       DINOv2 bundle -> rebuild ViT via timm + cls-token pooling
-   │       BYOL/conv bundle -> build_backbone + mean pooling
+   │       must be an SSL pretrain bundle (meta has 'method') — a train
+   │       bundle hard-exits; DINOv2 bundle -> rebuild ViT via timm +
+   │       cls-token pooling; BYOL/conv bundle -> build_backbone + mean pooling
    │   else: build_backbone (timm pretrained, from scratch)
    ├─► ClassificationHead + FocalLoss + AdamW + AMP + early stopping (patience)
+   │       training.epochs must be a positive integer (>= 1)
    │
    └─► save <output_dir>/{model.pt, model_{epoch}.pt (every save_interval),
                           training_plot.pdf, training_report.txt, <config>.yml}
@@ -1521,7 +1564,9 @@ auto-increments. Re-running inference on an existing DB
 replaced, so stale `reduction_pca`/`reduction_umap` rows cannot reference
 dead uids. The delete is scoped to the `directory` values of the rows being
 written, so multiple datasets sharing one `output_dir` accumulate — each
-dataset replaces only its own directories' rows. Deleting `infer.db` manually
+dataset replaces only its own directories' rows. Rows whose `directory` is
+empty/missing (source path unavailable) are deleted unconditionally, or
+re-runs would accumulate duplicates for them. Deleting `infer.db` manually
 is still required to change its schema (no migrations).
 
 ### 7.6 Config schemas

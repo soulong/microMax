@@ -161,3 +161,12 @@ class WellGridControls(QScrollArea):
         self._image_block_btn.style().unpolish(self._image_block_btn)
         self._image_block_btn.style().polish(self._image_block_btn)
         self.image_block_toggled.emit(self._image_blocked)
+
+    def reset_image_block(self) -> None:
+        """Reset the image-block toggle to the unblocked state (full reset)."""
+        self._image_blocked = False
+        self._image_block_btn.setText("Block Image")
+        self._image_block_btn.setProperty("class", "secondary")
+        self._image_block_btn.setStyleSheet("")
+        self._image_block_btn.style().unpolish(self._image_block_btn)
+        self._image_block_btn.style().polish(self._image_block_btn)

@@ -171,7 +171,7 @@ class SegmentBlockWidget(QWidget):
         self._preview_btn.setProperty("class", "secondary")
         row5.addWidget(self._pick_btn)
         row5.addWidget(self._preview_btn)
-        self._mask_toggle_btn = QPushButton("Show Mask")
+        self._mask_toggle_btn = QPushButton("Hide Mask")
         self._mask_toggle_btn.setCheckable(True)
         self._mask_toggle_btn.setChecked(True)
         self._mask_toggle_btn.setProperty("class", "secondary")

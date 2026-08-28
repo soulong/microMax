@@ -34,7 +34,8 @@ def _make_one_channel_per_file_dataset_zero_padded_channels(
 ):
     """Like the above but channels are 2-digit zero-padded (ch01, ch02, ...).
 
-    Regression fixture: ensures the channel group '01' yields column 'ch1'.
+    Regression fixture: ensures the channel group '01' yields column 'ch01'
+    (verbatim capture — no leading-zero stripping).
     """
     for site in range(n_sites):
         row = site + 1
@@ -571,3 +572,113 @@ def test_image_dataset_explicit_well_natsorted(tmp_path):
     wells = list(ds.metadata["well"])
     # Lexicographic would give A1, A10, A2 — natsorted gives A1, A2, A10.
     assert wells == ["A1", "A2", "A10"]
+
+
+def test_get_imageset_mask_only_row_exits(tmp_path):
+    """A row whose image files are missing (mask-only) must hard-exit with a
+    clear message, not crash with a raw TypeError."""
+    _make_one_channel_per_file_dataset_with_masks(tmp_path, n_sites=2)
+    # Delete site 2's image files, keeping its mask
+    for ch in (1, 2):
+        (tmp_path / f"r02c02f01p01-ch{ch}.tiff").unlink()
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)\.tiff"
+        ),
+        mask_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)_cp_masks_(?P<mask_name>\w+)\.png"
+        ),
+        channel_layout=None,
+    )
+    # Row 0 (site 1) is intact
+    img, masks = ds.get_imageset(0)
+    assert img.shape == (64, 64, 2)
+    assert "mask_cell" in masks
+    # Row 1 (site 2) is mask-only -> hard-exit
+    with pytest.raises(SystemExit):
+        ds.get_imageset(1)
+
+
+def test_get_imageset_multi_channel_mask_only_first_row(tmp_path):
+    """Multi-channel-per-file: auto-detect skips mask-only rows and the first
+    real image defines shape/channels; get_imageset on the mask-only row
+    hard-exits."""
+    # Site 1: mask only (no image)
+    mask = np.zeros((32, 32), dtype=np.uint16)
+    mask[5:15, 5:15] = 1
+    Image.fromarray(mask).save(str(tmp_path / "r01c01f01p01_ch1_cp_masks_cell.png"))
+    # Site 2: full CHW image + mask
+    arr = np.zeros((2, 32, 32), dtype=np.uint16)
+    arr[0] = 1000
+    arr[1] = 2000
+    imwrite(str(tmp_path / "r02c01f01p01.tiff"), arr)
+    mask2 = np.zeros((32, 32), dtype=np.uint16)
+    mask2[10:20, 10:20] = 1
+    Image.fromarray(mask2).save(str(tmp_path / "r02c01f01p01_ch1_cp_masks_cell.png"))
+
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)\.tiff"),
+        mask_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)_ch(?P<channel>\d+)_cp_masks_(?P<mask_name>\w+)\.png"
+        ),
+        channel_layout="CHW",
+    )
+    # Auto-detect found properties from row 1 (first row with an image)
+    assert ds.img_shape == (32, 32)
+    assert ds.intensity_colnames == ["ch1", "ch2"]
+    # Mask-only row (index 0) hard-exits
+    with pytest.raises(SystemExit):
+        ds.get_imageset(0)
+    # Intact row works
+    img, masks = ds.get_imageset(1)
+    assert img.shape == (32, 32, 2)
+    assert "mask_cell" in masks
+
+
+def test_image_path_unknown_channel_exits(tmp_path):
+    """image_path with a channel not in the metadata must hard-exit cleanly."""
+    _make_one_channel_per_file_dataset(tmp_path, n_sites=1, n_channels=2)
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)\.tiff"
+        ),
+        channel_layout=None,
+    )
+    with pytest.raises(SystemExit):
+        ds.image_path(0, "ch99")
+
+
+def test_image_path_missing_file_exits(tmp_path):
+    """image_path for a NaN (mask-only/deleted) row must hard-exit."""
+    _make_one_channel_per_file_dataset_with_masks(tmp_path, n_sites=2)
+    for ch in (1, 2):
+        (tmp_path / f"r02c02f01p01-ch{ch}.tiff").unlink()
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)\.tiff"
+        ),
+        mask_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)_cp_masks_(?P<mask_name>\w+)\.png"
+        ),
+        channel_layout=None,
+    )
+    with pytest.raises(SystemExit):
+        ds.image_path(1, "ch1")
+
+
+def test_filter_metadata_invalid_regex_exits(tmp_path):
+    """An invalid filter regex must hard-exit, never raise a raw re.error."""
+    _make_one_channel_per_file_dataset(tmp_path, n_sites=2, n_channels=1)
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)\.tiff"
+        ),
+        channel_layout=None,
+    )
+    with pytest.raises(SystemExit):
+        ds.filter_metadata("field", "(")

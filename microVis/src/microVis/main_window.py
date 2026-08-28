@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from natsort import natsort_key
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -182,13 +183,17 @@ class MainWindow(QMainWindow):
         # PyGwalker server state
         self._pgw_httpd = None
         self._pgw_thread = None
-        self._pgw_serving = False
         self._pgw_loader = None
         self._pgw_loader_thread = None
 
         # Full-res zoom cache
         self._thread_pool = QThreadPool.globalInstance()
         self._pending_workers: int = 0
+        # True while a channel-toggle batch is in flight — the batch-finish
+        # (in-place pixmap update) must also run when every worker ERRORS,
+        # otherwise _pending_workers reaches 0 with no update ever dispatched.
+        self._channel_toggle_batch: bool = False
+        self._channel_toggle_results: list = []
         self._shutting_down: bool = False
         # Retention registry for QRunnables: the workers run with
         # setAutoDelete(False), so a reference must be kept until the
@@ -440,6 +445,11 @@ class MainWindow(QMainWindow):
         self._selected_wells = set()
         self._ch_config = {}
         self._image_controls.set_channels({})
+        # Drop the previous dataset's merged metadata — otherwise the new
+        # dataset's well-grid "Color by", overlay dropdowns, and table preview
+        # would list the OLD dataset's metadata columns.
+        self._metadata_df = None
+        self._metadata_merged = None
         # Close old DataModule — it's no longer needed after browsing away.
         if self._dm is not None:
             self._dm.close()
@@ -861,15 +871,22 @@ class MainWindow(QMainWindow):
         ic.set_filter_options(fields, stacks, timepoints, extra_cols)
 
         # Connect filter signals only for widgets that exist (missing
-        # structural columns yield None widgets).
+        # structural columns yield None widgets). UniqueConnection: the
+        # widgets survive reloads of the same dataset (set_filter_options
+        # no-ops on identical options), so plain connect would stack
+        # duplicate handlers with every "Load Dataset".
         if ic.fields_widget:
-            ic.fields_widget.selection_changed.connect(self._on_image_filter_changed)
+            ic.fields_widget.selection_changed.connect(
+                self._on_image_filter_changed, Qt.UniqueConnection)
         if ic.stacks_widget:
-            ic.stacks_widget.selection_changed.connect(self._on_image_filter_changed)
+            ic.stacks_widget.selection_changed.connect(
+                self._on_image_filter_changed, Qt.UniqueConnection)
         if ic.timepoints_widget:
-            ic.timepoints_widget.selection_changed.connect(self._on_image_filter_changed)
+            ic.timepoints_widget.selection_changed.connect(
+                self._on_image_filter_changed, Qt.UniqueConnection)
         for widget in ic.get_extra_widgets().values():
-            widget.selection_changed.connect(self._on_image_filter_changed)
+            widget.selection_changed.connect(
+                self._on_image_filter_changed, Qt.UniqueConnection)
 
         # Channel controls
         ic.set_channels(self._ch_config, max_value=self._channel_max_value())
@@ -1020,12 +1037,30 @@ class MainWindow(QMainWindow):
 
     # ── PyGwalker ────────────────────────────────────────────────────────────
 
+    def _cleanup_pygwalker_loader(self) -> None:
+        """Quit and release an in-flight PyGwalker loader thread, if any.
+
+        A slow first load must never tear down a NEWER loader: a stale
+        data_ready from the old thread would quit/delete the new loader and
+        start the server with the old table's data.
+        """
+        if self._pgw_loader_thread is not None:
+            self._pgw_loader_thread.quit()
+            self._pgw_loader_thread.wait()
+        if self._pgw_loader is not None:
+            self._pgw_loader.deleteLater()
+            self._pgw_loader = None
+        if self._pgw_loader_thread is not None:
+            self._pgw_loader_thread.deleteLater()
+            self._pgw_loader_thread = None
+
     def _on_pygwalker_open(self) -> None:
         """Launch PyGwalker in the browser for the currently selected table."""
         if self._dm is None or not self._current_table:
             return
 
         self._shutdown_pygwalker()
+        self._cleanup_pygwalker_loader()
 
         self._data_view.set_pygwalker_hint(0, sampled=False)
 
@@ -1100,7 +1135,6 @@ class MainWindow(QMainWindow):
             address = f"http://localhost:{port}"
 
             self._pgw_httpd = CustomTCPServer(("127.0.0.1", port), handler)
-            self._pgw_serving = True
 
             def _serve():
                 try:
@@ -1111,7 +1145,6 @@ class MainWindow(QMainWindow):
                     logger.exception("PyGwalker server error")
                 finally:
                     self._pgw_httpd = None
-                    self._pgw_serving = False
 
             self._pgw_thread = threading.Thread(target=_serve)
             self._pgw_thread.start()
@@ -1121,15 +1154,7 @@ class MainWindow(QMainWindow):
 
     def _on_pygwalker_error(self, msg: str) -> None:
         """Handle data loading error."""
-        if self._pgw_loader_thread is not None:
-            self._pgw_loader_thread.quit()
-            self._pgw_loader_thread.wait()
-        if self._pgw_loader is not None:
-            self._pgw_loader.deleteLater()
-            self._pgw_loader = None
-        if self._pgw_loader_thread is not None:
-            self._pgw_loader_thread.deleteLater()
-            self._pgw_loader_thread = None
+        self._cleanup_pygwalker_loader()
         logger.error("PyGwalker data loading failed: %s", msg)
 
     def _shutdown_pygwalker(self) -> None:
@@ -1143,7 +1168,6 @@ class MainWindow(QMainWindow):
             self._pgw_thread.join(timeout=3)
             self._pgw_thread = None
         self._pgw_httpd = None
-        self._pgw_serving = False
 
     # ── Grid Handlers ────────────────────────────────────────────────────────
 
@@ -1370,8 +1394,6 @@ class MainWindow(QMainWindow):
             # the registry reference lets Python GC free the wrapper (the
             # pool only touches the runnable during run(), and it is never
             # auto-deleted: setAutoDelete(False)).
-            if hasattr(w, "deleteLater"):
-                w.deleteLater()
 
         worker.signals.finished.connect(_release)
         worker.signals.error.connect(_release)
@@ -1381,16 +1403,17 @@ class MainWindow(QMainWindow):
         """Invalidate all pending background workers."""
         self._gen += 1
         self._pending_workers = 0
+        self._channel_toggle_batch = False
 
-    def _detect_change(self) -> str:
-        """Compare current state to last state. Returns change category."""
+    def _build_state(self) -> dict:
+        """Snapshot the current filter/contrast/overlay state for change detection."""
         ic = self._image_controls
         # Normalize ch_config so colors are always tuples (avoids list != tuple)
         normalized_ch = {
             ch: {k: tuple(v) if isinstance(v, list) else v for k, v in cfg.items()}
             for ch, cfg in self._ch_config.items()
         }
-        new_state = {
+        return {
             "wells": frozenset(self._selected_wells),
             "fields": tuple(ic.get_selected_fields()),
             "stacks": tuple(ic.get_selected_stacks()),
@@ -1411,6 +1434,10 @@ class MainWindow(QMainWindow):
             "sort_by_row": ic.sort_by_row.isChecked(),
             "thumb_size": int(ic.image_size.value()),
         }
+
+    def _detect_change(self) -> str:
+        """Compare current state to last state. Returns change category."""
+        new_state = self._build_state()
         old = self._last_state
         self._last_state = new_state
 
@@ -1485,13 +1512,17 @@ class MainWindow(QMainWindow):
         # Absent widget (column missing) → [] is passed to lookup as "no filter".
         # Every early-exit must invalidate in-flight workers (_cancel_workers
         # bumps _gen), or stale results from the previous dispatch would
-        # repopulate the cleared display.
+        # repopulate the cleared display. The state snapshot must ALSO be
+        # updated here — otherwise re-selecting the exact previous selection
+        # looks like "no change" (_detect_change returns "none") and the
+        # display stays empty forever.
         if ic.fields_widget is not None and not fields:
             self._cancel_workers()
             self._image_display.clear()
             self._raw_cache.clear()
             self._mask_cache.clear()
             self._polygon_cache.clear()
+            self._last_state = self._build_state()
             return
         if ic.stacks_widget is not None and not stacks:
             self._cancel_workers()
@@ -1499,6 +1530,7 @@ class MainWindow(QMainWindow):
             self._raw_cache.clear()
             self._mask_cache.clear()
             self._polygon_cache.clear()
+            self._last_state = self._build_state()
             return
         if ic.timepoints_widget is not None and not timepoints:
             self._cancel_workers()
@@ -1506,6 +1538,7 @@ class MainWindow(QMainWindow):
             self._raw_cache.clear()
             self._mask_cache.clear()
             self._polygon_cache.clear()
+            self._last_state = self._build_state()
             return
         # Extra-col filters: widget exists but nothing selected → show nothing
         # (consistent with fields/stacks/timepoints behaviour).
@@ -1516,6 +1549,7 @@ class MainWindow(QMainWindow):
                 self._raw_cache.clear()
                 self._mask_cache.clear()
                 self._polygon_cache.clear()
+                self._last_state = self._build_state()
                 return
 
         # Wells exist but none selected via grid → show nothing.
@@ -1526,6 +1560,7 @@ class MainWindow(QMainWindow):
             self._raw_cache.clear()
             self._mask_cache.clear()
             self._polygon_cache.clear()
+            self._last_state = self._build_state()
             return
 
         thumb_size = int(ic.image_size.value())
@@ -1634,9 +1669,11 @@ class MainWindow(QMainWindow):
             # Keep existing thumbnails visible — update in-place when workers finish
             self._pending_workers = len(rows_info)
             self._channel_toggle_results = []
+            self._channel_toggle_batch = True
         else:
             self._image_display.begin_results(thumb_size)
             self._pending_workers = len(rows_info)
+            self._channel_toggle_batch = False
 
         gen = self._gen
         channel_names = list(self._ch_config.keys())
@@ -1810,6 +1847,46 @@ class MainWindow(QMainWindow):
             overlay_vmax=result.get("overlay_vmax", 1.0),
         )
 
+    def _finish_channel_toggle_batch(self) -> None:
+        """Apply the accumulated toggle results in place (no flash).
+
+        Runs when the last worker of a channel-toggle batch completes —
+        whether it finished or errored — so the display always converges on
+        the toggled channel state.
+        """
+        self._channel_toggle_batch = False
+        if self._image_blocked:
+            return
+        # Collect thumbnails currently showing full-res
+        full_res_keys = set()
+        from microVis.widgets.image_display import _ThumbnailView
+        for row_widget, _ in self._image_display._row_widgets.values():
+            for thumb in row_widget.findChildren(_ThumbnailView):
+                if thumb._is_full_res and thumb._full_res_item is not None:
+                    full_res_keys.add(thumb._row_idx)
+
+        self._image_display.update_pixmaps_in_place(
+            self._channel_toggle_results,
+            self._overlay_alpha, self._overlay_cmap,
+            remove_full_res=False,  # keep full-res visible until re-composited
+        )
+
+        # Re-dispatch full-res workers for thumbnails that were zoomed in.
+        # Dispatch with the thumbnail's ACTUAL generation (not gen=0,
+        # which bypasses the stale-result guard in set_full_res_pixmap).
+        if full_res_keys:
+            from microVis.widgets.image_display import _ThumbnailView
+            redispatch: dict[int, int] = {}
+            for row_widget, _ in self._image_display._row_widgets.values():
+                for thumb in row_widget.findChildren(_ThumbnailView):
+                    if thumb._row_idx in full_res_keys:
+                        thumb._full_res_gen += 1
+                        redispatch[thumb._row_idx] = thumb._full_res_gen
+            for row_idx, fr_gen in redispatch.items():
+                self._on_full_res_requested(row_idx, gen=fr_gen)
+
+        self._channel_toggle_results = []
+
     def _on_worker_channel_toggle_finished(self, result: dict) -> None:
         """Called on main thread when a channel-toggle worker completes."""
         if self._shutting_down:
@@ -1827,39 +1904,9 @@ class MainWindow(QMainWindow):
             self._polygon_cache[row_idx] = result["polygons"]
         self._channel_toggle_results.append(result)
         self._pending_workers = max(0, self._pending_workers - 1)
-        if self._image_blocked:
-            return
         # When all workers done, update pixmaps in-place (no flash)
         if self._pending_workers == 0:
-            # Collect thumbnails currently showing full-res
-            full_res_keys = set()
-            from microVis.widgets.image_display import _ThumbnailView
-            for row_widget, _ in self._image_display._row_widgets.values():
-                for thumb in row_widget.findChildren(_ThumbnailView):
-                    if thumb._is_full_res and thumb._full_res_item is not None:
-                        full_res_keys.add(thumb._row_idx)
-
-            self._image_display.update_pixmaps_in_place(
-                self._channel_toggle_results,
-                self._overlay_alpha, self._overlay_cmap,
-                remove_full_res=False,  # keep full-res visible until re-composited
-            )
-
-            # Re-dispatch full-res workers for thumbnails that were zoomed in.
-            # Dispatch with the thumbnail's ACTUAL generation (not gen=0,
-            # which bypasses the stale-result guard in set_full_res_pixmap).
-            if full_res_keys:
-                from microVis.widgets.image_display import _ThumbnailView
-                redispatch: dict[int, int] = {}
-                for row_widget, _ in self._image_display._row_widgets.values():
-                    for thumb in row_widget.findChildren(_ThumbnailView):
-                        if thumb._row_idx in full_res_keys:
-                            thumb._full_res_gen += 1
-                            redispatch[thumb._row_idx] = thumb._full_res_gen
-                for row_idx, fr_gen in redispatch.items():
-                    self._on_full_res_requested(row_idx, gen=fr_gen)
-
-            self._channel_toggle_results = []
+            self._finish_channel_toggle_batch()
 
     def _on_worker_error(self, msg: str, gen: int) -> None:
         if self._shutting_down:
@@ -1869,6 +1916,10 @@ class MainWindow(QMainWindow):
         if gen != self._gen:
             return
         self._pending_workers = max(0, self._pending_workers - 1)
+        # An all-error toggle batch must still converge: run the in-place
+        # update with whatever results arrived before the failures.
+        if self._pending_workers == 0 and self._channel_toggle_batch:
+            self._finish_channel_toggle_batch()
         logger.warning("Image worker error: %s", msg)
 
     def _on_pixel_clicked(self, row_idx: int, x: int, y: int,
@@ -1954,7 +2005,7 @@ class MainWindow(QMainWindow):
         worker.signals.finished.connect(self._on_full_res_finished)
         worker.signals.error.connect(
             lambda msg: logger.warning("Full-res worker error: %s", msg))
-        self._thread_pool.start(worker)
+        self._start_worker(worker)
 
     def _on_full_res_finished(self, payload, row_idx: int, gen: int,
                                mask=None, obj_values=None, polygons=None,
@@ -2137,8 +2188,6 @@ class MainWindow(QMainWindow):
         mask_full_name = f"mask_{mask_name}"
         mask = mask_dict.get(mask_full_name)
         if mask is None:
-            mask = mask_dict.get(mask_name)
-        if mask is None:
             logger.warning(
                 "Selected mask '%s' not found for row %d — crop aborted "
                 "(no first-mask fallback)", mask_name, row_idx)
@@ -2169,7 +2218,7 @@ class MainWindow(QMainWindow):
             lambda msg: logger.warning("Crop worker error: %s", msg),
             Qt.QueuedConnection,
         )
-        self._thread_pool.start(worker)
+        self._start_worker(worker)
 
     def _on_crop_finished(self, rgb: np.ndarray, key: ObjectKey) -> None:
         """Update the class box thumbnail with the cropped image."""
@@ -2195,6 +2244,7 @@ class MainWindow(QMainWindow):
         """Handle object export button click."""
         if self._dm is None:
             return
+        from PySide6.QtWidgets import QMessageBox
 
         # Export is an action button — persist current GUI state (patterns +
         # channel colors) to session.yml before starting the export work.
@@ -2219,7 +2269,6 @@ class MainWindow(QMainWindow):
         # Determine mask name from export mask dropdown
         mask_name = ic.get_export_mask()
         if not mask_name:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Export Error", "No mask selected for object extraction.")
             return
 
@@ -2234,7 +2283,6 @@ class MainWindow(QMainWindow):
         if object_mode == "Annotated":
             annotations = self._label_panel.get_annotations()
             if not annotations:
-                from PySide6.QtWidgets import QMessageBox
                 QMessageBox.information(
                     self, "No Annotations",
                     "No annotated objects found. Create classes and annotate objects first.",
@@ -2245,7 +2293,17 @@ class MainWindow(QMainWindow):
         annotated_keys = None  # set of row_idx for "Annotated"
         extra_filters: dict[str, list[str]] = {}
         if object_mode == "Selected images":
-            wells = sorted(self._selected_wells) if self._selected_wells else self._dm.get_wells()
+            # Wells exist but none selected → warn, never export the whole
+            # plate (matches the viewer's "wells exist but none selected →
+            # show nothing" rule; "All" mode is the explicit whole-plate path).
+            if not self._selected_wells and self._dm.get_wells():
+                QMessageBox.warning(
+                    self, "No Wells Selected",
+                    "No wells are selected in the plate grid. Select at least "
+                    "one well to export, or switch the mode to 'All'.",
+                )
+                return
+            wells = sorted(self._selected_wells)
             fields = list(ic.get_selected_fields())
             stacks = list(ic.get_selected_stacks())
             timepoints = list(ic.get_selected_timepoints())
@@ -2260,7 +2318,14 @@ class MainWindow(QMainWindow):
             # Selected wells only — the Image Filters (fields/stacks/
             # timepoints/extra cols) are intentionally ignored. Empty
             # wells/fields/stacks/timepoints means "no filter" in the worker.
-            wells = sorted(self._selected_wells) if self._selected_wells else self._dm.get_wells()
+            if not self._selected_wells and self._dm.get_wells():
+                QMessageBox.warning(
+                    self, "No Wells Selected",
+                    "No wells are selected in the plate grid. Select at least "
+                    "one well to export, or switch the mode to 'All'.",
+                )
+                return
+            wells = sorted(self._selected_wells)
             fields = []
             stacks = []
             timepoints = []
@@ -2322,17 +2387,22 @@ class MainWindow(QMainWindow):
             well_subdir=well_subdir,
             extra_filters=extra_filters,
         )
-        worker.signals.progress.connect(self._on_export_progress)
+        worker.signals.progress.connect(
+            lambda c, t, g=gen: self._on_export_progress(c, t, g),
+            Qt.QueuedConnection)
         worker.signals.finished.connect(self._on_export_finished)
         worker.signals.error.connect(
             lambda msg, g=gen: self._on_export_error(msg, g),
             Qt.QueuedConnection,
         )
-        self._thread_pool.start(worker)
+        self._start_worker(worker)
 
-    def _on_export_progress(self, current: int, total: int) -> None:
-        """Update export progress."""
+    def _on_export_progress(self, current: int, total: int, gen: int = 0) -> None:
+        """Update export progress (gen-guarded: a stale export from a
+        previous dataset must not overwrite the status bar)."""
         if self._shutting_down:
+            return
+        if gen != getattr(self, "_export_gen", 0):
             return
         self._pixel_info.set_text(f"Exporting: {current}/{total} images...")
 
@@ -2395,15 +2465,7 @@ class MainWindow(QMainWindow):
 
         # Tear down PyGwalker
         self._shutdown_pygwalker()
-        if self._pgw_loader_thread is not None and self._pgw_loader_thread.isRunning():
-            self._pgw_loader_thread.quit()
-            self._pgw_loader_thread.wait(1000)
-        if self._pgw_loader is not None:
-            self._pgw_loader.deleteLater()
-            self._pgw_loader = None
-        if self._pgw_loader_thread is not None:
-            self._pgw_loader_thread.deleteLater()
-            self._pgw_loader_thread = None
+        self._cleanup_pygwalker_loader()
 
         # Invalidate all pending workers
         self._cancel_workers()
@@ -2446,6 +2508,8 @@ class MainWindow(QMainWindow):
         self._object_mask_selected = ""
         self._image_blocked = False
         self._pending_workers = 0
+        self._channel_toggle_batch = False
+        self._channel_toggle_results = []
 
         # Reset widgets
         self._image_display.clear()
@@ -2536,6 +2600,9 @@ class MainWindow(QMainWindow):
         gw.palette.addItems(QUALITATIVE_PALETTES)
         gw.palette.setCurrentText("Set1")
         gw.palette.blockSignals(False)
+        # The image-block toggle is a plain button (no signals to block) —
+        # reset its label/style so it agrees with _image_blocked = False.
+        gw.reset_image_block()
 
         # Reset data view
         self._data_view.reset()

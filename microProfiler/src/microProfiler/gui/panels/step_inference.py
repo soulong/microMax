@@ -56,6 +56,9 @@ class InferenceBlockWidget(QWidget):
         self._capability_checked_path: Optional[str] = None
         self._color_by_auto = True
         self._max_value = DEFAULT_MAX_VALUE
+        # True once a max_value came from an explicit source (config restore
+        # or block copy) — the dataset-dtype default must never overwrite it.
+        self._max_value_explicit = False
         self._var_threshold = 0.95
         self._build_ui()
 
@@ -341,9 +344,11 @@ class InferenceBlockWidget(QWidget):
     def get_max_value(self) -> float:
         return self._max_value
 
-    def set_max_value(self, value: float) -> None:
+    def set_max_value(self, value: float, explicit: bool = False) -> None:
         self._max_value = float(value)
         self._max_value_label.setText(f"{self._max_value:g}")
+        if explicit:
+            self._max_value_explicit = True
 
     def get_checked_channels(self) -> List[str]:
         """Checked channels in row order (left-to-right).
@@ -515,7 +520,7 @@ class InferenceStepPanel(BlockContainerPanel):
             except Exception:
                 pass
             block._output_db.setText(src.get_output_db())
-            block.set_max_value(src.get_max_value())
+            block.set_max_value(src.get_max_value(), explicit=src._max_value_explicit)
             block._feature_cb.setChecked(src._feature_cb.isChecked())
             block._pred_class_cb.setChecked(src._pred_class_cb.isChecked())
             block._pred_prob_cb.setChecked(src._pred_prob_cb.isChecked())
@@ -546,7 +551,7 @@ class InferenceStepPanel(BlockContainerPanel):
             block._output_db.setText(str(db_name))
         max_value = cfg.get("max_value")
         if max_value is not None:
-            block.set_max_value(float(max_value))
+            block.set_max_value(float(max_value), explicit=True)
         BaseStepPanel._set_widget(block._feature_cb, cfg.get("feature", True), "feature")
         BaseStepPanel._set_widget(block._pred_class_cb, cfg.get("pred_class", True), "pred_class")
         BaseStepPanel._set_widget(block._pred_prob_cb, cfg.get("pred_prob", True), "pred_prob")
@@ -590,7 +595,9 @@ class InferenceStepPanel(BlockContainerPanel):
         derived = _max_value_for_dtype(dtype)
         self._default_max_value = derived
         for block in self._blocks:
-            if block.get_max_value() == DEFAULT_MAX_VALUE:
+            # Explicitly configured max_value (config restore / block copy) is
+            # always trusted — only untouched defaults adopt the dtype value.
+            if not block._max_value_explicit and block.get_max_value() == DEFAULT_MAX_VALUE:
                 block.set_max_value(derived)
 
     def max_value_mismatches(self, dtype) -> List[str]:

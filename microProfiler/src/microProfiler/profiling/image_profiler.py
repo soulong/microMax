@@ -117,6 +117,12 @@ def profile_images(
             "profile_images requires at least one channel "
             "(empty channels are skipped by the pipeline, never 'all')."
         )
+    unknown = [c for c in channels if c not in ds.intensity_colnames]
+    if unknown:
+        raise ValueError(
+            f"image_channels unknown channels: {unknown}. "
+            f"Available: {list(ds.intensity_colnames)}"
+        )
     logger.debug(
         "profile_images: channels=%s, thresholds=%s, db=%s, table=%s, count=%d, workers=%d",
         channels, thresholds, db_path, table_name, len(ds), n_workers,
@@ -166,7 +172,11 @@ def profile_images(
                                     logger.exception("Image profiling failed for row %d — aborting", chunk_start + task_idx)
                                     raise
         except InterruptedError:
-            logger.info("Image profiling interrupted by user")
+            # A cancel must propagate so the pipeline treats the run as
+            # interrupted (never as a completed step): the GUI relies on
+            # InterruptedError to skip success handlers and applied_steps
+            # bookkeeping. The writer still flushes below in `finally`.
+            raise
         except Exception:
             # A run-level profiling failure re-raises so the dataset is NOT
             # reported complete. Note: batches flushed before the failure are

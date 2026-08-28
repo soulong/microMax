@@ -165,7 +165,12 @@ def _cell_to_tensor(img_hwc, channels, aug_pipeline,
 # ----------------------------------------------------------------------------
 
 def stratified_split(records, val_ratio, seed):
-    """Split records into train/val, stratified by 'label'."""
+    """Split records into train/val, stratified by 'label'.
+
+    val_ratio: 0 disables validation (val = []); values in (0, 1) keep at
+    least one record per class with >= 2 samples. A ratio >= 1 would empty
+    the train set — callers must validate (train hard-exits).
+    """
     rng = np.random.default_rng(seed)
     by_label = {}
     for r in records:
@@ -175,10 +180,8 @@ def stratified_split(records, val_ratio, seed):
         idx = np.arange(len(items))
         rng.shuffle(idx)
         n_val = int(len(items) * val_ratio)
-        if len(items) > 1:
+        if val_ratio > 0 and len(items) > 1:
             n_val = max(1, n_val)
-        else:
-            n_val = 0
         for i in idx[:n_val]:
             val.append(items[i])
         for i in idx[n_val:]:
@@ -318,17 +321,16 @@ class SingleCellDataset(Dataset):
     a label from the file path, so label_csv labels are honored verbatim.
     """
 
-    def __init__(self, pairs, label_to_idx, labels=None,
+    def __init__(self, pairs, label_to_idx, labels,
                  channels=None,
                  augmentation_spec=None,
                  normalize_method="per_channel",
                  clip_low=0.05, clip_high=99.95,
                  with_masking=False,
                  fixed_reference=False,
-                 max_value=None,
-                 label_column="directory"):
+                 max_value=None):
         self.pairs = list(pairs)
-        self.labels = list(labels) if labels is not None else None
+        self.labels = list(labels)
         self.label_to_idx = label_to_idx
         self.channels = list(channels) if channels is not None else None
         self.with_masking = with_masking
@@ -337,7 +339,6 @@ class SingleCellDataset(Dataset):
         self.clip_high = clip_high
         self.fixed_reference = fixed_reference
         self.max_value = max_value
-        self.label_column = label_column
         self.aug_pipeline = build_pipeline(augmentation_spec) if augmentation_spec else None
 
     def __len__(self):
@@ -355,22 +356,14 @@ class SingleCellDataset(Dataset):
             img_hwc, self.channels, self.aug_pipeline,
             self.normalize_method, self.clip_low, self.clip_high, self.with_masking,
             ref_stats)
-        if self.labels is not None:
-            label = self.labels[idx]
-            label_idx = self.label_to_idx.get(label, -1)
-            if label_idx < 0:
-                raise ValueError(
-                    f"Label {label!r} is not in label_to_idx "
-                    f"{sorted(self.label_to_idx)} — check label_csv/label_from_dir "
-                    f"resolution for row {idx} ({cell_ds.metadata.iloc[cell_idx].get('path')})."
-                )
-            return tensor, label_idx
-        # Fallback (no labels list): derive from the metadata label_column.
-        meta = cell_ds.metadata.iloc[cell_idx]
-        label = meta.get(self.label_column)
-        if label is not None:
-            label = os.path.basename(str(label).replace("\\", "/"))
-        label_idx = self.label_to_idx.get(label, -1) if label is not None else -1
+        label = self.labels[idx]
+        label_idx = self.label_to_idx.get(label, -1)
+        if label_idx < 0:
+            raise ValueError(
+                f"Label {label!r} is not in label_to_idx "
+                f"{sorted(self.label_to_idx)} — check label_csv/label_from_dir "
+                f"resolution for row {idx} ({cell_ds.metadata.iloc[cell_idx].get('path')})."
+            )
         return tensor, label_idx
 
 
@@ -428,6 +421,17 @@ class WholeImageCellDataset(Dataset):
 
     def __len__(self):
         return len(self._flat_index)
+
+    def subsample(self, indices):
+        """Keep only the given flat-index positions (ascending order).
+
+        The public sampling seam for inference: meta_rows and feature rows
+        are written in flat-index order, so the kept set must stay sorted to
+        preserve the metadata ↔ prediction alignment.
+        """
+        keep = sorted(indices)
+        self._flat_index = [self._flat_index[i] for i in keep]
+        self._field_stems = [self._field_stems[i] for i in keep]
 
     def __getitem__(self, idx):
         row_idx, label = self._flat_index[idx]

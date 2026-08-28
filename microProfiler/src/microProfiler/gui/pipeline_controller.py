@@ -117,9 +117,14 @@ class PipelineController(QObject):
                 logger.warning(
                     "Replaced pipeline worker still running after cancel — "
                     "it may still write result.db concurrently")
-            # PipelineWorker no longer auto-deletes its QThread, so release it
-            # explicitly here together with the worker object.
-            prev_thread.deleteLater()
+                # Thread still executing (e.g. blocked inside inference):
+                # deleting a live QThread leaves a dangling C++ wrapper.
+                # Schedule cleanup via the thread's own finished signal
+                # (emitted after _execute's finally quits the thread).
+                prev_thread.finished.connect(prev_thread.deleteLater)
+            else:
+                # Thread stopped: safe to release immediately.
+                prev_thread.deleteLater()
             self._worker.deleteLater()
         worker = PipelineWorker()
         self._view.progress_connect_update(worker.progress)
@@ -148,10 +153,14 @@ class PipelineController(QObject):
 
     def _cancel_current_worker(self) -> None:
         if self._worker is not None:
-            try:
-                self._worker.finished.disconnect()
-            except (RuntimeError, TypeError):
-                pass
+            # Disconnect BOTH signals: a stale queued finished/error from the
+            # cancelled run must not fire the success handlers or pop error
+            # dialogs after the user already cancelled.
+            for sig in (self._worker.finished, self._worker.error):
+                try:
+                    sig.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
             self._worker.cancel()
         self._pending_finished = None
         if self._preview_worker is not None:
@@ -470,6 +479,15 @@ class PipelineController(QObject):
             return
         if self._view.dataset is None:
             logger.info("No dataset loaded - load a dataset.")
+            return
+        if not step.is_enabled():
+            # An unchecked panel must never start a run: run_step would
+            # execute nothing, yet _on_step_finished would record the step
+            # name in applied_steps — gating the real step out forever.
+            logger.info(f"{step.step_name} is not enabled - check the box to run it.")
+            self._view.progress_show_status(
+                f"{step.step_name} is not enabled — check the 'Run' box first."
+            )
             return
         self._view.set_running(True)
 

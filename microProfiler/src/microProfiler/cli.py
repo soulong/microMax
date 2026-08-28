@@ -215,6 +215,23 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 sys.exit(1)
+            # Duplicate output_db names would silently overwrite each other's
+            # inference rows — the GUI's validate_blocks rejects these, so the
+            # CLI must too.
+            seen_dbs: dict = {}
+            for entry in cfg.inference.configs:
+                if not entry.channels:
+                    continue
+                db_name = resolve_inference_db(entry)
+                if db_name in seen_dbs:
+                    print(
+                        f"Error: duplicate inference output_db '{db_name}' used "
+                        f"by blocks '{seen_dbs[db_name]}' and '{entry.model}'. "
+                        f"Rename one of them.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                seen_dbs[db_name] = entry.model
 
         datasets = resolve_datasets(dataset_dir, dataset_pattern)
         if not datasets:

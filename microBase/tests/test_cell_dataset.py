@@ -186,6 +186,18 @@ def test_cell_dataset_empty_directory(tmp_path):
     assert ds.intensity_colnames == []
 
 
+def test_cell_dataset_image_pattern_property(tmp_path):
+    """image_pattern property returns the original string (compiled or str)."""
+    pat = r"C1_f(?P<field>\d+)_z01_t01_\d+\.tiff"
+    _make_cell_dataset_with_meta(tmp_path, n_cells=2, n_channels=1)
+    ds1 = CellDataset(root=tmp_path, channel_layout="CHW", image_pattern=re.compile(pat))
+    assert ds1.image_pattern == pat
+    ds2 = CellDataset(root=tmp_path, channel_layout="CHW", image_pattern=pat)
+    assert ds2.image_pattern == pat
+    ds3 = CellDataset(root=tmp_path, channel_layout="CHW")
+    assert ds3.image_pattern is None
+
+
 def test_cell_dataset_skips_non_tiff(tmp_path):
     """Non-TIFF files in the directory are ignored."""
     _make_cell_dataset(tmp_path, n_cells=2, n_channels=1)

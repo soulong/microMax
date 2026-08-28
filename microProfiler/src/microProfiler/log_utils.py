@@ -66,12 +66,20 @@ def setup_logging(
             logger.addHandler(console)
 
     if log_file:
-        log_file = Path(log_file)
+        log_file = Path(log_file).resolve()
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_file)
-        fh.setLevel(level)
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
+        # Idempotent: run_pipeline/run_step re-call setup_logging with
+        # clear_existing=False; a second FileHandler for the same file would
+        # duplicate every log record.
+        if not any(
+            isinstance(h, logging.FileHandler)
+            and Path(h.baseFilename).resolve() == log_file
+            for h in logger.handlers
+        ):
+            fh = logging.FileHandler(log_file)
+            fh.setLevel(level)
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
 
     # Suppress noisy tifffile warnings (non-critical TIFF tag issues)
     logging.getLogger("tifffile").setLevel(logging.ERROR)

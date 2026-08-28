@@ -14,7 +14,6 @@ from microProfiler.preprocessing.tile_splitter import tile_dataset
 from microProfiler.segmentation.cellpose import segment_dataset
 from microProfiler.profiling.image_profiler import profile_images
 from microProfiler.profiling.object_profiler import profile_objects
-from microModel.infer import run_inference
 
 DATA_DIR = Path(r"/path/to/unified/images")
 OUTPUT_DB = DATA_DIR / "result.db"
@@ -61,8 +60,13 @@ profile_objects(
 print(f"\nDone! Results written to: {OUTPUT_DB}")
 
 # --- Inference (requires a trained microModel .pt bundle) ---
-# Build the microModel whole-image inference config dict. The model path is
-# faked here — replace MODEL_PATH with a real trained bundle to run.
+# The model path is faked here — replace MODEL_PATH with a real trained
+# bundle to run. microModel is imported lazily (the suite's convention:
+# microProfiler runs fully without microModel installed).
+try:
+    from microModel.infer import run_inference
+except ImportError:
+    run_inference = None
 mm_cfg = {
     "mode": "whole_image",
     "model": str(MODEL_PATH),
@@ -89,8 +93,11 @@ mm_cfg = {
         "batch_size": 128,
     },
 }
-run_inference(mm_cfg)
-print(f"Inference results written to: {INFER_DB}")
+if run_inference is None:
+    print("microModel not installed — skipping inference (install microModel to run it).")
+else:
+    run_inference(mm_cfg)
+    print(f"Inference results written to: {INFER_DB}")
 
 
 # Equivalent config-driven pipeline (see examples/pipeline_config.yml)

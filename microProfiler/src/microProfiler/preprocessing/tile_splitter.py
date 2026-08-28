@@ -54,10 +54,12 @@ def tile_dataset(
         for i in range(total):
             sp.report(i, "")
             row = metadata.iloc[i]
-            img_dir = row["directory"]
             for ch in ds.intensity_colnames:
                 if pd.notna(row[ch]):
-                    src = Path(img_dir) / row[ch]
+                    # row[ch] is an absolute path (root / reldir / fname); the
+                    # `directory` column is a relative subdir and must NOT be
+                    # used to resolve output paths (CWD-dependent).
+                    src = Path(row[ch])
                     if not src.exists():
                         logger.warning("Missing file, skipping: %s", src)
                         continue
@@ -81,7 +83,9 @@ def tile_dataset(
                             + new_field
                             + src.name[field_end:]
                         )
-                        write_image(Path(img_dir) / new_filename, tile_data)
+                        # Write next to the source (src.parent), never relative
+                        # to the process CWD.
+                        write_image(src.parent / new_filename, tile_data)
                     all_sources.append(src)
 
         sp.finish("Tiling complete")

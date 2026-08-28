@@ -52,20 +52,16 @@ def get_criterion(method, method_cfg, device):
         from lightly.loss import DINOLoss, IBOTPatchLoss, KoLeoLoss
         # output_dim must match DINOv2ProjectionHead's output_dim (65536),
         # NOT the backbone input dim — the losses compare the head outputs.
-        teacher_temp_warmup = method_cfg.get("teacher_temp_start", 0.04)
-        teacher_temp = method_cfg.get("teacher_temp_end", 0.07)
-        warmup_epochs = method_cfg.get("warmup_epochs", 30)
+        # The teacher temperature is NOT configured here: dinov2.train_step
+        # passes the cosine-scheduled teacher_temp explicitly every step,
+        # which overrides the losses' internal schedules entirely.
         dino_criterion = DINOLoss(
             output_dim=65536,
             student_temp=0.1,
-            warmup_teacher_temp=teacher_temp_warmup,
-            teacher_temp=teacher_temp,
-            warmup_teacher_temp_epochs=warmup_epochs,
         ).to(device)
         ibot_criterion = IBOTPatchLoss(
             output_dim=65536,
             student_temp=0.1,
-            teacher_temp=teacher_temp,
         ).to(device)
         koleo_criterion = KoLeoLoss()
         return (dino_criterion, ibot_criterion, koleo_criterion)

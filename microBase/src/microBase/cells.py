@@ -84,7 +84,7 @@ def crop_all_cells(volume, mask, padding=4, labels=None):
         padding: pixels of padding.
         labels: optional iterable of labels to crop. If None, crops all.
 
-Returns:
+    Returns:
         list of (crop, cell_mask, bbox, label) tuples.
     """
     if labels is None:

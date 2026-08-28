@@ -26,7 +26,8 @@ from tqdm import tqdm
 
 from microBase import CellDataset, ImageDataset, build_pipeline
 
-from .utils import (logger, set_seed, load_label_csv, resolve_output_paths, copy_config_file,
+from .utils import (logger, set_seed, select_device, load_label_csv,
+                    resolve_output_paths, copy_config_file,
                     add_file_logging, resolve_max_value)
 from .dataset import (WholeImageCellDataset, subsample, _cell_to_tensor,
                       _compute_ref_stats, _to_float_max)
@@ -124,8 +125,20 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
 
     # Re-run protection: replace THIS dataset's rows instead of appending.
     # Scoped to the written directories so multiple datasets sharing one
-    # output DB accumulate instead of overwriting each other.
-    dirs = {str(m.get("directory") or "") for m in meta_rows} - {""}
+    # output DB accumulate instead of overwriting each other. Rows with an
+    # empty/missing directory (source path unavailable) must also be deleted,
+    # or re-runs accumulate duplicates for them.
+    dirs: set[str] = set()
+    has_null_dir = False
+    for m in meta_rows:
+        d = m.get("directory")
+        if d is None or d == "":
+            has_null_dir = True
+        else:
+            dirs.add(str(d))
+    if has_null_dir:
+        conn.execute(
+            "DELETE FROM inference WHERE directory IS NULL OR directory = ''")
     if dirs:
         ph = ", ".join("?" * len(dirs))
         existing = conn.execute(
@@ -212,7 +225,9 @@ class _SingleCellInferDataset(Dataset):
             self.channels, self.aug_pipeline,
             self.normalize_method, self.clip_low, self.clip_high, self.with_masking,
             ref_stats)
-        return tensor, idx
+        # Single tensor (no idx): _forward_pass only consumes batch[0], and
+        # a plain tensor batch keeps the default collate trivial.
+        return tensor
 
 
 # ----------------------------------------------------------------------------
@@ -434,9 +449,7 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
             entries.append({"idx": idx, "ground_truth": gt})
         entries = subsample(entries, sample_max, sample_by, seed,
                             label_key="ground_truth")
-        keep = set(e["idx"] for e in entries)
-        ds._flat_index = [ds._flat_index[i] for i in sorted(keep)]
-        ds._field_stems = [ds._field_stems[i] for i in sorted(keep)]
+        ds.subsample(e["idx"] for e in entries)
         logger.info("Sub-sampled to %d cells", len(ds))
 
     loader_kwargs = dict(batch_size=batch_size, shuffle=False,
@@ -510,7 +523,7 @@ def run_inference(config, config_path=None):
         sys.exit(1)
 
     logger.info("Loading model from %s", model_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = select_device()
     set_seed(42)
     bundle = torch.load(model_path, map_location=device, weights_only=False)
     meta = bundle["meta"]

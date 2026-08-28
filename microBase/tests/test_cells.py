@@ -65,7 +65,6 @@ def test_crop_cell_padding_clamped():
 
 def test_crop_cell_no_pixels():
     """Cell ID not in mask -> exits with error (corruption)."""
-    import pytest
     volume, mask = _make_volume_mask(n_cells=1)
     with pytest.raises(SystemExit):
         crop_cell(volume, mask, 999)

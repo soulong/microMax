@@ -145,11 +145,15 @@ def _try_resume(config, device):
     return ckpt, config
 
 
-def _build_records_from_cell_dataset(cell_ds, root, label_from_dir, label_csv,
-                                     label_column):
+def _build_records_from_cell_dataset(cell_ds, root, label_from_dir, label_csv):
     """Walk a CellDataset's metadata DataFrame and return a list of record dicts."""
     label_map = {}
-    if label_csv and os.path.exists(label_csv):
+    if label_csv:
+        # A configured-but-missing CSV is a typo — never silently fall back to
+        # directory labels (§2 no-guessing).
+        if not os.path.exists(label_csv):
+            print(f"Error: label_csv file not found: {label_csv}", file=sys.stderr)
+            sys.exit(1)
         label_map = load_label_csv(label_csv)
 
     records = []
@@ -249,7 +253,6 @@ def train(config, config_path=None):
     max_value = resolve_max_value(data_cfg)
     label_from_dir = data_cfg.get("label_from_dir", True)
     label_csv = data_cfg.get("label_csv")
-    label_column = "directory"
 
     seed = 42
     output_dir = config.get("output_dir", "runs")
@@ -277,7 +280,7 @@ def train(config, config_path=None):
         n_avail = len(cell_ds.intensity_colnames)
         resolved_per_root[r] = resolve_channels(channels, n_avail, r)
         recs = _build_records_from_cell_dataset(
-            cell_ds, r, label_from_dir, label_csv, label_column)
+            cell_ds, r, label_from_dir, label_csv)
         for rec in recs:
             rec["cell_dataset"] = cell_ds
         all_records.extend(recs)
@@ -333,15 +336,19 @@ def train(config, config_path=None):
 
     set_seed(seed)
 
-    train_records, val_records = stratified_split(
-        all_records, train_cfg.get("val_ratio", 0.25), seed)
+    val_ratio = train_cfg.get("val_ratio", 0.25)
+    if not (0 <= val_ratio < 1):
+        print(f"Error: training.val_ratio must be in [0, 1), got {val_ratio!r} "
+              f"(0 disables validation)", file=sys.stderr)
+        sys.exit(1)
+    train_records, val_records = stratified_split(all_records, val_ratio, seed)
     logger.info("Train: %d  Val: %d", len(train_records), len(val_records))
 
-    if not val_records:
+    if not val_records and val_ratio > 0:
         print(
             "Error: validation split is empty — every class needs at least "
             "two samples for a non-empty val set (val_ratio "
-            f"{train_cfg.get('val_ratio', 0.25)}).",
+            f"{val_ratio}).",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -357,8 +364,7 @@ def train(config, config_path=None):
         clip_low=clip_low, clip_high=clip_high,
         with_masking=with_masking,
         fixed_reference=fixed_reference,
-        max_value=max_value,
-        label_column=label_column)
+        max_value=max_value)
     val_ds = SingleCellDataset(
         [(r["cell_dataset"], r["idx"]) for r in val_records],
         label_to_idx,
@@ -369,8 +375,7 @@ def train(config, config_path=None):
         clip_low=clip_low, clip_high=clip_high,
         with_masking=with_masking,
         fixed_reference=fixed_reference,
-        max_value=max_value,
-        label_column=label_column)
+        max_value=max_value)
 
     # ---- Build model ----
     ssl_bundle_path = config.get("resume", {}).get("ssl_model")
@@ -387,6 +392,19 @@ def train(config, config_path=None):
             sys.exit(1)
         logger.info("Loading SSL backbone from %s", ssl_bundle_path)
         ssl_bundle = torch.load(ssl_bundle_path, map_location=device, weights_only=False)
+        # resume.ssl_model must point at an SSL pretrain bundle (meta has
+        # 'method') — a train bundle's meta has no 'method' and would
+        # silently take the generic backbone path below (which only works
+        # by accident). Same contract pretrain enforces via
+        # _load_checkpoint_state.
+        if "method" not in (ssl_bundle.get("meta") or {}):
+            print(
+                "Error: resume.ssl_model must point at an SSL pretrain bundle "
+                f"(meta has 'method'); {ssl_bundle_path} is not an SSL bundle. "
+                "Use resume.sl_model for train-bundle resumes.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         model, ssl_method, ssl_meta = _build_model_from_ssl(
             ssl_bundle, model_cfg, num_classes, device)
         trained_backbone = ssl_meta["backbone"]
@@ -456,6 +474,11 @@ def train(config, config_path=None):
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
     epochs = train_cfg.get("epochs", 10)
+    if epochs is None or int(epochs) < 1:
+        print(f"Error: training.epochs must be a positive integer, got {epochs!r}",
+              file=sys.stderr)
+        sys.exit(1)
+    epochs = int(epochs)
     patience = train_cfg.get("patience", 5)
     save_interval = train_cfg.get("save_interval")
 
@@ -505,17 +528,18 @@ def train(config, config_path=None):
         avg_loss = tot_loss / n_batches if n_batches else 0.0
         train_loss_history.append(avg_loss)
 
-        # Validation
+        # Validation (skipped entirely when val_ratio: 0 disabled the split)
         model.eval()
         yt, yp = [], []
-        with torch.no_grad():
-            for x, y in val_loader:
-                x = x.to(device)
-                logits, _ = model(x)
-                yt.extend(y.tolist())
-                yp.extend(logits.argmax(1).cpu().tolist())
-        acc = float(accuracy_score(yt, yp))
-        f1 = float(f1_score(yt, yp, average="macro", zero_division=0))
+        if val_records:
+            with torch.no_grad():
+                for x, y in val_loader:
+                    x = x.to(device)
+                    logits, _ = model(x)
+                    yt.extend(y.tolist())
+                    yp.extend(logits.argmax(1).cpu().tolist())
+        acc = float(accuracy_score(yt, yp)) if yt else 0.0
+        f1 = float(f1_score(yt, yp, average="macro", zero_division=0)) if yt else 0.0
         val_acc_history.append(acc)
         val_f1_history.append(f1)
 
@@ -566,7 +590,6 @@ def train(config, config_path=None):
     eval_model.eval()
 
     # ---- Plots + report ----
-    result = None
     from .vis import plot_training_results
     eval_model.to(device)
     result = plot_training_results(

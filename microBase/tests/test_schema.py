@@ -43,6 +43,23 @@ def test_derive_well_non_numeric_col_raises():
         derive_well("A", "A")
 
 
+def test_derive_well_non_numeric_row_raises():
+    """Mixed row values ('1.5', 'A1') must raise instead of producing garbage wells."""
+    with pytest.raises(ValueError, match="row value"):
+        derive_well("1.5", 1)
+    with pytest.raises(ValueError, match="row value"):
+        derive_well("A1", 1)
+    with pytest.raises(ValueError, match="row value"):
+        derive_well(1.5, 1)
+
+
+def test_derive_well_alpha_row_ok():
+    """Alphabetic rows pass through _row_to_letter ('A' -> 'A1')."""
+    assert derive_well("A", 1) == "A1"
+    assert derive_well("a", 1) == "A1"
+    assert derive_well("P", 12) == "P12"
+
+
 def test_metadata_schema_no_well():
     """No row/col -> no well derivation."""
     schema = MetadataSchema.infer({"field", "timepoint"})
