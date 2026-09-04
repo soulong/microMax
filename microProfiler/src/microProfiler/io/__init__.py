@@ -42,22 +42,7 @@ def clone_dataset(ds: ImageDataset) -> ImageDataset:
     Shares root/patterns but copies metadata and filters so the clone
     can be filtered independently. Cache is fresh (not shared).
     """
-    clone = ImageDataset.__new__(ImageDataset)
-    clone.root = ds.root
-    clone.channel_layout = ds.channel_layout
-    clone.image_subdir_pattern = ds.image_subdir_pattern
-    clone._filters = list(ds._filters) if ds._filters else []
-    clone._image_pattern = ds._image_pattern
-    clone._mask_pattern = ds._mask_pattern
-    clone._metadata = ds._metadata.copy() if ds._metadata is not None else None
-    clone._intensity_colnames = list(ds._intensity_colnames)
-    clone._mask_colnames = list(ds._mask_colnames)
-    clone._img_shape = ds._img_shape
-    clone._img_dtype = ds._img_dtype
-    clone._schema = ds._schema
-    clone._captured_fields = set(ds.captured_fields)
-    clone._cache = type(ds._cache)(maxsize=ds._cache.maxsize) if hasattr(ds, "_cache") else None
-    return clone
+    return ds.clone()
 
 
 def rebuild_dataset(ds: ImageDataset) -> ImageDataset:

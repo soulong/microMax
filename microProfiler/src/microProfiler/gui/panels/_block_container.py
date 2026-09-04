@@ -45,6 +45,12 @@ class BlockContainerPanel(BaseStepPanel):
         self._pending_block_configs: List[dict] = []
         self._last_channels: List[str] = []
         self._last_masks: List[str] = []
+        # While True, _pending_block_configs are re-applied on every dataset-
+        # driven repopulation. It stays active until BOTH channels and masks
+        # have real data (dataset loaded), then turns off so later
+        # repopulations (filter edits, post-run refresh) never resurrect the
+        # restored config over the user's current selections.
+        self._restore_active: bool = False
 
     def _build_block_container(self, add_btn_text: str = "+ Add New Block") -> None:
         """Set up the block container layout with add button."""
@@ -121,13 +127,21 @@ class BlockContainerPanel(BaseStepPanel):
 
         Called after populate_channels/populate_masks rebuild the
         dataset-driven widgets — at that point the config can be applied to
-        real checkbox/mask widgets. The stash is consumed once.
+        real checkbox/mask widgets. The stash is NOT consumed: restore stays
+        active until both channels and masks have been populated with real
+        data (see populate_channels/populate_masks), so a channels-first
+        repopulation can never eat the config before masks arrive.
         """
-        pending = self._pending_block_configs
-        self._pending_block_configs = []
+        if not self._restore_active:
+            return
         for i, block in enumerate(self._blocks):
-            if i < len(pending):
-                self._apply_block_config(block, pending[i])
+            if i < len(self._pending_block_configs):
+                self._apply_block_config(block, self._pending_block_configs[i])
+
+    def _maybe_finish_restore(self) -> None:
+        """Turn restore off once both channels and masks carry real data."""
+        if self._restore_active and self._channels and self._last_masks:
+            self._restore_active = False
 
     # ── Serialization: structured list-of-dicts format (load_config_section) ──
 
@@ -142,6 +156,7 @@ class BlockContainerPanel(BaseStepPanel):
         # re-apply channel + mask selections when the dataset loads (at
         # restore time those widgets don't exist yet).
         self._pending_block_configs = [cfg for cfg in sections if isinstance(cfg, dict)]
+        self._restore_active = True
         self._remove_all_blocks()
         self._blocks_layout.removeItem(self._add_btn_layout)
 
@@ -187,6 +202,7 @@ class BlockContainerPanel(BaseStepPanel):
         self._channels = list(channels)
         self._on_channels_changed(channels)
         self._reapply_pending_configs()
+        self._maybe_finish_restore()
         self.parameter_changed.emit()
 
     def _on_channels_changed(self, channels: List[str]) -> None:
@@ -210,6 +226,7 @@ class BlockContainerPanel(BaseStepPanel):
             if fn is not None:
                 fn(mask_names)
         self._reapply_pending_configs()
+        self._maybe_finish_restore()
         self.parameter_changed.emit()
 
     # ── Extra top-level section keys ─────────────────────────────────────
@@ -239,8 +256,10 @@ class BlockContainerPanel(BaseStepPanel):
         if not isinstance(section, dict):
             return
         run_val = section.get("run")
-        if run_val is not None:
-            self.setChecked(bool(run_val) if not isinstance(run_val, str) else run_val.lower() in ("1", "true", "yes"))
+        if isinstance(run_val, bool):
+            # Strict typing: a session.yml 'run' must be a real bool (the GUI
+            # only ever writes real booleans).
+            self.setChecked(run_val)
         self._apply_extra_config_items(section)
         # A section without a `configs` list carries no block state (e.g.
         # session.yml written by another tool, or a bare {"run": ...}) — keep

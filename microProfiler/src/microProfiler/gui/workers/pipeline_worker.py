@@ -85,7 +85,6 @@ class PipelineWorker(QObject):
                 self._result_ds = run_step(
                     self._cfg, self._step_name, self._dataset_dir, progress=collector, ds=self._ds,
                 )
-                self._applied_steps = None
             else:
                 result_ds, applied = run_pipeline(
                     self._cfg, root_dir=self._dataset_dir, progress=collector, ds=self._ds,

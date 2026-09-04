@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import os
-import time
 from enum import Enum
 from multiprocessing import cpu_count
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -300,13 +299,8 @@ class BaSiC(BaseModel):
                 + "with dimension of (T,Y,X) or (T,Z,Y,X)."
             )
 
-        if images.shape[-1] < 10 and not skip_shape_warning:
-            pass
-
         if fitting_weight is not None and fitting_weight.shape != images.shape:
             raise ValueError("fitting_weight must have the same shape as images.")
-
-        time.monotonic()
 
         Im = self._resize_to_working_size(images)
 
@@ -397,7 +391,7 @@ class BaSiC(BaseModel):
             else:
                 B = jnp.ones(Im2.shape[0], dtype=jnp.float32)
             I_R = jnp.zeros(Im2.shape, dtype=jnp.float32)
-            S, D_R, D_Z, I_R, B, norm_ratio, converged = fitting_step.fit(
+            S, D_R, D_Z, I_R, B, norm_ratio, _ = fitting_step.fit(
                 Im2,
                 W,
                 W_D,
@@ -408,8 +402,6 @@ class BaSiC(BaseModel):
                 I_R,
             )
             self._score = norm_ratio
-            if not converged:
-                pass
             if S.max() == 0:
                 raise RuntimeError(
                     "Estimated flatfield is zero. "
@@ -443,13 +435,8 @@ class BaSiC(BaseModel):
 
                 if self._reweight_score <= self.reweighting_tol:
                     break
-            if i == self.max_reweight_iterations - 1:
-                pass
             last_S = S
             last_D = D
-
-        if not converged:
-            pass
 
         assert S is not None
         assert D is not None
@@ -461,7 +448,7 @@ class BaSiC(BaseModel):
                 if self.fitting_mode == FittingMode.approximate:
                     B = jnp.mean(Im, axis=(1, 2, 3))
                 I_R = jnp.zeros(Im.shape, dtype=jnp.float32)
-                I_R, B, norm_ratio, converged = fitting_step.fit_baseline(
+                I_R, B, norm_ratio, _ = fitting_step.fit_baseline(
                     Im,
                     W,
                     S,
@@ -508,8 +495,6 @@ class BaSiC(BaseModel):
         """
         if self.baseline is None:
             raise RuntimeError("BaSiC object is not initialized")
-
-        time.monotonic()
 
         # Convert to the correct format
         im_float = images.astype(np.float32)

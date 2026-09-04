@@ -195,7 +195,7 @@ def _build_model_from_ssl(ssl_bundle, model_cfg, num_classes, device):
     method = meta.get("method")
     in_chans = meta["in_chans"]
 
-    if method == "dinov2":
+    if method in ("dinov2", "dinov3"):
         backbone = build_dinov2_vit(meta["backbone"], in_chans, pretrained=False)
         feat_dim = backbone.num_features
         pool_fn = cls_token_pool_fn
@@ -571,7 +571,7 @@ def train(config, config_path=None):
     # trained_in_chans), not model_cfg — a config/bundle mismatch otherwise
     # builds the wrong architecture and load_state_dict fails or the eval
     # model silently has random weights.
-    if ssl_method == "dinov2":
+    if ssl_method in ("dinov2", "dinov3"):
         eval_backbone = build_dinov2_vit(trained_backbone, trained_in_chans,
                                          pretrained=False)
         eval_feat_dim = eval_backbone.num_features

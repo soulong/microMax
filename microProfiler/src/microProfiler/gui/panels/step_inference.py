@@ -159,10 +159,6 @@ class InferenceBlockWidget(QWidget):
         self._pred_class_cb.setChecked(True)
         self._pred_class_cb.setToolTip("Write the predicted class (requires a train bundle)")
         row_out.addWidget(self._pred_class_cb)
-        self._pred_prob_cb = QCheckBox("pred_prob")
-        self._pred_prob_cb.setChecked(True)
-        self._pred_prob_cb.setToolTip("Write the argmax softmax probability (requires pred_class)")
-        row_out.addWidget(self._pred_prob_cb)
         row_out.addSpacing(10)
         row_out.addWidget(QLabel("DB:"))
         self._output_db = QLineEdit("infer.db")
@@ -232,19 +228,10 @@ class InferenceBlockWidget(QWidget):
         self._browse_btn.clicked.connect(self._on_browse)
         self._pca_browse_btn.clicked.connect(self._on_browse_pca)
         self._umap_browse_btn.clicked.connect(self._on_browse_umap)
-        self._pred_class_cb.toggled.connect(self._on_pred_class_toggled)
-        self._on_pred_class_toggled(self._pred_class_cb.isChecked())
         self._color_by.currentIndexChanged.connect(self._on_color_by_changed)
 
     def _on_color_by_changed(self, *_):
         self._color_by_auto = False
-
-    def _on_pred_class_toggled(self, checked: bool) -> None:
-        # microModel writes pred_prob only when pred_class is on — gate the
-        # checkbox instead of silently dropping the output.
-        self._pred_prob_cb.setEnabled(checked)
-        if not checked:
-            self._pred_prob_cb.setChecked(False)
 
     def _update_capability_ui(self) -> None:
         if self._classify_capable is None:
@@ -460,7 +447,6 @@ class InferenceBlockWidget(QWidget):
             "channels": self.get_checked_channels() or None,
             "feature": self._feature_cb.isChecked(),
             "pred_class": self._pred_class_cb.isChecked(),
-            "pred_prob": self._pred_prob_cb.isChecked(),
             "output_db": self.get_output_db(),
             "max_value": self._max_value,
         }
@@ -493,7 +479,7 @@ class InferenceStepPanel(BlockContainerPanel):
     def _connect_block_signals(self, block: InferenceBlockWidget) -> None:
         super()._connect_block_signals(block)
         for w in (block._model_path, block._output_db, block._mask_combo,
-                  block._feature_cb, block._pred_class_cb, block._pred_prob_cb,
+                  block._feature_cb, block._pred_class_cb,
                   block._color_by, block._sample_per_class,
                   block._reducer_pca_path, block._reducer_umap_path):
             self._wire_param_signal(w)
@@ -523,7 +509,6 @@ class InferenceStepPanel(BlockContainerPanel):
             block.set_max_value(src.get_max_value(), explicit=src._max_value_explicit)
             block._feature_cb.setChecked(src._feature_cb.isChecked())
             block._pred_class_cb.setChecked(src._pred_class_cb.isChecked())
-            block._pred_prob_cb.setChecked(src._pred_prob_cb.isChecked())
             block._mask_combo.clear()
             for i in range(src._mask_combo.count()):
                 block._mask_combo.addItem(src._mask_combo.itemText(i))
@@ -554,7 +539,6 @@ class InferenceStepPanel(BlockContainerPanel):
             block.set_max_value(float(max_value), explicit=True)
         BaseStepPanel._set_widget(block._feature_cb, cfg.get("feature", True), "feature")
         BaseStepPanel._set_widget(block._pred_class_cb, cfg.get("pred_class", True), "pred_class")
-        BaseStepPanel._set_widget(block._pred_prob_cb, cfg.get("pred_prob", True), "pred_prob")
         mask_name = cfg.get("mask_name", "")
         if mask_name:
             mask_name = str(mask_name).removeprefix("mask_")

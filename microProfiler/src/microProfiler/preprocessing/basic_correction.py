@@ -92,10 +92,11 @@ def fit_models(
     model_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("BaSiC fitting channels")
+    fitted_any = False
     for ci, chan in enumerate(channels):
         progress.report("BaSiC Fit", ci, len(channels), f"Fitting channel {chan}")
         paths = [
-            Path(metadata.iloc[i]["directory"]) / metadata.iloc[i][chan]
+            Path(metadata.iloc[i][chan])
             for i in range(len(metadata))
             if pd.notna(metadata.iloc[i][chan])
         ]
@@ -104,6 +105,7 @@ def fit_models(
             logger.warning("No existing files for channel %s, skipping", chan)
             continue
 
+        fitted_any = True
         model = basic_fit(paths, n_image, enable_darkfield, working_size)
 
         with open(model_dir / f"{chan}.pkl", "wb") as f:
@@ -120,10 +122,13 @@ def fit_models(
             )
 
     progress.report("BaSiC Fit", len(channels), len(channels), "Fit complete")
-    # Mark that these models were fit under the zproject-first preprocessing
-    # order, so the GUI "Apply" downgrade path can refuse to reuse stale
-    # models that were fit under the old (basic-before-zproject) order.
-    (model_dir / ".fit_order").write_text("zproject_first", encoding="utf-8")
+    # Only mark the fit-order when at least one model was actually fitted —
+    # an all-skipped run must not advertise fresh models.
+    if fitted_any:
+        # Mark that these models were fit under the zproject-first
+        # preprocessing order, so the GUI "Apply" downgrade path can refuse
+        # to reuse stale models fit under the old (basic-before-zproject) order.
+        (model_dir / ".fit_order").write_text("zproject_first", encoding="utf-8")
     return model_dir
 
 
@@ -145,13 +150,15 @@ def transform_images(
 
         model_path = root / ".microprofiler" / "BaSiC_model" / f"{chan}.pkl"
         if not model_path.exists():
+            logger.warning(
+                "No BaSiC model for channel %s, skipping transform", chan)
             continue
 
         with open(model_path, "rb") as f:
             model = pickle.load(f)
 
         paths = [
-            Path(metadata.iloc[i]["directory"]) / metadata.iloc[i][chan]
+            Path(metadata.iloc[i][chan])
             for i in range(len(metadata))
             if pd.notna(metadata.iloc[i][chan])
         ]

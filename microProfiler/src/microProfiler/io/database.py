@@ -57,12 +57,11 @@ class Database:
         conn = self._get_conn()
         # Copy so the caller's DataFrame is never mutated in place.
         df = df.copy()
-        # Convert Path objects to strings.
+        # Convert any Path values to strings (a column may mix Path/str — the
+        # first-row sample alone is not a reliable type probe).
         for col in df.columns:
-            if df[col].dtype == "object" and len(df) > 0:
-                sample = df[col].iloc[0]
-                if isinstance(sample, Path):
-                    df[col] = df[col].astype(str)
+            if df[col].dtype == "object" and len(df) > 0 and any(isinstance(v, Path) for v in df[col]):
+                df[col] = df[col].map(lambda v: str(v) if isinstance(v, Path) else v)
         df.to_sql(table_name, conn, if_exists=if_exists, index=False)
 
     def list_tables(self) -> "set[str]":

@@ -17,6 +17,7 @@ from microBase import ImageDataset
 
 from microProfiler.config import PipelineConfig, resolve_inference_db
 from microProfiler.io import Database
+from microProfiler.pipeline.errors import MetadataValidationError
 from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
 
 logger = logging.getLogger(__name__)
@@ -61,13 +62,15 @@ def _run_resize(
     root_dir: Path,
     progress: ProgressCollector = NullProgressCollector(),
 ):
+    if not (cfg.resize and cfg.resize.run):
+        return ds
+    # Import after the gate: a disabled step must not pull in (or import-time
+    # configure) the preprocessing dependencies.
     from microProfiler.preprocessing.resizer import resize_dataset
 
-    kwargs = {}
-    if cfg.resize and cfg.resize.run:
-        kwargs = {"scale_factor": cfg.resize.scale_factor}
     return _run_preprocessing_step(
-        ds, "resize", cfg.resize, resize_dataset, kwargs, progress,
+        ds, "resize", cfg.resize, resize_dataset,
+        {"scale_factor": cfg.resize.scale_factor}, progress,
     )
 
 
@@ -77,19 +80,21 @@ def _run_basic(
     root_dir: Path,
     progress: ProgressCollector = NullProgressCollector(),
 ):
+    if not (cfg.basic and cfg.basic.run):
+        return ds
+    # Import after the gate — the vendored basic package imports JAX.
     from microProfiler.preprocessing.basic_correction import apply_basic
 
-    kwargs = {}
-    if cfg.basic and cfg.basic.run:
-        kwargs = {
+    return _run_preprocessing_step(
+        ds, "basic", cfg.basic, apply_basic,
+        {
             "mode": cfg.basic.mode,
             "n_image": cfg.basic.n_image,
             "working_size": cfg.basic.working_size,
             "enable_darkfield": cfg.basic.enable_darkfield,
             "root_dir": root_dir,
-        }
-    return _run_preprocessing_step(
-        ds, "basic", cfg.basic, apply_basic, kwargs, progress,
+        },
+        progress,
     )
 
 
@@ -99,20 +104,24 @@ def _run_zproject(
     root_dir: Path,
     progress: ProgressCollector = NullProgressCollector(),
 ):
-    if cfg.zproject and cfg.zproject.run and "stack" not in ds.metadata.columns:
-        from microProfiler.pipeline import MetadataValidationError
+    if not (cfg.zproject and cfg.zproject.run):
+        return ds
+    if "stack" not in ds.metadata.columns:
         raise MetadataValidationError(
             "Z-projection is enabled but the dataset has no 'stack' column. "
             "Either disable zproject or use an image_pattern with a (?P<stack>...) group."
         )
-
+    if ds.channel_layout is not None:
+        raise MetadataValidationError(
+            "Z-projection is not supported for multi-channel-per-file (CHW/HWC) "
+            "datasets — each file already holds one plane per site."
+        )
+    # Import after the gate.
     from microProfiler.preprocessing.z_projection import z_project_dataset
 
-    kwargs = {}
-    if cfg.zproject and cfg.zproject.run:
-        kwargs = {"method": cfg.zproject.method, "delete_original": True}
     return _run_preprocessing_step(
-        ds, "zproject", cfg.zproject, z_project_dataset, kwargs, progress,
+        ds, "zproject", cfg.zproject, z_project_dataset,
+        {"method": cfg.zproject.method, "delete_original": True}, progress,
     )
 
 
@@ -122,24 +131,24 @@ def _run_tile(
     root_dir: Path,
     progress: ProgressCollector = NullProgressCollector(),
 ):
-    if cfg.tile and cfg.tile.run and "field" not in ds.metadata.columns:
-        from microProfiler.pipeline import MetadataValidationError
+    if not (cfg.tile and cfg.tile.run):
+        return ds
+    if "field" not in ds.metadata.columns:
         raise MetadataValidationError(
             "Tiling is enabled but the dataset has no 'field' column. "
             "Either disable tile or use an image_pattern with a (?P<field>...) group."
         )
-
+    # Import after the gate.
     from microProfiler.preprocessing.tile_splitter import tile_dataset
 
-    kwargs = {}
-    if cfg.tile and cfg.tile.run:
-        kwargs = {
+    return _run_preprocessing_step(
+        ds, "tile", cfg.tile, tile_dataset,
+        {
             "tile_width": cfg.tile.tile_width,
             "tile_height": cfg.tile.tile_height,
             "delete_original": True,
-        }
-    return _run_preprocessing_step(
-        ds, "tile", cfg.tile, tile_dataset, kwargs, progress,
+        },
+        progress,
     )
 
 
@@ -165,7 +174,7 @@ def _run_segment(
             )
             progress.report(
                 f"segment ({entry.object_name})", 0, 0,
-                f"Skipped — no chan1 channels configured",
+                "Skipped — no chan1 channels configured",
             )
             continue
         logger.debug(

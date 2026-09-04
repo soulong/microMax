@@ -1,0 +1,235 @@
+# =============================================================================
+# DINOv3 SSL 预训练 —— Phase 2：Gram 锚定（密集特征精修）
+# =============================================================================
+# 用途：在 Phase 1 自监督结果之上做"Gram anchoring"——用冻结的早期教师
+#       （gram.ckpt = Phase 1 的 model.pt）约束 student 的 patch 特征
+#       Gram 矩阵，缓解长程训练/大模型导致的密集特征退化（论文 §4）。
+#       Phase 2 会继续与 Phase 1 相同的视图流，并追加 2 个高分辨率 gram crop。
+#
+# 使用前提：先跑 pretrain_dinov3_phase1.yml 得到 <phase1 输出>/model.pt，
+#   然后把下面两处指向它：
+#     resume.ssl_model = <phase1 model.pt>   （继续优化 student/teacher）
+#     dinov3.gram.ckpt = <phase1 model.pt>   （冻结的 gram teacher 权重）
+#   resume.type 建议 continue（同数据精确续跑）；换数据请用 transfer。
+#
+# 与 Phase 1 的差异（其余参数见 phase1 文件逐键注释）：
+#   - dinov3.gram.use_loss: true 及整块 gram 配置生效
+#   - augmentation_views 末尾追加 2 个 448px gram teacher crop 视图
+#   - 更保守的调度：LR/动量/权重衰减取常数，LR 降低到 5e-5，轮数约为 Phase 1 的 1/3
+# 数据特征沿用 Phase 1：crop 129–224 px、~5K–50K 细胞、单通道 16-bit 荧光；
+# head 32768、4 个 local 视图与 Phase 1 保持一致（bundle 会锁定架构，resume 时以 bundle 为准）。
+# =============================================================================
+
+mode: single_cell
+
+method: dinov3
+
+output_dir: 20260830_dinov3_phase2
+
+data:
+  root:
+    - sc_dataset/p53/2026-07-10_63x
+    - sc_dataset/p53/2026-07-11_63x
+    - sc_dataset/p53/2026-07-14_63x
+    - sc_dataset/p53/2026-07-18_22_63x
+    - sc_dataset/p53/2026-07-18_37_63x
+    - sc_dataset/opencell/single_cell
+  image_pattern: null
+  max_value: 65535
+  channels: [1]
+  channel_layout: null
+  label_from_dir: true
+  label_csv: null
+  sample_max: null
+  sample_by: per_dataset
+
+# Phase 2 = Phase 1 的延续：指向 Phase 1 的 model.pt。
+# continue：模型+优化器+调度从断点继续（同数据）；transfer：仅权重、epoch 归 0（换数据）。
+resume:
+  ssl_model: 20260830_dinov3_phase1/model.pt   # ← 改为 Phase 1 实际输出路径
+  type: continue
+
+backbone:
+  # 必须与 Phase 1 一致（架构由 bundle 锁定，resume 时 bundle 获胜）
+  name: vit_small_patch16_dinov3
+  pretrained: true                    # Phase 2 由 resume 接管权重，此值仅影响首次创建
+
+dinov3:
+  input_dim: null
+  drop_path_rate: 0.1
+
+  # ---- DINO head（与 Phase 1 21845 原型；由 bundle 锁定）----
+  head_n_prototypes: 21845
+  head_hidden_dim: 2048
+  head_bottleneck_dim: 256
+  head_nlayers: 3
+  ibot_head_n_prototypes: 21845
+  ibot_head_hidden_dim: 2048
+  ibot_head_bottleneck_dim: 256
+  ibot_head_nlayers: 3
+
+  # ---- loss 温度与权重（与 Phase 1 一致）----
+  student_temp: 0.1
+  sinkhorn_n_iterations: 3
+  global_ignore_diagonal: true
+  dino_loss_weight: 1.0
+  ibot_loss_weight: 1.0
+  koleo_loss_weight: 0.1
+  reweight_dino_local_loss: false
+  local_loss_weight_schedule: null
+
+  # ---- iBOT 掩码（与 Phase 1 一致）----
+  mask_ratio_min: 0.1
+  mask_ratio_max: 0.5
+  mask_sample_probability: 0.5
+
+  # ---- 调度（Phase 2 更收敛：LR/动量/WD 取常数）----
+  freeze_last_layer_epochs: 0         # 上一阶段已过防塌缩期，不再冻结
+  warmup_epochs: 2                    # 短 warmup 即可（权重已收敛）
+  transfer_warmup_epochs: 1
+  teacher_temp_start: 0.04
+  teacher_temp_end: 0.07              # start==end 即常数
+  weight_decay_start: 0.04            # 常数 0.04（与 Phase 1 一致）
+  weight_decay_end: 0.04
+  momentum_start: 0.994               # Phase 2 教师 EMA 用常数 0.994（官方锚定阶段）
+  momentum_end: 0.994
+  lr_final: 5.0e-5
+
+  # ---- Gram 锚定（Phase 2 核心）----
+  gram:
+    use_loss: true
+    loss_weight: 2.0                  # 官方锚定阶段最高权重；若 dense 任务提升不明显
+                                      # 可试 1.0；也可改用 loss_weight_schedule 逐步爬升
+    loss_weight_schedule: null        # {start, peak, end, warmup_epochs, cosine_epochs}
+    ckpt: 20260830_dinov3_phase1/model.pt   # ← 指向 Phase 1 model.pt（冻结 gram teacher）
+    ema_teacher: false                # 用 ckpt 冻结教师（推荐）；如想省一张骨干显存可改 true
+                                      # （true 时勿设 crops_size，下方两个 gram 视图也不需要）
+    it_load_ema_teacher: -1
+    rep_update: true                  # 周期用当前 EMA teacher 刷新 gram teacher（官方行为）
+    update_frequency: 20000           # 20k global steps 刷新一次
+    it_first_update: 0
+    max_updates: null
+    normalized: true
+    img_level: true                   # 单细胞每图一个 Gram 矩阵，显存友好
+    remove_neg: false
+    remove_only_teacher_neg: false
+    tokens_used: all
+    crops_size: 448                   # 高分辨率 gram crop（448/16=28×28 网格，高于 224 全局）。
+                                      # 显存不足(OOM)时降到 384 或 224；必须整除 16
+    global_teacher_resize_method: bicubic
+    global_teacher_resize_antialias: false
+
+# =============================================================================
+# augmentation_views —— Phase 2 = Phase 1 的 8 个视图 + 末尾 2 个 gram teacher crop
+# 顺序约定（train_step 按序切分）：
+#   [0:2]          = global（student/teacher）
+#   [2:2+N]        = local（student）
+#   [2+N:2+N+2]    = gram teacher crops（高分辨率，弱增强）
+# =============================================================================
+augmentation_views:
+  # ---- Global view 1 ----
+  - - HorizontalFlip: {p: 0.5}
+    - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
+    - LongestMaxSize: {max_size: 224, p: 1.0}
+    - RandomScale: {scale_range: [-0.2, 0.1], p: 0.7}
+    - RandomResizedCrop: {size: [224, 224], scale: [0.85, 1.0], ratio: [0.9, 1.1], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.01], contrast_range: [-0.1, 0.2], ensure_safe_output: True, p: 0.7}
+    - RandomGamma: {gamma_range: [80, 120], p: 0.7}
+    - GaussNoise: {std_range: [0.0005, 0.001], p: 0.5}
+    - GaussianBlur: {blur_range: [3, 7], sigma_range: [0.5, 2.0], p: 0.5}
+  # ---- Global view 2 ----
+  - - HorizontalFlip: {p: 0.5}
+    - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
+    - LongestMaxSize: {max_size: 224, p: 1.0}
+    - RandomScale: {scale_range: [-0.1, 0.2], p: 0.7}
+    - RandomResizedCrop: {size: [224, 224], scale: [0.65, 1.0], ratio: [0.9, 1.1], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.03], contrast_range: [-0.15, 0.25], ensure_safe_output: True, p: 0.7}
+    - RandomGamma: {gamma_range: [80, 120], p: 0.7}
+    - GaussNoise: {std_range: [0.001, 0.004], p: 0.5}
+    - GaussianBlur: {blur_range: [1, 5], sigma_range: [0.5, 3.0], p: 0.6}
+  # ---- Local 1..4（112×112；与 Phase 1 一致的单细胞适配裁剪）----
+  - - HorizontalFlip: {p: 0.5}
+    - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
+    - RandomResizedCrop: {size: [112, 112], scale: [0.4, 0.85], ratio: [0.9, 1.1], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.2, 0.2], ensure_safe_output: True, p: 0.8}
+    - GaussNoise: {std_range: [0.001, 0.004], p: 0.7}
+    - GaussianBlur: {blur_range: [1, 5], sigma_range: [1.0, 4.0], p: 0.7}
+    - Downscale: {scale_range: [0.5, 0.9], p: 0.4}
+  - - HorizontalFlip: {p: 0.5}
+    - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
+    - RandomResizedCrop: {size: [112, 112], scale: [0.3, 0.7], ratio: [0.85, 1.15], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.25, 0.25], ensure_safe_output: True, p: 0.8}
+    - RandomGamma: {gamma_range: [80, 120], p: 0.8}
+    - GaussNoise: {std_range: [0.001, 0.004], p: 0.7}
+    - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 4.0], p: 0.7}
+    - Downscale: {scale_range: [0.5, 0.9], p: 0.4}
+  - - HorizontalFlip: {p: 0.5}
+    - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
+    - RandomResizedCrop: {size: [112, 112], scale: [0.35, 0.8], ratio: [0.9, 1.1], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.3, 0.3], p: 0.8}
+    - RandomGamma: {gamma_range: [80, 120], p: 0.8}
+    - GaussNoise: {std_range: [0.001, 0.006], p: 0.7}
+    - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 5.0], p: 0.8}
+    - Downscale: {scale_range: [0.4, 0.8], p: 0.6}
+  - - HorizontalFlip: {p: 0.5}
+    - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
+    - RandomResizedCrop: {size: [112, 112], scale: [0.3, 0.7], ratio: [0.85, 1.15], mask_interpolation: 0, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.3, 0.3], p: 0.8}
+    - RandomGamma: {gamma_range: [80, 120], p: 0.8}
+    - GaussNoise: {std_range: [0.001, 0.006], p: 0.7}
+    - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 5.0], p: 0.8}
+    - Downscale: {scale_range: [0.4, 0.8], p: 0.6}
+  # ---- Phase 2 追加：gram teacher crops（高分辨率 448，弱增强，仅填充分辨率用）----
+  - - LongestMaxSize: {max_size: 448, p: 1.0}
+    - PadIfNeeded: {min_height: 448, min_width: 448, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.01], contrast_range: [-0.05, 0.05], ensure_safe_output: True, p: 0.3}
+  - - LongestMaxSize: {max_size: 448, p: 1.0}
+    - PadIfNeeded: {min_height: 448, min_width: 448, p: 1.0}
+    - RandomBrightnessContrast: {brightness_range: [0, 0.01], contrast_range: [-0.05, 0.05], ensure_safe_output: True, p: 0.3}
+
+# 推理/UMAP 用确定性增强（必填）
+augmentation_infer:
+  - LongestMaxSize: {max_size: 224, p: 1.0}
+  - PadIfNeeded: {min_height: 224, min_width: 224, p: 1.0}
+
+normalize:
+  method: per_channel
+  with_masking: false
+  fixed_reference: true
+  clip_low: 0.05
+  clip_high: 99.95
+
+dataloader:
+  num_workers: 4
+  prefetch_factor: 2
+  persistent_workers: true
+
+vis_augment:
+  num_samples: 24
+
+monitoring:
+  enabled: true
+  tensorboard: true
+  csv: true
+  log_every_steps: 10
+  patch_similarity_samples: 6         # patch 相似度图与 attention map 的采样样本数
+  attention_maps: true                # 每 save_interval 同时输出 CLS attention map PDF
+  gram_split_stats: true              # Phase 2 gram 启用，本项生效（masked/unmasked 分项）
+  head_logits_track: true
+
+# =============================================================================
+# training —— Phase 2 更收敛的优化设置
+# =============================================================================
+training:
+  optimizer: adamw
+  lr: 5.0e-5                          # 锚定阶段的低 LR（官方大模型 3e-5；单细胞 5K–50K 用 5e-5）
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+  grad_clip: 10.0
+  grad_accum_steps: 8                 # 32 × 8 = 有效 256；含 gram 前向后显存更大，
+                                      # 若 OOM 改 16×16 或 crops_size 降为 384/224
+  batch_size: 32
+  epochs: 30                          # 约为 Phase 1 的 1/3（Gram 精修阶段）
+  save_interval: 6
+  n_image_umap: 10000
+  amp: true

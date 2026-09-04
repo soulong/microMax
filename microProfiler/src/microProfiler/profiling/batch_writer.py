@@ -28,6 +28,11 @@ class BatchWriter:
         self._first_write = True
         self._results: List[pd.DataFrame] = []
         self._batch: List[pd.DataFrame] = []
+        # Column schema fixed at first flush: later batches are reindexed to
+        # it so a row that lost a per-channel feature group (see
+        # object_profiler._run_per_channel_regionprops) can never introduce
+        # new columns on append and crash the SQLite write.
+        self._columns: Optional[pd.Index] = None
 
     def add(self, df: pd.DataFrame) -> None:
         """Add a DataFrame to the current batch.  Flushes when full."""
@@ -40,6 +45,10 @@ class BatchWriter:
         if not self._batch:
             return
         combined = pd.concat(self._batch, ignore_index=True)
+        if self._columns is None:
+            self._columns = combined.columns
+        else:
+            combined = combined.reindex(columns=self._columns)
         if self._db is not None:
             self._db.save_table(
                 combined, self._table_name,

@@ -257,6 +257,31 @@ class ImageDataset:
             f"channels={self._intensity_colnames}, masks={self._mask_colnames})"
         )
 
+    # ---- Clone ----
+
+    def clone(self):
+        """Return a lightweight copy sharing root/patterns, with independent
+        metadata, filters, and a fresh cache.
+
+        Filters can be applied to the clone without affecting the original.
+        """
+        c = ImageDataset.__new__(ImageDataset)
+        c.root = self.root
+        c.channel_layout = self.channel_layout
+        c.image_subdir_pattern = self.image_subdir_pattern
+        c._filters = list(self._filters) if self._filters else []
+        c._image_pattern = self._image_pattern
+        c._mask_pattern = self._mask_pattern
+        c._metadata = self._metadata.copy() if self._metadata is not None else None
+        c._intensity_colnames = list(self._intensity_colnames)
+        c._mask_colnames = list(self._mask_colnames)
+        c._img_shape = self._img_shape
+        c._img_dtype = self._img_dtype
+        c._schema = self._schema
+        c._captured_fields = set(self._captured_fields)
+        c._cache = _LRUCache(maxsize=self._cache.maxsize)
+        return c
+
     # ---- Construction helpers ----
 
     def _iter_image_files(self):

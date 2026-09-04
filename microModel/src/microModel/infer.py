@@ -21,16 +21,15 @@ import json
 import sqlite3
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from microBase import CellDataset, ImageDataset, build_pipeline
+from microBase import CellDataset, ImageDataset
 
 from .utils import (logger, set_seed, select_device, load_label_csv,
                     resolve_output_paths, copy_config_file,
                     add_file_logging, resolve_max_value)
-from .dataset import (WholeImageCellDataset, subsample, _cell_to_tensor,
-                      _compute_ref_stats, _to_float_max)
+from .dataset import (WholeImageCellDataset, SingleCellDataset, subsample)
 from .backbone import load_model_from_bundle, load_ssl_backbone_from_bundle
 
 
@@ -187,50 +186,6 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
 
 
 # ----------------------------------------------------------------------------
-# Single-cell inference dataset
-# ----------------------------------------------------------------------------
-
-class _SingleCellInferDataset(Dataset):
-    """Reads TIFFs lazily via CellDataset. Pipeline: load -> mask -> augment
-    (augmentation_infer from bundle) -> normalize -> tensor."""
-
-    def __init__(self, cell_dataset, indices, channels,
-                 augmentation_spec,
-                 normalize_method, clip_low, clip_high, with_masking,
-                 fixed_reference=False, max_value=None):
-        self.cell_dataset = cell_dataset
-        self.indices = list(indices)
-        self.channels = list(channels) if channels is not None else None
-        self.normalize_method = normalize_method
-        self.clip_low = clip_low
-        self.clip_high = clip_high
-        self.with_masking = with_masking
-        self.fixed_reference = fixed_reference
-        self.max_value = max_value
-        self.aug_pipeline = build_pipeline(augmentation_spec) if augmentation_spec else None
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, idx):
-        cell_idx = self.indices[idx]
-        img_hwc = _to_float_max(self.cell_dataset.get_cell(cell_idx), self.max_value)
-        ref_stats = None
-        if self.fixed_reference:
-            ref_stats = _compute_ref_stats(
-                img_hwc, self.channels, self.with_masking,
-                self.clip_low, self.clip_high, self.normalize_method)
-        tensor = _cell_to_tensor(
-            img_hwc,
-            self.channels, self.aug_pipeline,
-            self.normalize_method, self.clip_low, self.clip_high, self.with_masking,
-            ref_stats)
-        # Single tensor (no idx): _forward_pass only consumes batch[0], and
-        # a plain tensor batch keeps the default collate trivial.
-        return tensor
-
-
-# ----------------------------------------------------------------------------
 # Forward pass
 # ----------------------------------------------------------------------------
 
@@ -347,10 +302,14 @@ def _run_single_cell(data_dir, meta, model, device,
         logger.info("Sub-sampled to %d entries (sample_max=%s, sample_by=%s)",
                     len(entries), sample_max, sample_by)
 
-    dataset = _SingleCellInferDataset(
-        cell_ds, [e["idx"] for e in entries], channels,
-        augmentation_spec,
-        normalize_method, clip_low, clip_high, with_masking,
+    dataset = SingleCellDataset(
+        [(cell_ds, e["idx"]) for e in entries],
+        {"_": 0}, ["_"] * len(entries),
+        channels=channels,
+        augmentation_spec=augmentation_spec,
+        normalize_method=normalize_method,
+        clip_low=clip_low, clip_high=clip_high,
+        with_masking=with_masking,
         fixed_reference=fixed_reference, max_value=max_value)
     loader_kwargs = dict(batch_size=batch_size, shuffle=False,
                          num_workers=dl_num_workers,

@@ -5,11 +5,12 @@ it in _SSL_REGISTRY below.
 
 import sys
 
-from . import byol, dinov2
+from . import byol, dinov2, dinov3
 
 _SSL_REGISTRY = {
     "byol": byol.build_byol,
     "dinov2": dinov2.build_dinov2,
+    "dinov3": dinov3.build_dinov3,
 }
 
 
@@ -34,9 +35,11 @@ def get_train_step(method):
         return byol.train_step
     elif method == "dinov2":
         return dinov2.train_step
+    elif method == "dinov3":
+        return dinov3.train_step
     print(
         f"Error: no train_step for SSL method '{method}'. "
-        f"Available: byol, dinov2",
+        f"Available: byol, dinov2, dinov3",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -65,6 +68,26 @@ def get_criterion(method, method_cfg, device):
         ).to(device)
         koleo_criterion = KoLeoLoss()
         return (dino_criterion, ibot_criterion, koleo_criterion)
+    elif method == "dinov3":
+        # DINOv3 losses are ported into models/dinov3.py (Sinkhorn-Knopp
+        # teacher centering + Gram anchoring); all temperature handling is
+        # done inside dinov3.train_step.
+        from .dinov3 import DINOLoss, iBOTPatchLoss, KoLeoLoss, GramLoss
+        proto_dim = int(method_cfg.get("head_n_prototypes", 65536))
+        student_temp = float(method_cfg.get("student_temp", 0.1))
+        dino_criterion = DINOLoss(proto_dim, student_temp=student_temp).to(device)
+        ibot_criterion = iBOTPatchLoss(proto_dim, student_temp=student_temp).to(device)
+        koleo_criterion = KoLeoLoss()
+        gram_cfg = method_cfg.get("gram", {}) or {}
+        if gram_cfg.get("use_loss", False):
+            gram_criterion = GramLoss(
+                apply_norm=gram_cfg.get("normalized", True),
+                remove_neg=gram_cfg.get("remove_neg", False),
+                remove_only_teacher_neg=gram_cfg.get("remove_only_teacher_neg", False),
+            ).to(device)
+        else:
+            gram_criterion = None
+        return (dino_criterion, ibot_criterion, koleo_criterion, gram_criterion)
     print(
         f"Error: no criterion for SSL method '{method}'",
         file=sys.stderr,

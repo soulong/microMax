@@ -23,14 +23,13 @@ class NullProgressCollector(ProgressCollector):
 
 
 class SubscribableProgressCollector(ProgressCollector):
-    """Pub-sub collector: multiple listeners can attach/detach.
+    """Pub-sub collector: multiple listeners can subscribe.
 
     Used by the GUI: the PipelineWorker attaches a progress-signal emitter,
-    and the CLI attaches a print function.
-
-    ``cancel_check`` is an optional ``Callable[[], bool]`` the worker sets so
-    long-running black-box calls (e.g. microModel inference) can distinguish
-    "aborted because the user cancelled" from "genuinely failed".
+    and the CLI attaches a print function. ``cancel_check`` is an optional
+    ``Callable[[], bool]`` the worker sets so long-running black-box calls
+    (e.g. microModel inference) can distinguish "aborted because the user
+    cancelled" from "genuinely failed".
     """
 
     def __init__(self) -> None:

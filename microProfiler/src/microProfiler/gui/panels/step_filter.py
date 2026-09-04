@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import List, Tuple
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -31,6 +31,12 @@ class FilterPanel(BaseStepPanel):
         self.setTitle("Filter")
         self._updating = False
         self._filter_widgets: List[Tuple[QComboBox, QLineEdit, QPushButton]] = []
+        # Every keystroke rebuilds the filtered dataset — debounce it so the
+        # user can type a pattern without re-filtering per character.
+        self._debounce_timer = QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(300)
+        self._debounce_timer.timeout.connect(self._apply_filters)
         self._build_controls()
         self.setChecked(False)
         super().setCheckable(False)
@@ -135,7 +141,7 @@ class FilterPanel(BaseStepPanel):
 
     def _on_filter_changed(self, *_args) -> None:
         if not self._updating:
-            self._apply_filters()
+            self._debounce_timer.start()
 
     def _apply_filters(self) -> None:
         if self._updating:

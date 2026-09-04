@@ -321,10 +321,21 @@ class ObjectProfileBlockWidget(QWidget):
     def populate_channels(self, channels: List[str]) -> None:
         """Rebuild the five channel rows (all unchecked by default).
 
-        Restored configs re-check their channels via _apply_block_config after
+        Currently-checked selections are preserved across the rebuild (a
+        filtered-dataset or post-run refresh must not wipe the user's picks);
+        restored configs re-check their channels via _apply_block_config after
         this runs (base-class deferred restore).
         """
         self._channels = channels
+
+        # Snapshot current selections before the widgets are destroyed.
+        saved = {
+            "intensity": {cb.text() for cb in self._intensity_cbs if cb.isChecked()},
+            "radial": {cb.text() for cb in self._radial_cbs if cb.isChecked()},
+            "granularity": {cb.text() for cb in self._gran_cbs if cb.isChecked()},
+            "glcm": {cb.text() for cb in self._glcm_cbs if cb.isChecked()},
+            "correlation": {cb.text() for cb in self._corr_cbs if cb.isChecked()},
+        }
 
         # Remove placeholders and existing checkboxes
         BaseStepPanel._remove_placeholder(self._intensity_ch_layout, "_intensity_placeholder", self)
@@ -355,24 +366,30 @@ class ObjectProfileBlockWidget(QWidget):
 
         for i, ch in enumerate(channels):
             cb = QCheckBox(ch)
+            cb.setChecked(ch in saved["intensity"])
             self._intensity_ch_layout.insertWidget(1 + i, cb)
             self._intensity_cbs.append(cb)
 
             cb = QCheckBox(ch)
+            cb.setChecked(ch in saved["radial"])
             self._radial_layout.insertWidget(1 + i, cb)
             self._radial_cbs.append(cb)
 
             cb = QCheckBox(ch)
+            cb.setChecked(ch in saved["granularity"])
             self._gran_layout.insertWidget(1 + i, cb)
             self._gran_cbs.append(cb)
 
             cb = QCheckBox(ch)
+            cb.setChecked(ch in saved["glcm"])
             self._glcm_layout.insertWidget(1 + i, cb)
             self._glcm_cbs.append(cb)
 
             for other in channels:
                 if other > ch:
-                    pair_cb = QCheckBox(f"{ch}-{other}")
+                    pair = f"{ch}-{other}"
+                    pair_cb = QCheckBox(pair)
+                    pair_cb.setChecked(pair in saved["correlation"])
                     self._corr_layout.insertWidget(1 + len(self._corr_cbs), pair_cb)
                     self._corr_cbs.append(pair_cb)
 

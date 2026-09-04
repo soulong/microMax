@@ -32,25 +32,27 @@ class PreviewWorker(QObject):
         self._dataset: Optional[ImageDataset] = None
         self._row_idx: int = 0
 
-    def preview_basic(self, ds: ImageDataset, row_idx: int, channels: List[str], root_dir: Optional[Path] = None) -> None:
+    def preview_basic(self, ds: ImageDataset, row_idx: int, channels: List[str], root_dir: Optional[Path] = None) -> bool:
         if self._thread.isRunning():
-            return
+            return False
         self._cancel_event.clear()
         self._dataset = ds
         self._row_idx = row_idx
         self._op = "basic"
         self._params = {"channels": channels, "root_dir": root_dir}
         self._thread.start()
+        return True
 
-    def preview_segment(self, ds: ImageDataset, row_idx: int, seg_params: dict) -> None:
+    def preview_segment(self, ds: ImageDataset, row_idx: int, seg_params: dict) -> bool:
         if self._thread.isRunning():
-            return
+            return False
         self._cancel_event.clear()
         self._dataset = ds
         self._row_idx = row_idx
         self._op = "segment"
         self._params = seg_params
         self._thread.start()
+        return True
 
     def _execute(self) -> None:
         try:

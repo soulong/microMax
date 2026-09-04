@@ -258,17 +258,23 @@ class SegmentBlockWidget(QWidget):
             self._c2_view.clear_image()
 
     def populate_channels(self, channels: List[str]) -> None:
-        """Rebuild the Chan1/Chan2 checkbox rows (unchecked by default).
+        """Rebuild the Chan1/Chan2 checkbox rows.
 
-        Stored configs (session.yml) re-check their channels via
-        _apply_block_config after this runs (base-class deferred restore).
+        Currently-checked selections are preserved across the rebuild so a
+        filtered-dataset or post-run refresh never wipes the user's picks;
+        restored configs re-check their channels via _apply_block_config
+        (base-class deferred restore).
         """
         self._channels = channels
+
+        # Snapshot current selections before the widgets are destroyed.
+        saved_chan1 = {cb.text() for cb in self._chan1_checkboxes if cb.isChecked()}
+        saved_chan2 = {cb.text() for cb in self._chan2_checkboxes if cb.isChecked()}
         self._chan1_checkboxes.clear()
         self._chan2_checkboxes.clear()
 
         # Helper to rebuild one channel row
-        def _rebuild_row(row, placeholder_attr, checkbox_list, checked_default, toggled_handler):
+        def _rebuild_row(row, placeholder_attr, checkbox_list, checked_set, toggled_handler):
             placeholder = getattr(self, placeholder_attr, None)
             if placeholder is not None:
                 for i in range(row.count() - 1, -1, -1):
@@ -298,16 +304,16 @@ class SegmentBlockWidget(QWidget):
             # Insert checkboxes
             for ch in channels:
                 cb = QCheckBox(ch)
-                cb.setChecked(checked_default)
+                cb.setChecked(ch in checked_set)
                 cb.toggled.connect(toggled_handler)
                 row.insertWidget(insert_at, cb)
                 checkbox_list.append(cb)
                 insert_at += 1
 
-        # Both Chan1 and Chan2 default unchecked; stored configs (session.yml)
-        # re-check their channels via populate_channels/_set_checked_states.
-        _rebuild_row(self._chan1_row, "_chan1_placeholder", self._chan1_checkboxes, False, self._on_chan1_toggled)
-        _rebuild_row(self._chan2_row, "_chan2_placeholder", self._chan2_checkboxes, False, self._on_chan2_toggled)
+        # Both Chan1 and Chan2 keep their current selections across the
+        # rebuild; stored configs (session.yml) re-check via _apply_block_config.
+        _rebuild_row(self._chan1_row, "_chan1_placeholder", self._chan1_checkboxes, saved_chan1, self._on_chan1_toggled)
+        _rebuild_row(self._chan2_row, "_chan2_placeholder", self._chan2_checkboxes, saved_chan2, self._on_chan2_toggled)
 
     def build_config_section(self) -> dict:
         chan1 = self.get_chan1()

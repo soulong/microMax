@@ -11,6 +11,7 @@ from typing import Sequence, Tuple
 import numpy as np
 from scipy.ndimage import distance_transform_edt, map_coordinates, mean as nd_mean
 from skimage.feature import graycomatrix, graycoprops
+from skimage.graph import MCP_Geometric
 from skimage.morphology import disk, dilation, erosion, reconstruction
 
 logger = logging.getLogger(__name__)
@@ -54,14 +55,29 @@ def _radial_features_one_object(
 
     # Distance from each pixel to the boundary of the object.
     d_to_edge = distance_transform_edt(mask)
+    yy, xx = np.mgrid[0:mask.shape[0], 0:mask.shape[1]].astype(float)
     # Medial axis: the point farthest from the edge.
     cy, cx = np.unravel_index(int(np.argmax(d_to_edge)), d_to_edge.shape)
-    # Distance from each pixel to the medial axis point (Euclidean).
-    yy, xx = np.mgrid[0:mask.shape[0], 0:mask.shape[1]].astype(float)
-    d_from_center = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    # Degenerate objects (farthest point carries no interior) fall back to
+    # the centre of mass, matching CellProfiler's behaviour.
+    if d_to_edge[cy, cx] == 0:
+        cy, cx = np.argwhere(mask).mean(axis=0).round().astype(int)
+    # Distance from each pixel to the centre, measured along 8-connected
+    # shortest paths INSIDE the object (geodesic) — matches CellProfiler's
+    # ``centrosome.propagate``. A straight Euclidean line would shortcut
+    # across concave/crescent objects.
+    cost = np.where(mask, 1.0, np.inf)
+    try:
+        d_from_center = MCP_Geometric(cost, fully_connected=True).find_costs([(cy, cx)])[0]
+    except Exception:
+        # Fallback: Euclidean straight-line distance.
+        d_from_center = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
     # CP scaled normalisation: 0 = centre, 1 = edge. The +1e-3 keeps the
-    # denominator positive at boundary pixels (d_to_edge == 0).
-    norm = d_from_center / (d_from_center + d_to_edge + 1e-3)
+    # denominator positive at boundary pixels (d_to_edge == 0). Non-object
+    # pixels carry inf from the geodesic search; zero them so the division
+    # stays finite (they are excluded by ``mask`` downstream anyway).
+    d_finite = np.where(mask, d_from_center, 0.0)
+    norm = d_finite / (d_finite + d_to_edge + 1e-3)
 
     bin_idx = np.clip(np.floor(norm * nbins).astype(int), 0, nbins - 1)
     # The mask is True for object pixels, False for background. We work only
@@ -147,9 +163,21 @@ def make_radial_distribution(
 
     Ring ordering is inner→outer (bin 1 is the innermost ring, closest to the
     object centre), matching CellProfiler's ``FracAtD_<b>of<n>_<image>``.
+
+    The full ``3*nbins`` vector is computed ONCE per (mask, intensity) pair
+    and shared by all columns: regionprops invokes each extra_property per
+    object, so a naive per-column recompute multiplies runtime ~12x.
     """
     def _compute(mask, intensity):
         return _radial_all(mask, intensity, nbins=nbins)
+
+    cache: dict = {}
+
+    def _vector(mask, intensity):
+        key = (id(mask), id(intensity))
+        if key not in cache:
+            cache[key] = _compute(mask, intensity)
+        return cache[key]
 
     fns = []
     n_features = 3
@@ -158,7 +186,7 @@ def make_radial_distribution(
             idx = feat_idx * nbins + b
 
             def _fn(mask, intensity, _idx=idx):
-                return float(_compute(mask, intensity)[_idx])
+                return float(_vector(mask, intensity)[_idx])
 
             fns.append(_named(_fn, f"radial_{feat_name}_bin{b + 1}of{nbins}_{ch_name}"))
     return fns
@@ -175,7 +203,9 @@ def _subsample(image, mask, factor):
     Returns (pixels, new_mask, new_shape).
     """
     h, w = image.shape
-    new_shape = (max(1, int(round(h * factor))), max(1, int(round(w * factor))))
+    # Floor semantics (int(shape * factor)) match CellProfiler's float mgrid
+    # slice; round() could differ by one pixel on non-integer products.
+    new_shape = (max(1, int(h * factor)), max(1, int(w * factor)))
     if new_shape == (h, w):
         return image.astype(float).copy(), mask.astype(bool).copy(), new_shape
     i, j = np.mgrid[0:new_shape[0], 0:new_shape[1]].astype(float) / factor
@@ -295,7 +325,6 @@ def _granularity_per_object_full(
 
     pixels = pixels - back_dilated
     pixels[pixels < 0] = 0
-    pixels[~gran_mask] = 0
 
     fp = disk(1, dtype=bool)
     ero = pixels.copy()
@@ -401,7 +430,87 @@ class _GranularityComputer:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _GLCM_PROPS = ("contrast", "dissimilarity", "homogeneity", "energy", "correlation",
-               "asm", "entropy")
+               "asm", "entropy",
+               "variance", "sumaverage", "sumvariance", "sumentropy",
+               "differencevariance", "differenceentropy",
+               "infomeasure1", "infomeasure2")
+
+# Features not provided by skimage graycoprops; computed manually from the
+# normalised GLCM with the standard Haralick (1973) definitions.
+_EXTRA_GLCM_PROPS = frozenset((
+    "variance", "sumaverage", "sumvariance", "sumentropy",
+    "differencevariance", "differenceentropy",
+    "infomeasure1", "infomeasure2",
+))
+
+
+def _glcm_extra_feature(p: np.ndarray, prop: str) -> float:
+    """One self-computed Haralick feature from a GLCM matrix.
+
+    ``p`` is a single (levels x levels) GLCM with the background row/col
+    already dropped (indices correspond to quantised gray levels 1..levels).
+    This function normalises it to probabilities and applies the standard
+    Haralick (1973) formulas with log2 entropies, matching CellProfiler's
+    mahotas-based MeasureTexture. DifferenceVariance uses the textbook
+    weighted form (mahotas' ``px_minus_y.var()`` is an implementation quirk).
+    """
+    total = p.sum()
+    if total > 0:
+        p = p / total
+    L = p.shape[0]
+    k = np.arange(1, L + 1, dtype=float)   # actual quantised gray levels
+    ii = k[:, None]
+    jj = k[None, :]
+    add_ij = ii + jj                       # i + j (2 .. 2L)
+    abs_diff = np.abs(ii - jj)             # |i - j| (0 .. L-1)
+    px = p.sum(axis=1)
+    py = p.sum(axis=0)
+    plus = np.bincount(add_ij.ravel().astype(np.intp), weights=p.ravel(),
+                       minlength=2 * L + 1)
+    minus = np.bincount(abs_diff.ravel().astype(np.intp), weights=p.ravel(),
+                        minlength=L)
+
+    if prop == "variance":
+        ux = float(np.sum(k * px))
+        return float(np.sum((k - ux) ** 2 * px))
+    if prop == "sumaverage":
+        kp = np.arange(2 * L + 1, dtype=float)
+        return float(np.sum(kp * plus))
+    if prop == "sumvariance":
+        kp = np.arange(2 * L + 1, dtype=float)
+        sa = float(np.sum(kp * plus))
+        return float(np.sum((kp - sa) ** 2 * plus))
+    if prop == "sumentropy":
+        nz = plus[plus > 0]
+        return float(-np.sum(nz * np.log2(nz)))
+    if prop == "differencevariance":
+        km = np.arange(L, dtype=float)
+        mu_d = float(np.sum(km * minus))
+        return float(np.sum((km - mu_d) ** 2 * minus))
+    if prop == "differenceentropy":
+        nz = minus[minus > 0]
+        return float(-np.sum(nz * np.log2(nz)))
+
+    # InfoMeasure1 / InfoMeasure2 share the marginal entropies.
+    probs = p[p > 0]
+    HXY = float(-np.sum(probs * np.log2(probs))) if probs.size else 0.0
+    px_nz = px[px > 0]
+    py_nz = py[py > 0]
+    HX = float(-np.sum(px_nz * np.log2(px_nz))) if px_nz.size else 0.0
+    HY = float(-np.sum(py_nz * np.log2(py_nz))) if py_nz.size else 0.0
+    if prop == "infomeasure1":
+        outer = np.outer(px, py)
+        mask_p = p > 0
+        term = probs * np.log2(outer[mask_p])   # same (i, j) mask as probs
+        hxy1 = float(-np.sum(term)) if term.size else 0.0
+        denom = max(HX, HY)
+        return float((HXY - hxy1) / denom) if denom > 0 else 0.0
+    if prop == "infomeasure2":
+        outer = np.outer(px, py)
+        o_nz = outer[outer > 0]
+        hxy2 = float(-np.sum(o_nz * np.log2(o_nz))) if o_nz.size else 0.0
+        return float(np.sqrt(max(0.0, 1.0 - np.exp(-2.0 * (hxy2 - HXY)))))
+    raise ValueError(f"Unknown GLCM property: {prop!r}")
 
 
 def _glcm_all(
@@ -460,16 +569,22 @@ def _glcm_all(
                 if total > 0:
                     glcm_masked[:, :, di, a] /= total
 
+        n_angle = glcm_masked.shape[3]
         for p in props:
             if p == "asm":
                 vals = graycoprops(glcm_masked, "energy")[0] ** 2
             elif p == "entropy":
                 entropies = []
-                for a in range(glcm_masked.shape[3]):
+                for a in range(n_angle):
                     p_mat = glcm_masked[:, :, 0, a]
                     nonzero = p_mat[p_mat > 0]
                     entropies.append(float(-np.sum(nonzero * np.log2(nonzero))))
                 vals = np.array(entropies)
+            elif p in _EXTRA_GLCM_PROPS:
+                vals = np.array([
+                    _glcm_extra_feature(glcm_masked[:, :, 0, a], p)
+                    for a in range(n_angle)
+                ])
             else:
                 vals = graycoprops(glcm_masked, p)[0]
             results.append(float(vals.mean()))
@@ -495,12 +610,23 @@ def make_glcm(
             levels=levels, props=props,
         )
 
+    # Compute the full vector once per (mask, intensity) pair: regionprops
+    # invokes every extra_property per object, so a per-column recompute
+    # repeats the whole graycomatrix pass for each of the len(distances)*len(props) columns.
+    cache: dict = {}
+
+    def _vector(mask, intensity):
+        key = (id(mask), id(intensity))
+        if key not in cache:
+            cache[key] = _compute(mask, intensity)
+        return cache[key]
+
     fns = []
     for di, d in enumerate(distances):
         for pi, p in enumerate(props):
             idx = di * len(props) + pi
             def _fn(mask, intensity, _idx=idx):
-                return float(_compute(mask, intensity)[_idx])
+                return float(_vector(mask, intensity)[_idx])
             fns.append(_named(_fn, f"glcm_{p}_d{d}_{ch_name}"))
     return fns
 

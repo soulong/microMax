@@ -119,7 +119,8 @@ object_profile:
 # the microModel CLI table format (`inference` + optional reduction tables).
 # max_value is REQUIRED per block (65535 for 16-bit, 255 for 8-bit) and is
 # always trusted as configured. For SSL bundles only `feature` applies —
-# pred_class/pred_prob are ignored (microModel downgrades with a warning).
+# pred_class is ignored (microModel downgrades with a warning). pred_prob is
+# not a config key: microModel writes it together with pred_class.
 # inference:
 #   run: true
 #   configs:
@@ -128,7 +129,6 @@ object_profile:
 #       channels: null            # ORDERED channel names; top-to-bottom = model input order; null/[] = block SKIPPED (never "all")
 #       feature: true
 #       pred_class: true
-#       pred_prob: true
 #       output_db: infer.db
 #       max_value: 65535
 #       reduction:                # omit/null = no dimension reduction

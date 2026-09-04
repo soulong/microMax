@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
@@ -15,6 +14,7 @@ from scipy.ndimage import find_objects
 from skimage.measure import regionprops_table
 
 from microBase import ImageDataset
+from microProfiler.profiling import resolve_source_directory
 from microProfiler.profiling.batch_writer import BatchWriter
 from microProfiler.profiling.extras import (
     _named,
@@ -45,26 +45,6 @@ def _lookup_mask(mask_data: Dict[str, np.ndarray], mask_name: str) -> Optional[n
     if prefixed in mask_data:
         return mask_data[prefixed]
     return None
-
-
-def _resolve_source_directory(row, intensity_colnames) -> str:
-    """Derive directory from source file path, matching microModel's behavior.
-
-    Returns the parent directory of the first available source file path,
-    with backslashes normalized to forward slashes. This matches how
-    microModel's infer.py computes the 'directory' column.
-    """
-    source_path = None
-    if "__file__" in row and row["__file__"]:
-        source_path = row["__file__"]
-    else:
-        for col in intensity_colnames:
-            if col in row and row[col]:
-                source_path = row[col]
-                break
-    if not source_path:
-        return ""
-    return os.path.dirname(str(source_path)).replace("\\", "/")
 
 
 # ── Shape properties ─────────────────────────────────────────────────────
@@ -231,6 +211,11 @@ def _run_per_channel_regionprops(
     for ch_idx, fns in groups.items():
         if not fns:
             continue
+        ch_name = channel_names[ch_idx] if ch_idx < len(channel_names) else str(ch_idx)
+        expected_cols = [
+            getattr(fn, "name", None) or f"{ch_name}_{i}"
+            for i, fn in enumerate(fns)
+        ]
         try:
             props = regionprops_table(
                 mask, img[..., ch_idx],
@@ -239,12 +224,19 @@ def _run_per_channel_regionprops(
             )
             dfs.append(pd.DataFrame(props))
         except Exception:
-            # Intentional design: a channel whose feature group fails to
-            # compute is logged and skipped; the remaining channels (and the
-            # run) continue. Fix the data/feature at the source, don't abort
-            # the whole plate.
-            ch_name = channel_names[ch_idx] if ch_idx < len(channel_names) else str(ch_idx)
-            logger.exception("Error computing extra properties for channel %s — skipping", ch_name)
+            # The channel's feature group failed — log and continue, but emit
+            # its expected columns filled with NaN so the row keeps a stable
+            # column set across the batch (BatchWriter reindexes to the first
+            # flush's schema; a missing column here would otherwise surface as
+            # an unrelated SQLite append error).
+            logger.exception(
+                "Error computing extra properties for channel %s — filling NaN", ch_name,
+            )
+            labels = np.unique(mask)
+            labels = labels[labels != 0]
+            nan_df = pd.DataFrame({"label": labels})
+            nan_df[expected_cols] = np.nan
+            dfs.append(nan_df)
     if not dfs:
         return pd.DataFrame()
     result = dfs[0]
@@ -416,7 +408,7 @@ def _process_one_object(
             k: v for k, v in row.to_dict().items()
             if k not in ds.intensity_colnames and k not in ds.mask_colnames
         }
-        meta["directory"] = _resolve_source_directory(row, ds.intensity_colnames)
+        meta["directory"] = resolve_source_directory(row, ds.intensity_colnames)
         image_data, mask_data = ds.get_imageset(idx)
         mask = _lookup_mask(mask_data, mask_name)
         if mask is None:
@@ -498,7 +490,7 @@ def profile_objects(
             "profile_objects requires intensity_channels "
             "(empty channels are skipped by the pipeline, never 'all')."
         )
-    correlation_pairs = resolved.correlation_pairs
+    correlation_pairs = resolved.correlation_pairs or correlation_pairs
     if correlation_pairs is not None:
         correlation_pairs = [tuple(p) if isinstance(p, list) else p for p in correlation_pairs]
 
@@ -533,7 +525,7 @@ def profile_objects(
     BATCH = 50
     n_total = len(ds)
     completed = 0
-    result_df = None
+    executor = None
 
     with BatchWriter(db_path, table_name, BATCH) as writer:
         try:
@@ -551,7 +543,9 @@ def profile_objects(
                         # progress bar reaches n_total exactly.
                         completed += 1
                 else:
-                    # Process in chunks to avoid pre-loading all images into RAM
+                    # One executor for the whole run — chunks only bound how
+                    # many images are pre-loaded into RAM at once.
+                    executor = ProcessPoolExecutor(max_workers=n_workers)
                     for chunk_start in range(0, n_total, BATCH):
                         chunk_end = min(chunk_start + BATCH, n_total)
                         tasks = []
@@ -570,57 +564,65 @@ def profile_objects(
                                 k: v for k, v in row.to_dict().items()
                                 if k not in ds.intensity_colnames and k not in ds.mask_colnames
                             }
-                            meta["directory"] = _resolve_source_directory(row, ds.intensity_colnames)
+                            meta["directory"] = resolve_source_directory(row, ds.intensity_colnames)
                             image_data, mask_data = ds.get_imageset(idx)
                             tasks.append((
-                                image_data, mask_data, ds.intensity_colnames, meta,
-                                mask_name, parent_mask_name, intensity_channels,
-                                correlation_pairs, measure_kwargs,
+                                # (global row index, worker args) — futures are
+                                # keyed by the global index so error logs point
+                                # at the real row, not the chunk-relative slot.
+                                idx, (image_data, mask_data, ds.intensity_colnames, meta,
+                                      mask_name, parent_mask_name, intensity_channels,
+                                      correlation_pairs, measure_kwargs),
                             ))
 
-                        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                            futures = {
-                                executor.submit(_profile_object_worker, t): idx
-                                for idx, t in enumerate(tasks)
-                            }
-                            chunk_completed = 0
-                            for future in as_completed(futures):
-                                task_idx = futures[future]
-                                try:
-                                    result = future.result()
-                                    if result is not None:
-                                        writer.add(result)
-                                    completed += 1
-                                    chunk_completed += 1
-                                    sp.tick("")
-                                except InterruptedError:
-                                    raise
-                                except BrokenProcessPool:
-                                    lost = len(tasks) - chunk_completed
-                                    logger.error("Worker process crashed — %d remaining task(s) in chunk skipped", lost)
-                                    raise
-                                except Exception:
-                                    logger.exception("Object profiling failed for row %d — skipping", chunk_start + task_idx)
+                        futures = {
+                            executor.submit(_profile_object_worker, payload): row_idx
+                            for row_idx, payload in tasks
+                        }
+                        chunk_completed = 0
+                        for future in as_completed(futures):
+                            row_idx = futures[future]
+                            try:
+                                result = future.result()
+                                if result is not None:
+                                    writer.add(result)
+                                completed += 1
+                                chunk_completed += 1
+                                sp.tick("")
+                            except InterruptedError:
+                                raise
+                            except BrokenProcessPool:
+                                lost = len(tasks) - chunk_completed
+                                logger.error("Worker process crashed — %d remaining task(s) in chunk skipped", lost)
+                                raise
+                            except Exception:
+                                logger.exception("Object profiling failed for row %d — skipping", row_idx)
         except InterruptedError:
             # A cancel must propagate so the pipeline treats the run as
             # interrupted (never as a completed step): the GUI relies on
             # InterruptedError to skip success handlers and applied_steps
-            # bookkeeping. The writer still flushes below in `finally`.
+            # bookkeeping. Queued tasks are cancelled; running ones finish.
+            # The writer still flushes on with-block exit.
+            if executor is not None:
+                executor.shutdown(cancel_futures=True)
+            raise
+        except BrokenProcessPool:
+            if executor is not None:
+                executor.shutdown(cancel_futures=True)
             raise
         except Exception:
             # A run-level profiling failure re-raises so the dataset is NOT
             # reported complete. Batches flushed before the failure are
-            # already committed (writer.close() in finally); the CLI batch
-            # loop logs the dataset failure and continues, and the GUI worker
-            # surfaces the error dialog. Object tables have no row-count
-            # guard — delete result.db (or the table) before re-running after
-            # a failed object run.
+            # already committed; the CLI batch loop logs the dataset failure
+            # and continues, and the GUI worker surfaces the error dialog.
+            # Object tables have no row-count guard — delete result.db (or
+            # the table) before re-running after a failed object run.
+            if executor is not None:
+                executor.shutdown(cancel_futures=True)
             logger.exception("Object profiling failed")
             raise
-        finally:
-            # step_start/step_end are emitted by the orchestrator
-            # (pipeline.steps._run_profile) — emitting step_end here too would
-            # double-report the same step key to the progress collector.
-            result_df = writer.close()
+        else:
+            if executor is not None:
+                executor.shutdown()
 
-    return result_df
+    return None

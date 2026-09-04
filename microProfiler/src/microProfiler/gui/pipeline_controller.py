@@ -166,10 +166,14 @@ class PipelineController(QObject):
         if self._preview_worker is not None:
             self._preview_worker.cancel()
         self._preview_running = False
+        # A cancel can happen while a fit/preview override cursor is active —
+        # release it (no-op when the stack is empty).
+        from PySide6.QtWidgets import QApplication
+        QApplication.restoreOverrideCursor()
         self._view.set_running(False)
         self._view.progress_reset()
 
-    def _save_session_yml(self, executed_steps: Optional[list] = None) -> None:
+    def _save_session_yml(self, executed_steps: list) -> None:
         settings: dict = {}
         for step in self._view.get_all_step_panels():
             section = step.to_config()
@@ -189,22 +193,13 @@ class PipelineController(QObject):
         dataset_dir = self._output_path()
         sf = SessionFile(dataset_dir)
         sf.save(settings)
-        # applied_steps must never shrink: gated in-place preprocessing steps
-        # (resize/zproject/basic/tile) stay marked once actually applied
-        # (run_pipeline itself unions prev_applied), so unchecking a checkbox
-        # later can't cause a destructive re-run on already-processed files.
+        # applied_steps must never shrink: pipeline-internal persistence
+        # (run_pipeline/run_step) already unions every completed step, so here
+        # we only union the finished run's steps. The old "checked-items"
+        # fallback was removed — it marked checked-but-never-run steps as
+        # applied, wrongly skipping them on later runs.
         prev_applied = set(sf.get_applied_steps())
-        if executed_steps is not None:
-            applied = sorted(prev_applied | set(executed_steps))
-        else:
-            # Inference is non-destructive and never gates a re-run — it is
-            # excluded from the checked fallback so its checkbox state can
-            # never mark it "applied".
-            checked = [
-                s.step_name for s in self._view.get_all_step_panels()
-                if s.isChecked() and s.step_name != "inference"
-            ]
-            applied = sorted(prev_applied | set(checked))
+        applied = sorted(prev_applied | set(executed_steps))
         sf.set_applied_steps(applied)
 
     # ── Pipeline run handlers ────────────────────────────────────────────
@@ -214,6 +209,38 @@ class PipelineController(QObject):
             QMessageBox.warning(self._view.widget(), "Missing Input", "Please select an input directory.")
             return True
         return False
+
+    def _validate_segment_names(self) -> Optional[str]:
+        """Shared segment-block validation (duplicate/empty object names).
+
+        Used by run_segmentation and run_all so Run All never bypasses the
+        checks a plain Run Segmentation performs.
+        """
+        seg_panel = self._view.get_step_panel("segment")
+        if seg_panel is None or not hasattr(seg_panel, "validate_object_names"):
+            return None
+        return seg_panel.validate_object_names()
+
+    def _validate_object_blocks(self) -> Optional[str]:
+        """Shared object-profiling validation (parent mask == object mask).
+
+        Used by run_profiling and run_all so Run All never bypasses the check
+        a plain Run Profiling performs.
+        """
+        self._sync_seg_masks_to_profiling()
+        obj_panel = self._view.get_step_panel("object_profile")
+        if obj_panel is None or not hasattr(obj_panel, "_blocks"):
+            return None
+        for block in obj_panel._blocks:
+            obj_mask = block.get_mask_name()
+            parent_mask = block.get_parent_mask_name()
+            if parent_mask and parent_mask == obj_mask:
+                return (
+                    f"Parent mask cannot be the same as the object mask "
+                    f"('{obj_mask}'). "
+                    "Please choose a different parent mask or set it to None."
+                )
+        return None
 
     def run_preprocessing(self) -> None:
         if self._view.running or self._missing_input():
@@ -264,17 +291,15 @@ class PipelineController(QObject):
         if self._view.dataset is None:
             logger.info("No dataset loaded - load a dataset.")
             return
-        seg_panel = self._view.get_step_panel("segment")
-        if seg_panel is None or not hasattr(seg_panel, "validate_object_names"):
-            return
-        name_error = seg_panel.validate_object_names()
-        if name_error:
-            QMessageBox.warning(self._view.widget(), "Invalid Names", name_error)
+        error = self._validate_segment_names()
+        if error:
+            QMessageBox.warning(self._view.widget(), "Invalid Names", error)
             return
         # NOTE: blocks with no checked Chan1 channels are NOT an error — they
         # are skipped at runtime (empty channels = skip, never "all").
 
         self._view.set_running(True)
+        seg_panel = self._view.get_step_panel("segment")
         cfg = self._build_step_config(seg_panel)
         self._ensure_worker()
         run_gen = self._worker_gen
@@ -300,20 +325,11 @@ class PipelineController(QObject):
             logger.info("No dataset loaded - load a dataset.")
             return
 
-        obj_panel = self._view.get_step_panel("object_profile")
-        if obj_panel is not None and hasattr(obj_panel, "_blocks"):
-            self._sync_seg_masks_to_profiling()
-            for block in obj_panel._blocks:
-                obj_mask = block.get_mask_name()
-                parent_mask = block.get_parent_mask_name()
-                if parent_mask and parent_mask == obj_mask:
-                    QMessageBox.warning(
-                        self._view.widget(), "Invalid Mask Selection",
-                        f"Parent mask cannot be the same as the object mask "
-                        f"('{obj_mask}'). "
-                        "Please choose a different parent mask or set it to None."
-                    )
-                    return
+        error = self._validate_object_blocks()
+        if error:
+            QMessageBox.warning(
+                self._view.widget(), "Invalid Mask Selection", error)
+            return
 
         # Build config first to determine which tables to drop
         cfg = self._build_base_config()
@@ -417,7 +433,17 @@ class PipelineController(QObject):
                 "Please load a dataset before running the full pipeline."
             )
             return
-        self._sync_seg_masks_to_profiling()
+        # Run All must apply the same block validations as the individual
+        # Run Segmentation / Run Profiling buttons.
+        error = self._validate_segment_names()
+        if error:
+            QMessageBox.warning(self._view.widget(), "Invalid Names", error)
+            return
+        error = self._validate_object_blocks()
+        if error:
+            QMessageBox.warning(
+                self._view.widget(), "Invalid Mask Selection", error)
+            return
 
         inf_panel = self._view.get_step_panel("inference")
         if inf_panel is not None and inf_panel.is_enabled():
@@ -658,12 +684,19 @@ class PipelineController(QObject):
         from PySide6.QtWidgets import QApplication
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            if self._preview_worker is not None:
-                self._preview_worker.preview_segment(ds, idx, seg_params)
+            started = (
+                self._preview_worker is not None
+                and self._preview_worker.preview_segment(ds, idx, seg_params)
+            )
         except Exception:
             QApplication.restoreOverrideCursor()
             self._preview_running = False
             raise
+        if not started:
+            # Worker thread still busy — it silently declined to start; the
+            # pending flag and override cursor must not stay stuck forever.
+            QApplication.restoreOverrideCursor()
+            self._preview_running = False
 
     def preview_step(self, step) -> None:
         if self._preview_running:
@@ -678,13 +711,21 @@ class PipelineController(QObject):
             self._preview_pending_step = step
             self._preview_block_index = None
             self._preview_running = True
+            started = False
             if step.step_name == "basic" and self._preview_worker is not None:
                 chans = ds.intensity_colnames
-                self._preview_worker.preview_basic(ds, idx, chans, root_dir=self._output_path())
+                started = self._preview_worker.preview_basic(
+                    ds, idx, chans, root_dir=self._output_path())
         except Exception:
             QApplication.restoreOverrideCursor()
             self._preview_running = False
             raise
+        if not started:
+            # Worker thread still busy — it silently declined to start; the
+            # pending flag and override cursor must not stay stuck forever.
+            QApplication.restoreOverrideCursor()
+            self._preview_running = False
+            self._preview_pending_step = None
 
     def on_preview_ready(self, result) -> None:
         self._preview_running = False
@@ -785,4 +826,8 @@ class PipelineController(QObject):
     def on_pipeline_error(self, message: str) -> None:
         self._view.progress_show_error(message)
         self._view.set_running(False)
+        # Fit/preview runs leave an override cursor active; release it even on
+        # the error path (no-op when the stack is empty).
+        from PySide6.QtWidgets import QApplication
+        QApplication.restoreOverrideCursor()
         QMessageBox.critical(self._view.widget(), "Pipeline Error", message)

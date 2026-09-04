@@ -38,10 +38,6 @@ def apply_filters(ds, filters) -> None:
         ds.filter_metadata(f.column, f.pattern)
 
 
-class MetadataValidationError(ValueError):
-    """Raised when an enabled step requires a metadata column that is absent."""
-
-
 def run_step(
     cfg: PipelineConfig,
     step_name: str,
@@ -68,7 +64,9 @@ def run_step(
 
     if step_name in PREPROC_STEPS:
         prev_applied = set(SessionFile(root_dir).get_applied_steps())
-        if step_name in prev_applied and not _is_fit_only_basic(cfg):
+        if step_name in prev_applied and not (
+            step_name == "basic" and _is_fit_only_basic(cfg)
+        ):
             logger.info("Skipping %s — already applied in previous run", step_name)
             if ds is None:
                 ds = _build_dataset(cfg, root_dir)
@@ -77,7 +75,24 @@ def run_step(
     if ds is None:
         ds = _build_dataset(cfg, root_dir)
     kwargs = {"result_db": result_db} if step_name in _PROFILE_STEPS else {}
-    return fn(cfg, ds, root_dir, progress, **kwargs)
+    ds = fn(cfg, ds, root_dir, progress, **kwargs)
+    if _step_will_execute(cfg, step_name) and not (
+        step_name == "basic" and _is_fit_only_basic(cfg)
+    ):
+        _persist_applied(root_dir, [step_name])
+    return ds
+
+
+def _persist_applied(root_dir: Path, executed: list[str]) -> None:
+    """Union executed steps into session.yml's applied_steps (never shrinks).
+
+    Called immediately after each step completes inside run_pipeline/run_step,
+    so a later failure or a GUI cancel still records the in-place steps that
+    already ran — a destructive re-run after a partial failure is impossible.
+    """
+    sf = SessionFile(root_dir)
+    applied = sorted(set(sf.get_applied_steps()) | set(executed))
+    sf.set_applied_steps(applied)
 
 
 def run_pipeline(
@@ -122,6 +137,9 @@ def run_pipeline(
         if _step_will_execute(cfg, step_name) and not fit_only:
             logger.info("%s step done", step_name)
             applied_steps.append(step_name)
+            # Persist per completed step so a later failure or cancel keeps
+            # the already-executed in-place steps recorded in session.yml.
+            _persist_applied(root_dir, [step_name])
 
     applied_steps = sorted(set(prev_applied) | set(applied_steps))
 

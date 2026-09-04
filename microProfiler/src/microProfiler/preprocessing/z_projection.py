@@ -46,6 +46,11 @@ def z_project_dataset(
 
     if "stack" not in metadata.columns:
         raise ValueError("Metadata must contain a 'stack' column for Z-projection")
+    if ds.channel_layout is not None:
+        raise ValueError(
+            "Z-projection is not supported for multi-channel-per-file (CHW/HWC) "
+            "datasets — each file already holds one plane per site."
+        )
 
     exclude = set(ds.intensity_colnames) | set(ds.mask_colnames) | {"stack", "directory"}
     group_cols = [c for c in metadata.columns if c not in exclude]

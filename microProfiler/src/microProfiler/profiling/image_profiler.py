@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -12,8 +13,8 @@ import pandas as pd
 from skimage.measure import label, regionprops_table
 
 from microBase import ImageDataset
+from microProfiler.profiling import resolve_source_directory
 from microProfiler.profiling.batch_writer import BatchWriter
-from microProfiler.profiling.object_profiler import _resolve_source_directory
 from microProfiler.progress import StepProgress
 from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
 
@@ -90,7 +91,7 @@ def _process_one_image(
     row = ds.metadata.iloc[idx]
     excluded = set(ds.intensity_colnames) | set(ds.mask_colnames)
     meta = {k: v for k, v in row.to_dict().items() if k not in excluded}
-    meta["directory"] = _resolve_source_directory(row, ds.intensity_colnames)
+    meta["directory"] = resolve_source_directory(row, ds.intensity_colnames)
     measures = measure_single_image(image_data, ds.intensity_colnames, channels, thresholds)
     return pd.DataFrame([{**meta, **measures}])
 
@@ -130,7 +131,7 @@ def profile_images(
     BATCH = 50
     n_total = len(ds)
     completed = 0
-    result_df = None
+    executor = None
 
     with BatchWriter(db_path, table_name, BATCH) as writer:
         try:
@@ -138,11 +139,24 @@ def profile_images(
                 if n_workers == 1:
                     for idx in range(n_total):
                         sp.report(idx, "")
-                        result = _process_one_image(ds, idx, channels, thresholds)
+                        try:
+                            result = _process_one_image(ds, idx, channels, thresholds)
+                        except InterruptedError:
+                            raise
+                        except Exception:
+                            # Align with object profiler's per-row skip: one
+                            # bad image logs and continues (the CLI's row-count
+                            # guard still flags an incomplete table).
+                            logger.exception(
+                                "Image profiling failed for row %d — skipping", idx)
+                            completed += 1
+                            continue
                         writer.add(result)
                         completed += 1
                 else:
-                    # Process in chunks to avoid pre-loading all images into RAM
+                    # One executor for the whole run (chunks only bound how
+                    # many images are pre-loaded into RAM).
+                    executor = ProcessPoolExecutor(max_workers=n_workers)
                     for chunk_start in range(0, n_total, BATCH):
                         chunk_end = min(chunk_start + BATCH, n_total)
                         tasks = []
@@ -151,45 +165,49 @@ def profile_images(
                             row = ds.metadata.iloc[idx]
                             excluded = set(ds.intensity_colnames) | set(ds.mask_colnames)
                             meta = {k: v for k, v in row.to_dict().items() if k not in excluded}
-                            meta["directory"] = _resolve_source_directory(row, ds.intensity_colnames)
-                            tasks.append((image_data, ds.intensity_colnames, channels, thresholds, meta))
+                            meta["directory"] = resolve_source_directory(row, ds.intensity_colnames)
+                            tasks.append((idx, (image_data, ds.intensity_colnames, channels, thresholds, meta)))
 
-                        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                            futures = {
-                                executor.submit(_profile_image_worker, t): idx
-                                for idx, t in enumerate(tasks)
-                            }
-                            for future in as_completed(futures):
-                                task_idx = futures[future]
-                                try:
-                                    result = future.result()
-                                    writer.add(result)
-                                    completed += 1
-                                    sp.tick("")
-                                except InterruptedError:
-                                    raise
-                                except Exception:
-                                    logger.exception("Image profiling failed for row %d — aborting", chunk_start + task_idx)
-                                    raise
+                        futures = {
+                            executor.submit(_profile_image_worker, payload): idx
+                            for idx, payload in tasks
+                        }
+                        for future in as_completed(futures):
+                            idx = futures[future]
+                            try:
+                                result = future.result()
+                                writer.add(result)
+                                completed += 1
+                                sp.tick("")
+                            except InterruptedError:
+                                raise
+                            except Exception:
+                                logger.exception(
+                                    "Image profiling failed for row %d — skipping", idx)
+                                completed += 1
+                                sp.tick("")
         except InterruptedError:
             # A cancel must propagate so the pipeline treats the run as
-            # interrupted (never as a completed step): the GUI relies on
-            # InterruptedError to skip success handlers and applied_steps
-            # bookkeeping. The writer still flushes below in `finally`.
+            # interrupted (never as a completed step); queued tasks are
+            # cancelled, running ones finish. The writer still flushes below.
+            if executor is not None:
+                executor.shutdown(cancel_futures=True)
+            raise
+        except BrokenProcessPool:
+            if executor is not None:
+                executor.shutdown(cancel_futures=True)
             raise
         except Exception:
             # A run-level profiling failure re-raises so the dataset is NOT
             # reported complete. Note: batches flushed before the failure are
-            # already committed (writer.close() in finally) — the partial
-            # table is not silently accepted because cli._is_dataset_complete
-            # compares the image row count against the dataset size (and the
-            # GUI worker surfaces the error dialog).
-            logger.exception("Image profiling failed")
+            # already committed — the partial table is not silently accepted
+            # because cli._is_dataset_complete compares the image row count
+            # against the dataset size (and the GUI worker surfaces the error).
+            if executor is not None:
+                executor.shutdown(cancel_futures=True)
             raise
-        finally:
-            # step_start/step_end are emitted by the orchestrator
-            # (pipeline.steps._run_profile) — emitting step_end here too would
-            # double-report the same step key to the progress collector.
-            result_df = writer.close()
+        else:
+            if executor is not None:
+                executor.shutdown()
 
-    return result_df
+    return None

@@ -133,15 +133,13 @@ class ObjectProfileEntry:
         if self.glcm_levels is not None:
             glcm_levels = self.glcm_levels
 
-        radial_bins = self.radial_bins
-
         return ResolvedProfiling(
             mask_name=self.mask_name,
             parent_mask_name=self.parent_mask_name,
             output_table_name=self.output_table_name,
             intensity_channels=self.intensity_channels,
             radial_channels=self.radial_channels,
-            radial_bins=radial_bins,
+            radial_bins=self.radial_bins,
             granularity_channels=self.gran_channels,
             gran_spectrum_length=gran_spectrum_length,
             gran_subsample_ratio=gran_subsample_ratio,
@@ -201,8 +199,9 @@ class InferenceReductionConfig:
 class InferenceEntry:
     """One inference block: a trained microModel bundle applied per object.
 
-    feature/pred_class/pred_prob are output toggles; SSL bundles only support
-    features (pred_class/pred_prob are gated in the GUI). max_value is the
+    feature/pred_class are output toggles; SSL bundles only support features
+    (pred_class is gated in the GUI). pred_prob is always written together
+    with pred_class by microModel — no separate toggle. max_value is the
     maximum possible intensity of the input dtype (65535 for 16-bit, 255 for
     8-bit) and is always read from config — it is trusted as-is.
     """
@@ -212,7 +211,6 @@ class InferenceEntry:
     channels: Optional[List[str]] = None
     feature: bool = True
     pred_class: bool = True
-    pred_prob: bool = True
     output_db: str = "infer.db"
     max_value: Optional[float] = None
     reduction: Optional[InferenceReductionConfig] = None
@@ -293,16 +291,14 @@ def _dict_to_config(d: Dict) -> PipelineConfig:
 
 
 def _coerce_bool(value: Any, attr: str) -> bool:
-    """Coerce a YAML 'run' flag to bool (rejects 'false' as a quoted string)."""
+    """Strict boolean parse — a YAML 'run' flag must be a real bool.
+
+    Quoted strings like "false" are rejected (no lenient dual-form parsing);
+    the user is responsible for writing config values with correct types.
+    """
     if isinstance(value, bool):
         return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in ("1", "true", "yes", "on"):
-            return True
-        if lowered in ("0", "false", "no", "off"):
-            return False
-    raise ValueError(f"'{attr}' must be a boolean (true/false), got {value!r}")
+    raise ValueError(f"'{attr}' must be a real boolean (true/false), got {value!r}")
 
 
 def _check_keys(attr: str, section: Dict, known: set) -> None:
@@ -356,7 +352,6 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
             _check(entry.gpu_batch_size >= 1, "'segment.configs[].gpu_batch_size' must be >= 1")
             _check(entry.resize_factor > 0, "'segment.configs[].resize_factor' must be > 0")
             _check(entry.flow_threshold >= 0, "'segment.configs[].flow_threshold' must be >= 0")
-            _check(entry.cellprob_threshold >= 0, "'segment.configs[].cellprob_threshold' must be >= 0")
             entries.append(entry)
         return SegmentConfig(
             run=_coerce_bool(section.get("run", False), "segment.run"),
@@ -415,7 +410,11 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
 
 
 def _dataclass_from_section(attr: str, cls, section: Dict):
-    """Instantiate a dataclass from a section dict, rejecting unknown keys."""
+    """Instantiate a dataclass from a section dict, rejecting unknown keys.
+
+    Strict config typing: empty lists normalize to None (``[] in yml -> None``)
+    and a ``run`` flag must be a real bool.
+    """
     known = set(cls.__dataclass_fields__)
     unknown = set(section) - known
     if unknown:
@@ -423,11 +422,21 @@ def _dataclass_from_section(attr: str, cls, section: Dict):
             f"Unknown keys in '{attr}' section: {sorted(unknown)}. "
             f"Valid keys: {sorted(known)}"
         )
-    return cls(**section)
+    coerced = {
+        k: (None if isinstance(v, list) and not v else v)
+        for k, v in section.items()
+    }
+    if "run" in coerced:
+        coerced["run"] = _coerce_bool(coerced["run"], f"{attr}.run")
+    return cls(**coerced)
 
 
 def _entry_from_section(attr: str, cls, entry: Dict):
-    """Instantiate a block-list entry dataclass, rejecting unknown keys."""
+    """Instantiate a block-list entry dataclass, rejecting unknown keys.
+
+    Empty lists normalize to None (``[] in yml -> None``), so optional
+    channel lists are either a real list or None — never a stale [].
+    """
     known = set(cls.__dataclass_fields__)
     unknown = set(entry) - known
     if unknown:
@@ -435,7 +444,10 @@ def _entry_from_section(attr: str, cls, entry: Dict):
             f"Unknown keys in '{attr}.configs' entry: {sorted(unknown)}. "
             f"Valid keys: {sorted(known)}"
         )
-    return cls(**entry)
+    return cls(**{
+        k: (None if isinstance(v, list) and not v else v)
+        for k, v in entry.items()
+    })
 
 
 def config_to_dict(cfg: PipelineConfig) -> Dict:

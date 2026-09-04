@@ -12,29 +12,48 @@ from .utils import logger
 
 
 def build_dinov2_vit(vit_name, in_chans, pretrained=False):
-    """Build a timm ViT for DINOv2 with the special init args.
+    """Build a timm ViT usable for DINO-style SSL (cls-token pooling).
 
-    DINOv2 rebuilds the ViT via timm directly (not via build_backbone)
-    because ViT requires pos_embed="learn", dynamic_img_size=True,
-    init_values=1e-5. Any timm ViT with a class token is accepted — anything
-    else (conv nets, gap/no-cls variants) hard-exits (no silent fallback).
+    Two timm model families are accepted:
+      1. Classic timm `VisionTransformer` (DINOv2 checkpoints such as
+         `vit_*_patch14_dinov2.*`): created with pos_embed="learn",
+         dynamic_img_size=True, init_values=1e-5.
+      2. timm DINOv3 backbones (`vit_*_patch16_dinov3*`, e.g.
+         `vit_small_patch16_dinov3`): these are implemented on the Eva
+         architecture (RoPE, register tokens, num_prefix_tokens=5) and do NOT
+         accept the VisionTransformer-specific kwargs — they are created with
+         a plain create_model call (dynamic_img_size is built-in).
+    Anything without a patch_embed / blocks / a class token hard-exits
+    (no silent fallback).
 
-    pretrained=True loads ImageNet weights through timm's loader (first conv
-    adapted to in_chans via adapt_input_conv, classifier dropped, strict=False
-    so the missing layer_scale keys keep their init_values=1e-5).
+    pretrained=True loads timm weights (ImageNet/LVD); the first conv is
+    adapted to in_chans via timm's adapt_input_conv.
     """
     try:
         vit = timm.create_model(
             vit_name, pretrained=pretrained, in_chans=in_chans, num_classes=0,
             pos_embed="learn", dynamic_img_size=True, init_values=1e-5)
+    except TypeError:
+        # timm DINOv3 (Eva-based) backbones reject the VisionTransformer
+        # kwargs — rebuild without them.
+        try:
+            vit = timm.create_model(
+                vit_name, pretrained=pretrained, in_chans=in_chans, num_classes=0)
+        except Exception as e:
+            print(f"Error: failed to create DINOv3 ViT '{vit_name}': {e}",
+                  file=sys.stderr)
+            sys.exit(1)
     except Exception as e:
         print(f"Error: failed to create DINOv2 ViT '{vit_name}': {e}",
               file=sys.stderr)
         sys.exit(1)
-    if not isinstance(vit, VisionTransformer) or vit.num_prefix_tokens < 1:
+    ok = (hasattr(vit, "patch_embed") and hasattr(vit, "blocks")
+          and getattr(vit, "num_prefix_tokens", 0) >= 1
+          and getattr(vit, "embed_dim", None) is not None)
+    if not ok:
         print(
-            f"Error: '{vit_name}' is not a timm VisionTransformer with a class "
-            f"token; DINOv2 requires one (cls-token pooling + cls-token loss).",
+            f"Error: '{vit_name}' is not a DINO-style timm ViT (needs a "
+            f"patch_embed, blocks and a class token); got {type(vit).__name__}.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -107,7 +126,7 @@ def extract_backbone_state_dict(state_dict, method):
     'backbone.*'. The prefix is stripped so the result loads directly into a
     standalone backbone.
     """
-    prefix = "student_backbone.vit." if method == "dinov2" else "backbone."
+    prefix = "student_backbone.vit." if method in ("dinov2", "dinov3") else "backbone."
     return {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
 
 
@@ -144,7 +163,7 @@ def load_model_from_bundle(bundle, device=None):
     ssl_method = meta.get("ssl_method")
     in_chans = meta["in_chans"]
 
-    if ssl_method == "dinov2":
+    if ssl_method in ("dinov2", "dinov3"):
         backbone = build_dinov2_vit(meta["backbone"], in_chans, pretrained=False)
         feat_dim = backbone.num_features
         pool_fn = cls_token_pool_fn
@@ -186,7 +205,7 @@ def load_ssl_backbone_from_bundle(bundle, device=None):
     method = meta.get("method")
     in_chans = meta["in_chans"]
 
-    if method == "dinov2":
+    if method in ("dinov2", "dinov3"):
         backbone = build_dinov2_vit(meta["backbone"], in_chans, pretrained=False)
         feat_dim = backbone.num_features
         pool_fn = cls_token_pool_fn

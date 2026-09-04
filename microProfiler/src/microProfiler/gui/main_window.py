@@ -60,6 +60,10 @@ class WindowWheelFilter(QObject):
     def eventFilter(self, watched, event):
         if event.type() != QEvent.Type.Wheel:
             return False
+        # A combo popup (or any other top-level popup) is its own window —
+        # its wheel events must NOT be swallowed by the main-window scroller.
+        if isinstance(watched, QWidget) and watched.window() is not self._window:
+            return False
         if event.modifiers() & Qt.ControlModifier:
             return False
         mw = self._window
@@ -139,13 +143,22 @@ class MainWindow(QMainWindow):
     def get_image_subdir_pattern(self) -> Optional[str]:
         return self._custom_image_subdir_pattern.text().strip() or None
 
+    def _clear_progress_error(self) -> None:
+        """Drop the error style class set by progress_show_error."""
+        if self._progress_label.property("class") == "error":
+            self._progress_label.setProperty("class", "status-bar")
+            self._progress_label.style().polish(self._progress_label)
+
     def progress_reset(self) -> None:
+        self._clear_progress_error()
         self._progress_label.setVisible(False)
 
     def progress_finished(self) -> None:
+        self._clear_progress_error()
         self._progress_label.setVisible(False)
 
     def progress_show_status(self, message: str) -> None:
+        self._clear_progress_error()
         self._progress_label.setText(message)
         self._progress_label.setVisible(True)
 
@@ -688,6 +701,12 @@ class MainWindow(QMainWindow):
             self.refresh_step_panels(ds.intensity_colnames)
             self._basic_panel.set_preview_channels(ds.intensity_colnames)
 
+            # Initialize the filter-edit caches: otherwise the first filter
+            # edit sees unset (None) values, triggers a full panel refresh and
+            # wipes the user's channel selections on every panel.
+            self._last_filter_channels = tuple(ds.intensity_colnames)
+            self._last_filter_masks = tuple(ds.mask_colnames)
+
             # max_value is read from config and always trusted; a mismatch
             # against the dataset dtype is a non-blocking warning (§Q12) so the
             # user can check the yml — the configured value is still used.
@@ -756,6 +775,11 @@ class MainWindow(QMainWindow):
         self._loaded_dataset_dir = None
         self._update_window_title()
         self._update_tab_status()
+        # A failed load must not leave a Browse-restored config pending —
+        # populating a later dataset with stale channel selections is wrong.
+        img_panel = getattr(self, "_image_profile_panel", None)
+        if img_panel is not None and hasattr(img_panel, "_pending_settings"):
+            del img_panel._pending_settings
         QMessageBox.warning(self, "Load Failed", f"Could not load dataset:\n{msg}")
 
     def _on_input_changed(self):
@@ -772,9 +796,14 @@ class MainWindow(QMainWindow):
         obj_panel = getattr(self, "_object_profile_panel", None)
         if obj_panel is not None:
             obj_panel._pending_block_configs = []
+            obj_panel._restore_active = False
         inf_panel = getattr(self, "_inference_panel", None)
         if inf_panel is not None:
             inf_panel._pending_block_configs = []
+            inf_panel._restore_active = False
+        img_panel = getattr(self, "_image_profile_panel", None)
+        if img_panel is not None and hasattr(img_panel, "_pending_settings"):
+            del img_panel._pending_settings
         self._clear_dataset_info()
         if hasattr(self, '_filter_panel') and self._filter_panel is not None:
             self._filter_panel._reset_filters()

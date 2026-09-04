@@ -11,7 +11,8 @@ from microBase import ImageDataset, SessionFile
 from microProfiler.config import config_to_dict, load_config, PipelineConfig, resolve_inference_db
 from microProfiler.io import Database
 from microProfiler.log_utils import set_default_logging_level, setup_logging
-from microProfiler.pipeline import MetadataValidationError, apply_filters, run_pipeline
+from microProfiler.pipeline import apply_filters, run_pipeline
+from microProfiler.pipeline.errors import MetadataValidationError
 from microProfiler.pipeline._micromodel_bridge import INFERENCE_TABLE, REDUCTION_TABLES
 
 logger = logging.getLogger(__name__)
@@ -260,17 +261,23 @@ def main(argv: list[str] | None = None) -> int:
 
             logger.info("Processing dataset: %s", dataset_dir)
             try:
-                ds, applied_steps = run_pipeline(
+                # applied_steps are persisted inside run_pipeline (per executed
+                # step), so a later failure never loses the in-place steps.
+                ds, _ = run_pipeline(
                     cfg, root_dir=dataset_dir, log_file=args.log_file,
                 )
                 cfg_dict = config_to_dict(cfg)
                 sf = SessionFile(dataset_dir)
                 sf.save(cfg_dict)
-                sf.set_applied_steps(applied_steps)
                 logger.info("Dataset complete: %s", dataset_dir)
                 processed += 1
                 print()
             except MetadataValidationError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            except (ValueError, TypeError) as e:
+                # Invalid config / bad types (e.g. scale_factor: "2") — clean
+                # hard-exit, not a raw traceback.
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
             except SystemExit as e:
@@ -291,8 +298,6 @@ def main(argv: list[str] | None = None) -> int:
             processed, skipped, len(datasets),
         )
         return 0
-
-    return 1
 
 
 def _dry_run(cfg: PipelineConfig, datasets: list[Path], log: logging.Logger) -> None:

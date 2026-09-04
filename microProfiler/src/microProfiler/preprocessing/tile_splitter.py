@@ -46,6 +46,11 @@ def tile_dataset(
     delete_original: bool = True,
     progress: ProgressCollector = NullProgressCollector(),
 ) -> ImageDataset:
+    if not ds.image_pattern or "field" not in re.compile(ds.image_pattern).groupdict():
+        raise ValueError(
+            "Tiling requires an image_pattern with a (?P<field>...) group — "
+            "tile numbering would otherwise collapse on rebuild."
+        )
     metadata = ds.metadata
     all_sources: list = []
     total = len(metadata)

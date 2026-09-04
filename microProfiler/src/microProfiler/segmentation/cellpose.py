@@ -18,7 +18,7 @@ import pandas as pd
 import torch
 from PIL import Image
 from cellpose import models
-from skimage.morphology import closing
+from skimage.segmentation import expand_labels
 from skimage.transform import rescale, resize
 from tqdm import tqdm
 
@@ -68,10 +68,10 @@ def build_cellpose_image(
     resize_factor: float,
 ) -> np.ndarray:
     """Build a (C, H, W) array from metadata for Cellpose-SAM."""
-    img_dir = Path(row["directory"])
-
+    # row[ch] is an absolute source path — use it directly (pathlib would
+    # discard any leading directory component for absolute paths anyway).
     ch1_paths = [
-        img_dir / row[ch] for ch in chan1
+        Path(row[ch]) for ch in chan1
         if ch in row and pd.notna(row[ch])
     ]
     if not ch1_paths:
@@ -80,7 +80,7 @@ def build_cellpose_image(
 
     if chan2:
         ch2_paths = [
-            img_dir / row[ch] for ch in chan2
+            Path(row[ch]) for ch in chan2
             if ch in row and pd.notna(row[ch])
         ]
         if not ch2_paths:
@@ -113,8 +113,7 @@ def segment_single(
     orig_shape = None
     if resize_factor != 1.0:
         from microProfiler.io import read_image_shape
-        img_dir = Path(row["directory"])
-        first_ch_path = img_dir / row[chan1[0]]
+        first_ch_path = Path(row[chan1[0]])
         if first_ch_path.exists():
             orig_shape = read_image_shape(first_ch_path)
     img = build_cellpose_image(row, chan1, chan2, merge1, merge2, resize_factor)
@@ -144,7 +143,11 @@ def segment_single(
     else:
         c1_img = img[0]
         c2_img = img[1] if img.shape[0] >= 2 else None
-    masks = closing(masks)
+    # Label-safe gap fill: grayscale closing on a label map applies min/max
+    # filtering to the label VALUES, reassigning 1-2px gaps to whichever label
+    # number wins and moving object boundaries. expand_labels preserves label
+    # identity while filling small background gaps.
+    masks = expand_labels(masks, distance=1)
     return c1_img, c2_img, masks
 
 
@@ -228,7 +231,7 @@ def segment_dataset(
             summary["skipped"] += 1
             summary["errors"].append(f"Row {idx}: missing path for channel '{stem_ch}'")
             continue
-        src_path = Path(row["directory"]) / stem_val
+        src_path = Path(stem_val)
         if not src_path.exists():
             summary["skipped"] += 1
             summary["errors"].append(f"Source not found: {src_path.name}")
@@ -267,6 +270,11 @@ def segment_dataset(
                 # truncates every label to 0 (empty/corrupt mask).
                 masks = rescale(masks, 1.0 / resize_factor, order=0, preserve_range=True).astype(np.uint16)
 
+            # Label-safe gap fill (was: grayscale closing, which min/max-
+            # filtered the label VALUES and moved boundaries). Objects are
+            # counted AFTER the fill so n_objects always matches the mask
+            # that is actually saved.
+            masks = expand_labels(masks, distance=1)
             n_objects = len(np.unique(masks)) - 1
             if n_objects <= 0:
                 summary["processed"] += 1
@@ -278,7 +286,7 @@ def segment_dataset(
                     logger.warning("Removed stale mask %s (re-segmentation found no objects)", mask_path)
                 continue
 
-            mask_to_save = closing(masks).astype(np.uint16)
+            mask_to_save = masks.astype(np.uint16)
             mask_path.parent.mkdir(parents=True, exist_ok=True)
             Image.fromarray(mask_to_save).save(str(mask_path))
             summary["processed"] += 1
@@ -302,6 +310,10 @@ def segment_dataset(
     logger.info(
         "Segmentation complete: %d processed, %d skipped, %d failed, %d masks saved",
         summary["processed"], summary["skipped"], summary["failed"], summary["masks_saved"],
+    )
+    logger.info(
+        "Mask smoothing switched from closing to expand_labels — labels are "
+        "preserved, but objects may differ from previous runs (re-segment to update)"
     )
     if summary["errors"]:
         logger.debug("Segmentation errors: %s", summary["errors"])
