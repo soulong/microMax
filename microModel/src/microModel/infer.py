@@ -29,7 +29,7 @@ from microBase import CellDataset, ImageDataset
 
 from .utils import (logger, set_seed, select_device, load_label_csv,
                     resolve_output_paths, copy_config_file,
-                    add_file_logging, resolve_max_value)
+                    add_file_logging, resolve_max_value, sql_ident)
 from .dataset import (WholeImageCellDataset, SingleCellDataset, subsample)
 from .backbone import load_model_from_bundle, load_ssl_backbone_from_bundle
 
@@ -76,14 +76,16 @@ def _init_db(conn, mode, extra_cols=None, prob_cols=None):
         cols.append("mask_filename TEXT")
         cols.append("label INTEGER NOT NULL DEFAULT 0")
     cols.append("ground_truth TEXT")
+    # Metadata/probability column names come from regex captures / class
+    # names (arbitrary text, may contain spaces or dots) — quote them all.
     for c in extra_cols:
-        cols.append(f"{c} TEXT")
+        cols.append(f"{sql_ident(c)} TEXT")
     cols.append("pred_class TEXT")
     # Probability of the pred_class winner only — the full per-class vector
     # lives in the prob_<name> columns.
     cols.append("pred_prob REAL")
     for c in prob_cols:
-        cols.append(f"{c} REAL")
+        cols.append(f"{sql_ident(c)} REAL")
     cols.append("features BLOB")
     col_defs = ", ".join(cols)
     conn.execute(f"CREATE TABLE IF NOT EXISTS inference ({col_defs})")
@@ -178,7 +180,7 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
     base_cols.append("ground_truth")
     tail_cols = ["pred_class", "pred_prob"] + prob_cols + ["features"]
     all_cols = base_cols + extra_cols + tail_cols
-    col_names = ", ".join(all_cols)
+    col_names = ", ".join(sql_ident(c) for c in all_cols)
     placeholders = ", ".join("?" * len(all_cols))
 
     rows = []
@@ -309,7 +311,7 @@ def _run_single_cell(data_dir, meta, model, device,
     for i in range(len(md)):
         row = md.iloc[i]
         path = row["path"]
-        abs_path = os.path.abspath(path)
+        abs_path = os.path.normcase(os.path.abspath(path))
         file_dir = os.path.dirname(path).replace("\\", "/")
         gt = _resolve_gt(label_map, label_from_dir, abs_path, file_dir)
         entry = {
@@ -433,7 +435,8 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
         for idx in range(len(ds)):
             row_idx, label = ds._flat_index[idx]
             source_path = ds.row_source_path(row_idx)
-            abs_path = os.path.abspath(source_path) if source_path else None
+            abs_path = (os.path.normcase(os.path.abspath(source_path))
+                        if source_path else None)
             file_dir = os.path.dirname(source_path).replace("\\", "/") if source_path else ""
             gt = _resolve_gt(label_map, label_from_dir, abs_path, file_dir)
             entries.append({"idx": idx, "ground_truth": gt})
@@ -591,7 +594,12 @@ def run_inference(config, config_path=None):
     dl_persistent_workers = dl_cfg.get("persistent_workers", True) and dl_num_workers > 0
 
     label_map = {}
-    if label_csv and os.path.exists(label_csv):
+    if label_csv:
+        # A configured-but-missing CSV is a typo — never silently fall back
+        # to label_from_dir/NULL ground truth (same policy as train).
+        if not os.path.exists(label_csv):
+            print(f"Error: label_csv file not found: {label_csv}", file=sys.stderr)
+            sys.exit(1)
         label_map = load_label_csv(label_csv)
 
     out_pairs = resolve_output_paths(data_roots, output_dir)

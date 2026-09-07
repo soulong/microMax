@@ -102,8 +102,8 @@ dinov3:
     ema_teacher: false                # 用 ckpt 冻结教师（推荐）；如想省一张骨干显存可改 true
                                       # （true 时勿设 crops_size，下方两个 gram 视图也不需要）
     it_load_ema_teacher: -1
-    rep_update: true                  # 周期用当前 EMA teacher 刷新 gram teacher（官方机制；
-                                      # 论文每 10k 步，这里 20k 为显存/时间折衷）
+    rep_update: true                  # 周期用当前 EMA teacher 刷新 gram teacher（官方机制，
+                                      # 与论文一致：每 10k 步）
     update_frequency: 10000           # 刷新间隔（global steps）
     it_first_update: 0
     max_updates: null
@@ -118,7 +118,8 @@ dinov3:
     global_teacher_resize_antialias: false
 
 # =============================================================================
-# augmentation_views —— Phase 2 = Phase 1 的 8 个视图 + 末尾 2 个 gram teacher crop
+# augmentation_views —— Phase 2 = Phase 1 的 6 个视图(2 global + 4 local)
+# + 末尾 2 个 gram teacher crop(共 8 个)。
 # 顺序约定（train_step 按序切分）：
 #   [0:2]          = global（student/teacher）
 #   [2:2+N]        = local（student）

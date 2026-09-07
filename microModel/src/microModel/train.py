@@ -169,7 +169,7 @@ def _build_records_from_cell_dataset(cell_ds, root, label_from_dir, label_csv):
     for i in range(len(md)):
         row = md.iloc[i]
         path = row["path"]
-        abs_path = os.path.abspath(path)
+        abs_path = os.path.normcase(os.path.abspath(path))
         if abs_path in label_map:
             label = label_map[abs_path]
         elif label_from_dir:
@@ -457,6 +457,16 @@ def train(config, config_path=None):
             ssl_bundle, model_cfg, num_classes, device)
         trained_backbone = ssl_meta["backbone"]
         trained_in_chans = ssl_meta["in_chans"]
+        if trained_in_chans != len(resolved_channels):
+            # Same gate the scratch path has: a mismatch would otherwise only
+            # crash at the first forward with a cryptic conv-shape error.
+            print(
+                f"Error: data.channels resolves to {len(resolved_channels)} "
+                f"but the SSL bundle's backbone was built with "
+                f"in_chans={trained_in_chans}; use matching data.channels.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     else:
         # From scratch (timm pretrained). On resume the checkpoint state dict
         # fully overwrites these weights, so the ImageNet load is skipped.

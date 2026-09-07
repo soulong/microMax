@@ -47,6 +47,7 @@ from .utils import (
     shorten_labels,
     save_reducer,
     load_reducer,
+    sql_ident,
     validate_pca,
     validate_umap_pipeline,
     add_file_logging,
@@ -324,11 +325,6 @@ def _build_palette():
 def _res_tag(res):
     """Compact resolution tag for table columns / file names (1.0 -> '1')."""
     return f"{float(res):g}"
-
-
-def _quote_col(name):
-    """Double-quote a SQLite identifier (resolution tags may contain a dot)."""
-    return '"' + name + '"'
 
 
 def _leiden_partition(W, resolution, seed):
@@ -1041,9 +1037,9 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
         if cluster_res_list:
             # Resolution tags may contain a dot ("0.5"), so every identifier
             # is quoted.
-            cols = ", ".join(f'{_quote_col(f"cluster_res{_res_tag(r)}")} INTEGER NOT NULL'
+            cols = ", ".join(f'{sql_ident(f"cluster_res{_res_tag(r)}")} INTEGER NOT NULL'
                              for r in cluster_res_list)
-            col_names = ", ".join(_quote_col(f"cluster_res{_res_tag(r)}")
+            col_names = ", ".join(sql_ident(f"cluster_res{_res_tag(r)}")
                                   for r in cluster_res_list)
             ph = ", ".join("?" * len(cluster_res_list))
             conn.execute("DROP TABLE IF EXISTS find_cluster")
@@ -1184,7 +1180,9 @@ def plot_training_results(model, device, val_loader, num_classes, label_to_idx,
                 yt_all.extend(y.tolist())
                 yp_all.extend(logits.argmax(1).cpu().tolist())
 
-    cls_names = list(label_to_idx.keys())
+    # Class order for the confusion-matrix axes follows the label_to_idx
+    # mapping (sorted by index), not dict insertion order.
+    cls_names = sorted(label_to_idx, key=label_to_idx.get)
     if multi_label:
         # No confusion matrix exists for multi-label — bar-chart the F1 of
         # every category instead.

@@ -210,8 +210,10 @@ class VisInteractiveServer:
             if col not in self._color_by_cols and col not in _exclude_color:
                 self._color_by_cols.append(col)
 
-        # Load all from inference table (single table, no JOINs needed)
-        col_select = ", ".join(infer_cols)
+        # Load all from inference table (single table, no JOINs needed).
+        # Column names may contain spaces (prob_<class> columns derive from
+        # arbitrary class names) — quote every identifier.
+        col_select = ", ".join(f'"{c}"' for c in infer_cols)
         cur = conn.execute(f"SELECT {col_select} FROM inference")
         col_names = [desc[0] for desc in cur.description]
 
@@ -778,11 +780,13 @@ function computeColors(points, colorBy) {
         else { r = 177 + (t-0.75)*4*(253-177); g = 204 + (t-0.75)*4*(231-204); b = 95 + (t-0.75)*4*(37-95); }
         return 'rgb(' + Math.round(r) + ',' + Math.round(g) + ',' + Math.round(b) + ')';
       }
-      var colors = nums.map(function(n) {
+      // Continuous columns keep the RAW numeric array: the trace colors via
+      // the shared Plotly coloraxis (added to the layout in renderPlot),
+      // which is what actually renders the colorbar.
+      return { values: nums, colors: nums.map(function(n) {
         var t = max > min ? (n - min) / (max - min) : 0.5;
         return viridis(Math.max(0, Math.min(1, t)));
-      });
-      return { colors: colors, type: 'continuous', min: min, max: max };
+      }), type: 'continuous', min: min, max: max };
     }
   }
 
@@ -809,11 +813,19 @@ function getPlotTrace(points, mode) {
   var xKey = mode + '_x';
   var yKey = mode + '_y';
   var colorInfo = computeColors(points, _colorBy);
+  var marker = { size: 4, color: colorInfo.colors, opacity: 0.7 };
+  if (colorInfo.type === 'continuous') {
+    // Numeric column -> raw values + the shared coloraxis (its colorbar is
+    // attached to the layout in renderPlot). Precomputed rgb strings would
+    // leave the coloraxis unreferenced and the colorbar invisible.
+    marker.color = colorInfo.values;
+    marker.coloraxis = 'coloraxis';
+  }
   var trace = {
     x: points.map(function(d) { return d[xKey]; }),
     y: points.map(function(d) { return d[yKey]; }),
     mode: 'markers', type: 'scattergl',
-    marker: { size: 4, color: colorInfo.colors, opacity: 0.7 },
+    marker: marker,
     text: points.map(function(d) {
       // Hover shows ONLY the top-N classes by probability (N from the
       // Top_N control), highest first. No separate pred_class/pred_prob line.

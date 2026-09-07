@@ -93,7 +93,9 @@ def load_label_csv(path):
         fp = str(r["filepath"])
         if not os.path.isabs(fp):
             fp = os.path.join(base, fp)
-        label_map[os.path.abspath(fp)] = str(r["label"])
+        # normcase makes the lookup Windows-case-insensitive: a CSV written
+        # with "d:\..." must match data on "D:\..." (abspath alone doesn't).
+        label_map[os.path.normcase(os.path.abspath(fp))] = str(r["label"])
     return label_map
 
 
@@ -290,6 +292,16 @@ def save_reducer(obj, path):
     logger.info("Saved reducer to %s", path)
 
 
+def sql_ident(name):
+    """Double-quote a SQLite identifier.
+
+    Class names and resolution tags become column names (prob_<class>,
+    cluster_res<resolution>) and may contain spaces or dots — unquoted
+    identifiers would make the CREATE TABLE / SELECT statements invalid SQL.
+    """
+    return '"' + str(name) + '"'
+
+
 def load_reducer(path):
     with open(path, "rb") as f:
         obj = pickle.load(f)
@@ -306,7 +318,7 @@ def validate_pca(pca, n_features, name="reduction_pca"):
             file=sys.stderr,
         )
         sys.exit(1)
-    if hasattr(pca, "n_components"):
+    if hasattr(pca, "n_components") and n_in is not None:
         logger.info("%s: %d components, %d features", name, pca.n_components, n_in)
 
 

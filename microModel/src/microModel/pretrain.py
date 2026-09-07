@@ -440,7 +440,7 @@ def _prepare_pretrain_data(config):
         # sample_by='per_dataset' caps per data root (not across all roots).
         items = [{"pair": p, "root": r} for p, r in zip(all_pairs, root_of_pair)]
         items = subsample(items, sample_max, sample_by, seed,
-                          label_key="__unlabeled__", root_key="root")
+                          label_key=None, root_key="root")
         all_pairs = [it["pair"] for it in items]
         logger.info("Sub-sampled to %d records (sample_max=%s, sample_by=%s)",
                     len(all_pairs), sample_max, sample_by)

@@ -206,6 +206,9 @@ def subsample(items, sample_max, sample_by, seed,
         return list(items)
 
     def _label_of(i):
+        if label_key is None:
+            # No label column in these items (e.g. unlabeled pretrain pools).
+            return "__unlabeled__"
         lab = items[i].get(label_key)
         return lab if lab is not None else "__unlabeled__"
 
@@ -293,7 +296,16 @@ class SSLMultiViewDataset(Dataset):
 
     def __getitem__(self, idx):
         cell_idx = self.indices[idx]
-        img_hwc = _to_float_max(self.cell_dataset.get_cell(cell_idx), self.max_value)
+        try:
+            img_hwc = _to_float_max(self.cell_dataset.get_cell(cell_idx), self.max_value)
+        except SystemExit as e:
+            # Convert microBase's hard-exit on missing/corrupt files into a
+            # clean exception (a sys.exit inside a DataLoader worker just
+            # kills the worker with a cryptic error).
+            raise ValueError(
+                f"Failed to load cell {cell_idx} from "
+                f"{self.cell_dataset.metadata.iloc[cell_idx].get('path')} ({e})"
+            ) from e
         # Fixed-reference mode: stats computed ONCE on the raw cell, then
         # applied as a fixed transform to every view (photometric aug survives).
         ref_stats = None
@@ -352,7 +364,17 @@ class SingleCellDataset(Dataset):
 
     def __getitem__(self, idx):
         cell_ds, cell_idx = self.pairs[idx]
-        img_hwc = _to_float_max(cell_ds.get_cell(cell_idx), self.max_value)
+        try:
+            img_hwc = _to_float_max(cell_ds.get_cell(cell_idx), self.max_value)
+        except SystemExit as e:
+            # microBase readers hard-exit (sys.exit) on missing/corrupt
+            # files; inside a DataLoader worker that surfaces as a cryptic
+            # "worker died" error, so convert it to a clean exception
+            # (same guard as WholeImageCellDataset below).
+            raise ValueError(
+                f"Failed to load cell {cell_idx} from "
+                f"{cell_ds.metadata.iloc[cell_idx].get('path')} ({e})"
+            ) from e
         ref_stats = None
         if self.fixed_reference:
             ref_stats = _compute_ref_stats(

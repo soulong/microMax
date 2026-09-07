@@ -52,7 +52,9 @@ resume:
 # Augmentation pipeline — list of {AlbumentationsClassName: {kwargs}} dicts.
 # train = random transforms; infer = deterministic resize (validation).
 # Both must end at the same size (LongestMaxSize + PadIfNeeded + Resize).
-# Locked to bundle values when resume.sl_model is set.
+# NOTE: augmentation is only locked to bundle values on an exact-resume
+# (resume.sl_model, see train_from_scratch.yml); this config's ssl_model
+# transfer uses the pipelines below as written.
 augmentation_train:
   - HorizontalFlip: {p: 0.5}
   - Rotate: {angle_range: [-180, 180], border_mode: 0, p: 0.5}
