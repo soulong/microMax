@@ -440,7 +440,14 @@ class MainWindow(QMainWindow):
         # Invalidate in-flight exports too: their results must not re-enable
         # the export UI or report for a dataset no longer on screen.
         self._export_gen = getattr(self, "_export_gen", 0) + 1
+        # A gen-bumped export can never reach its re-enable path (stale
+        # terminal signals return early) — restore the export UI here.
+        self._image_controls.set_export_enabled(True)
+        # Dataset-scoped selections must not leak into the next dataset.
+        self._object_mask_selected = ""
+        self._current_table = None
         self._label_panel.clear_all()
+        self._image_controls.clear_classes()
         self._grid_canvas.clear()
         self._selected_wells = set()
         self._ch_config = {}
@@ -452,7 +459,7 @@ class MainWindow(QMainWindow):
         self._metadata_merged = None
         # Close old DataModule — it's no longer needed after browsing away.
         if self._dm is not None:
-            self._dm.close()
+            self._dm.close_db()
             self._dm = None
         self._loaded_dataset_dir = None
         self._update_window_title()
@@ -534,7 +541,7 @@ class MainWindow(QMainWindow):
         self._update_grid_columns()
         self._populate_overlay_columns()
         # Close persistent DB connection — cached data remains available
-        self._dm.close_db_only()
+        self._dm.close_db()
         # Redraw the well grid with new DB columns (replaces clear+redraw)
         self._update_grid()
         logger.info("Switched to DB: %s", path)
@@ -610,8 +617,8 @@ class MainWindow(QMainWindow):
             self._data_view.set_db_browse_enabled(True)
             self._data_view.set_meta_browse_enabled(False)
             # Show default DB label (none until user loads a DB)
-            if self._dm and self._dm._db_path is not None:
-                self._data_view.set_db_label(self._dm._db_path.name)
+            if self._dm and self._dm.db_path is not None:
+                self._data_view.set_db_label(self._dm.db_path.name)
             else:
                 self._data_view.set_db_label("")
 
@@ -652,7 +659,7 @@ class MainWindow(QMainWindow):
             self._populate_label_controls()
 
             # Close DB connection — cached data remains available
-            self._dm.close_db_only()
+            self._dm.close_db()
 
             # Patterns + channel colors were already persisted to session.yml
             # by _on_load_dataset_clicked before starting the scan. This
@@ -1379,6 +1386,10 @@ class MainWindow(QMainWindow):
         self._object_mask_selected = mask_name
         self._mask_cache.clear()
         self._polygon_cache.clear()
+        # In-flight image workers were dispatched under the OLD mask; their
+        # results would re-populate the just-cleared caches (same worker
+        # generation) and the overlay fast path would render stale polygons.
+        self._cancel_workers()
         self._schedule_image_refresh()
 
     def _schedule_image_refresh(self) -> None:
@@ -1654,9 +1665,12 @@ class MainWindow(QMainWindow):
         # Use cached overlay data when overlay settings AND the loaded DB
         # haven't changed (the DB path is part of the key, otherwise a
         # different result.db with the same table/column names would serve
-        # stale overlay data).
+        # stale overlay data). Keying by id(_metadata_merged) is safe only
+        # because _on_metadata_merge/_on_metadata_clear null the cache
+        # whenever the DataFrame is replaced — an id alone could be recycled
+        # by CPython for a new object.
         meta_id = id(self._metadata_merged)
-        db_key = getattr(self._dm, "_db_path", None) or getattr(self._dm, "db_path", None) or ""
+        db_key = self._dm.db_path or ""
         overlay_key = f"{self._overlay_table}:{self._overlay_col}:{meta_id}:{db_key}"
         if self._overlay_cache is not None and self._overlay_cache_key == overlay_key:
             overlay_values, object_counts, per_object_values, overlay_vmin, overlay_vmax = self._overlay_cache
@@ -2475,7 +2489,7 @@ class MainWindow(QMainWindow):
 
         # Close DataModule
         if self._dm is not None:
-            self._dm.close()
+            self._dm.close_db()
             self._dm = None
 
         # Clear data references
@@ -2549,6 +2563,8 @@ class MainWindow(QMainWindow):
         ic.auto_high.blockSignals(False)
         ic.set_label_masks([])
         ic.set_object_masks([])
+        ic.clear_classes()
+        ic.set_export_enabled(True)
         ic.update_export_annotated_option(False)
         # Reset widget state that _on_full_reset's field resets must stay in
         # sync with (otherwise e.g. the alpha slider shows 40% while
@@ -2627,5 +2643,5 @@ class MainWindow(QMainWindow):
         # Flush Windows message queue to clear "Not Responding" state
         QApplication.processEvents()
         if self._dm is not None:
-            self._dm.close()
+            self._dm.close_db()
         super().closeEvent(event)

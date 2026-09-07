@@ -34,12 +34,19 @@ def _safe_str(meta: pd.DataFrame, idx, col: str) -> str:
 
 def _infer_plate_dims(wells: list[str]) -> tuple[int, int]:
     """Infer plate dimensions from well names (e.g. B2, D2 → 4 rows, 2 cols)."""
+    def _row_number(letters: str) -> int:
+        # A=1, ..., Z=26, AA=27, ... (base-26, matching well_grid_canvas)
+        n = 0
+        for ch in letters:
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+        return n
+
     max_row = 0
     max_col = 0
     for w in wells:
         m = re.match(r"([A-Z]+)(\d+)", w)
         if m:
-            max_row = max(max_row, ord(m.group(1)[-1]) - ord("A") + 1)
+            max_row = max(max_row, _row_number(m.group(1)))
             max_col = max(max_col, int(m.group(2)))
     return max_row, max_col
 
@@ -432,18 +439,22 @@ class DataModule:
 
     # ── Cleanup ────────────────────────────────────────────────────
 
-    def close_db_only(self) -> None:
-        """Close the persistent DB connection. Cached data remains available."""
+    @property
+    def db_path(self) -> "Path | None":
+        """Path of the profiling DB backing this dataset (None if absent)."""
+        return self._db_path
+
+    def close_db(self) -> None:
+        """Close the persistent DB connection. Cached image data remains
+        available; the DataModule itself is discarded with the dataset."""
         if self._db_conn is not None:
             self._db_conn.close()
             self._db_conn = None
             logger.info("DB connection closed (cache retained)")
 
-    def close(self) -> None:
-        """Close the SQLite connection."""
-        if self._db_conn is not None:
-            self._db_conn.close()
-            self._db_conn = None
+    # Alias kept for readability at call sites that think of it as "final
+    # teardown" — both names close exactly the same connection.
+    close = close_db
 
 
 def parse_plate_metadata(path: str) -> pd.DataFrame:
@@ -497,7 +508,10 @@ def parse_plate_metadata(path: str) -> pd.DataFrame:
         if col == "well":
             continue
         converted = pd.to_numeric(result[col], errors="coerce")
-        if converted.notna().sum() > 0:
+        non_null = result[col].notna().sum()
+        # Coerce only when every non-null value converted — "at least one"
+        # would silently blank entries like "12a".
+        if non_null > 0 and converted.notna().sum() == non_null:
             result[col] = converted
 
     return result

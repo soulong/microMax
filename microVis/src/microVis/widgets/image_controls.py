@@ -748,6 +748,21 @@ class ImageControls(QScrollArea):
 
         self.label_class_added.emit(name)
 
+    def clear_classes(self) -> None:
+        """Remove ALL annotation-class checkboxes in one go.
+
+        Used when browsing away from a dataset / full reset: the classes
+        belonged to the old dataset's label table. Emits no per-class
+        signals — the label panel is cleared by the caller, and N removal
+        signals mid-reset would re-trigger panel handlers.
+        """
+        for cb in self._class_checkboxes.values():
+            self._class_select_layout.removeWidget(cb)
+            cb.deleteLater()
+        self._class_checkboxes.clear()
+        self._class_select_label.setVisible(False)
+        self._class_select_scroll.setVisible(False)
+
     def _on_remove_class(self) -> None:
         """Remove the last added class."""
         if not self._class_checkboxes:

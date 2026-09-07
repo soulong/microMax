@@ -110,6 +110,9 @@ class ImageWorkerConfig:
     contrast_method: str
     contrast_gamma: float
     invert: bool
+    # need_mask / need_polygons are always set to the same value at the
+    # only construction site (main_window._dispatch_image_workers) and must
+    # stay in sync — the mask polygons render on top of the mask.
     need_polygons: bool
     dm: object | None = None
     overlay_val: float | str | None = None

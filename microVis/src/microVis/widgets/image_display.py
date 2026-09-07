@@ -412,7 +412,11 @@ class _ThumbnailView(QGraphicsView):
             self._full_res_item.setScale(min(thumb_w / full_w, thumb_h / full_h))
         self._scene.addItem(self._full_res_item)
 
-        # Fade in with QTimer
+        # Fade in with QTimer. Stop any running fade first — a second
+        # result during a fade would otherwise orphan the old timer, and
+        # both would tick on the shared _fade_step.
+        if self._fade_timer is not None:
+            self._fade_timer.stop()
         steps = 5
         interval = 30  # ms per step → 150ms total
         self._fade_step = 0
@@ -431,6 +435,9 @@ class _ThumbnailView(QGraphicsView):
 
     def remove_full_res(self) -> None:
         """Remove full-res overlay, restoring thumbnail view."""
+        # Invalidate any in-flight full-res load: its result must not
+        # re-add the overlay after this removal.
+        self._full_res_gen += 1
         if self._fade_timer is not None:
             self._fade_timer.stop()
             self._fade_timer = None
