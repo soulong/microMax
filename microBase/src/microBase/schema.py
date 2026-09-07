@@ -16,6 +16,9 @@ from natsort import natsorted
 
 
 STRUCTURAL_COLS = {"well", "field", "stack", "timepoint", "channel", "row", "col"}
+# Captured columns that are internal bookkeeping, not user-facing extra
+# metadata: `ext`/`tile` come from optional pattern groups with no analytical
+# meaning, and `mask_name`/`channel` are consumed into mask/intensity columns.
 REGEX_META_COLS = {"ext", "tile", "mask_name"}
 
 

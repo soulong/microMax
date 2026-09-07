@@ -52,6 +52,17 @@ def crop_cell(volume, mask, label, padding=4):
         )
         sys.exit(1)
 
+    if mask.shape != volume.shape[:2]:
+        # A mismatched mask would broadcast-error below; exit with the
+        # project's standard clear message instead.
+        print(
+            f"Error: mask shape {mask.shape} does not match volume "
+            f"{volume.shape[:2]}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    padding = max(0, int(padding))
+
     ys, xs = np.where(mask == label)
     if len(ys) == 0:
         print(

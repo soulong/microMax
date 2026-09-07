@@ -530,12 +530,12 @@ def _load_cell_image(d, mode, view):
     (this fixes the image size) -> normalize (fixed-reference aware).
     Returns a (H, W, 3) uint8 display image, or None on failure.
     """
-    from microBase import read_tiff_channels, read_tiff, read_mask, crop_cell, get_labels
+    from microBase import read_tiff_channels, read_image, read_mask, crop_cell, get_labels
     directory = d.get("directory") or ""
     try:
         if mode == "whole_image":
             ch_files = json.loads(d["filename"])
-            arrays = [read_tiff(os.path.join(directory, f) if directory else f)
+            arrays = [read_image(os.path.join(directory, f) if directory else f)
                       for f in ch_files]
             img = np.stack(arrays, axis=-1)
             mask_m = read_mask(d.get("mask_filename") or "")

@@ -133,8 +133,9 @@ class ImageDataset:
         mask_pattern: optional regex matching mask files. Must have a
             `mask_name` group plus whatever structural groups image_pattern has.
         channel_layout: None (default, one-channel-per-file), "CHW", or "HWC".
-        image_subdir_pattern: optional glob pattern restricting which subdirs
-            to scan (e.g. "Images/").
+        image_subdir_pattern: optional GLOB pattern (not a regex — unlike
+            image_pattern/mask_pattern) restricting which subdirs to scan
+            (e.g. "Images/").
         filters: optional dict of {column: regex_str} to filter rows after build.
     """
 
@@ -199,6 +200,10 @@ class ImageDataset:
 
         # LRU cache for raw (image, mask_dict) per row_idx
         self._cache = _LRUCache(maxsize=8)
+        # Bumped whenever metadata is rebuilt/filtered — in-flight readers
+        # compare against it so a stale read is never cached under a row_idx
+        # that filter_metadata has since re-indexed (see get_imageset).
+        self._metadata_generation = 0
 
         self.build_metadata()
 
@@ -280,6 +285,7 @@ class ImageDataset:
         c._schema = self._schema
         c._captured_fields = set(self._captured_fields)
         c._cache = _LRUCache(maxsize=self._cache.maxsize)
+        c._metadata_generation = 0
         return c
 
     # ---- Construction helpers ----
@@ -313,6 +319,9 @@ class ImageDataset:
 
     def build_metadata(self):
         """Scan root, parse filenames with regex, build pivoted metadata DataFrame."""
+        # Any (re)build invalidates row indices — in-flight readers must not
+        # cache results keyed by the old indexing (see get_imageset).
+        self._metadata_generation += 1
         # Group 1: collect parsed records
         # Each image record: {shared_key -> {channel: filepath, ...extra meta}}
         # Mask records similar with mask_name.
@@ -349,10 +358,10 @@ class ImageDataset:
                 rec["__file__"] = str(self.root / reldir / fname)
             # Store structural + extra meta from regex captures (verbatim —
             # all metadata stays TEXT from extraction through DB storage).
+            # `directory` is reserved (the record's real on-disk directory) —
+            # a capture with that name must not clobber it.
             for k, v in gd.items():
-                if k == "channel":
-                    continue
-                if k == "mask_name":
+                if k in ("channel", "mask_name", "directory"):
                     continue
                 rec[k] = v
 
@@ -465,7 +474,7 @@ class ImageDataset:
                 first_path = row[ch_cols[0]]
                 if pd.isna(first_path):
                     continue
-                arr = _io.read_tiff(first_path)
+                arr = _io.read_image(first_path)
                 self._img_shape = arr.shape  # (H, W)
                 self._img_dtype = arr.dtype
                 return
@@ -480,7 +489,14 @@ class ImageDataset:
                 return
 
     def _shared_key(self, groupdict):
-        """Build a hashable shared key from regex captures, ignoring channel/mask_name."""
+        """Build a hashable shared key from regex captures, ignoring channel/mask_name.
+
+        Site identity is the regex captures ONLY — the on-disk directory is
+        deliberately excluded so masks written next to the images (or in
+        another subtree) still join to their site by captures alone. Two
+        files with identical captures in different subdirs therefore merge
+        into one record (last file wins).
+        """
         parts = []
         for k in sorted(groupdict.keys()):
             if k in ("channel", "mask_name"):
@@ -551,7 +567,15 @@ class ImageDataset:
             (img_data, mask_dict) where:
               img_data  : (H, W, C) array
               mask_dict : {mask_col_name: (H, W) int array}
+
+        Results are cached and shared by reference — never mutate the
+        returned arrays (copy first), or the cache is corrupted for every
+        subsequent reader.
         """
+        # Capture the metadata generation so a concurrent filter_metadata
+        # (GUI thread) between this miss and the put below can't leave the
+        # read cached under a row_idx that no longer means the same site.
+        generation = self._metadata_generation
         cached = self._cache.get(row_idx)
         if cached is not None:
             img_data, all_masks = cached
@@ -565,7 +589,7 @@ class ImageDataset:
             # one-channel-per-file: read each, stack
             arrays = []
             for ch in self._intensity_colnames:
-                arrays.append(_io.read_tiff(img_paths[ch]))
+                arrays.append(_io.read_image(img_paths[ch]))
             img_data = np.stack(arrays, axis=-1)  # (H, W, C)
         else:
             # multi-channel-per-file: read all pages
@@ -581,7 +605,8 @@ class ImageDataset:
         for mname, mpath in mask_paths.items():
             mask_dict[mname] = _io.read_mask(mpath)
 
-        self._cache.put(row_idx, (img_data, mask_dict))
+        if generation == self._metadata_generation:
+            self._cache.put(row_idx, (img_data, mask_dict))
         if masks is None:
             return img_data, dict(mask_dict)
         return img_data, {m: mask_dict[m] for m in masks if m in mask_dict}
@@ -624,6 +649,9 @@ class ImageDataset:
         """Filter rows by regex on a column. Mutates metadata."""
         self._metadata = _apply_filter(self._metadata, column, pattern).reset_index(drop=True)
         self._filters.append((column, pattern))
+        # row_idx meaning changed (rows dropped, order re-indexed): evict the
+        # cache AND invalidate in-flight reads that captured the old indexing.
+        self._metadata_generation += 1
         self._cache.clear()
 
     # ---- Single-cell cropping ----

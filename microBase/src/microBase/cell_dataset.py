@@ -128,6 +128,11 @@ class CellDataset:
                         # Single-cell files shouldn't have a channel group
                         # (channels are inside the file). Skip if present.
                         continue
+                    if k in ("stem", "path", "directory"):
+                        # Reserved record keys — a capture with one of these
+                        # names would clobber the real file path/stem and
+                        # break get_cell with a confusing "file not found".
+                        continue
                     # Captures are used verbatim — metadata stays TEXT.
                     rec[k] = v
             records.append(rec)

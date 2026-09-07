@@ -13,7 +13,7 @@ Provides:
 - derive_well, MetadataSchema
 """
 
-__version__ = "0.9.1"
+__version__ = "0.10.0"
 
 import os as _os
 _os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -24,7 +24,7 @@ from .schema import (
     derive_well,
 )
 from .io import (
-    read_tiff,
+    read_image,
     read_tiff_channels,
     read_mask,
 )
@@ -59,7 +59,7 @@ __all__ = [
     "crop_cell",
     "crop_all_cells",
     "get_labels",
-    "read_tiff",
+    "read_image",
     "read_tiff_channels",
     "read_mask",
     "load_yaml",

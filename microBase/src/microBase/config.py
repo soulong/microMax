@@ -50,6 +50,11 @@ def load_yaml(path):
     except yaml.YAMLError as e:
         print(f"Error: failed to parse YAML {path}: {e}", file=sys.stderr)
         sys.exit(1)
+    except (OSError, UnicodeDecodeError) as e:
+        # An existing but unreadable file (Windows file lock, non-UTF-8
+        # bytes) gets the same print + exit contract as a parse error.
+        print(f"Error: failed to read YAML {path}: {e}", file=sys.stderr)
+        sys.exit(1)
     if data is None:
         return {}
     if not isinstance(data, dict):

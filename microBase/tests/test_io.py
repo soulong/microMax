@@ -15,7 +15,7 @@ def _make_tiff(tmp_path, name, arr):
 def test_read_tiff_single_channel_2d(tmp_path):
     arr = np.random.randint(0, 65535, size=(64, 64), dtype=np.uint16)
     _make_tiff(tmp_path, "img.tif", arr)
-    out = mio.read_tiff(tmp_path / "img.tif")
+    out = mio.read_image(tmp_path / "img.tif")
     assert out.shape == (64, 64)
     assert out.dtype == arr.dtype
     np.testing.assert_array_equal(out, arr)
@@ -25,7 +25,7 @@ def test_read_tiff_squeezes_3d_single_channel(tmp_path):
     """A (1, H, W) TIFF should be squeezed to (H, W)."""
     arr = np.random.randint(0, 255, size=(1, 32, 32), dtype=np.uint8)
     _make_tiff(tmp_path, "img.tif", arr)
-    out = mio.read_tiff(tmp_path / "img.tif")
+    out = mio.read_image(tmp_path / "img.tif")
     assert out.shape == (32, 32)
 
 
@@ -69,7 +69,7 @@ def test_read_mask_png(tmp_path):
 
 def test_read_tiff_missing_file_exits(tmp_path):
     with pytest.raises(SystemExit):
-        mio.read_tiff(tmp_path / "nonexistent.tif")
+        mio.read_image(tmp_path / "nonexistent.tif")
 
 
 def test_read_tiff_channels_bad_layout_exits(tmp_path):
@@ -173,17 +173,17 @@ def test_read_tiff_corrupt_file_exits(tmp_path):
     p = tmp_path / "corrupt.tif"
     p.write_bytes(b"not a real tiff")
     with pytest.raises(SystemExit):
-        mio.read_tiff(p)
+        mio.read_image(p)
 
 
 def test_read_tiff_rgb_reduces_first_channel(tmp_path):
-    """RGB file -> first channel only (read_tiff is single-channel)."""
+    """RGB file -> first channel only (read_image is single-channel)."""
     from PIL import Image
     arr = np.zeros((16, 16, 3), dtype=np.uint8)
     arr[:, :, 0] = 7
     arr[:, :, 1] = 200
     Image.fromarray(arr).save(str(tmp_path / "rgb.png"))
-    out = mio.read_tiff(tmp_path / "rgb.png")
+    out = mio.read_image(tmp_path / "rgb.png")
     assert out.shape == (16, 16)
     np.testing.assert_array_equal(out, np.full((16, 16), 7, dtype=np.uint8))
 

@@ -32,7 +32,7 @@ from flask import Flask, jsonify, request
 from microBase import (
     build_pipeline,
     apply,
-    read_tiff,
+    read_image,
     read_tiff_channels,
     read_mask,
     crop_cell,
@@ -389,7 +389,7 @@ class VisInteractiveServer:
         arrays = []
         for ch_fname in ch_filenames:
             ch_path = os.path.join(directory, ch_fname) if directory else ch_fname
-            arrays.append(read_tiff(ch_path))
+            arrays.append(read_image(ch_path))
         img_hwc = np.stack(arrays, axis=-1)  # (H, W, C)
 
         # Load mask — mask_filename is a full filepath stored in DB

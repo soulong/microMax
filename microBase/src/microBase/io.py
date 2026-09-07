@@ -117,12 +117,15 @@ def normalize_tiff_array(arr, channel_layout, path=None):
         return arr.shape[:2], arr.shape[-1], arr
 
 
-def read_tiff(path):
+def read_image(path):
     """Read a single-channel image (TIFF/PNG/JPEG). Returns 2D array (H, W).
 
-    Uses PIL for format-agnostic reading. Multi-channel files (RGB/RGBA) are
-    reduced to their first channel. Callers wanting multi-channel data should
-    use `read_tiff_channels` (TIFF-only).
+    Uses PIL for format-agnostic reading. Multi-channel PACKED files
+    (RGB/RGBA, last axis 3-4) are reduced to their first channel. Any other
+    3D shape (e.g. a (C, H, W) multi-page TIFF fed to the one-channel-per-file
+    path) is a layout mistake and hard-exits instead of being silently
+    mis-sliced. Callers wanting multi-channel data should use
+    `read_tiff_channels` (TIFF-only).
     """
     arr = _read_or_exit(path, "image")
     if arr.ndim == 3:
@@ -131,9 +134,17 @@ def read_tiff(path):
             arr = arr[0]
         elif arr.shape[-1] == 1:
             arr = arr[:, :, 0]
-        else:
+        elif arr.shape[-1] in (3, 4):
             # RGB/RGBA — take first channel
             arr = arr[:, :, 0]
+        else:
+            print(
+                f"Error: single-channel image reader got a {arr.shape} array "
+                f"at {path} — this looks like a multi-channel (CHW?) file; "
+                f"use read_tiff_channels / set channel_layout instead.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     if arr.ndim != 2:
         print(
             f"Error: expected single-channel image, got shape {arr.shape} at {path}",
