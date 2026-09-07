@@ -11,9 +11,9 @@
 
 mode: whole_image
 
-model: runs_dino/model.pt         # train bundle (model.pt) or SSL bundle (model.pt)
+model: 20260830_dinov3_phase2/model.pt         # train bundle (model.pt) or SSL bundle (model.pt)
 
-output_dir: runs_dino/infer           # shared DB dir for all roots; null = per-dataset
+output_dir: null           # shared DB dir for all roots; null = per-dataset
 
 data:
   root:
@@ -29,13 +29,13 @@ data:
   max_value: 65535                    # max possible intensity of the input dtype (65535 for 16-bit, 255 for 8-bit); images are divided by it on load
   channels: [1]                       # 1-based indices; null = all
   channel_layout: null                # CHW | HWC | null (one-channel-per-file)
-  label_from_dir: true                # label from parent dir name
+  label_from_dir: false                # label from parent dir name
   label_csv: null                     # CSV [path, label]; null = not used
   sample_max: null                    # null = no limit
   sample_by: per_dataset              # per_class | per_dataset
 
 dataloader:
-  num_workers: 4
+  num_workers: 6
   prefetch_factor: 2
   persistent_workers: true
 
@@ -45,11 +45,32 @@ inference:
   db_name: infer.db
   batch_size: 128
 
-# PCA + UMAP reduction — run via `micromodel vis-reduction --config <this_file>`.
+# Multi-method DR — run via `micromodel vis-reduction --config <this_file>`.
 # Reducers are fit once on merged features from all DBs, then applied per-DB.
+# Per DR method: one multi-page PDF (reduction_<method>.pdf — one page per
+# color_by entry, then one per cluster k; color_by null = a single
+# light-blue page) + a reduction_<method> table (pca: pc_1/pc_2, others:
+# <method>_1/<method>_2). Reducers persist to reduction_<method>.pkl.
+# With cluster_k: KMeans clustering -> a find_cluster table per DB
+# (cluster_<k>, 1-based IDs ordered by UMAP centroid distance from the plot
+# origin), extra cluster color pages, and one representative-cell sheet per
+# k (cluster_k<k>.pdf, cells rendered as their inference-mode input ->
+# uniform size; needs the model bundle). Models persist to cluster.pkl.
+# cluster: <path to a baseline cluster.pkl> predicts ALL stored k for this
+# dataset instead of re-fitting — cluster IDs stay baseline-aligned
+# (cluster_k is ignored then).
 reduction:
-  color_by: [pred_class, pred_prob]   # first = stratification column; valid: pred_class, pred_prob, directory, ground_truth
-  var_threshold: 0.95                 # auto PCA dims covering this fraction of variance (min 2); also used as UMAP preprocessing dim
-  sample_per_class: 2000              # max points per class to fit reducers; 0 = all
-  reducer_pca: null                   # path to pre-fitted PCA .pkl; null = fit new
-  reducer_umap: null                  # path to pre-fitted UMAP .pkl; null = fit new
+  method: [umap]                      # list, DR methods to run (subset of pca/umap/pacmap/localmap)
+  color_by: null                      # list, null = single light-blue page; first = stratification column
+  cluster_k: null                     # list, KMeans cluster counts; null/empty = no cluster finding (ignored when cluster is set)
+  sample_per_class: null              # max points per class to fit reducers; 0/null = all
+  # reduction_pca: null                 # path to a pre-fitted reduction_pca.pkl; null = fit new
+  # reduction_umap: null                # path to a pre-fitted reduction_umap.pkl; null = fit new
+  # reduction_pacmap: null              # path to a pre-fitted reduction_pacmap.pkl; null = fit new
+  # reduction_localmap: null            # path to a pre-fitted reduction_localmap.pkl; null = fit new
+  # cluster: null                       # path to a baseline cluster.pkl; null = fit new (and save cluster.pkl)
+  reduction_pca: D:\Model\20260830_dinov3_phase2\infer_sc\reduction_pca.pkl          # e.g. reuse the baseline reducers
+  reduction_umap: D:\Model\20260830_dinov3_phase2\infer_sc\reduction_umap.pkl
+  reduction_pacmap: D:\Model\20260830_dinov3_phase2\infer_sc\reduction_pacmap.pkl
+  reduction_localmap: D:\Model\20260830_dinov3_phase2\infer_sc\reduction_localmap.pkl
+  cluster:      D:\Model\20260830_dinov3_phase2\infer_sc\cluster.pkl                # e.g. predict the baseline clusters

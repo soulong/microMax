@@ -1,6 +1,9 @@
-"""Interactive PCA/UMAP viewer with live image inspection (Flask server).
+"""Interactive reduction viewer with live image inspection (Flask server).
 
-Reads reduction_pca / reduction_umap / inference tables from infer.db.
+Reads the reduction_<method> tables (pca/umap/pacmap/localmap), the optional
+find_cluster table and the inference table from infer.db. One plot tab is
+offered per method that actually has a table; cluster_<k> columns from
+find_cluster are exposed as categorical color_by options.
 The bundle meta uses the same field names for augmentation_infer,
 normalize_method, normalize_with_masking, clip_low, clip_high, channels,
 channel_layout.
@@ -16,6 +19,7 @@ Image loading:
 """
 
 import os
+import re
 import sys
 import json
 import sqlite3
@@ -35,7 +39,8 @@ from microBase import (
     get_labels,
 )
 
-from .utils import logger, resolve_output_paths, resolve_max_value, stratified_sample_indices
+from .utils import (logger, resolve_output_paths, resolve_max_value,
+                    stratified_sample_indices, parse_pred_prob)
 from .dataset import _to_float_max
 
 
@@ -91,6 +96,8 @@ class VisInteractiveServer:
         self.scatter_data = []
         self._available_channels = None
         self._color_by_cols = []
+        # DR methods with a reduction_<method> table (canonical order).
+        self._dr_methods = []
 
         self.app = Flask(__name__)
         self.app.route("/")(self._serve_html)
@@ -132,33 +139,63 @@ class VisInteractiveServer:
 
     def _load_coords(self, db_path):
         conn = sqlite3.connect(db_path)
+        # Discover every reduction_<method> table written by vis-reduction.
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name IN ('reduction_pca', 'reduction_umap')")
-        tables = {row[0] for row in cur.fetchall()}
+            "AND name LIKE 'reduction_%'")
+        tables = sorted(row[0] for row in cur.fetchall())
         if not tables:
             logger.warning(
-                "reduction_pca/reduction_umap tables not found in %s. "
+                "No reduction_* tables found in %s. "
                 "Run 'micromodel vis-reduction' first.", db_path)
             conn.close()
             return
 
-        # Load PCA coords (first 2 PCs for plotting) from reduction_pca
+        # Per-method 2D coords by uid. pca stores pc_1/pc_2, every other
+        # method stores <method>_1/<method>_2. Stale tables missing their
+        # coordinate columns are skipped with a warning.
         coords_by_uid = {}
-        if "reduction_pca" in tables:
-            cur = conn.execute("SELECT uid, pc_1, pc_2 FROM reduction_pca")
-            for uid, pc1, pc2 in cur.fetchall():
+        for table in tables:
+            method = table[len("reduction_"):]
+            if method not in ("pca", "umap", "pacmap", "localmap"):
+                continue
+            x_col = "pc_1" if method == "pca" else f"{method}_1"
+            y_col = "pc_2" if method == "pca" else f"{method}_2"
+            cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+            if x_col not in cols or y_col not in cols:
+                logger.warning("Table %s lacks %s/%s columns; skipping",
+                               table, x_col, y_col)
+                continue
+            for uid, x, y in conn.execute(f"SELECT uid, {x_col}, {y_col} FROM {table}"):
                 d = coords_by_uid.setdefault(int(uid), {})
-                d["pca_x"] = float(pc1)
-                d["pca_y"] = float(pc2)
+                d[f"{method}_x"] = float(x)
+                d[f"{method}_y"] = float(y)
+            if method not in self._dr_methods:
+                self._dr_methods.append(method)
+        # Canonical method order (alphabetical sqlite_master order otherwise).
+        canonical = ("pca", "umap", "pacmap", "localmap")
+        self._dr_methods = ([m for m in canonical if m in self._dr_methods]
+                            + [m for m in self._dr_methods if m not in canonical])
 
-        # Load UMAP coords from reduction_umap
-        if "reduction_umap" in tables:
-            cur = conn.execute("SELECT uid, umap_1, umap_2 FROM reduction_umap")
-            for uid, u1, u2 in cur.fetchall():
-                d = coords_by_uid.setdefault(int(uid), {})
-                d["umap_x"] = float(u1)
-                d["umap_y"] = float(u2)
+        # find_cluster: one 1-based cluster_<k> column per KMeans k; exposed
+        # to the frontend as categorical color_by options.
+        cluster_by_uid = {}
+        cluster_cols = []
+        has_fc = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='find_cluster'"
+        ).fetchone()
+        if has_fc:
+            all_cols = [row[1] for row in conn.execute("PRAGMA table_info(find_cluster)")]
+            cluster_cols = [c for c in all_cols if c.startswith("cluster_")]
+            if cluster_cols:
+                sel = ", ".join(["uid"] + cluster_cols)
+                for row in conn.execute(f"SELECT {sel} FROM find_cluster"):
+                    d = cluster_by_uid.setdefault(int(row[0]), {})
+                    for col, val in zip(cluster_cols, row[1:]):
+                        d[col] = int(val) if val is not None else None
+            for col in cluster_cols:
+                if col not in self._color_by_cols:
+                    self._color_by_cols.append(col)
 
         # Get inference table columns dynamically
         cur = conn.execute("PRAGMA table_info(inference)")
@@ -181,9 +218,7 @@ class VisInteractiveServer:
             d = dict(zip(col_names, row))
             uid = int(d.get("uid"))
             coords = coords_by_uid.get(uid)
-            if coords is None:
-                continue
-            if "pca_x" not in coords or "umap_x" not in coords:
+            if not coords:
                 continue
 
             directory = str(d.get("directory", ""))
@@ -201,17 +236,41 @@ class VisInteractiveServer:
                 display_name = filename
             src = (directory + "/" + display_name) if directory else display_name
 
+            # Multi-label display data: [name, prob] pairs sorted by
+            # probability (desc) — the frontend shows the top N (page
+            # control). Source: the per-class prob_<name> columns written by
+            # every classify bundle (features-only SSL rows carry none and
+            # show no ranking).
+            prob_items = []
+            for col in infer_cols:
+                if col.startswith("prob_") and d.get(col) is not None:
+                    try:
+                        prob_items.append((col[len("prob_"):], float(d[col])))
+                    except (TypeError, ValueError):
+                        pass
+            ml_pairs = sorted(prob_items, key=lambda t: -t[1])
+
+            # cid: OpenCell filenames embed CID#####; whole_image rows have
+            # no CID in the name and fall back to the mask cell label.
+            m_cid = re.search(r"CID\d+", filename)
+            cid = m_cid.group(0) if m_cid else (
+                str(label) if self.mode == "whole_image" else "")
+
             point = {
-                "pca_x": coords["pca_x"], "pca_y": coords["pca_y"],
-                "umap_x": coords["umap_x"], "umap_y": coords["umap_y"],
                 "pred_class": str(d.get("pred_class")) if d.get("pred_class") else "unknown",
-                "pred_prob": float(d.get("pred_prob")) if d.get("pred_prob") is not None else 0.0,
+                "pred_prob": parse_pred_prob(d.get("pred_prob")),
                 "source_image": src,
                 "directory": directory,
                 "filename": filename,
                 "label": label,
                 "mask_filename": mask_filename,
+                "cid": cid,
+                "ml": [[n, round(p, 4)] for n, p in ml_pairs],
             }
+            # One <method>_x/<method>_y pair per available DR method.
+            point.update(coords)
+            # Cluster assignments (cluster_<k> columns) for color_by support.
+            point.update(cluster_by_uid.get(uid, {}))
             # Add all inference table columns for color_by support
             _exclude_point = {"uid", "directory", "filename", "label", "mask_filename",
                               "features", "pred_class",
@@ -230,14 +289,15 @@ class VisInteractiveServer:
         self.scatter_data.extend(db_points)
 
     def _subsample_points(self, points):
-        """Sub-sample points using reduction.sample_per_class (stratified by first color_by)."""
-        sample_per_class = self.red_cfg.get("sample_per_class", 1000)
+        """Sub-sample points using reduction.sample_per_class (null/0 = keep all)."""
+        sample_per_class = self.red_cfg.get("sample_per_class", 1000) or 0
         if sample_per_class <= 0 or len(points) <= sample_per_class:
             return points
 
-        color_by_vals = self.red_cfg.get("color_by", "pred_class")
+        color_by_vals = self.red_cfg.get("color_by")
         if isinstance(color_by_vals, str):
             color_by_vals = [color_by_vals]
+        color_by_vals = color_by_vals or []
         first_cb = color_by_vals[0] if color_by_vals else "pred_class"
         seed = 42
         labels = [pt.get(first_cb, "unknown") for pt in points]
@@ -366,6 +426,9 @@ class VisInteractiveServer:
             if extra not in color_by_cols:
                 color_by_cols.insert(0, extra)
 
+        # DR methods with a table, already in canonical order
+        methods = list(self._dr_methods)
+
         # Channels: all available from data (not just training channels)
         channels = self._available_channels or self.meta.get("channels", [1])
 
@@ -376,6 +439,7 @@ class VisInteractiveServer:
             "norm_default": self.norm_method_default,
             "mask_default": self.norm_with_masking_default,
             "color_by_cols": color_by_cols,
+            "methods": methods,
         })
 
     def _api_scatter(self):
@@ -553,6 +617,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
   <label>Color_by:
     <select id="color-by-select"></select>
   </label>
+  <label>Top_N:
+    <input type="number" id="top-n" value="5" min="1" max="30" step="1">
+  </label>
+  <label><input type="checkbox" id="show-src"> src</label>
+  <label><input type="checkbox" id="show-cid"> cid</label>
   <span>Ch:</span>
   <div id="color-controls" style="display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center;"></div>
 </div>
@@ -560,10 +629,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 <div id="image-row">
 </div>
 <div id="plot-section">
-  <div id="plot-tabs">
-    <button class="tab active" id="tab-pca">PCA</button>
-    <button class="tab" id="tab-umap">UMAP</button>
-  </div>
+  <div id="plot-tabs"></div>
   <div id="plot-container">
     <div id="plot-div" style="max-width:700px;"></div>
   </div>
@@ -574,10 +640,14 @@ var selectedPoint = null;
 var pinnedPoints = new Set();
 var configData = {};
 var activeTab = 'pca';
-var pcaTrace = null, umapTrace = null;
+var drMethods = ['pca', 'umap'];
 var _lastData = null, _lastChannels = null, _lastPointData = null, _lastNormMode = 'per_channel';
 var _savedChannelVals = {};
 var _colorBy = 'pred_class';
+// Same 60-color palette as the static reduction PDFs (tab20/20b/20c).
+var PALETTE60 = ['#1f77b4','#aec7e8','#ff7f0e','#ffbb78','#2ca02c','#98df8a','#d62728','#ff9896','#9467bd','#c5b0d5','#8c564b','#c49c94','#e377c2','#f7b6d2','#7f7f7f','#c7c7c7','#bcbd22','#dbdb8d','#17becf','#9edae5','#393b79','#5254a3','#6b6ecf','#9c9ede','#637939','#8ca252','#b5cf6b','#cedb9c','#8c6d31','#bd9e39','#e7ba52','#e7cb94','#843c39','#ad494a','#d6616b','#e7969c','#7b4173','#a55194','#ce6dbd','#de9ed6','#3182bd','#6baed6','#9ecae1','#c6dbef','#e6550d','#fd8d3c','#fdae6b','#fdd0a2','#31a354','#74c476','#a1d99b','#c7e9c0','#756bb1','#9e9ac8','#bcbddc','#dadaeb','#636363','#969696','#bdbdbd','#d9d9d9'];
+// Uniform scatter color when no color_by is selected (matches the PDFs).
+var NONE_COLOR = '#87CEEB';
 
 function showError(msg) {
   var row = document.getElementById('image-row');
@@ -598,7 +668,24 @@ async function loadConfig() {
   document.getElementById('cb-mask').checked = maskDefault;
   buildChannelWidgets(configData.channels);
   buildColorBySelect(configData.color_by_cols || ['pred_class']);
+  buildTabs(configData.methods || ['pca', 'umap']);
   loadScatter();
+}
+
+// One tab per DR method that has a reduction_<method> table in the DBs.
+function buildTabs(methods) {
+  drMethods = methods;
+  if (drMethods.indexOf(activeTab) < 0) activeTab = drMethods[0] || 'pca';
+  var bar = document.getElementById('plot-tabs');
+  bar.innerHTML = '';
+  drMethods.forEach(function(m) {
+    var b = document.createElement('button');
+    b.className = 'tab' + (m === activeTab ? ' active' : '');
+    b.id = 'tab-' + m;
+    b.textContent = m.toUpperCase();
+    b.addEventListener('click', function() { switchTab(m); });
+    bar.appendChild(b);
+  });
 }
 
 function buildChannelWidgets(channels) {
@@ -636,6 +723,10 @@ function buildChannelWidgets(channels) {
 function buildColorBySelect(cols) {
   var sel = document.getElementById('color-by-select');
   sel.innerHTML = '';
+  // "none" = uniform light-blue points (matches color_by: null in the PDFs).
+  var noneOpt = document.createElement('option');
+  noneOpt.value = '__none__'; noneOpt.textContent = 'none';
+  sel.appendChild(noneOpt);
   cols.forEach(function(c) {
     var opt = document.createElement('option');
     opt.value = c; opt.textContent = c;
@@ -659,56 +750,61 @@ function isNumericColumn(points, key) {
 }
 
 function computeColors(points, colorBy) {
-  if (!colorBy || colorBy === 'pred_class') {
-    var labels = points.map(function(d) { return d.pred_class || 'unknown'; });
-    var cats = [];
-    labels.forEach(function(l) { if (cats.indexOf(l) < 0) cats.push(l); });
-    cats.sort();
-    var palette = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2','#7f7f7f','#bcbd22','#17becf',
-                   '#aec7e8','#ffbb78','#98df8a','#ff9896','#c5b0d5','#c49c94','#f7b6d2','#c7c7c7','#dbdb8d','#9edae5'];
-    var colorMap = {};
-    cats.forEach(function(c, i) { colorMap[c] = palette[i % palette.length]; });
-    return { colors: labels.map(function(l) { return colorMap[l] || '#333'; }),
-             type: 'categorical', categories: cats, colorMap: colorMap };
+  if (!colorBy || colorBy === '__none__') {
+    return { colors: points.map(function() { return NONE_COLOR; }),
+             type: 'none', categories: [], colorMap: {} };
   }
 
-  var values = points.map(function(d) { return d[colorBy]; });
-  var numeric = isNumericColumn(points, colorBy);
+  // pred_class is always categorical; cluster_* columns hold integer IDs
+  // from find_cluster but must also color categorically (cluster ID order
+  // encodes plot-distance, not magnitude). Everything else keeps the
+  // numeric-check heuristic (numeric -> viridis, else categorical).
+  if (colorBy !== 'pred_class' && colorBy.indexOf('cluster_') !== 0) {
+    var values = points.map(function(d) { return d[colorBy]; });
+    var numeric = isNumericColumn(points, colorBy);
 
-  if (numeric) {
-    var nums = values.map(function(v) { return parseFloat(v); });
-    var min = Math.min.apply(null, nums);
-    var max = Math.max.apply(null, nums);
-    function viridis(t) {
-      var r, g, b;
-      if (t < 0.25) { r = 68 + t*4*(59-68); g = 1 + t*4*(82-1); b = 84 + t*4*(139-84); }
-      else if (t < 0.5) { r = 59 + (t-0.25)*4*(81-59); g = 82 + (t-0.25)*4*(171-82); b = 139 + (t-0.25)*4*(41-139); }
-      else if (t < 0.75) { r = 81 + (t-0.5)*4*(177-81); g = 171 + (t-0.5)*4*(204-171); b = 41 + (t-0.5)*4*(95-41); }
-      else { r = 177 + (t-0.75)*4*(253-177); g = 204 + (t-0.75)*4*(231-204); b = 95 + (t-0.75)*4*(37-95); }
-      return 'rgb(' + Math.round(r) + ',' + Math.round(g) + ',' + Math.round(b) + ')';
+    if (numeric) {
+      var nums = values.map(function(v) { return parseFloat(v); });
+      var min = Math.min.apply(null, nums);
+      var max = Math.max.apply(null, nums);
+      function viridis(t) {
+        var r, g, b;
+        if (t < 0.25) { r = 68 + t*4*(59-68); g = 1 + t*4*(82-1); b = 84 + t*4*(139-84); }
+        else if (t < 0.5) { r = 59 + (t-0.25)*4*(81-59); g = 82 + (t-0.25)*4*(171-82); b = 139 + (t-0.25)*4*(41-139); }
+        else if (t < 0.75) { r = 81 + (t-0.5)*4*(177-81); g = 171 + (t-0.5)*4*(204-171); b = 41 + (t-0.5)*4*(95-41); }
+        else { r = 177 + (t-0.75)*4*(253-177); g = 204 + (t-0.75)*4*(231-204); b = 95 + (t-0.75)*4*(37-95); }
+        return 'rgb(' + Math.round(r) + ',' + Math.round(g) + ',' + Math.round(b) + ')';
+      }
+      var colors = nums.map(function(n) {
+        var t = max > min ? (n - min) / (max - min) : 0.5;
+        return viridis(Math.max(0, Math.min(1, t)));
+      });
+      return { colors: colors, type: 'continuous', min: min, max: max };
     }
-    var colors = nums.map(function(n) {
-      var t = max > min ? (n - min) / (max - min) : 0.5;
-      return viridis(Math.max(0, Math.min(1, t)));
-    });
-    return { colors: colors, type: 'continuous', min: min, max: max };
-  } else {
-    var strVals = values.map(String);
-    var cats = [];
-    strVals.forEach(function(v) { if (cats.indexOf(v) < 0) cats.push(v); });
-    cats.sort();
-    var palette = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2','#7f7f7f','#bcbd22','#17becf',
-                   '#aec7e8','#ffbb78','#98df8a','#ff9896','#c5b0d5','#c49c94','#f7b6d2','#c7c7c7','#dbdb8d','#9edae5'];
-    var colorMap = {};
-    cats.forEach(function(c, i) { colorMap[c] = palette[i % palette.length]; });
-    return { colors: strVals.map(function(v) { return colorMap[v] || '#333'; }),
-             type: 'categorical', categories: cats, colorMap: colorMap };
   }
+
+  // Categorical: unique values, numeric-aware sort (cluster IDs ascend with
+  // the legend), 60-color palette shared with the static PDFs.
+  var strVals = points.map(function(d) {
+    var v = d[colorBy];
+    return (v === null || v === undefined) ? '' : String(v);
+  });
+  var cats = [];
+  strVals.forEach(function(v) { if (cats.indexOf(v) < 0) cats.push(v); });
+  cats.sort(function(a, b) {
+    var fa = parseFloat(a), fb = parseFloat(b);
+    if (!isNaN(fa) && !isNaN(fb)) return fa - fb;
+    return a < b ? -1 : (a > b ? 1 : 0);
+  });
+  var colorMap = {};
+  cats.forEach(function(c, i) { colorMap[c] = PALETTE60[i % PALETTE60.length]; });
+  return { colors: strVals.map(function(v) { return colorMap[v] || '#333'; }),
+           type: 'categorical', categories: cats, colorMap: colorMap };
 }
 
 function getPlotTrace(points, mode) {
-  var xKey = mode === 'pca' ? 'pca_x' : 'umap_x';
-  var yKey = mode === 'pca' ? 'pca_y' : 'umap_y';
+  var xKey = mode + '_x';
+  var yKey = mode + '_y';
   var colorInfo = computeColors(points, _colorBy);
   var trace = {
     x: points.map(function(d) { return d[xKey]; }),
@@ -716,12 +812,25 @@ function getPlotTrace(points, mode) {
     mode: 'markers', type: 'scattergl',
     marker: { size: 4, color: colorInfo.colors, opacity: 0.7 },
     text: points.map(function(d) {
-      var info = 'label: ' + d.pred_class + '<br>prob: ' + d.pred_prob.toFixed(3);
-      if (_colorBy && _colorBy !== 'pred_class') {
-        info += '<br>' + _colorBy + ': ' + d[_colorBy];
+      // Hover shows ONLY the top-N classes by probability (N from the
+      // Top_N control), highest first. No separate pred_class/pred_prob line.
+      var topN = parseInt(document.getElementById('top-n').value, 10) || 5;
+      var ml = d.ml || [];
+      var lines = [];
+      var n = Math.min(topN, ml.length);
+      for (var i = 0; i < n; i++) {
+        lines.push((i + 1) + '. ' + ml[i][0] + ': ' + ml[i][1].toFixed(3));
       }
-      info += '<br>src: ' + d.source_image.split(/[/\\\\]/).pop() + '<br>cid: ' + d.label;
-      return info;
+      if (_colorBy && _colorBy !== 'pred_class' && _colorBy !== '__none__') {
+        lines.push(_colorBy + ': ' + d[_colorBy]);
+      }
+      if (document.getElementById('show-src').checked) {
+        lines.push('src: ' + d.source_image.split(/[/\\\\]/).pop());
+      }
+      if (document.getElementById('show-cid').checked) {
+        lines.push('cid: ' + (d.cid || d.label));
+      }
+      return lines.join('<br>');
     }),
     hoverinfo: 'text',
     customdata: points.map(function(d,i) { return [d.source_image, d.label, i]; }),
@@ -743,16 +852,12 @@ function updatePlotSize() {
 async function loadScatter() {
   var r = await fetch('/api/scatter');
   scatterData = await r.json();
-  pcaTrace = getPlotTrace(scatterData, 'pca');
-  umapTrace = getPlotTrace(scatterData, 'umap');
   renderPlot();
   window.addEventListener('resize', updatePlotSize);
 }
 
 function renderPlot() {
-  var newTrace = getPlotTrace(scatterData, activeTab);
-  if (activeTab === 'pca') pcaTrace = newTrace; else umapTrace = newTrace;
-  var trace = newTrace;
+  var trace = getPlotTrace(scatterData, activeTab);
 
   var container = document.getElementById('plot-container');
   var maxW = 700;
@@ -767,7 +872,7 @@ function renderPlot() {
 
   var traces = [trace];
   var colorInfo = trace._colorInfo;
-  if (colorInfo && colorInfo.type === 'categorical' && colorInfo.categories.length <= 30) {
+  if (colorInfo && colorInfo.type === 'categorical' && colorInfo.categories.length <= 60) {
     colorInfo.categories.forEach(function(cat) {
       var dummyTrace = {
         x: [null], y: [null],
@@ -789,11 +894,12 @@ function renderPlot() {
 }
 
 function switchTab(tab) {
-  if (tab === activeTab) return;
+  if (tab === activeTab || drMethods.indexOf(tab) < 0) return;
   activeTab = tab;
   var tabs = document.querySelectorAll('#plot-tabs .tab');
-  tabs.forEach(function(el) { el.classList.remove('active'); });
-  document.getElementById('tab-' + tab).classList.add('active');
+  tabs.forEach(function(el) {
+    el.classList.toggle('active', el.id === 'tab-' + tab);
+  });
   renderPlot();
 }
 
@@ -981,8 +1087,13 @@ function renderChannels(data, channels, pointData, normMode) {
   row.appendChild(compCard);
 }
 
-document.getElementById('tab-pca').addEventListener('click', function() { switchTab('pca'); });
-document.getElementById('tab-umap').addEventListener('click', function() { switchTab('umap'); });
+// Tab buttons are built dynamically from /api/config (one per DR method) —
+// no hardcoded per-tab listeners here.
+// Hover content controls: changing Top_N / src / cid re-renders the traces
+// (tooltips are baked into the trace text arrays).
+document.getElementById('top-n').addEventListener('input', renderPlot);
+document.getElementById('show-src').addEventListener('change', renderPlot);
+document.getElementById('show-cid').addEventListener('change', renderPlot);
 var normRadios = document.querySelectorAll('input[name="norm-mode"]');
 normRadios.forEach(function(el) {
   el.addEventListener('change', function() { if (selectedPoint) fetchImage(); });

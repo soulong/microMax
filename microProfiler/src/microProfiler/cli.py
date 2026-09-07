@@ -13,7 +13,10 @@ from microProfiler.io import Database
 from microProfiler.log_utils import set_default_logging_level, setup_logging
 from microProfiler.pipeline import apply_filters, run_pipeline
 from microProfiler.pipeline.errors import MetadataValidationError
-from microProfiler.pipeline._micromodel_bridge import INFERENCE_TABLE, REDUCTION_TABLES
+from microProfiler.pipeline._micromodel_bridge import (
+    INFERENCE_TABLE,
+    expected_reduction_tables,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +126,7 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
             infer_db = dataset_dir / resolve_inference_db(entry)
             tables = {INFERENCE_TABLE}
             if entry.reduction and entry.reduction.enabled:
-                tables |= REDUCTION_TABLES
+                tables |= expected_reduction_tables(entry)
             missing = tables - _existing_tables(infer_db)
             if missing:
                 logger.info(

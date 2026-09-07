@@ -59,7 +59,12 @@ class InferenceBlockWidget(QWidget):
         # True once a max_value came from an explicit source (config restore
         # or block copy) — the dataset-dtype default must never overwrite it.
         self._max_value_explicit = False
-        self._var_threshold = 0.95
+        # No-widget reduction keys, round-tripped verbatim from YAML.
+        self._method = None
+        self._cluster = None
+        self._cluster_k = None
+        self._reduction_pacmap = None
+        self._reduction_localmap = None
         self._build_ui()
 
     # ── UI ──────────────────────────────────────────────────────────────
@@ -177,12 +182,12 @@ class InferenceBlockWidget(QWidget):
 
         # Row 4: reduction group
         layout.addWidget(make_hsep())
-        self._reduction_group = QGroupBox("Dimension reduction (PCA + UMAP)")
+        self._reduction_group = QGroupBox("Dimension reduction")
         self._reduction_group.setCheckable(True)
         self._reduction_group.setChecked(False)
         self._reduction_group.setToolTip(
-            "Fit PCA (0.95 cumulative variance) + UMAP on the features and write "
-            "reduction_pca / reduction_umap / reduction_pca_variance tables. "
+            "Fit the configured DR methods (pca/umap/pacmap/localmap) on the "
+            "features and write reduction_<method> / find_cluster tables. "
             "No plots are produced. Provided reducers transform directly; "
             "otherwise reducers are fit (and saved) per dataset.")
         red_layout = QVBoxLayout(self._reduction_group)
@@ -453,11 +458,15 @@ class InferenceBlockWidget(QWidget):
         if self._reduction_group.isChecked():
             section["reduction"] = {
                 "enabled": True,
-                "var_threshold": self._var_threshold,
+                "method": self._method,
                 "color_by": self._color_by.currentText(),
+                "cluster": self._cluster,
+                "cluster_k": self._cluster_k,
                 "sample_per_class": self._sample_per_class.value(),
-                "reducer_pca": self._reducer_pca_path.text().strip() or None,
-                "reducer_umap": self._reducer_umap_path.text().strip() or None,
+                "reduction_pca": self._reducer_pca_path.text().strip() or None,
+                "reduction_umap": self._reducer_umap_path.text().strip() or None,
+                "reduction_pacmap": self._reduction_pacmap,
+                "reduction_localmap": self._reduction_localmap,
             }
         return section
 
@@ -559,13 +568,18 @@ class InferenceStepPanel(BlockContainerPanel):
             block.set_channel_state(order, set(channels_cfg))
         red = cfg.get("reduction") or {}
         block._reduction_group.setChecked(bool(red.get("enabled", False)))
-        # var_threshold has no GUI widget — keep the config value verbatim so
-        # a YAML with var_threshold: 0.99 survives a GUI round-trip.
-        block._var_threshold = float(red.get("var_threshold", 0.95))
-        if red.get("reducer_pca"):
-            block._reducer_pca_path.setText(str(red["reducer_pca"]))
-        if red.get("reducer_umap"):
-            block._reducer_umap_path.setText(str(red["reducer_umap"]))
+        # method / cluster / cluster_k / reduction_pacmap / reduction_localmap
+        # have no GUI widget — keep the config values verbatim so a YAML with
+        # custom values survives a round-trip.
+        block._method = red.get("method")
+        block._cluster = red.get("cluster")
+        block._cluster_k = red.get("cluster_k")
+        block._reduction_pacmap = red.get("reduction_pacmap")
+        block._reduction_localmap = red.get("reduction_localmap")
+        if red.get("reduction_pca"):
+            block._reducer_pca_path.setText(str(red["reduction_pca"]))
+        if red.get("reduction_umap"):
+            block._reducer_umap_path.setText(str(red["reduction_umap"]))
         BaseStepPanel._set_widget(block._color_by, red.get("color_by", "pred_class"), "color_by")
         BaseStepPanel._set_widget(block._sample_per_class, red.get("sample_per_class", 10000), "sample_per_class")
         block._color_by_auto = False

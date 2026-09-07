@@ -23,7 +23,31 @@ logger = logging.getLogger(__name__)
 # show_reduction. Kept here so the CLI completeness check and the pipeline
 # never hardcode microModel's schema in two places.
 INFERENCE_TABLE = "inference"
-REDUCTION_TABLES = frozenset({"reduction_pca", "reduction_umap", "reduction_pca_variance"})
+# Every table show_reduction may write, across all DR methods.
+REDUCTION_TABLES = frozenset({
+    "reduction_pca", "reduction_umap", "reduction_pacmap", "reduction_localmap",
+    "find_cluster",
+})
+
+_DR_METHODS = ("pca", "umap", "pacmap", "localmap")
+
+
+def expected_reduction_tables(entry) -> frozenset:
+    """Tables show_reduction will write for one entry's reduction config.
+
+    One reduction_<method> table per configured method (default [pca, umap])
+    plus find_cluster when cluster_k is set — the completeness check must not
+    demand tables for methods the entry doesn't run.
+    """
+    if not (entry.reduction and entry.reduction.enabled):
+        return frozenset()
+    methods = entry.reduction.method if entry.reduction.method else ["pca", "umap"]
+    tables = {f"reduction_{m}" for m in methods if m in _DR_METHODS}
+    # find_cluster is written both by a fresh cluster_k fit and by a
+    # baseline cluster.pkl predict.
+    if entry.reduction.cluster_k or entry.reduction.cluster:
+        tables.add("find_cluster")
+    return frozenset(tables)
 
 
 def run_mm_inference(mm_cfg, **kwargs):
@@ -231,11 +255,15 @@ def _build_mm_inference_config(entry, cfg: PipelineConfig, ds, root_dir: Path) -
     }
     if entry.reduction and entry.reduction.enabled:
         mm_cfg["reduction"] = {
-            "var_threshold": entry.reduction.var_threshold if entry.reduction.var_threshold is not None else 0.95,
-            "color_by": entry.reduction.color_by if entry.reduction.color_by is not None else "pred_class",
+            "method": entry.reduction.method if entry.reduction.method is not None else ["pca", "umap"],
+            "color_by": entry.reduction.color_by,
+            "cluster": entry.reduction.cluster,
+            "cluster_k": entry.reduction.cluster_k,
             "sample_per_class": entry.reduction.sample_per_class if entry.reduction.sample_per_class is not None else 10000,
-            "reducer_pca": entry.reduction.reducer_pca,
-            "reducer_umap": entry.reduction.reducer_umap,
+            "reduction_pca": entry.reduction.reduction_pca,
+            "reduction_umap": entry.reduction.reduction_umap,
+            "reduction_pacmap": entry.reduction.reduction_pacmap,
+            "reduction_localmap": entry.reduction.reduction_localmap,
         }
     return mm_cfg
 

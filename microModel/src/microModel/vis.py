@@ -2,12 +2,14 @@
 
 show_augmentation adapts to both pretrain configs (augmentation_views) and
 train configs (augmentation_train + augmentation_infer).
-show_reduction fits PCA + UMAP on infer.db features, writes reduction
-tables, saves plots.
+show_reduction fits the configured DR methods (pca/umap/pacmap/localmap) on
+infer.db features, writes one reduction_<method> table per method plus the
+optional find_cluster table, and saves one multi-page PDF per DR method.
 """
 
 import os
 import sys
+import json
 import time
 import sqlite3
 import random
@@ -20,9 +22,13 @@ import matplotlib
 matplotlib.rcParams['pdf.fonttype'] = 42
 matplotlib.rcParams['ps.fonttype'] = 42
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.lines import Line2D
 from sklearn.metrics import confusion_matrix
 from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
 import umap
+import pacmap
 
 from microBase import (
     CellDataset,
@@ -44,6 +50,7 @@ from .utils import (
     add_file_logging,
     resolve_max_value,
     stratified_sample_indices,
+    parse_pred_prob,
 )
 
 
@@ -250,29 +257,94 @@ def _imshow(ax, data, title, cmap="gray", vmin=None, vmax=None, mask=None):
 
 
 # ----------------------------------------------------------------------------
-# Reduction view (PCA + UMAP)
+# Reduction view (pca / umap / pacmap / localmap + optional clustering)
 # ----------------------------------------------------------------------------
 
-def _plot_reduction_scatter(X, labels, label_names, title, xlabel, ylabel,
-                            save_path, pred_probs=None, continuous=False):
-    fig, ax = plt.subplots(figsize=(9, 6))
+#: Canonical DR method order — `reduction.method` is filtered against this.
+DR_METHODS = ("pca", "umap", "pacmap", "localmap")
 
-    if continuous:
+#: Pretty axis prefix per DR method (plot titles / axis labels).
+DR_AXIS_NAMES = {"pca": "PC", "umap": "UMAP", "pacmap": "PaCMAP",
+                 "localmap": "LocalMAP"}
+
+#: PCA component count feeding UMAP and the cluster finder (same whitened
+#: space as the label-refinement clustering workflow).
+UMAP_PRE_COMPONENTS = 50
+
+#: Default scatter color when color_by is null (light blue).
+SINGLE_COLOR = "#87CEEB"
+
+#: Points-per-category / categories-per-row in the cluster contact sheet.
+CONTACT_SHEET_PER_CLUSTER = 5
+CONTACT_SHEET_GROUPS_PER_ROW = 5
+
+#: Minimum foreground (nonzero-pixel) fraction for a sheet representative.
+#: Near-empty segmentation slivers carry almost no information, so their
+#: generic DINOv3 features land right at a cluster centroid and would
+#: otherwise dominate the nearest-centroid representative slots. 10% keeps
+#: those (and just-above-threshold sparse fragments) out; normal cells sit
+#: far above it (dataset median ~42%).
+CONTACT_SHEET_MIN_FOREGROUND = 0.10
+
+#: Cap on candidates scanned per cluster while skipping degenerate crops.
+CONTACT_SHEET_MAX_SCAN = 60
+
+
+def _foreground_fraction(img_u8):
+    """Fraction of pixels with any nonzero channel in a (H, W, 3) uint8 image.
+
+    Zeros stay exactly zero through normalization, so this equals the raw
+    crop's foreground fraction.
+    """
+    if img_u8 is None:
+        return 0.0
+    return float(np.any(img_u8 > 0, axis=2).mean())
+
+
+def _build_palette():
+    """60-entry categorical palette (tab20 + tab20b + tab20c)."""
+    palette = []
+    for cmap_name in ("tab20", "tab20b", "tab20c"):
+        cmap_obj = plt.colormaps[cmap_name]
+        palette.extend([cmap_obj(i) for i in range(cmap_obj.N)])
+    return palette
+
+
+def _plot_reduction_page(X, title, xlabel, ylabel, pdf, labels=None,
+                         label_names=None, pred_probs=None, continuous=False):
+    """Write one DR scatter page into an open PdfPages.
+
+    Data points are rasterized (non-editable bitmap, rendered at the dpi
+    given in pdf.savefig); axes, ticks, legend text and annotations stay
+    editable vector objects. The legend shows colored TEXT only (no marker
+    dots). labels=None draws every point in the default light blue with no
+    legend/annotations (the color_by: null case).
+    """
+    fig, ax = plt.subplots(figsize=(7.5, 6.5))
+    # Keep the plotting area square regardless of data ranges or colorbar.
+    ax.set_box_aspect(1)
+
+    if labels is None:
+        ax.scatter(X[:, 0], X[:, 1], c=SINGLE_COLOR, alpha=0.8, s=10,
+                   edgecolors="none", rasterized=True)
+    elif continuous:
         # Continuous scatter is only used for pred_prob, whose values always
-        # come from the DB rows (probs_fit) — never fall back to `labels`
+        # come from the DB rows (pred_probs) — never fall back to `labels`
         # (class-name strings would raise inside np.array(..., float64)).
         if pred_probs is None:
             raise ValueError("continuous scatter requires pred_probs")
         prob_arr = np.array(pred_probs, dtype=np.float64)
         sort_idx = np.argsort(prob_arr)
-        X_plot = X[sort_idx]
-        sc = ax.scatter(X_plot[:, 0], X_plot[:, 1], c=prob_arr[sort_idx],
-                        cmap="viridis", alpha=0.8, s=10, edgecolors="none", vmin=0, vmax=1)
+        sc = ax.scatter(X[sort_idx, 0], X[sort_idx, 1], c=prob_arr[sort_idx],
+                        cmap="viridis", alpha=0.8, s=10, edgecolors="none",
+                        vmin=0, vmax=1, rasterized=True)
         cbar = fig.colorbar(sc, ax=ax)
         cbar.set_label("Prediction Probability")
     else:
+        labels_arr = np.asarray(labels)
         unique_classes = sorted(set(labels))
-        centroids = np.array([X[np.array(labels) == cls].mean(axis=0) for cls in unique_classes])
+        centroids = np.array([X[labels_arr == cls].mean(axis=0)
+                              for cls in unique_classes])
         n_cls = len(unique_classes)
         if n_cls > 1:
             from sklearn.metrics import pairwise_distances
@@ -283,13 +355,12 @@ def _plot_reduction_scatter(X, labels, label_names, title, xlabel, ylabel,
                 neighbor_mask[i, np.argpartition(dists[i], k + 1)[1:k + 1]] = True
             neighbor_mask |= neighbor_mask.T
 
-        palette = []
-        for cmap_name in ['tab20', 'tab20b']:
-            cmap_obj = plt.colormaps[cmap_name]
-            palette.extend([cmap_obj(i) for i in range(min(cmap_obj.N, 20))])
-
+        palette = _build_palette()
+        # Assign colors largest-class-first, always picking the palette entry
+        # most distant from the colors already used by spatially neighboring
+        # classes (centroids in the DR plot) so close classes stay distinct.
         assigned_color = {}
-        sizes = [np.sum(np.array(labels) == cls) for cls in unique_classes]
+        sizes = [np.sum(labels_arr == cls) for cls in unique_classes]
         order = sorted(range(n_cls), key=lambda i: sizes[i], reverse=True)
         for idx in order:
             cls = unique_classes[idx]
@@ -328,32 +399,278 @@ def _plot_reduction_scatter(X, labels, label_names, title, xlabel, ylabel,
             colors_plot = [assigned_color[l] for l in labels]
 
         ax.scatter(X_plot[:, 0], X_plot[:, 1],
-                   c=colors_plot, alpha=0.8, s=10, edgecolors='none')
+                   c=colors_plot, alpha=0.8, s=10, edgecolors='none',
+                   rasterized=True)
 
-        from matplotlib.patches import Patch
-        legend_handles = [Patch(color=assigned_color[cls], label=label_name_map[cls]) for cls in unique_classes]
-        ax.legend(handles=legend_handles, fontsize=7, markerscale=3, loc="best")
+        # Legend = colored text only (invisible handles carry no marker).
+        # With many classes the tall legend stretches the tight bbox and
+        # dwarfs the plot — the centroid annotations identify everything
+        # then, so the legend is limited to readable sizes.
+        if n_cls <= 30:
+            handles = [Line2D([], [], linestyle="none") for _ in unique_classes]
+            leg = ax.legend(handles, [label_name_map[cls] for cls in unique_classes],
+                            fontsize=7, loc="best", framealpha=0.85)
+            for text, cls in zip(leg.get_texts(), unique_classes):
+                text.set_color(assigned_color[cls])
 
-        for cls_idx in unique_classes:
-            mask = np.array(labels) == cls_idx
-            center = X[mask].mean(axis=0)
-            ax.annotate(label_name_map[cls_idx], center, fontsize=9, weight="bold",
-                        ha="center", va="center",
-                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
+        for cls in unique_classes:
+            center = X[labels_arr == cls].mean(axis=0)
+            ax.annotate(label_name_map[cls], center, fontsize=9, weight="bold",
+                        ha="center", va="center", color=assigned_color[cls],
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                                  ec="gray", alpha=0.8))
 
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     plt.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    logger.info("Reduction plot saved to %s", save_path)
+    pdf.savefig(fig, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
-def show_reduction(config, save_plots=True, raise_on_error=False):
-    """Fit/load PCA + UMAP on infer.db features and write reduction tables.
+def _to_rgb_display(img_hwc):
+    """(H, W, C) raw crop -> (H, W, 3) uint8 contact-sheet image.
 
-    save_plots=False skips the PDF scatter outputs (tables are still written) —
+    Each channel is percentile-normalized independently; up to 3 channels map
+    to R/G/B, more channels average to grayscale.
+    """
+    chans = []
+    for c in range(img_hwc.shape[2]):
+        ch = img_hwc[:, :, c].astype(np.float32)
+        lo, hi = np.percentile(ch, [1, 99])
+        if hi <= lo:
+            hi = lo + 1.0
+        chans.append(np.clip((ch - lo) / (hi - lo), 0, 1))
+    if len(chans) == 1:
+        rgb = np.stack([chans[0]] * 3, axis=-1)
+    elif len(chans) == 2:
+        rgb = np.stack([chans[0], chans[1], np.zeros_like(chans[0])], axis=-1)
+    elif len(chans) == 3:
+        rgb = np.stack(chans, axis=-1)
+    else:
+        gray = np.mean(chans, axis=0)
+        rgb = np.stack([gray] * 3, axis=-1)
+    return (rgb * 255).astype(np.uint8)
+
+
+def _build_cell_view(config, mode, channels, channel_layout):
+    """Inference-input context for the contact sheet, from the model bundle.
+
+    Loads model.pt for augmentation_infer + normalize meta so contact-sheet
+    cells are rendered exactly as the model saw them at inference (same
+    resize/crop pipeline -> uniform image size, same normalization).
+    """
+    model_path = config.get("model")
+    if not isinstance(model_path, str) or not model_path or not os.path.exists(model_path):
+        print(f"Error: the cluster contact sheet needs the model bundle "
+              f"(inference-time preprocessing), but model is missing or not "
+              f"found: {model_path}", file=sys.stderr)
+        sys.exit(1)
+    bundle = torch.load(model_path, map_location="cpu", weights_only=False)
+    meta = bundle.get("meta") or {}
+    if "augmentation_infer" not in meta:
+        print("Error: bundle meta missing 'augmentation_infer' — cannot "
+              "rebuild the inference input for the contact sheet", file=sys.stderr)
+        sys.exit(1)
+    aug_spec = meta["augmentation_infer"]
+    return {
+        "aug": build_pipeline(aug_spec) if aug_spec else None,
+        "channels": channels,
+        "channel_layout": channel_layout,
+        "with_masking": bool(meta.get("normalize_with_masking", False)),
+        "clip_low": meta.get("clip_low", 0.05),
+        "clip_high": meta.get("clip_high", 99.95),
+        "normalize_method": meta.get("normalize_method", "per_channel"),
+        "fixed_reference": bool(meta.get("normalize_fixed_reference", False)),
+        "max_value": resolve_max_value(config["data"]),
+    }
+
+
+def _load_cell_image(d, mode, view):
+    """Load one DB row's cell exactly as inference saw it.
+
+    Order mirrors dataset._cell_to_tensor: load -> float by max_value ->
+    channel subset -> foreground mask -> bundle augmentation_infer pipeline
+    (this fixes the image size) -> normalize (fixed-reference aware).
+    Returns a (H, W, 3) uint8 display image, or None on failure.
+    """
+    from microBase import read_tiff_channels, read_tiff, read_mask, crop_cell, get_labels
+    directory = d.get("directory") or ""
+    try:
+        if mode == "whole_image":
+            ch_files = json.loads(d["filename"])
+            arrays = [read_tiff(os.path.join(directory, f) if directory else f)
+                      for f in ch_files]
+            img = np.stack(arrays, axis=-1)
+            mask_m = read_mask(d.get("mask_filename") or "")
+            label = int(d.get("label") or 0)
+            if label not in get_labels(mask_m):
+                return None
+            img, _, _ = crop_cell(img, mask_m, label, padding=4)
+        else:
+            path = os.path.join(directory, d["filename"]) if directory else d["filename"]
+            img = read_tiff_channels(path, view["channels"],
+                                     channel_layout=view["channel_layout"])
+        img = _to_float_max(img, view["max_value"])
+        if mode == "whole_image" and view["channels"] is not None:
+            ch_idx = [c - 1 for c in view["channels"] if c <= img.shape[2]]
+            img = img[:, :, ch_idx]
+        mask = ((img != 0).any(axis=2).astype(np.uint8)
+                if view["with_masking"] else None)
+        ref_stats = None
+        if view["fixed_reference"]:
+            ref_stats = _compute_ref_stats(
+                img, None, view["with_masking"], view["clip_low"],
+                view["clip_high"], view["normalize_method"])
+        if view["aug"] is not None:
+            img, mask = apply(view["aug"], img, mask)
+        if ref_stats is not None:
+            img = _normalize_fixed(img, mask, ref_stats)
+        else:
+            img = normalize(img, mask=mask, method=view["normalize_method"],
+                            clip_low=view["clip_low"], clip_high=view["clip_high"])
+        return _to_rgb_display(img)
+    except (Exception, SystemExit) as e:
+        # microBase readers hard-exit (SystemExit) on bad files — degrade to
+        # a warning + empty slot instead of aborting the whole run.
+        logger.warning("Contact sheet: failed to load %s/%s: %s",
+                       directory, d.get("filename"), e)
+        return None
+
+
+def _write_cluster_sheet(k, ids_all, W, km, dicts, path, mode, view):
+    """Contact-sheet PDF for one k: representative cells per cluster.
+
+    Representatives are the cells nearest each cluster centroid in the
+    whitened feature space (W), skipping crops whose foreground fraction is
+    below CONTACT_SHEET_MIN_FOREGROUND; every cell is rendered as its
+    inference-mode input (bundle augmentation_infer pipeline -> uniform
+    size). Layout: CONTACT_SHEET_PER_CLUSTER images per cluster,
+    CONTACT_SHEET_GROUPS_PER_ROW clusters per row; cluster blocks are ordered
+    by cluster ID.
+    """
+    n_per = CONTACT_SHEET_PER_CLUSTER
+    groups = CONTACT_SHEET_GROUPS_PER_ROW
+    rows = -(-k // groups)  # ceil
+    # A narrow empty spacer column after each cluster group keeps adjacent
+    # clusters visually separated.
+    width_ratios = []
+    for _ in range(groups):
+        width_ratios += [1.0] * n_per + [0.45]
+    fig, axes = plt.subplots(
+        rows, groups * (n_per + 1),
+        figsize=(1.15 * sum(width_ratios), 1.55 * rows),
+        squeeze=False, gridspec_kw={"width_ratios": width_ratios})
+    for cid in range(1, k + 1):
+        member = np.where(ids_all == cid)[0]
+        r, g = divmod(cid - 1, groups)
+        base = g * (n_per + 1)
+        if member.size == 0:
+            for j in range(n_per + 1):
+                axes[r][base + j].axis("off")
+            continue
+        dist = np.linalg.norm(W[member] - km.cluster_centers_[cid - 1], axis=1)
+        order = member[np.argsort(dist)]
+        # Walk candidates nearest-first, skipping near-empty crops (see
+        # CONTACT_SHEET_MIN_FOREGROUND) until n_per valid representatives.
+        imgs = []
+        scanned = 0
+        for idx in order:
+            if len(imgs) >= n_per or scanned >= CONTACT_SHEET_MAX_SCAN:
+                break
+            scanned += 1
+            img = _load_cell_image(dicts[idx], mode, view)
+            if img is None or _foreground_fraction(img) < CONTACT_SHEET_MIN_FOREGROUND:
+                continue
+            imgs.append(img)
+        if len(imgs) < n_per:
+            logger.warning("Cluster %d: only %d/%d representatives pass the "
+                           "%.0f%% foreground filter (scanned %d candidates)",
+                           cid, len(imgs), n_per,
+                           CONTACT_SHEET_MIN_FOREGROUND * 100, scanned)
+        for j in range(n_per):
+            ax = axes[r][base + j]
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if j < len(imgs):
+                ax.imshow(imgs[j])
+            if j == 0:
+                ax.set_title(f"cluster {cid} (n={member.size})", fontsize=8)
+        axes[r][base + n_per].axis("off")  # spacer after the group
+    # Any trailing cluster slot beyond k stays empty.
+    for cid in range(k, rows * groups):
+        r, g = divmod(cid, groups)
+        base = g * (n_per + 1)
+        for j in range(n_per + 1):
+            axes[r][base + j].axis("off")
+    fig.subplots_adjust(wspace=0.06, hspace=0.3)
+    with PdfPages(path) as pdf:
+        pdf.savefig(fig, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Cluster image sheet (k=%d) saved to %s", k, path)
+
+
+def _dr_transform(method, reducer, feats):
+    """Transform raw feature rows to a 2D embedding with one method's reducer.
+
+    PCA reducers are sliced to 2 columns so pre-fitted >2-component pickles
+    (older runs) keep working. pacmap/localmap are fit with save_tree=True so
+    out-of-sample transform needs no basis data.
+    """
+    if method == "pca":
+        return reducer.transform(feats)[:, :2]
+    if method == "umap":
+        pca_pre = reducer.get("pca_pre")
+        model = reducer["umap"]
+        return model.transform(pca_pre.transform(feats) if pca_pre is not None else feats)
+    return reducer.transform(feats)  # pacmap / localmap (n_components=2)
+
+
+def _fit_embedding(method, reducer, feats_fit):
+    """Embedding of the FIT subset itself.
+
+    The nonlinear methods store their fit embedding — transforming the fit
+    rows would only re-approximate it.
+    """
+    if method == "pca":
+        return reducer.transform(feats_fit)
+    if method == "umap":
+        return reducer["umap"].embedding_
+    return reducer.embedding_  # pacmap / localmap
+
+
+def show_reduction(config, save_plots=True, raise_on_error=False):
+    """Fit/load the configured DR methods on infer.db features and write tables.
+
+    reduction.method selects from pca / umap / pacmap / localmap. PCA is fit
+    with exactly 2 components; UMAP is preceded by a plain PCA to
+    UMAP_PRE_COMPONENTS dimensions; PaCMAP/LocalMAP reduce their input
+    internally. Every method writes a reduction_<method> table (pca columns
+    pc_1/pc_2, others <method>_1/<method>_2) into each DB; the legacy
+    reduction_pca_variance table is no longer written (and dropped if a stale
+    copy exists).
+
+    reduction.cluster_k lists KMeans cluster counts run on a whitened
+    PCA space of the features (same space as the label-refinement clustering).
+    Cluster IDs are 1-based and ordered by each cluster's centroid distance to
+    the origin of the reference DR plot (UMAP when present, else the first
+    configured method), so nearby-in-the-plot clusters get nearby IDs. The
+    fitted whitening PCA + per-k KMeans + ID maps persist to cluster.pkl.
+    reduction.cluster pointing at a saved cluster.pkl switches to baseline
+    mode: every stored k is PREDICTED for the new data (cluster_k ignored),
+    so cluster IDs stay aligned with the baseline across datasets. IDs go
+    to the find_cluster table (cluster_<k> columns), become extra color pages
+    in every method's PDF, and get a representative-cell sheet per k
+    (cluster_k<k>.pdf — cells rendered as their inference-mode input
+    via the bundle's augmentation_infer pipeline, so all images share one
+    size).
+
+    One multi-page PDF per method (reduction_<method>.pdf): one page per
+    color_by entry, then one per cluster k. color_by null = a single page
+    with all points in the default light blue. Scatter labels use the class
+    color on a luminance-adaptive text box.
+
+    save_plots=False skips the PDF outputs (tables are still written) —
     used by microProfiler, which is a data-only analysis suite.
     raise_on_error=True converts logged-error abort paths into raised
     RuntimeError/ValueError (the CLI keeps its print + sys.exit semantics).
@@ -369,22 +686,40 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
     db_name = inf_cfg.get("db_name", "infer.db")
     seed = 42
 
-    color_by_vals = red_cfg.get("color_by", "pred_class")
-    if isinstance(color_by_vals, str):
+    # DR methods: canonical order, unknown names dropped with a warning.
+    methods_raw = red_cfg.get("method") or ["pca", "umap"]
+    if isinstance(methods_raw, str):
+        methods_raw = [methods_raw]
+    unknown = [m for m in methods_raw if m not in DR_METHODS]
+    if unknown:
+        logger.warning("Unknown reduction method(s) %s; dropping (valid: %s)",
+                       unknown, list(DR_METHODS))
+    methods = [m for m in DR_METHODS if m in methods_raw]
+    if not methods:
+        if raise_on_error:
+            raise ValueError("No valid reduction.method; aborting reduction.")
+        logger.error("No valid reduction.method; aborting reduction.")
+        return
+
+    # color_by: null = default light-blue single-color pages. Otherwise the
+    # same valid values as before; cluster pages are appended later.
+    color_by_vals = red_cfg.get("color_by")
+    if color_by_vals is None:
+        color_by_vals = []
+    elif isinstance(color_by_vals, str):
         color_by_vals = [color_by_vals]
     valid_color_by = {"pred_class", "directory", "pred_prob", "ground_truth"}
-    color_by_vals = [cb for cb in color_by_vals if cb is not None]
-    filtered = [cb for cb in color_by_vals if cb in valid_color_by]
     dropped = [cb for cb in color_by_vals if cb not in valid_color_by]
     if dropped:
         logger.warning("Unknown color_by %s; dropping (valid: %s)", dropped, sorted(valid_color_by))
-    color_by_vals = filtered
-    if not color_by_vals:
-        if raise_on_error:
-            raise ValueError("No valid color_by values; aborting reduction.")
-        logger.error("No valid color_by values; aborting reduction.")
-        return
-    first_cb = color_by_vals[0]
+    color_by_vals = [cb for cb in color_by_vals if cb in valid_color_by]
+    first_cb = color_by_vals[0] if color_by_vals else None
+
+    # cluster_k: list of KMeans cluster counts; null/empty/0 entries = skip.
+    cluster_ks = []
+    for k in (red_cfg.get("cluster_k") or []):
+        if k and int(k) not in cluster_ks:
+            cluster_ks.append(int(k))
 
     # Phase 1: load all DBs and merge features
     out_pairs = resolve_output_paths(data_roots, base_output_dir)
@@ -422,40 +757,38 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
     if base_output_dir:
         add_file_logging(save_dirs[0])
 
-    feats_merged = np.concatenate([e[1] for e in db_entries], axis=0)
-    dicts_merged = []
+    feats_all = np.concatenate([e[1] for e in db_entries], axis=0)
+    dicts_all = []
     for _, _, dicts in db_entries:
-        dicts_merged.extend(dicts)
-    logger.info("Merged %d feature vectors from %d DB(s)",
-                feats_merged.shape[0], len(db_entries))
+        dicts_all.extend(dicts)
+    n_all = feats_all.shape[0]
+    logger.info("Merged %d feature vectors from %d DB(s)", n_all, len(db_entries))
 
-    # Phase 2: sample subset for fitting
-    sample_per_class = red_cfg.get("sample_per_class", 1000)
-    reducer_pca_path = red_cfg.get("reducer_pca")
-    reducer_umap_path = red_cfg.get("reducer_umap")
-    # Sampling gates whichever reducer still needs FITTING — a pre-fitted
-    # reducer is validated/transformed on all data; an unfitted one must not
-    # silently fit on the full dataset when only the other is pre-fitted.
-    needs_pca_fit = not reducer_pca_path
-    needs_umap_fit = not reducer_umap_path
+    # Phase 2: sample subset for fitting (null/0 = use all points)
+    sample_per_class = red_cfg.get("sample_per_class") or 0
+    # Sampling gates whichever reducer still needs FITTING.
+    needs_fit = any(not red_cfg.get(f"reduction_{m}") for m in methods)
 
-    dirs_merged = [d["directory"] for d in dicts_merged]
-    probs_merged = [d.get("pred_prob") or 0.0 for d in dicts_merged]
-    first_labels_merged, _ = _extract_color_data(first_cb, dicts_merged, dirs_merged, probs_merged)
-
-    if sample_per_class > 0 and (needs_pca_fit or needs_umap_fit):
+    dirs_all = [d["directory"] for d in dicts_all]
+    probs_all = [parse_pred_prob(d.get("pred_prob")) for d in dicts_all]
+    if sample_per_class > 0 and needs_fit:
+        if first_cb is not None:
+            first_labels_all, _ = _extract_color_data(first_cb, dicts_all, dirs_all, probs_all)
+        else:
+            first_labels_all = None
         fit_indices = _sample_fit_indices(
-            len(dicts_merged), first_labels_merged, first_cb, sample_per_class, seed)
-        feats_fit = feats_merged[fit_indices]
-        dicts_fit = [dicts_merged[i] for i in fit_indices]
-        dirs_fit = [dirs_merged[i] for i in fit_indices]
-        probs_fit = [probs_merged[i] for i in fit_indices]
-        if len(fit_indices) < len(dicts_merged):
-            logger.info("Sampled %d of %d rows for reducer fitting (sample_per_class=%d)",
-                        len(fit_indices), len(dicts_merged), sample_per_class)
+            n_all, first_labels_all, first_cb, sample_per_class, seed)
+        feats_fit = feats_all[fit_indices]
+        dicts_fit = [dicts_all[i] for i in fit_indices]
+        dirs_fit = [dirs_all[i] for i in fit_indices]
+        probs_fit = [probs_all[i] for i in fit_indices]
+        logger.info("Sampled %d of %d rows for reducer fitting (sample_per_class=%d)",
+                    len(fit_indices), n_all, sample_per_class)
     else:
-        feats_fit, dicts_fit = feats_merged, dicts_merged
-        dirs_fit, probs_fit = dirs_merged, probs_merged
+        fit_indices = np.arange(n_all)
+        feats_fit, dicts_fit = feats_all, dicts_all
+        dirs_fit, probs_fit = dirs_all, probs_all
+    sampled = len(fit_indices) < n_all
 
     if len(dicts_fit) < 2:
         if raise_on_error:
@@ -464,171 +797,203 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
         logger.error("Too few samples for reduction view (< 2), got %d", len(dicts_fit))
         return
 
-    # Phase 3: fit (or load) PCA + UMAP
-    var_threshold = red_cfg.get("var_threshold", 0.95)
-
-    if reducer_pca_path:
-        if not os.path.exists(reducer_pca_path):
-            if raise_on_error:
-                raise RuntimeError(f"reducer_pca not found: {reducer_pca_path}")
-            print(f"Error: reducer_pca not found: {reducer_pca_path}", file=sys.stderr)
-            sys.exit(1)
-        pca_full = load_reducer(reducer_pca_path)
-        validate_pca(pca_full, feats_merged.shape[1])
-        logger.info("PCA: loaded reducer from %s", reducer_pca_path)
-    else:
-        pca_full = PCA(n_components=var_threshold)
-        pca_full.fit(feats_fit)
-        if pca_full.n_components_ < 2:
-            pca_full = PCA(n_components=2).fit(feats_fit)
+    # Phase 3: fit (or load) one reducer per method
+    reducers = {}
+    for m in methods:
+        pre_path = red_cfg.get(f"reduction_{m}")
+        if pre_path:
+            if not os.path.exists(pre_path):
+                if raise_on_error:
+                    raise RuntimeError(f"reduction_{m} not found: {pre_path}")
+                print(f"Error: reduction_{m} not found: {pre_path}", file=sys.stderr)
+                sys.exit(1)
+            reducers[m] = load_reducer(pre_path)
+            if m == "pca":
+                validate_pca(reducers[m], feats_all.shape[1])
+            elif m == "umap":
+                validate_umap_pipeline(reducers[m], feats_all.shape[1])
+            logger.info("%s: loaded reducer from %s", m.upper(), pre_path)
+            continue
+        if m == "pca":
+            reducers[m] = PCA(n_components=2).fit(feats_fit)
+        elif m == "umap":
+            dim = feats_fit.shape[1]
+            n_pre = min(UMAP_PRE_COMPONENTS, feats_fit.shape[0], dim)
+            pca_pre = (PCA(n_components=n_pre).fit(feats_fit)
+                       if n_pre < dim else None)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="n_jobs value", category=UserWarning)
+                model = umap.UMAP(random_state=seed)
+                model.fit(pca_pre.transform(feats_fit) if pca_pre is not None else feats_fit)
+            reducers[m] = {"pca_pre": pca_pre, "umap": model}
+        elif m == "pacmap":
+            # PaCMAP reduces its input internally (apply_pca=True default);
+            # save_tree keeps the neighbor index inside the pickled reducer.
+            reducers[m] = pacmap.PaCMAP(
+                n_components=2, random_state=seed, save_tree=True).fit(feats_fit)
+        else:  # localmap
+            reducers[m] = pacmap.LocalMAP(
+                n_components=2, random_state=seed, save_tree=True).fit(feats_fit)
         for d in save_dirs:
-            save_reducer(pca_full, os.path.join(d, "reducer_pca.pkl"))
-        logger.info("PCA %dD: explained variance ratio = %.4f",
-                    pca_full.n_components_, pca_full.explained_variance_ratio_.sum())
+            save_reducer(reducers[m], os.path.join(d, f"reduction_{m}.pkl"))
+        logger.info("%s: fitted on %d points", m.upper(), feats_fit.shape[0])
 
-    raw_var = pca_full.explained_variance_
-    var_ratio = pca_full.explained_variance_ratio_
-    cum_ratio = np.cumsum(var_ratio)
-    n_pca = pca_full.n_components_
-    pc_axis_labels = [f"PC {i+1} ({var_ratio[i]*100:.1f}%)" for i in range(n_pca)]
+    # Phase 4: transform. The fit subset feeds the plots + cluster ordering;
+    # the full merge feeds the DB tables. When nothing was sampled the fit
+    # embeddings ARE the full embeddings (transform would only re-approximate
+    # them for the nonlinear methods).
+    X_fit = {m: _fit_embedding(m, reducers[m], feats_fit) for m in methods}
+    X_all = X_fit if not sampled else {
+        m: _dr_transform(m, reducers[m], feats_all) for m in methods}
 
-    if reducer_umap_path:
-        if not os.path.exists(reducer_umap_path):
+    # Phase 5: cluster finding (whitened PCA space, KMeans per k). IDs are
+    # 1-based, ordered by cluster-centroid distance to the origin of the
+    # reference DR plot (UMAP preferred) so plot-nearby clusters get nearby
+    # IDs. Fit fresh (cluster: null — models persisted to cluster.pkl) or
+    # load a baseline cluster.pkl and PREDICT, so new datasets inherit the
+    # baseline's cluster IDs (cluster_k is ignored then; every stored k is
+    # predicted).
+    cluster_ids = {}
+    cluster_path = red_cfg.get("cluster")
+    if cluster_path:
+        if not os.path.exists(cluster_path):
             if raise_on_error:
-                raise RuntimeError(f"reducer_umap not found: {reducer_umap_path}")
-            print(f"Error: reducer_umap not found: {reducer_umap_path}", file=sys.stderr)
+                raise RuntimeError(f"cluster not found: {cluster_path}")
+            print(f"Error: cluster not found: {cluster_path}", file=sys.stderr)
             sys.exit(1)
-        umap_pipeline = load_reducer(reducer_umap_path)
-        validate_umap_pipeline(umap_pipeline, feats_merged.shape[1])
-        pca_pre = umap_pipeline.get("pca_pre")
-        reducer = umap_pipeline["umap"]
-        logger.info("UMAP: loaded reducer from %s", reducer_umap_path)
-    else:
-        n_pre = pca_full.n_components_
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="n_jobs value", category=UserWarning)
-            if n_pre > 2:
-                pca_pre = PCA(n_components=n_pre)
-                pca_pre.fit(feats_fit)
-                logger.info("UMAP preprocessing PCA: %d -> %d components, explained variance = %.4f",
-                            feats_fit.shape[1], n_pre, pca_pre.explained_variance_ratio_.sum())
-            else:
-                pca_pre = None
-            reducer = umap.UMAP(random_state=seed)
-            reducer.fit(pca_pre.transform(feats_fit) if pca_pre is not None else feats_fit)
-            for d in save_dirs:
-                save_reducer({"pca_pre": pca_pre, "umap": reducer},
-                             os.path.join(d, "reducer_umap.pkl"))
-        logger.info("UMAP: fitted on %d points", feats_fit.shape[0])
+        cluster_obj = load_reducer(cluster_path)
+        validate_pca(cluster_obj["pca_whiten"], feats_all.shape[1],
+                     name="cluster.pkl pca_whiten")
+        W = cluster_obj["pca_whiten"].transform(feats_all)
+        W = W / np.maximum(np.linalg.norm(W, axis=1, keepdims=True), 1e-8)
+        cluster_ks = sorted(cluster_obj["models"])
+        logger.info("Clustering: loaded baseline %s — predicting all stored "
+                    "k=%s (cluster_k ignored)", cluster_path, cluster_ks)
+        for k in cluster_ks:
+            entry = cluster_obj["models"][k]
+            km, id_map = entry["kmeans"], entry["id_map"]
+            cluster_ids[k] = (id_map[km.predict(W)], km)
+    elif cluster_ks:
+        dim = feats_fit.shape[1]
+        n_white = min(UMAP_PRE_COMPONENTS, feats_fit.shape[0], dim)
+        pca_w = PCA(n_components=n_white, whiten=True).fit(feats_fit)
+        W = pca_w.transform(feats_all)
+        W = W / np.maximum(np.linalg.norm(W, axis=1, keepdims=True), 1e-8)
+        ref = "umap" if "umap" in methods else methods[0]
+        logger.info("Clustering: whitened PCA %dd -> KMeans k=%s (ID order ref: %s)",
+                    n_white, cluster_ks, ref)
+        cluster_obj = {"pca_whiten": pca_w, "models": {}}
+        for k in cluster_ks:
+            km = KMeans(n_clusters=k, random_state=seed, n_init=10).fit(W)
+            ref_fit_ids = km.labels_[fit_indices]
+            cent = np.array([X_fit[ref][ref_fit_ids == c].mean(axis=0)
+                             for c in range(k)])
+            order = np.argsort(np.linalg.norm(cent, axis=1))
+            id_map = np.empty(k, dtype=int)
+            id_map[order] = np.arange(1, k + 1)
+            cluster_ids[k] = (id_map[km.labels_], km)
+            cluster_obj["models"][k] = {"kmeans": km, "id_map": id_map}
+        for d in save_dirs:
+            save_reducer(cluster_obj, os.path.join(d, "cluster.pkl"))
 
-    # Phase 4: transform fit subset + plot (plots optional — microProfiler is
-    # a data-only suite and leaves plotting to later visualization)
-    X_pca_fit = pca_full.transform(feats_fit)
-    X_pca_pre_fit = pca_pre.transform(feats_fit) if pca_pre is not None else feats_fit
-    X_umap_fit = reducer.transform(X_pca_pre_fit)
-
+    # Phase 6: plots — one multi-page PDF per method
     if save_plots:
-        for cb in color_by_vals:
-            labels, label_names = _extract_color_data(cb, dicts_fit, dirs_fit, probs_fit)
-            continuous = (cb == "pred_prob")
-            for d in save_dirs:
-                _plot_reduction_scatter(
-                    X_pca_fit[:, :2], labels, label_names,
-                    f"PCA of feature vectors (colored by {cb})",
-                    pc_axis_labels[0], pc_axis_labels[1],
-                    os.path.join(d, f"feature_pca_{cb}.pdf"),
-                    pred_probs=probs_fit, continuous=continuous)
-                _plot_reduction_scatter(
-                    X_umap_fit, labels, label_names,
-                    f"UMAP of feature vectors (colored by {cb})", "UMAP 1", "UMAP 2",
-                    os.path.join(d, f"feature_umap_{cb}.pdf"),
-                    pred_probs=probs_fit, continuous=continuous)
+        for d in save_dirs:
+            for m in methods:
+                axis_name = DR_AXIS_NAMES[m]
+                pdf_path = os.path.join(d, f"reduction_{m}.pdf")
+                with PdfPages(pdf_path) as pdf:
+                    if not color_by_vals and not cluster_ks:
+                        _plot_reduction_page(
+                            X_fit[m], f"{axis_name} of feature vectors",
+                            f"{axis_name} 1", f"{axis_name} 2", pdf)
+                    for cb in color_by_vals:
+                        labels, label_names = _extract_color_data(
+                            cb, dicts_fit, dirs_fit, probs_fit)
+                        _plot_reduction_page(
+                            X_fit[m], f"{axis_name} of feature vectors (colored by {cb})",
+                            f"{axis_name} 1", f"{axis_name} 2", pdf,
+                            labels=labels, label_names=label_names,
+                            pred_probs=probs_fit, continuous=(cb == "pred_prob"))
+                    for k in cluster_ks:
+                        ids_fit = cluster_ids[k][0][fit_indices]
+                        _plot_reduction_page(
+                            X_fit[m],
+                            f"{axis_name} of feature vectors (colored by cluster, k={k})",
+                            f"{axis_name} 1", f"{axis_name} 2", pdf,
+                            labels=list(ids_fit),
+                            label_names=[str(i) for i in ids_fit])
+                logger.info("Reduction plot saved to %s", pdf_path)
+        # Representative-cell sheet per k (5 inference-mode inputs per
+        # cluster, 5 clusters per row, uniform cell size).
+        mode = config.get("mode", "single_cell")
+        channels_cfg = config["data"].get("channels")
+        channels = list(channels_cfg) if channels_cfg else [1]
+        channel_layout = config["data"].get("channel_layout")
+        cell_view = _build_cell_view(config, mode, channels, channel_layout)
+        for d in save_dirs:
+            for k in cluster_ks:
+                ids_all_k, km = cluster_ids[k]
+                _write_cluster_sheet(
+                    k, ids_all_k, W, km, dicts_all,
+                    os.path.join(d, f"cluster_k{k}.pdf"),
+                    mode, cell_view)
 
-    # Phase 5: batch-transform all DBs + write tables
-    pc_cols = ", ".join(f"pc_{i+1} REAL NOT NULL" for i in range(n_pca))
-    pc_col_names = ", ".join(f"pc_{i+1}" for i in range(n_pca))
-    pc_ph = ", ".join("?" * n_pca)
-
-    feats_merged_all = np.concatenate([e[1] for e in db_entries], axis=0)
+    # Phase 7: write per-DB tables
+    t0 = time.perf_counter()
     offsets = []
     _cursor = 0
-    for _, feats_all, _ in db_entries:
-        offsets.append((_cursor, _cursor + len(feats_all)))
-        _cursor += len(feats_all)
+    for _, feats_db, _ in db_entries:
+        offsets.append((_cursor, _cursor + len(feats_db)))
+        _cursor += len(feats_db)
 
-    t_tf0 = time.perf_counter()
-    X_pca_merged = pca_full.transform(feats_merged_all)
-    t_pca_full = time.perf_counter()
-
-    if pca_pre is not None and _pca_equivalent(pca_full, pca_pre):
-        X_pca_pre_merged = X_pca_merged
-    else:
-        X_pca_pre_merged = (pca_pre.transform(feats_merged_all)
-                            if pca_pre is not None else feats_merged_all)
-    t_pca_pre = time.perf_counter()
-
-    X_umap_merged = reducer.transform(X_pca_pre_merged)
-    t_umap = time.perf_counter()
-    logger.info("Batch transform on %d points: pca=%.1fs pca_pre=%.1fs umap=%.1fs",
-                len(feats_merged_all),
-                t_pca_full - t_tf0, t_pca_pre - t_pca_full, t_umap - t_pca_pre)
-
-    for (start, end), (db_path, feats_all, db_dicts_all) in zip(offsets, db_entries):
+    for (start, end), (db_path, feats_db, db_dicts) in zip(offsets, db_entries):
         t_db0 = time.perf_counter()
-        X_pca_all = X_pca_merged[start:end]
-        X_umap_all = X_umap_merged[start:end]
-        uids = [d["uid"] for d in db_dicts_all]
-
+        uids = [d["uid"] for d in db_dicts]
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA journal_mode=MEMORY")
         conn.execute("PRAGMA synchronous=OFF")
         conn.execute("PRAGMA temp_store=MEMORY")
 
-        # The pc_1..pc_k schema depends on the auto-selected component count,
-        # which can change between runs — drop before recreating.
-        conn.execute("DROP TABLE IF EXISTS reduction_pca")
+        # Legacy table from the variance-tracking schema — no longer written.
         conn.execute("DROP TABLE IF EXISTS reduction_pca_variance")
 
-        conn.execute(
-            f"CREATE TABLE IF NOT EXISTS reduction_pca ("
-            f"uid INTEGER PRIMARY KEY, {pc_cols})")
-        pca_cols = X_pca_all.T.tolist()
-        conn.executemany(
-            f"INSERT OR REPLACE INTO reduction_pca (uid, {pc_col_names}) "
-            f"VALUES (?, {pc_ph})",
-            list(zip(uids, *pca_cols)))
+        for m in methods:
+            col = "pc" if m == "pca" else m
+            # Drop first: the old PCA schema could carry pc_1..pc_k columns.
+            conn.execute(f"DROP TABLE IF EXISTS reduction_{m}")
+            conn.execute(
+                f"CREATE TABLE reduction_{m} ("
+                f"uid INTEGER PRIMARY KEY, {col}_1 REAL NOT NULL, {col}_2 REAL NOT NULL)")
+            arr = X_all[m][start:end]
+            conn.executemany(
+                f"INSERT OR REPLACE INTO reduction_{m} (uid, {col}_1, {col}_2) "
+                f"VALUES (?, ?, ?)",
+                list(zip(uids, arr[:, 0].tolist(), arr[:, 1].tolist())))
 
-        conn.execute("""CREATE TABLE IF NOT EXISTS reduction_umap (
-            uid INTEGER PRIMARY KEY,
-            umap_1 REAL NOT NULL,
-            umap_2 REAL NOT NULL)""")
-        umap_cols = X_umap_all.T.tolist()
-        conn.executemany(
-            "INSERT OR REPLACE INTO reduction_umap (uid, umap_1, umap_2) VALUES (?, ?, ?)",
-            list(zip(uids, *umap_cols)))
-
-        conn.execute("""CREATE TABLE IF NOT EXISTS reduction_pca_variance (
-            pc_id INTEGER PRIMARY KEY,
-            variance REAL NOT NULL,
-            variance_ratio REAL NOT NULL,
-            cumulative_variance_ratio REAL NOT NULL)""")
-        conn.executemany(
-            "INSERT OR REPLACE INTO reduction_pca_variance "
-            "(pc_id, variance, variance_ratio, cumulative_variance_ratio) VALUES (?, ?, ?, ?)",
-            [(i + 1, float(raw_var[i]), float(var_ratio[i]), float(cum_ratio[i]))
-             for i in range(n_pca)])
+        if cluster_ks:
+            cols = ", ".join(f"cluster_{k} INTEGER NOT NULL" for k in cluster_ks)
+            col_names = ", ".join(f"cluster_{k}" for k in cluster_ks)
+            ph = ", ".join("?" * len(cluster_ks))
+            conn.execute("DROP TABLE IF EXISTS find_cluster")
+            conn.execute(
+                f"CREATE TABLE find_cluster (uid INTEGER PRIMARY KEY, {cols})")
+            conn.executemany(
+                f"INSERT OR REPLACE INTO find_cluster (uid, {col_names}) "
+                f"VALUES (?, {ph})",
+                list(zip(uids, *[cluster_ids[k][0][start:end].tolist()
+                                 for k in cluster_ks])))
 
         conn.commit()
         conn.close()
-        t_db1 = time.perf_counter()
-        logger.info("Wrote %d PCA (%dD) + %d UMAP (2D) + %d variance rows to %s "
-                    "(db_write=%.1fs)",
-                    len(feats_all), n_pca, len(feats_all), n_pca, db_path,
-                    t_db1 - t_db0)
+        logger.info("Wrote %s tables + cluster info (%d rows) to %s (db_write=%.1fs)",
+                    "/".join(methods), end - start, db_path,
+                    time.perf_counter() - t_db0)
 
-    logger.info("Reduction complete: fitted on %d samples, transformed %d DB(s), "
-                "reducers+plots saved to %s",
-                feats_fit.shape[0], len(db_entries), save_dirs)
+    logger.info("Reduction complete: methods=%s, cluster_k=%s, fitted on %d "
+                "samples, transformed %d DB(s), outputs in %s",
+                methods, cluster_ks or None, feats_fit.shape[0], len(db_entries),
+                save_dirs)
 
 
 def _load_inference_features(db_path, raise_on_error=False):
@@ -691,24 +1056,13 @@ def _extract_color_data(cb, dicts, dirs, probs):
 
 
 def _sample_fit_indices(n_orig, labels, color_by, sample_per_class, seed):
-    """Select indices for reducer fitting, stratified by `labels`."""
+    """Select indices for reducer fitting, stratified by `labels`.
+
+    labels=None (color_by null) or pred_prob samples uniformly.
+    """
     return stratified_sample_indices(
         n_orig, labels, sample_per_class, seed,
-        uniform=(color_by == "pred_prob"))
-
-
-def _pca_equivalent(a, b):
-    """True if two fitted PCA objects produce identical transforms."""
-    if a is b:
-        return True
-    if (getattr(a, "n_components", None) != getattr(b, "n_components", None)
-            or getattr(a, "n_features_in_", None) != getattr(b, "n_features_in_", None)):
-        return False
-    ca = getattr(a, "components_", None)
-    cb = getattr(b, "components_", None)
-    if ca is None or cb is None:
-        return False
-    return np.array_equal(ca, cb)
+        uniform=(color_by is None or color_by == "pred_prob"))
 
 
 # ----------------------------------------------------------------------------
@@ -716,19 +1070,31 @@ def _pca_equivalent(a, b):
 # ----------------------------------------------------------------------------
 
 def plot_training_results(model, device, val_loader, num_classes, label_to_idx,
-                          train_loss_history, val_acc_history, save_path=None):
+                          train_loss_history, val_acc_history, save_path=None,
+                          multi_label=False):
+    """Loss/accuracy history + a third panel that depends on the label mode:
+    single-label draws the normalized confusion matrix; multi-label draws a
+    per-class F1 bar chart at the 0.5 threshold. Returns a dict with the
+    final metrics plus "cm" (single-label) or "per_class_f1" (multi-label).
+    """
     if not train_loss_history:
         logger.warning("No training history to plot.")
         return None
 
+    # Imported here (not at module top) to keep vis import light for GUI users.
+    from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+
     fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-    axes[0].plot(train_loss_history, marker="o")
+    # x-axis is the 1-based epoch number (package-wide convention).
+    ep = range(1, len(train_loss_history) + 1)
+    axes[0].plot(ep, train_loss_history, marker="o")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Train Loss")
     axes[0].set_title("Training Loss")
     axes[0].grid(True)
 
-    axes[1].plot(val_acc_history, marker="s", color="orange")
+    axes[1].plot(range(1, len(val_acc_history) + 1), val_acc_history,
+                 marker="s", color="orange")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Val Accuracy")
     axes[1].set_title("Validation Accuracy")
@@ -740,25 +1106,45 @@ def plot_training_results(model, device, val_loader, num_classes, label_to_idx,
         for x, y in val_loader:
             x = x.to(device)
             logits, _ = model(x)
-            yt_all.extend(y.tolist())
-            yp_all.extend(logits.argmax(1).cpu().tolist())
-    cm = confusion_matrix(yt_all, yp_all, labels=list(range(num_classes)))
-    cm_norm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
-    cm_norm = np.nan_to_num(cm_norm)
-    im = axes[2].imshow(cm_norm, cmap="Blues", aspect="auto", vmin=0, vmax=1)
-    axes[2].set_xlabel("Predicted")
-    axes[2].set_ylabel("True")
-    axes[2].set_title("Confusion Matrix")
+            if multi_label:
+                yt_all.extend(y.long().tolist())
+                yp_all.extend((torch.sigmoid(logits) >= 0.5).long().cpu().tolist())
+            else:
+                yt_all.extend(y.tolist())
+                yp_all.extend(logits.argmax(1).cpu().tolist())
+
     cls_names = list(label_to_idx.keys())
-    axes[2].set_xticks(range(num_classes), cls_names, rotation=45)
-    axes[2].set_yticks(range(num_classes), cls_names)
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            val = cm_norm[i, j]
-            axes[2].text(j, i, f"{val:.2f}",
-                         ha="center", va="center",
-                         color="white" if val > 0.5 else "black")
-    plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+    if multi_label:
+        # No confusion matrix exists for multi-label — bar-chart the F1 of
+        # every category instead.
+        per_class = f1_score(yt_all, yp_all, average=None,
+                             zero_division=0) if yt_all else np.zeros(num_classes)
+        per_class_f1 = {cls_names[i]: float(per_class[i])
+                        for i in range(min(num_classes, len(per_class)))}
+        axes[2].bar(range(num_classes), per_class[:num_classes], color="steelblue")
+        axes[2].set_xticks(range(num_classes), cls_names, rotation=45, ha="right")
+        axes[2].set_ylabel("F1")
+        axes[2].set_ylim(0, 1)
+        axes[2].set_title("Per-class F1 (threshold 0.5)")
+        axes[2].grid(True, axis="y")
+        cm = None
+    else:
+        cm = confusion_matrix(yt_all, yp_all, labels=list(range(num_classes)))
+        cm_norm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
+        cm_norm = np.nan_to_num(cm_norm)
+        im = axes[2].imshow(cm_norm, cmap="Blues", aspect="auto", vmin=0, vmax=1)
+        axes[2].set_xlabel("Predicted")
+        axes[2].set_ylabel("True")
+        axes[2].set_title("Confusion Matrix")
+        axes[2].set_xticks(range(num_classes), cls_names, rotation=45)
+        axes[2].set_yticks(range(num_classes), cls_names)
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                val = cm_norm[i, j]
+                axes[2].text(j, i, f"{val:.2f}",
+                             ha="center", va="center",
+                             color="white" if val > 0.5 else "black")
+        plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
     plt.tight_layout()
 
     if save_path:
@@ -767,39 +1153,42 @@ def plot_training_results(model, device, val_loader, num_classes, label_to_idx,
 
     plt.close(fig)
 
-    from sklearn.metrics import accuracy_score, f1_score
     final_acc = float(accuracy_score(yt_all, yp_all)) if yt_all else 0.0
     final_f1 = float(f1_score(yt_all, yp_all, average="macro", zero_division=0)) if yt_all else 0.0
-    return {"cm": cm, "final_loss": train_loss_history[-1],
-            "final_acc": val_acc_history[-1], "final_f1": final_f1,
-            "final_val_acc": final_acc, "final_val_f1": final_f1}
+    result = {"final_loss": train_loss_history[-1],
+              "final_acc": val_acc_history[-1], "final_f1": final_f1,
+              "final_val_acc": final_acc, "final_val_f1": final_f1}
+    if cm is not None:
+        result["cm"] = cm
+    else:
+        result["per_class_f1"] = per_class_f1
+    return result
 
 
 # ----------------------------------------------------------------------------
 # Pretrain loss curve (for SSL pretrain)
 # ----------------------------------------------------------------------------
 
-def plot_pretrain_loss(loss_history, dino_history=None, ibot_history=None,
-                       koleo_history=None, gram_history=None, save_path=None):
-    """Plot pretrain loss curve. For DINOv2/DINOv3 also plot the components.
+def plot_pretrain_loss(loss_history, component_histories=None, save_path=None):
+    """Plot the pretrain total loss plus one curve per loss component.
 
     loss_history: list of per-epoch total loss.
-    dino_history/ibot_history/koleo_history/gram_history: optional per-epoch
-        component losses (SSL methods only); must be the same length as
-        loss_history to be plotted.
-    save_path: output PDF path. If None, the figure is not saved.
+    component_histories: {component_name: [per-epoch values]} — whatever the
+        method's train_step returned (dino/ibot/gram/recon/dist/adv/...).
+        Components whose history length does not match loss_history are
+        skipped. save_path: output PDF path. If None, the figure is not saved.
     """
     if not loss_history:
         logger.warning("No pretrain loss history to plot.")
         return None
 
     epochs = range(1, len(loss_history) + 1)
-    has_components = (dino_history is not None and len(dino_history) == len(loss_history)
-                      and ibot_history is not None and len(ibot_history) == len(loss_history)
-                      and koleo_history is not None and len(koleo_history) == len(loss_history))
-    has_gram = (gram_history is not None and len(gram_history) == len(loss_history))
+    components = {
+        name: hist for name, hist in (component_histories or {}).items()
+        if isinstance(hist, list) and len(hist) == len(loss_history)
+    }
 
-    if has_components:
+    if components:
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
         axes[0].plot(epochs, loss_history, label="total", linewidth=1.5)
         axes[0].set_xlabel("Epoch")
@@ -807,14 +1196,11 @@ def plot_pretrain_loss(loss_history, dino_history=None, ibot_history=None,
         axes[0].set_title("Total Loss")
         axes[0].grid(True)
         axes[0].legend()
-        axes[1].plot(epochs, dino_history, label="dino", linewidth=1.2)
-        axes[1].plot(epochs, ibot_history, label="ibot", linewidth=1.2)
-        axes[1].plot(epochs, koleo_history, label="koleo", linewidth=1.2)
-        if has_gram:
-            axes[1].plot(epochs, gram_history, label="gram", linewidth=1.2)
+        for name, hist in components.items():
+            axes[1].plot(epochs, hist, label=name, linewidth=1.2)
+        axes[1].set_title("Loss Components")
         axes[1].set_xlabel("Epoch")
         axes[1].set_ylabel("Loss")
-        axes[1].set_title("SSL Loss Components")
         axes[1].grid(True)
         axes[1].legend()
     else:
@@ -837,7 +1223,7 @@ def plot_pretrain_loss(loss_history, dino_history=None, ibot_history=None,
 # DINOv3 training-quality diagnostics
 # ----------------------------------------------------------------------------
 
-#: Head-collapse threshold in logit space (DINOv2 collapse-guard value):
+#: Head-collapse threshold in logit space (DINOv3 collapse-guard value):
 #: healthy heads sit at std ~0.02-0.06, collapsed heads at ~0.002.
 HEAD_LOGITS_STD_COLLAPSE_THRESHOLD = 5e-3
 

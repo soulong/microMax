@@ -1,16 +1,14 @@
 """DINOv3 SSL model (Meta AI recipe, arXiv:2508.10104) on a timm ViT backbone.
 
-The backbone stays a plain timm ViT (rebuilt via build_dinov2_vit in
-backbone.py, exactly like the DINOv2 method — pos_embed="learn",
-dynamic_img_size=True, init_values=1e-5). What changes vs. DINOv2 is the
-head / objective / regularization, ported 1:1 from facebookresearch/dinov3
-(which is built around a custom ViT + FSDP; microModel replaces that with
-any timm ViT that has a class token):
+The backbone stays a plain timm ViT (rebuilt via build_dino_vit in
+backbone.py — pos_embed="learn", dynamic_img_size=True, init_values=1e-5),
+ported 1:1 from facebookresearch/dinov3 (which is built around a custom ViT
++ FSDP; microModel replaces that with any timm ViT that has a class token):
 
   - Heads: DINO head (dino/CLS prototypes) and iBOT head (patch prototypes)
     are the official DINOHead — MLP -> bottleneck(256) -> L2-norm -> Linear
     (no BatchNorm, no weight-norm). The L2-norm + Sinkhorn-Knopp teacher
-    centering is the anti-collapse mechanism (DINOv2's BN heads are gone).
+    centering is the anti-collapse mechanism.
   - DINO loss: cross-entropy; teacher targets are Sinkhorn-Knopp-centered
     softmax (not softmax+EMA-center). Optionally ignores the diagonal
     (global crop i vs itself) — the DINOv3 default.
@@ -33,8 +31,10 @@ views only.
 
 This module is a drop-in SSL method for microModel: models/__init__.py
 registers "dinov3", pretrain.py dispatches to it, and every saved bundle has
-the same "student_backbone.vit.*" prefix so extract_backbone_state_dict and
-the downstream train/infer consumers treat it like DINOv2.
+the "teacher_backbone.vit.*" / "student_backbone.vit.*" prefixes so
+extract_backbone_state_dict and the downstream train/infer consumers know
+which branch to pull. Downstream extraction uses the TEACHER branch by
+default (EMA/Polyak average — official DINO-family evaluation practice).
 
 References:
   - https://arxiv.org/abs/2508.10104
@@ -58,9 +58,24 @@ from lightly.models.modules import MaskedVisionTransformerTIMM
 from lightly.utils.scheduler import cosine_schedule, linear_warmup_schedule
 from timm.models.vision_transformer import VisionTransformer
 
-from ..backbone import build_dinov2_vit
-from .dinov2 import _update_momentum_with_buffers
+from ..backbone import build_dino_vit
 from ..utils import logger
+
+
+def _update_momentum_with_buffers(model, model_ema, m):
+    """EMA of parameters AND float buffers (lightly's update_momentum only
+    does parameters).
+
+    Buffers matter for BatchNorm in the projection heads: the teacher's BN
+    running stats must track the student's, otherwise the teacher targets are
+    computed with stale statistics. Non-float buffers (e.g. BN's
+    num_batches_tracked) are left untouched.
+    """
+    for ema_param, param in zip(model_ema.parameters(), model.parameters()):
+        ema_param.data.mul_(m).add_(param.data, alpha=1 - m)
+    for ema_buffer, buffer in zip(model_ema.buffers(), model.buffers()):
+        if ema_buffer.dtype.is_floating_point:
+            ema_buffer.data.mul_(m).add_(buffer.data, alpha=1 - m)
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +481,7 @@ class DINOv3(nn.Module):
     (gram.ckpt) and optionally refreshed from the EMA teacher.
     """
 
-    def __init__(self, vit_name="vit_small_patch16_224", input_dim=None,
+    def __init__(self, vit_name="vit_small_patch16_224",
                  drop_path_rate=0.1, in_chans=3, pretrained=False,
                  head_cfg=None, gram_cfg=None, mask_cfg=None, loss_cfg=None):
         super().__init__()
@@ -475,22 +490,14 @@ class DINOv3(nn.Module):
         mask_cfg = mask_cfg or {}
         loss_cfg = loss_cfg or {}
 
-        vit_teacher = build_dinov2_vit(vit_name, in_chans, pretrained)
-        if input_dim is not None and input_dim != vit_teacher.embed_dim:
-            print(
-                f"Error: dinov3.input_dim={input_dim} does not match ViT "
-                f"'{vit_name}' embed_dim={vit_teacher.embed_dim}; set it to "
-                f"{vit_teacher.embed_dim} or remove it (null = derived)",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        vit_teacher = build_dino_vit(vit_name, in_chans, pretrained)
         input_dim = vit_teacher.embed_dim
 
-        # Teacher/student backbones (same wrappers + key prefixes as dinov2,
-        # so bundle extraction and downstream consumers are shared). The
+        # Teacher/student backbones (same wrappers + key prefixes for every
+        # bundle, so extraction and downstream consumers are shared). The
         # wrapper type follows the timm backbone: classic VisionTransformer
-        # -> lightly MaskedVisionTransformerTIMM (unchanged DINOv2 behaviour);
-        # timm DINOv3 (Eva/RoPE) -> _MaskedEva.
+        # -> lightly MaskedVisionTransformerTIMM; timm DINOv3 (Eva/RoPE) ->
+        # _MaskedEva.
         weight_init = "skip" if pretrained else ""
         self.teacher_backbone = _build_masked_vit(vit_teacher, weight_init)
         self.student_backbone = copy.deepcopy(self.teacher_backbone)
@@ -585,7 +592,7 @@ class DINOv3(nn.Module):
                         "2 high-res gram-teacher crop views).")
                 # Frozen gram teacher backbone (same architecture + wrapper type as
                 # the teacher/student; no heads attached).
-                vit_gram = build_dinov2_vit(vit_name, in_chans, pretrained=False)
+                vit_gram = build_dino_vit(vit_name, in_chans, pretrained=False)
                 self.gram_backbone = _build_masked_vit(vit_gram, weight_init="skip")
                 _freeze_eval_module(self.gram_backbone)
                 self._n_gram_views = 2
@@ -619,11 +626,11 @@ class DINOv3(nn.Module):
         if not sd:
             print(f"Error: {path} is not an SSL bundle (no 'state_dict')", file=sys.stderr)
             sys.exit(1)
-        prefix = "student_backbone.vit."
+        prefix = "teacher_backbone.vit."
         vt = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
         if not vt:
             print(f"Error: bundle {path} has no '{prefix}' weights "
-                  f"(not a DINOv2/DINOv3 SSL bundle)", file=sys.stderr)
+                  f"(not a DINOv3 SSL bundle)", file=sys.stderr)
             sys.exit(1)
         self.gram_backbone.vit.load_state_dict(vt)
         self._gram_teacher_initialized = True
@@ -715,16 +722,31 @@ def _freeze_eval_module(module: Module) -> None:
 
 
 def unbox_head_cfg(head_cfg, key):
-    """Head hyperparameters: nested 'dino'/'ibot' dicts, else shared keys."""
-    sub = head_cfg.get(key)
-    if sub is None:
-        sub = head_cfg
-    return {
-        "hidden_dim": int(sub.get("head_hidden_dim", 2048)),
-        "bottleneck_dim": int(sub.get("head_bottleneck_dim", 256)),
-        "nlayers": int(sub.get("head_nlayers", 3)),
-        "out_dim": int(sub.get("head_n_prototypes", 65536)),
-    }
+    """Head hyperparameters (hidden/bottleneck/nlayers/out_dim) for one of
+    the 'dino'/'ibot' heads.
+
+    Per-key resolution, most specific wins: a nested '<key>:' block (e.g.
+    dinov3.ibot.{...}), then the flat '<key>_head_*' keys (e.g.
+    ibot_head_n_prototypes), then the shared 'head_*' keys (the dino head's
+    values), then the built-in default.
+    """
+    nested = head_cfg.get(key)
+    if not isinstance(nested, dict):
+        nested = {}
+    vals = {}
+    for name, cfg_key, default in (
+            ("hidden_dim", "head_hidden_dim", 2048),
+            ("bottleneck_dim", "head_bottleneck_dim", 256),
+            ("nlayers", "head_nlayers", 3),
+            ("out_dim", "head_n_prototypes", 65536)):
+        vals[name] = nested.get(
+            name,
+            head_cfg.get(f"{key}_{cfg_key}",
+                         head_cfg.get(cfg_key, default)))
+    return {"hidden_dim": int(vals["hidden_dim"]),
+            "bottleneck_dim": int(vals["bottleneck_dim"]),
+            "nlayers": int(vals["nlayers"]),
+            "out_dim": int(vals["out_dim"])}
 
 
 def partial_head(in_dim, cfg):
@@ -755,7 +777,7 @@ def build_dinov3(backbone_cfg, method_cfg, device):
     """Build a DINOv3 model from config.
 
     backbone_cfg: {name (any timm ViT with a class token), in_chans, pretrained}.
-    method_cfg: {input_dim, drop_path_rate, head_*, dino/ibot/koleo weights,
+    method_cfg: {drop_path_rate, head_*, dino/ibot/koleo weights,
                  mask_*, freeze_last_layer_epochs, gram: {...}, schedules ...}
     """
     vit_name = backbone_cfg.get("name", "vit_small_patch16_224")
@@ -763,7 +785,6 @@ def build_dinov3(backbone_cfg, method_cfg, device):
     pretrained = backbone_cfg.get("pretrained", False)
     model = DINOv3(
         vit_name=vit_name,
-        input_dim=method_cfg.get("input_dim"),
         drop_path_rate=method_cfg.get("drop_path_rate", 0.1),
         in_chans=in_chans,
         pretrained=pretrained,
@@ -786,9 +807,9 @@ def build_dinov3(backbone_cfg, method_cfg, device):
 
 def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
                step_info, scaler=None, grad_clip=None, step=True):
-    """One DINOv3 training step. Returns
-    (loss, dino_loss, ibot_loss, koleo_loss, gram_loss_or_None) as Python
-    floats (components are used for per-epoch logging by pretrain_ssl).
+    """One DINOv3 training step. Returns (loss_value, components_dict) — the
+    uniform protocol consumed by pretrain_ssl (components: dino/ibot/koleo,
+    plus gram when the Gram anchoring loss is enabled).
 
     criterion = (dino_criterion, ibot_criterion, koleo_criterion,
                  gram_criterion_or_None)
@@ -1002,8 +1023,11 @@ def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
                 step=global_step - lr_warmup_steps,
                 max_steps=max(1, step_info["total_steps"] - lr_warmup_steps),
                 start_value=lr_peak, end_value=lr_final)
+        # Per-group LR scale: reserved for fine-tune stages that give the
+        # encoder a different LR than the heads (pretrain builds lr_scale=1
+        # groups, so dinov3 always uses the plain schedule value).
         for group in optimizer.param_groups:
-            group["lr"] = lr
+            group["lr"] = lr * group.get("lr_scale", 1.0)
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -1051,9 +1075,11 @@ def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
             if freeze:
                 _zero_last_layer_grads(model)
 
-    return (loss.item(),
-            dino_global.item(), ibot.item(), koleo.item(),
-            gram_loss.item() if gram_loss is not None else None)
+    components = {"dino": dino_global.item(), "ibot": ibot.item(),
+                  "koleo": koleo.item()}
+    if gram_loss is not None:
+        components["gram"] = gram_loss.item()
+    return loss.item(), components
 
 
 def _zero_last_layer_grads(model):

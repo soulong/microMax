@@ -1,0 +1,100 @@
+# Classification train config — FROM A PRETRAINED SSL BACKBONE.
+#
+# Loads an SSL pretrain bundle (resume.ssl_model), rebuilds its backbone,
+# adds a ClassificationHead and trains it. model.freeze_backbone: true keeps
+# the backbone frozen (linear probe — head-only training); set false to
+# fine-tune the whole model.
+#
+# Companion config: train_from_scratch.yml (no SSL bundle, random init). The
+# two files share the same schema; the difference is only the resume block +
+# backbone defaults.
+#
+# PATH CONVENTION: data.root / data.label_csv / output_dir / resume.ssl_model
+# are relative to the directory you launch from — use D:\Model\sc_dataset.
+#
+# Saves train bundles compatible with `micromodel infer` (classify mode):
+#   - model.pt (final; eval/best weights; no optimizer state — interval
+#     bundles model_{epoch}.pt carry the exact-resume state)
+#   - model_{epoch}.pt (every save_interval; raw training weights + optimizer
+#     state + best_state for exact resume)
+
+mode: single_cell
+
+method: classification               # classification | segmentation | ...
+
+output_dir: 20260906_train_oc_p53_probe
+
+data:
+  # root selects WHICH images train (union over roots); label_csv only
+  # annotates them — label_csv rows for files outside root are ignored,
+  # root files without a label are dropped. To train a subset, trim root.
+  root:
+    - sc_dataset/opencell/single_cell
+    - sc_dataset/p53/2026-07-10_63x
+    - sc_dataset/p53/2026-07-11_63x
+    - sc_dataset/p53/2026-07-14_63x
+    - sc_dataset/p53/2026-07-18_22_63x
+    - sc_dataset/p53/2026-07-18_37_63x
+  image_pattern: null                 # regex for metadata extraction; null = none
+  max_value: 65535                    # max possible intensity of the input dtype (65535 for 16-bit, 255 for 8-bit); images are divided by it on load
+  channels: [1]                       # 1-based indices; null = all
+  channel_layout: null                # CHW | HWC | null (one-channel-per-file)
+  label_from_dir: false               # disabled — labels come from label_csv only (unmatched files are dropped)
+  label_csv: sc_dataset/label.csv     # filepath -> label lookup table: each root-enumerated file is matched by abspath (rows outside root are ignored, root files without a row are dropped); paths relative to this CSV's directory. Loss follows the label form: plain single label = FocalLoss, ';'-joined categories = BCE multi-label
+  sample_max: 5000                    # null = no limit
+  sample_by: per_class                # per_class | per_dataset
+
+# resume.ssl_model = SSL pretrain bundle whose backbone is loaded (and locked
+# against the bundle meta). This config never uses resume.sl_model.
+resume:
+  ssl_model: ../20260805_pretrain_dino/model.pt   # SSL bundle for backbone transfer; adjust to your pretrain bundle
+
+# Augmentation pipeline — list of {AlbumentationsClassName: {kwargs}} dicts.
+# train = random transforms; infer = deterministic resize (validation).
+# Both must end at the same size (LongestMaxSize + PadIfNeeded + Resize).
+# Locked to bundle values when resume.sl_model is set.
+augmentation_train:
+  - HorizontalFlip: {p: 0.5}
+  - Rotate: {angle_range: [-180, 180], border_mode: 0, p: 0.5}
+  - RandomScale: {scale_range: [-0.1, 0.2], p: 0.7}
+  - RandomBrightnessContrast: {brightness_range: [0, 0.02], contrast_range: [-0.1, 0.2], p: 0.7}
+  - RandomGamma: {gamma_range: [80, 120], p: 0.7}
+  - GaussNoise: {std_range: [0.001, 0.002], p: 0.7}
+  # sigma_range MUST stay pinned low — the default (0.5, 3.0) independently
+  # samples huge sigmas that smear puncta into diffuse blobs (granularity is
+  # a class signal: nuclear_punctae vs nucleoplasm).
+  - GaussianBlur: {blur_range: [3, 5], sigma_range: [0.5, 1.0], p: 0.3}
+  - LongestMaxSize: {max_size: 224, p: 1.0}
+  - PadIfNeeded: {min_height: 224, min_width: 224, p: 1.0}
+augmentation_infer:
+  - LongestMaxSize: {max_size: 224, p: 1.0}
+  - PadIfNeeded: {min_height: 224, min_width: 224, p: 1.0}
+
+normalize:
+  method: global                      # global | per_channel | null
+  with_masking: false                 # true = stats from cell foreground only
+  fixed_reference: true               # stats on RAW cell, fixed transform per view; preserves brightness/contrast aug
+  clip_low: 0.05
+  clip_high: 99.95
+
+dataloader:
+  num_workers: 12
+  prefetch_factor: 4
+  persistent_workers: true
+
+model:
+  backbone: vit_small_patch16_dinov3  # placeholder — locked to the SSL bundle's backbone when resume.ssl_model is set
+  freeze_backbone: true               # true = freeze the SSL backbone, train the head only (linear probe); false = full fine-tune
+  focal_gamma: 2.0                    # focal exponent for BOTH losses: single-label FocalLoss and multi-label BCE (0 = plain CE / plain BCE)
+  label_smoothing: 0.1                # softens targets (focal: uniform CE smoothing; bce: towards 0.5); 0 = off
+
+training:
+  batch_size: 196
+  epochs: 50
+  save_interval: 20                   # save a complete model_{epoch}.pt bundle every N epochs; null = no periodic saves
+  lr: 0.001                           # head-only probe trains fine 10x faster; set 0.0001 when freeze_backbone: false
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  val_ratio: 0.15                     # ~10k validation cells out of 69k — stable metrics without starving training
+  amp: true                           # CUDA only; auto-disabled on CPU
+  patience: 5                         # early stopping epochs

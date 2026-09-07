@@ -11,7 +11,8 @@ Model mode is detected from the bundle: train bundles carry "state_dict" +
 "num_classes" in meta; SSL bundles carry a full "state_dict" without
 "num_classes".
 
-DB schema — single `inference` table + 3 lazily-created reduction tables.
+DB schema — single `inference` table + lazily-created reduction/cluster
+tables (reduction_<method>, find_cluster), written by vis.show_reduction.
 No _meta, no migrations.
 """
 
@@ -58,9 +59,14 @@ def _to_native(val):
     return val
 
 
-def _init_db(conn, mode, extra_cols=None):
-    """Create the single `inference` table."""
+def _init_db(conn, mode, extra_cols=None, prob_cols=None):
+    """Create the single `inference` table.
+
+    prob_cols: per-class probability columns, one REAL column per class in
+    class_names order (both single- and multi-label bundles).
+    """
     extra_cols = extra_cols or []
+    prob_cols = prob_cols or []
     cols = [
         "uid INTEGER PRIMARY KEY AUTOINCREMENT",
         "directory TEXT NOT NULL",
@@ -73,7 +79,11 @@ def _init_db(conn, mode, extra_cols=None):
     for c in extra_cols:
         cols.append(f"{c} TEXT")
     cols.append("pred_class TEXT")
+    # Probability of the pred_class winner only — the full per-class vector
+    # lives in the prob_<name> columns.
     cols.append("pred_prob REAL")
+    for c in prob_cols:
+        cols.append(f"{c} REAL")
     cols.append("features BLOB")
     col_defs = ", ".join(cols)
     conn.execute(f"CREATE TABLE IF NOT EXISTS inference ({col_defs})")
@@ -82,11 +92,19 @@ def _init_db(conn, mode, extra_cols=None):
 
 def _write_db(db_path, meta_rows, all_logits, all_features,
               class_names, write_features, extra_cols=None, mode="single_cell",
-              write_pred_class=False):
+              write_pred_class=False, multi_label=False):
     """Write meta + predictions + features into the `inference` table.
 
     write_pred_class: write pred_class/pred_prob (classify-capable bundle only).
     write_features: write the features BLOB.
+    Unified layout for BOTH label modes, no threshold:
+      - pred_class  : the single highest-probability class (argmax winner)
+      - pred_prob   : that class's probability (REAL)
+      - prob_<name> : the FULL per-class probability vector, one REAL column
+        per class in fixed class_names order — written by both modes
+    The only mode difference is the probability semantics: single-label uses
+    a softmax distribution (sums to 1), multi-label uses independent
+    per-class sigmoids.
     """
     extra_cols = extra_cols or []
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
@@ -94,11 +112,12 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
 
     if write_pred_class and all_logits:
         logits_all = torch.cat(all_logits, dim=0)
-        probs_all = torch.softmax(logits_all, dim=1)
-        preds_all = probs_all.argmax(1).tolist()
+        if multi_label:
+            probs_all = torch.sigmoid(logits_all)
+        else:
+            probs_all = torch.softmax(logits_all, dim=1)
     else:
         probs_all = None
-        preds_all = None
 
     if write_features and all_features:
         feats_all = torch.cat(all_features, dim=0).numpy()
@@ -106,12 +125,14 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
         feats_all = None
 
     conn = sqlite3.connect(db_path)
-    _init_db(conn, mode, extra_cols)
+    # One REAL column per class (class_names order) — both label modes.
+    prob_cols = [f"prob_{c}" for c in class_names] if write_pred_class else []
+    _init_db(conn, mode, extra_cols, prob_cols)
 
     n = len(meta_rows)
-    if write_pred_class and preds_all is not None and n != len(preds_all):
+    if write_pred_class and probs_all is not None and n != len(probs_all):
         print(
-            f"Error: meta_rows length {n} != predictions length {len(preds_all)}",
+            f"Error: meta_rows length {n} != predictions length {len(probs_all)}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -155,22 +176,29 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
         base_cols.append("mask_filename")
         base_cols.append("label")
     base_cols.append("ground_truth")
-    all_cols = base_cols + extra_cols + ["pred_class", "pred_prob", "features"]
+    tail_cols = ["pred_class", "pred_prob"] + prob_cols + ["features"]
+    all_cols = base_cols + extra_cols + tail_cols
     col_names = ", ".join(all_cols)
     placeholders = ", ".join("?" * len(all_cols))
 
     rows = []
     for i, meta in enumerate(meta_rows):
-        if write_pred_class:
-            pred_idx = int(preds_all[i])
+        pred_class = None
+        pred_prob = None
+        probs_row = None
+        if write_pred_class and probs_all is not None:
+            row_p = probs_all[i]
+            # Winner = highest-probability class; no threshold (an argmax
+            # always exists). The full vector goes to the prob_ columns.
+            pred_idx = int(row_p.argmax())
             pred_class = class_names[pred_idx] if class_names and pred_idx < len(class_names) else str(pred_idx)
-            pred_prob = float(probs_all[i, pred_idx])
-        else:
-            pred_class = None
-            pred_prob = None
+            pred_prob = float(row_p[pred_idx])
+            probs_row = [float(v) for v in row_p.tolist()]
         feat_blob = feats_all[i].tobytes() if feats_all is not None else None
         row = [_to_native(meta.get(c)) for c in base_cols + extra_cols]
-        row.extend([pred_class, pred_prob, feat_blob])
+        row.extend([pred_class, pred_prob])
+        row.extend(probs_row if probs_row is not None else [None] * len(prob_cols))
+        row.append(feat_blob)
         rows.append(tuple(row))
 
     conn.executemany(
@@ -248,7 +276,8 @@ def _run_single_cell(data_dir, meta, model, device,
                      classify_mode, pool_fn,
                      dl_num_workers=4, dl_prefetch_factor=2,
                      dl_persistent_workers=True,
-                     sample_max=None, sample_by='per_class', seed=42):
+                     sample_max=None, sample_by='per_class', seed=42,
+                     multi_label=False):
     logger.info("Running single-cell inference on %s", data_dir)
 
     cell_ds = CellDataset(data_dir, channel_layout=channel_layout,
@@ -330,7 +359,8 @@ def _run_single_cell(data_dir, meta, model, device,
     class_names = meta.get("class_names", []) if classify_mode else []
     return _write_db(db_path, meta_rows, all_logits, all_features,
                      class_names, write_features, extra_cols=extra_cols,
-                     mode="single_cell", write_pred_class=write_pred_class)
+                     mode="single_cell", write_pred_class=write_pred_class,
+                     multi_label=multi_label)
 
 
 # ----------------------------------------------------------------------------
@@ -345,7 +375,8 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
                      classify_mode, pool_fn,
                      dl_num_workers=4, dl_prefetch_factor=2,
                      dl_persistent_workers=True,
-                     sample_max=None, sample_by='per_class', seed=42):
+                     sample_max=None, sample_by='per_class', seed=42,
+                     multi_label=False):
     logger.info("Running whole-image inference on %s", data_dir)
 
     _required_meta = ("augmentation_infer", "normalize_method", "normalize_with_masking",
@@ -453,7 +484,8 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
     class_names = meta.get("class_names", []) if classify_mode else []
     return _write_db(db_path, meta_rows, all_logits, all_features,
                      class_names, write_features, extra_cols=extra_cols,
-                     mode="whole_image", write_pred_class=write_pred_class)
+                     mode="whole_image", write_pred_class=write_pred_class,
+                     multi_label=multi_label)
 
 
 # ----------------------------------------------------------------------------
@@ -507,6 +539,11 @@ def run_inference(config, config_path=None):
     # What to write (defaults: pred_class = bundle capability, feature = true).
     write_pred_class = bool(inf_cfg.get("pred_class", classify_mode))
     write_features = bool(inf_cfg.get("feature", True))
+    # Multi-label bundles (meta loss=bce) use per-class sigmoids instead of
+    # a softmax distribution — that is the ONLY output difference.
+    multi_label = classify_mode and meta.get("loss") == "bce"
+    if multi_label:
+        logger.info("Multi-label bundle (loss=bce): per-class sigmoid probs")
     if not classify_mode and write_pred_class:
         logger.warning("pred_class requested but the model bundle is an SSL "
                        "pretrain bundle (no classifier); writing features only")
@@ -587,7 +624,8 @@ def run_inference(config, config_path=None):
                     classify_mode, pool_fn,
                     dl_num_workers=dl_num_workers, dl_prefetch_factor=dl_prefetch_factor,
                     dl_persistent_workers=dl_persistent_workers,
-                    sample_max=sample_max, sample_by=sample_by, seed=seed)
+                    sample_max=sample_max, sample_by=sample_by, seed=seed,
+                    multi_label=multi_label)
             elif mode == "whole_image":
                 path = _run_whole_image(
                     data_dir, image_pattern_cfg, data_cfg["mask_pattern"],
@@ -600,7 +638,8 @@ def run_inference(config, config_path=None):
                     classify_mode, pool_fn,
                     dl_num_workers=dl_num_workers, dl_prefetch_factor=dl_prefetch_factor,
                     dl_persistent_workers=dl_persistent_workers,
-                    sample_max=sample_max, sample_by=sample_by, seed=seed)
+                    sample_max=sample_max, sample_by=sample_by, seed=seed,
+                    multi_label=multi_label)
             else:
                 print(f"Error: unknown inference mode: {mode}", file=sys.stderr)
                 sys.exit(1)

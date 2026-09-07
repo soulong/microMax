@@ -328,7 +328,9 @@ class SingleCellDataset(Dataset):
                  clip_low=0.05, clip_high=99.95,
                  with_masking=False,
                  fixed_reference=False,
-                 max_value=None):
+                 max_value=None,
+                 multi_label=False,
+                 label_separator=";"):
         self.pairs = list(pairs)
         self.labels = list(labels)
         self.label_to_idx = label_to_idx
@@ -339,6 +341,10 @@ class SingleCellDataset(Dataset):
         self.clip_high = clip_high
         self.fixed_reference = fixed_reference
         self.max_value = max_value
+        # multi_label=True turns each ';'-joined label string into a multi-hot
+        # float target vector (for BCELoss); absent classes are negatives.
+        self.multi_label = multi_label
+        self.label_separator = label_separator
         self.aug_pipeline = build_pipeline(augmentation_spec) if augmentation_spec else None
 
     def __len__(self):
@@ -357,6 +363,24 @@ class SingleCellDataset(Dataset):
             self.normalize_method, self.clip_low, self.clip_high, self.with_masking,
             ref_stats)
         label = self.labels[idx]
+        if self.multi_label:
+            # Multi-hot target: split the joined label string and mark every
+            # present class; classes not listed are negatives by convention.
+            target = torch.zeros(len(self.label_to_idx), dtype=torch.float32)
+            for cat in label.split(self.label_separator):
+                cat = cat.strip()
+                if not cat:
+                    continue
+                cls_idx = self.label_to_idx.get(cat, -1)
+                if cls_idx < 0:
+                    raise ValueError(
+                        f"Label category {cat!r} is not in label_to_idx "
+                        f"{sorted(self.label_to_idx)} — check label_csv "
+                        f"resolution for row {idx} "
+                        f"({cell_ds.metadata.iloc[cell_idx].get('path')})."
+                    )
+                target[cls_idx] = 1.0
+            return tensor, target
         label_idx = self.label_to_idx.get(label, -1)
         if label_idx < 0:
             raise ValueError(

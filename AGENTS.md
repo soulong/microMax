@@ -43,7 +43,8 @@ Console scripts after install:
 
 * `microBase` is the only package the three consumers (`microProfiler`,
   `microVis`, `microModel`) import. `microModel` additionally depends on
-  `lightly` (SSL heads/losses) and `timm` (backbones).
+  `lightly` (SSL heads/losses), `timm` (backbones) and `pacmap`
+  (PaCMAP/LocalMAP dimensionality reduction).
 
 * The three consumers never import each other directly, with ONE exception:
   `microProfiler` lazily imports `microModel` in its inference step.
@@ -246,10 +247,10 @@ data through `self._dm`; wrap heavy work in a `QRunnable` under `worker.py`.
 
 **Path:** `microMax/microModel/` · **Entry:** `micromodel` (CLI subcommands:
 `pretrain`, `train`, `infer`, `vis-augment`, `vis-reduction`,
-`vis-reduction-interactive`).
+`vis-reduction-interactive`, `vis-attention`).
 
 Additional deps: `lightly` (SSL projection heads/losses), `timm` (backbones +
-ViT rebuild).
+ViT rebuild), `pacmap` (PaCMAP/LocalMAP DR).
 
 Package layout (overview):
 
@@ -257,15 +258,16 @@ Package layout (overview):
 
 * `pretrain.py` / `train.py` / `infer.py` — the three stage entries.
 
-* `backbone.py` — backbone builders (incl. DINOv2-specific ViT), loss, head,
+* `backbone.py` — backbone builders (incl. DINOv3 ViT), loss, head,
   model + bundle loaders.
 
 * `dataset.py` — PyTorch Datasets: SSL multi-view, single-cell, whole-image.
 
-* `models/` — SSL method implementations: BYOL, DINOv2 (lightly-based),
-  DINOv3 (own DINO/iBOT/KoLeo/Gram components), behind a small registry.
+* `models/` — SSL method implementations: DINOv3 (lightly + own
+  DINO/iBOT/KoLeo/Gram components), behind a small registry.
 
-* `vis.py` — augmentation preview, PCA/UMAP reduction plots.
+* `vis.py` — augmentation preview, multi-method DR reduction plots
+  (pca/umap/pacmap/localmap) + optional KMeans cluster finding.
 
 * `vis_interactive.py` — Flask server for interactive point inspection.
 
@@ -280,17 +282,40 @@ Design:
   Input image size is defined entirely by the augmentation steps — there is
   no separate input-size parameter.
 
-* Pretrain is a generic SSL loop that dispatches by method through the
-  registry; it saves model bundles atomically and supports resume
-  (`continue` = exact extension, `transfer` = fresh run with pretrained
-  weights).
+* **Teacher-branch extraction:** all downstream feature consumers (infer,
+  train transfer, pretrain UMAP check, attention diagnostics) extract the
+  TEACHER backbone by default — the EMA/Polyak-averaged branch official
+  DINO-family evaluation uses (`extract_backbone_state_dict` prefix table:
+  dinov3 → `teacher_backbone.vit.` / `student_backbone.vit.`).
 
-* Train builds a classifier from an SSL backbone (transfer) or from scratch
-  and saves train bundles + plots/reports.
+* Pretrain is a generic SSL loop. Every method's `train_step` returns
+  `(loss, {component_name: value})` — the loop aggregates, logs (CSV/TB),
+  and persists component/monitor histories generically, so adding a loss or
+  head never touches the loop. It dispatches by method through the registry;
+  saves model bundles atomically and supports resume (`continue` = exact
+  extension, `transfer` = fresh run with pretrained weights).
+
+* Train builds a classifier on top of a backbone and saves train bundles +
+  plots/reports. Two config profiles: `train_from_scratch.yml` (random or
+  ImageNet init) and `train_from_pretrain.yml` (resume.ssl_model backbone
+  transfer, `freeze_backbone: true` = head-only linear probe). Labels come
+  from `label_csv` (`[filepath, label]`, relative paths resolved against the
+  CSV's own directory). The loss follows the label form — no config key:
+  plain single labels train FocalLoss, `;`-joined categories train
+  multi-label BCELoss; `model.focal_gamma` is the focal exponent in BOTH
+  losses (0 = plain CE / plain BCE). `model.label_smoothing` softens targets
+  in both modes. Unlabeled records are dropped with a warning; in multi-label
+  mode unlisted classes count as negatives (closed-world).
 
 * Infer loads a bundle, dispatches on bundle type (classify vs
   features-only) and mode (single\_cell vs whole\_image), and writes
-  `infer.db` (inference + optional reduction tables).
+  `infer.db` (inference + optional reduction tables). Both modes share one
+  layout with no threshold: `pred_class`/`pred_prob` hold the
+  highest-probability class and its probability, and the full per-class
+  vector is stored in fixed-order `prob_<class>` columns (single-label probs
+  are a softmax distribution, multi-label independent per-class sigmoids).
+  Probability-descending ordering is a display concern of
+  vis-reduction-interactive, never baked into the DB.
 
 * Bundles carry their meta (channels, normalization, augmentation);
   inference always uses the settings baked into the bundle at training time.

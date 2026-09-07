@@ -10,7 +10,7 @@ import math
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from tqdm import tqdm
 
 from . import __version__
@@ -25,18 +25,21 @@ from .monitor import (MetricsTracker, head_collapse_metrics, gram_split_metrics,
 
 
 def _save_bundle(output_dir, epoch, model, opt, loss_history, config, meta, method,
-                 final=False, dino_loss_history=None, ibot_loss_history=None,
-                 koleo_loss_history=None, gram_loss_history=None,
-                 head_std_history=None, head_entropy_history=None,
-                 teacher_student_sim_history=None, gram_masked_history=None,
-                 gram_unmasked_history=None):
+                 component_histories=None, monitor_histories=None, final=False):
     """Save a complete SSL bundle: full model state (backbone + heads +
-    momentum nets), meta, config, optimizer state, epoch, loss history.
+    momentum nets + training-time heads), meta, config, optimizer state,
+    epoch, loss history.
 
     Every saved .pt is a complete bundle — usable for exact resume, train
     transfer, and feature extraction. final=True writes model.pt (final
     epoch); otherwise model_{epoch}.pt (save_interval epochs). The epoch
     is 1-based, matching the filename (no zero padding).
+
+    component_histories: {component_name: [per-epoch values]} — whatever the
+    method's train_step returned (dino/ibot/gram/recon/dist/adv/...).
+    monitor_histories: {name: [per-epoch values]} — method-specific
+    diagnostic curves (head collapse / gram split) so their PDFs continue
+    across resumed runs.
     """
     bundle = {
         "state_dict": model.state_dict(),
@@ -45,31 +48,10 @@ def _save_bundle(output_dir, epoch, model, opt, loss_history, config, meta, meth
         "optimizer_state_dict": opt.state_dict(),
         "epoch": epoch,
         "loss_history": loss_history,
+        "component_histories": component_histories or {},
+        "monitor_histories": monitor_histories or {},
         "method": method,
     }
-    # DINOv2 component histories (dino/ibot/koleo) are persisted so a
-    # 'continue' resume restores them (absent in old bundles -> [] fallback).
-    # DINOv3 additionally persists the gram anchoring loss history and the
-    # monitoring diagnostics (head collapse / gram split) so their PDF curves
-    # continue seamlessly across resumed runs.
-    if dino_loss_history is not None:
-        bundle["dino_loss_history"] = dino_loss_history
-    if ibot_loss_history is not None:
-        bundle["ibot_loss_history"] = ibot_loss_history
-    if koleo_loss_history is not None:
-        bundle["koleo_loss_history"] = koleo_loss_history
-    if gram_loss_history is not None:
-        bundle["gram_loss_history"] = gram_loss_history
-    if head_std_history is not None:
-        bundle["head_std_history"] = head_std_history
-    if head_entropy_history is not None:
-        bundle["head_entropy_history"] = head_entropy_history
-    if teacher_student_sim_history is not None:
-        bundle["teacher_student_sim_history"] = teacher_student_sim_history
-    if gram_masked_history is not None:
-        bundle["gram_masked_history"] = gram_masked_history
-    if gram_unmasked_history is not None:
-        bundle["gram_unmasked_history"] = gram_unmasked_history
     fname = "model.pt" if final else f"model_{epoch}.pt"
     path = os.path.join(output_dir, fname)
     atomic_torch_save(bundle, path)
@@ -93,29 +75,27 @@ def _run_umap_check(model, method, loader, device, epoch, seed, save_path):
     with torch.no_grad():
         for batch in loader:
             x = batch[0].to(device)
-            if method in ("dinov2", "dinov3"):
-                f = model.student_backbone.encode(x)[:, 0]
-            else:
-                f = model.backbone(x)
-                if f.ndim == 4:
-                    f = f.mean(dim=(2, 3))
-                elif f.ndim == 3:
-                    f = f.mean(dim=1)
+            # Teacher (EMA) branch — official DINO-family evaluation uses
+            # the teacher backbone, which is a Polyak average of the
+            # student and yields the better features.
+            f = model.teacher_backbone.encode(x)[:, 0]
             feats.append(f.cpu().numpy())
     X = np.concatenate(feats, axis=0)
 
     reducer = umap.UMAP(random_state=seed)
     emb = reducer.fit_transform(X)
 
+    # epoch 0 = the pre-training baseline snapshot (before epoch 1 runs).
+    stage = "baseline (before training)" if epoch == 0 else f"epoch {epoch}"
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.scatter(emb[:, 0], emb[:, 1], s=12, alpha=0.8, edgecolors="none")
-    ax.set_title(f"UMAP check — epoch {epoch} ({len(X)} images)")
+    ax.set_title(f"UMAP check — {stage} ({len(X)} images)")
     ax.set_xlabel("UMAP 1")
     ax.set_ylabel("UMAP 2")
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    logger.info("UMAP check saved to %s (epoch %d, %d images)", save_path, epoch, len(X))
+    logger.info("UMAP check saved to %s (%s, %d images)", save_path, stage, len(X))
 
 
 def _run_attention_summary_check(model, loader, device, save_path, n_samples,
@@ -146,7 +126,7 @@ def _run_attention_summary_check(model, loader, device, save_path, n_samples,
                 amaps, grid, anchors = compute_patch_similarity_maps(
                     model, x1, n_anchors=4)
                 att_maps, _ = compute_cls_attention_maps(
-                    model.student_backbone, x1)
+                    model.teacher_backbone, x1)
                 if amaps and att_maps:
                     samples.append({"anchors": amaps, "attn": att_maps[0]})
                     all_inputs.append(_to_display_rgb(x[i].detach().cpu()))
@@ -220,6 +200,49 @@ def _load_checkpoint_state(model, ckpt, method=None):
     model.load_state_dict(state)
 
 
+# Method-block keys that determine saved state_dict SHAPES (the DINO/iBOT
+# heads' MLP widths and prototype counts, flat or nested under dino:/ibot:).
+# On resume the bundle wins for these — building the heads with a changed
+# value would crash load_state_dict. Everything else in the method block
+# (schedules, loss weights, temps, masking, gram) follows the current config.
+_METHOD_ARCH_KEYS = (
+    "head_hidden_dim", "head_bottleneck_dim", "head_nlayers", "head_n_prototypes",
+    "ibot_head_hidden_dim", "ibot_head_bottleneck_dim", "ibot_head_nlayers",
+    "ibot_head_n_prototypes",
+    "hidden_dim", "bottleneck_dim", "nlayers", "out_dim",
+)
+
+
+def _merge_method_config(saved, current, arch_keys):
+    """Merge the bundle's method block over the current run's block.
+
+    The CURRENT config wins for every key it sets (re-tuned schedules /
+    weights take effect; logged so overrides are never silent). Keys the
+    bundle saved but the config omits are adopted silently — omission means
+    "keep the bundle's value", which makes continue-resume exact by default.
+    `arch_keys` are locked to the bundle with a warning when the config
+    explicitly differs (the saved heads were built with them). Sub-blocks
+    (gram / nested dino:/ibot:) merge by the same rule recursively — which
+    subsumes the old gram phase-2 upgrade special case: a config that turns
+    gram.use_loss on simply wins over the bundle's false.
+    """
+    merged = dict(current)
+    for k, sv in saved.items():
+        if k not in merged:
+            merged[k] = sv
+            continue
+        cv = merged[k]
+        if isinstance(sv, dict) and isinstance(cv, dict):
+            merged[k] = _merge_method_config(sv, cv, arch_keys)
+        elif k in arch_keys and str(cv) != str(sv):
+            logger.warning("Locked method key %s differs: bundle=%s, "
+                           "config=%s; using bundle value", k, sv, cv)
+            merged[k] = sv
+        elif str(cv) != str(sv):
+            logger.info("Using new value for %s: %s (bundle had %s)", k, cv, sv)
+    return merged
+
+
 def _try_resume(config, device, method):
     """Load SSL checkpoint if resume.ssl_model is set. Returns (checkpoint, config)."""
     resume_path = config.get("resume", {}).get("ssl_model")
@@ -285,30 +308,17 @@ def _try_resume(config, device, method):
 
     merge_locked_normalize(saved_cfg, config)
 
-    # Method-specific block (e.g. byol/dinov3 head dims) — bundle wins for the
-    # keys it saved, so the saved model state (heads included) loads without
-    # shape mismatch. A leaf-wise merge (not full replace) lets a NEW run
-    # extend the block, while every leaf the bundle saved still wins. The one
-    # deliberate exception is the DINOv3 gram phase-2 upgrade: a run that
-    # explicitly sets gram.use_loss=true while the bundle was trained with it
-    # off is a Gram-anchoring stage — the new gram settings are kept.
+    # Method-specific block (e.g. dinov3 schedules + head dims): merge the
+    # bundle's block over the current one. Architecture keys are locked to
+    # the bundle so the saved model state (heads included) loads without
+    # shape mismatch; every other key follows the CURRENT config, so a
+    # stage-2 run can re-tune schedules/loss weights freely (logged, never
+    # silent). See _merge_method_config.
     final_method = (ckpt.get("meta") or {}).get("method", method)
     sm = saved_cfg.get(final_method, {})
     cm = config.get(final_method, {})
     if str(cm) != str(sm):
-        merged = dict(cm)
-        for k, v in sm.items():
-            cur = merged.get(k)
-            if isinstance(v, dict) and isinstance(cur, dict):
-                if (cur.get("use_loss") is True and v.get("use_loss") is False):
-                    continue  # gram phase-2 upgrade: keep the new gram block
-                sub = dict(cur)
-                for sk, sv in v.items():
-                    sub[sk] = sv
-                merged[k] = sub
-            else:
-                merged[k] = v
-        config[final_method] = merged
+        config[final_method] = _merge_method_config(sm, cm, _METHOD_ARCH_KEYS)
 
     return ckpt, config
 
@@ -340,21 +350,23 @@ def _resolve_monitoring_cfg(user_cfg):
 def _build_step_info(method, method_cfg, train_cfg, global_step, total_steps, warmup_steps):
     """Build the step_info dict for train_step (method-specific keys).
 
-    Shared by AMP/non-AMP paths. Method-specific keys (DINOv2/DINOv3 teacher
+    Shared by AMP/non-AMP paths. Method-specific keys (DINOv3 teacher
     temperature, weight decay schedule, koleo weight) are added only for
-    dinov2/dinov3.
+    dinov3.
     """
     step_info = {
         "global_step": global_step,
         "total_steps": total_steps,
         "warmup_steps": warmup_steps,
-        "lr_peak": train_cfg.get("lr", 0.0005 if method in ("dinov2", "dinov3") else 0.05),
+        # Must match pretrain_ssl's optimizer default — train_step drives
+        # every group's lr from this value each step, so the optimizer's
+        # initial lr is only a placeholder.
+        "lr_peak": train_cfg.get("lr", 0.0005),
         "lr_final": method_cfg.get("lr_final", 1e-6),
-        "momentum_start": method_cfg.get(
-            "momentum_start", 0.992 if method in ("dinov2", "dinov3") else 0.996),
+        "momentum_start": method_cfg.get("momentum_start", 0.992),
         "momentum_end": method_cfg.get("momentum_end", 1.0),
     }
-    if method in ("dinov2", "dinov3"):
+    if method == "dinov3":
         step_info.update({
             "koleo_weight": method_cfg.get("koleo_weight", 0.1),
             "teacher_temp_start": method_cfg.get("teacher_temp_start", 0.04),
@@ -446,11 +458,13 @@ def _prepare_pretrain_data(config):
             fixed_reference, augmentation_infer)
 
 
+
+
 def pretrain_ssl(config, config_path=None):
     """Generic SSL pretraining loop. Dispatches on config['method']."""
     method = config.get("method")
-    if method not in ("byol", "dinov2", "dinov3"):
-        print(f"Error: unknown SSL method '{method}'. Available: byol, dinov2, dinov3",
+    if method != "dinov3":
+        print(f"Error: unknown SSL method '{method}'. Available: dinov3",
               file=sys.stderr)
         sys.exit(1)
 
@@ -473,8 +487,8 @@ def pretrain_ssl(config, config_path=None):
     # (method_cfg, build_ssl_model, meta, optimizer/criterion) uses the method
     # the model was ACTUALLY built with.
     method = config["method"]
-    if method not in ("byol", "dinov2", "dinov3"):
-        print(f"Error: unknown SSL method '{method}'. Available: byol, dinov2, dinov3",
+    if method != "dinov3":
+        print(f"Error: unknown SSL method '{method}'. Available: dinov3",
               file=sys.stderr)
         sys.exit(1)
 
@@ -488,11 +502,14 @@ def pretrain_ssl(config, config_path=None):
               f"Available: continue, transfer", file=sys.stderr)
         sys.exit(1)
 
-    data_cfg = config["data"]
     train_cfg = config["training"]
-    backbone_cfg = config["backbone"]
+    # backbone block: required for dinov3 (name/pretrained).
+    backbone_cfg = config.get("backbone") or {}
+    if method == "dinov3" and not backbone_cfg.get("name"):
+        print("Error: dinov3 requires a backbone: block with name/pretrained "
+              "(e.g. name: vit_small_patch16_dinov3)", file=sys.stderr)
+        sys.exit(1)
     method_cfg = config.get(method, {})
-    norm_cfg = config.get("normalize", {})
     aug_views_cfg = config.get("augmentation_views", [])
     monitoring_cfg = _resolve_monitoring_cfg(config.get("monitoring"))
     if monitoring_cfg["enabled"]:
@@ -503,13 +520,6 @@ def pretrain_ssl(config, config_path=None):
                     monitoring_cfg["patch_similarity_samples"])
 
     # Validate views count
-    if method == "byol" and len(aug_views_cfg) < 2:
-        print(f"Error: BYOL requires at least 2 views, got {len(aug_views_cfg)}", file=sys.stderr)
-        sys.exit(1)
-    if method == "dinov2" and len(aug_views_cfg) < 3:
-        print(f"Error: DINOv2 requires at least 3 views (2 global + 1 local), "
-              f"got {len(aug_views_cfg)}", file=sys.stderr)
-        sys.exit(1)
     if method == "dinov3":
         gram_cfg = method_cfg.get("gram", {}) or {}
         n_gram_views = 2 if (gram_cfg.get("use_loss", False)
@@ -538,10 +548,13 @@ def pretrain_ssl(config, config_path=None):
 
     set_seed(seed)
 
-    # ---- Resolve data (shared with the offline vis_attention command) ----
+    # ---- Resolve data ----
+    # The config data block (shared with the offline vis_attention command).
     (all_pairs, resolved_channels, channel_layout, image_pattern,
      max_value, normalize_method, with_masking, clip_low, clip_high,
      fixed_reference, augmentation_infer) = _prepare_pretrain_data(config)
+    cfg_root = config["data"]["root"]
+    data_roots = [cfg_root] if isinstance(cfg_root, str) else list(cfg_root)
 
     logger.info("Found %d records, channels=%s", len(all_pairs), resolved_channels)
     logger.info("SSL method: %s, views: %d", method, len(aug_views_cfg))
@@ -549,12 +562,7 @@ def pretrain_ssl(config, config_path=None):
     set_seed(seed)
 
     # ---- Build dataset + dataloader ----
-    # SSLMultiViewDataset takes (cell_dataset, indices, channels, ...)
-    # We group pairs by cell_dataset to pass indices per dataset. But since
-    # SSLMultiViewDataset takes a single cell_dataset, we need to handle
-    # multi-root by building one dataset per root and concatenating.
-    # Simpler: build one SSLMultiViewDataset per cell_dataset, then ConcatDataset.
-    from torch.utils.data import ConcatDataset
+    # One SSLMultiViewDataset per cell_dataset, then ConcatDataset.
     by_cell_ds = {}
     for cell_ds, idx in all_pairs:
         by_cell_ds.setdefault(id(cell_ds), (cell_ds, []))[1].append(idx)
@@ -564,9 +572,9 @@ def pretrain_ssl(config, config_path=None):
         ds = SSLMultiViewDataset(
             cell_ds, indices, resolved_channels,
             augmentation_specs=aug_views_cfg,
-            normalize_method=normalize_method, clip_low=clip_low, clip_high=clip_high,
-            with_masking=with_masking, fixed_reference=fixed_reference,
-            max_value=max_value)
+            normalize_method=normalize_method, clip_low=clip_low,
+            clip_high=clip_high, with_masking=with_masking,
+            fixed_reference=fixed_reference, max_value=max_value)
         datasets.append(ds)
     if len(datasets) == 1:
         full_dataset = datasets[0]
@@ -578,12 +586,6 @@ def pretrain_ssl(config, config_path=None):
     prefetch_factor = dl_cfg.get("prefetch_factor", 2)
     persistent_workers = dl_cfg.get("persistent_workers", True) and num_workers > 0
     batch_size = train_cfg.get("batch_size", 128)
-    if method == "dinov2" and batch_size % 2 != 0:
-        # dinov2.train_step chunks the teacher's global-view outputs in pairs
-        # (views[0:2]) — an odd batch crashes lightly's DINOLoss stack.
-        print(f"Error: DINOv2 requires an EVEN training.batch_size "
-              f"(global views are paired); got {batch_size}", file=sys.stderr)
-        sys.exit(1)
     loader_kwargs = dict(
         batch_size=batch_size, shuffle=True, drop_last=True,
         num_workers=num_workers,
@@ -626,10 +628,7 @@ def pretrain_ssl(config, config_path=None):
                 model.load_gram_from_bundle(gram_ckpt)
 
     # Bundle meta — needed by every saved bundle (infer/train consumers).
-    if method in ("dinov2", "dinov3"):
-        feat_dim = model.student_backbone.vit.num_features
-    else:
-        feat_dim = getattr(model.backbone, "num_features", None)
+    feat_dim = model.student_backbone.vit.num_features
     meta = {
         "method": method,
         "backbone": backbone_cfg["name"],
@@ -645,31 +644,55 @@ def pretrain_ssl(config, config_path=None):
         "clip_low": clip_low,
         "clip_high": clip_high,
         "image_pattern": image_pattern,
+        "data_root": data_roots,
     }
 
-    # Separate parameters into decay (ndim >= 2: weight matrices, embeddings)
-    # and no-decay (ndim < 2: biases, LayerNorm gamma/beta) groups. Standard
-    # ViT practice — applying wd=0.4 to biases/LN is too aggressive.
-    decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
-    no_decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+    # Parameter groups. Standard ViT practice: decay (ndim >= 2: weight
+    # matrices, embeddings) vs no-decay (ndim < 2: biases, LayerNorm).
+    # training.encoder_lr (optional) scales the schedule LR for trainable
+    # encoder params ("encoder." prefix): head/decoder params train at
+    # training.lr while the encoder gets a lower LR, without touching the
+    # schedule code (train_step multiplies group["lr_scale"]).
+    # Must match _build_step_info's lr_peak default — train_step overwrites
+    # every group's lr from the schedule each step.
+    lr = float(train_cfg.get("lr", 0.0005))
+    encoder_lr = train_cfg.get("encoder_lr")
+    enc_scale = (float(encoder_lr) / lr) if encoder_lr else 1.0
+    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    if enc_scale != 1.0:
+        enc_named = [(n, p) for n, p in trainable if n.split(".")[0] == "encoder"]
+        rest_named = [(n, p) for n, p in trainable if n.split(".")[0] != "encoder"]
+        logger.info("encoder_lr=%s (scale %.3f): %d encoder params, %d "
+                    "head/decoder params", encoder_lr, enc_scale,
+                    len(enc_named), len(rest_named))
+    else:
+        enc_named, rest_named = [], trainable
 
-    optimizer_name = train_cfg.get("optimizer", "sgd" if method == "byol" else "adamw").lower()
+    def _param_groups(named_params, lr_scale, default_wd):
+        groups = []
+        decay = [p for _, p in named_params if p.ndim >= 2]
+        no_decay = [p for _, p in named_params if p.ndim < 2]
+        if decay:
+            groups.append({"params": decay, "weight_decay": default_wd,
+                           "lr_scale": lr_scale})
+        if no_decay:
+            groups.append({"params": no_decay, "weight_decay": 0.0,
+                           "lr_scale": lr_scale})
+        return groups
+
+    optimizer_name = train_cfg.get("optimizer", "adamw").lower()
     if optimizer_name == "sgd":
         optimizer = torch.optim.SGD(
-            [
-                {"params": decay_params, "weight_decay": train_cfg.get("weight_decay", 0.0)},
-                {"params": no_decay_params, "weight_decay": 0.0},
-            ],
-            lr=train_cfg.get("lr", 0.06),
+            _param_groups(rest_named, 1.0, train_cfg.get("weight_decay", 0.0))
+            + _param_groups(enc_named, enc_scale, train_cfg.get("weight_decay", 0.0)),
+            lr=lr,
             momentum=0.9,
         )
     elif optimizer_name == "adamw":
         optimizer = torch.optim.AdamW(
-            [
-                {"params": decay_params, "weight_decay": train_cfg.get("weight_decay", 0.04)},
-                {"params": no_decay_params, "weight_decay": 0.0},
-            ],
-            lr=train_cfg.get("lr", 0.001),
+            _param_groups(rest_named, 1.0, train_cfg.get("weight_decay", 0.04))
+            + _param_groups(enc_named, enc_scale, train_cfg.get("weight_decay", 0.04)),
+            lr=lr,
             betas=tuple(train_cfg.get("betas", (0.9, 0.999))),
         )
     else:
@@ -693,15 +716,13 @@ def pretrain_ssl(config, config_path=None):
 
     start_epoch = 0
     loss_history = []
-    dino_loss_history = []
-    ibot_loss_history = []
-    koleo_loss_history = []
-    gram_loss_history = []
-    head_std_history = []
-    head_entropy_history = []
-    sts_history = []
-    gram_masked_history = []
-    gram_unmasked_history = []
+    # Per-component loss histories: {name: [per-epoch value]} — the keys are
+    # whatever the method's train_step returns (dino/ibot/gram/recon/dist/
+    # adv/adv_acc). Plus method-specific diagnostic curves for the PDFs.
+    component_histories = {}
+    monitor_histories = {"head_std": [], "head_entropy": [],
+                         "teacher_student_sim": [], "gram_masked": [],
+                         "gram_unmasked": []}
     if checkpoint is not None:
         _load_checkpoint_state(model, checkpoint, method=method)
         if resume_type == "continue":
@@ -710,7 +731,8 @@ def pretrain_ssl(config, config_path=None):
             # optimizer state + loss history are restored so the run
             # continues where it left off.
             start_epoch = checkpoint.get("epoch", 0)
-            logger.info("Resuming from epoch %d", start_epoch)
+            logger.info("Resuming: %d epochs completed, continuing at epoch %d",
+                        start_epoch, start_epoch + 1)
             # Phase-handoff extension: when the checkpoint has already passed
             # the configured epoch target (e.g. phase-2 reuses a smaller
             # epoch count than phase-1 ended at), treat `epochs` as EXTRA
@@ -724,23 +746,15 @@ def pretrain_ssl(config, config_path=None):
             if "optimizer_state_dict" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             loss_history = checkpoint.get("loss_history", [])
-            # DINOv2/DINOv3 component histories (absent in old bundles -> []).
-            dino_loss_history = checkpoint.get("dino_loss_history", [])
-            ibot_loss_history = checkpoint.get("ibot_loss_history", [])
-            koleo_loss_history = checkpoint.get("koleo_loss_history", [])
-            gram_loss_history = checkpoint.get("gram_loss_history", [])
-            # DINOv3 monitoring diagnostics (absent in old bundles -> []).
-            head_std_history = checkpoint.get("head_std_history", [])
-            head_entropy_history = checkpoint.get("head_entropy_history", [])
-            sts_history = checkpoint.get("teacher_student_sim_history", [])
-            gram_masked_history = checkpoint.get("gram_masked_history", [])
-            gram_unmasked_history = checkpoint.get("gram_unmasked_history", [])
+            component_histories = dict(checkpoint.get("component_histories", {}))
+            for k, v in (checkpoint.get("monitor_histories") or {}).items():
+                monitor_histories[k] = list(v)
         else:
             # Transfer: domain-transfer / pretrained-weight init. The run
-            # restarts at epoch 0 with fresh schedules and a fresh optimizer
+            # restarts from epoch 1 with fresh schedules and a fresh optimizer
             # (AdamW/SGD moments are stale for the new data); only the model
             # weights are carried over.
-            logger.info("Transfer: fresh run (epoch 0) initialized from bundle "
+            logger.info("Transfer: fresh run starting at epoch 1, initialized from bundle "
                         "weights; optimizer state and loss history reset")
 
     # ---- SSL step tracking ----
@@ -808,10 +822,10 @@ def pretrain_ssl(config, config_path=None):
                 check_datasets[0] if len(check_datasets) == 1 else ConcatDataset(check_datasets),
                 batch_size=32, shuffle=False, num_workers=0)
             logger.info("UMAP check enabled: %d fixed images, fresh UMAP at "
-                        "epoch 0 baseline + each save_interval + final epoch",
+                        "pre-training baseline + each save_interval + final epoch",
                         n_pick)
 
-    # ---- Pre-training baseline UMAP check (epoch 0) ----
+    # ---- Pre-training baseline UMAP check (before epoch 1) ----
     # Features BEFORE any training (fresh pretrained init, or transfer
     # weights). Skipped when actually resuming with resume.type=continue —
     # the run is an exact extension of a previous one, so the baseline
@@ -819,20 +833,20 @@ def pretrain_ssl(config, config_path=None):
     if umap_check_loader is not None and (checkpoint is None or resume_type != "continue"):
         try:
             _run_umap_check(model, method, umap_check_loader, device, 0, seed,
-                            os.path.join(output_dir, "umap_check_epoch_0.pdf"))
+                            os.path.join(output_dir, "umap_check_baseline.pdf"))
         except Exception as e:
-            logger.error("UMAP check failed at epoch 0: %s", e)
+            logger.error("UMAP check failed on baseline: %s", e)
 
     # ---- Training loop ----
-    gram_enabled = bool((method_cfg.get("gram") or {}).get("use_loss", False))
+    # Uniform train_step protocol: every registered method returns
+    # (loss_value, {component_name: float}) — pretrain_ssl aggregates,
+    # logs and persists components generically, so adding a loss/head never
+    # touches this loop.
     diag_enabled = (monitoring_cfg["enabled"] and method == "dinov3")
     for epoch in range(start_epoch, epochs):
         model.train()
         tot_loss = 0.0
-        tot_dino = 0.0
-        tot_ibot = 0.0
-        tot_koleo = 0.0
-        tot_gram = 0.0
+        tot_comp = {}
         tot_head_std = 0.0
         tot_head_entropy = 0.0
         tot_sts = 0.0
@@ -843,8 +857,9 @@ def pretrain_ssl(config, config_path=None):
         n_batches = 0
         batch_in_epoch = 0
         for batch in tqdm(loader, desc=f"Epoch {epoch + 1}"):
-            # batch is a list of N view tensors (each (B, C, H, W))
-            # DataLoader auto-collates the list returned by SSLMultiViewDataset
+            # batch is a list of N view tensors (each (B, C, H, W)) for the
+            # SSL methods. DataLoader auto-collates the datasets' return
+            # values.
             do_step = ((batch_in_epoch + 1) % grad_accum_steps == 0) or \
                 (batch_in_epoch + 1 == len(loader))
             step_info = _build_step_info(
@@ -853,48 +868,31 @@ def pretrain_ssl(config, config_path=None):
                 # AMP: forward under autocast; train_step does its own scaled
                 # backward + optimizer step via the GradScaler.
                 with torch.amp.autocast("cuda"):
-                    if method == "dinov3":
-                        loss, dino_l, ibot_l, koleo_l, gram_l = train_step_fn(
-                            model, batch, optimizer, epoch, epochs,
-                            device, criterion, step_info,
-                            scaler, grad_clip, do_step)
-                    else:
-                        loss, dino_l, ibot_l, koleo_l = train_step_fn(
-                            model, batch, optimizer, epoch, epochs,
-                            device, criterion, step_info,
-                            scaler, grad_clip, do_step)
-                        gram_l = None
+                    loss_val, components = train_step_fn(
+                        model, batch, optimizer, epoch, epochs,
+                        device, criterion, step_info,
+                        scaler, grad_clip, do_step)
             else:
-                if method == "dinov3":
-                    loss, dino_l, ibot_l, koleo_l, gram_l = train_step_fn(
-                        model, batch, optimizer, epoch, epochs,
-                        device, criterion, step_info,
-                        scaler, grad_clip, do_step)
-                else:
-                    loss, dino_l, ibot_l, koleo_l = train_step_fn(
-                        model, batch, optimizer, epoch, epochs,
-                        device, criterion, step_info,
-                        scaler, grad_clip, do_step)
-                    gram_l = None
-            if not math.isfinite(loss):
-                print(f"Error: non-finite loss ({loss}) at epoch {epoch + 1}; "
+                loss_val, components = train_step_fn(
+                    model, batch, optimizer, epoch, epochs,
+                    device, criterion, step_info,
+                    scaler, grad_clip, do_step)
+            if not math.isfinite(loss_val):
+                print(f"Error: non-finite loss ({loss_val}) at epoch {epoch + 1}; "
                       f"aborting to avoid writing a corrupted SSL bundle",
                       file=sys.stderr)
                 sys.exit(1)
-            tot_loss += loss
-            if dino_l is not None:
-                tot_dino += dino_l
-                tot_ibot += ibot_l
-                tot_koleo += koleo_l
-            if gram_l is not None:
-                tot_gram += gram_l
+            tot_loss += loss_val
+            for k, v in components.items():
+                tot_comp[k] = tot_comp.get(k, 0.0) + v
 
-            # Monitoring: DINOv3 diagnostics + step-level metrics (CSV/TB).
+            # Monitoring: DINOv3 diagnostics (head collapse / gram split) +
+            # step-level metrics (CSV/TB). Other methods have no _last_diag.
             if diag_enabled and tracker is not None and getattr(model, "_last_diag", None):
                 diag = model._last_diag
-                step_metrics = {"loss": loss, "dino": dino_l, "ibot": ibot_l,
-                                "koleo": koleo_l, "gram": gram_l}
-                if monitoring_cfg.get("head_logits_track", True):
+                step_metrics = {"loss": loss_val, **components}
+                if (monitoring_cfg.get("head_logits_track", True)
+                        and "head_logits" in diag):
                     hm = head_collapse_metrics(diag, model._student_temp)
                     step_metrics.update(hm)
                     tot_head_std += hm["head_logits_std"]
@@ -902,7 +900,7 @@ def pretrain_ssl(config, config_path=None):
                     tot_sts += hm["teacher_student_sim"]
                     n_diag += 1
                 gram_diag = diag.get("gram")
-                if (gram_diag is not None and gram_l is not None
+                if (gram_diag is not None
                         and monitoring_cfg.get("gram_split_stats", True)):
                     gm = gram_split_metrics(criterion[3], *gram_diag)
                     step_metrics.update(gm)
@@ -920,74 +918,42 @@ def pretrain_ssl(config, config_path=None):
             global_step += 1
 
         avg_loss = tot_loss / n_batches if n_batches else 0.0
+        avg_comp = {k: v / n_batches for k, v in tot_comp.items()} if n_batches else {}
         loss_history.append(avg_loss)
-        if method in ("dinov2", "dinov3") and n_batches:
-            dino_loss_history.append(tot_dino / n_batches)
-            ibot_loss_history.append(tot_ibot / n_batches)
-            koleo_loss_history.append(tot_koleo / n_batches)
-            if method == "dinov3" and gram_enabled:
-                gram_loss_history.append(tot_gram / n_batches if n_batches else 0.0)
-                logger.info("  epoch=%d  loss=%.6f  (dino=%.4f  ibot=%.4f  "
-                            "koleo=%.4f  gram=%.4f)",
-                            epoch + 1, avg_loss,
-                            tot_dino / n_batches, tot_ibot / n_batches,
-                            tot_koleo / n_batches, tot_gram / n_batches)
-            elif method == "dinov3":
-                logger.info("  epoch=%d  loss=%.6f  (dino=%.4f  ibot=%.4f  "
-                            "koleo=%.4f)",
-                            epoch + 1, avg_loss,
-                            tot_dino / n_batches, tot_ibot / n_batches,
-                            tot_koleo / n_batches)
-            else:
-                logger.info("  epoch=%d  loss=%.6f  (dino=%.4f  ibot=%.4f  koleo=%.4f)",
-                            epoch + 1, avg_loss, tot_dino / n_batches, tot_ibot / n_batches,
-                            tot_koleo / n_batches)
-        else:
-            logger.info("  epoch=%d  loss=%.6f", epoch + 1, avg_loss)
+        for k, v in avg_comp.items():
+            component_histories.setdefault(k, []).append(v)
+        comp_txt = "  ".join(f"{k}={v:.4f}" for k, v in avg_comp.items())
+        logger.info("  epoch=%d  loss=%.6f%s", epoch + 1, avg_loss,
+                    f"  ({comp_txt})" if comp_txt else "")
 
-        # Monitoring: per-epoch scalars (CSV/TB) + diagnostic histories.
+        # Monitoring: per-epoch scalars (CSV/TB) + DINOv3 diagnostic histories.
         if tracker is not None:
-            epoch_metrics = {"loss": avg_loss}
-            if method in ("dinov2", "dinov3") and n_batches:
+            epoch_metrics = {"loss": avg_loss, **avg_comp}
+            if n_diag:
                 epoch_metrics.update({
-                    "dino": tot_dino / n_batches,
-                    "ibot": tot_ibot / n_batches,
-                    "koleo": tot_koleo / n_batches,
+                    "head_logits_std": tot_head_std / n_diag,
+                    "head_entropy": tot_head_entropy / n_diag,
+                    "teacher_student_sim": tot_sts / n_diag,
                 })
-                if method == "dinov3" and gram_enabled:
-                    epoch_metrics["gram"] = tot_gram / n_batches
-                if method == "dinov3" and n_diag:
+                if n_gram_diag:
                     epoch_metrics.update({
-                        "head_logits_std": tot_head_std / n_diag,
-                        "head_entropy": tot_head_entropy / n_diag,
-                        "teacher_student_sim": tot_sts / n_diag,
+                        "gram_masked": tot_gram_masked / n_gram_diag,
+                        "gram_unmasked": tot_gram_unmasked / n_gram_diag,
                     })
-                    if n_gram_diag:
-                        epoch_metrics.update({
-                            "gram_masked": tot_gram_masked / n_gram_diag,
-                            "gram_unmasked": tot_gram_unmasked / n_gram_diag,
-                        })
             tracker.add_epoch(epoch + 1, epoch_metrics)
         if method == "dinov3" and n_diag:
-            head_std_history.append(tot_head_std / n_diag)
-            head_entropy_history.append(tot_head_entropy / n_diag)
-            sts_history.append(tot_sts / n_diag)
+            monitor_histories["head_std"].append(tot_head_std / n_diag)
+            monitor_histories["head_entropy"].append(tot_head_entropy / n_diag)
+            monitor_histories["teacher_student_sim"].append(tot_sts / n_diag)
             if n_gram_diag:
-                gram_masked_history.append(tot_gram_masked / n_gram_diag)
-                gram_unmasked_history.append(tot_gram_unmasked / n_gram_diag)
+                monitor_histories["gram_masked"].append(tot_gram_masked / n_gram_diag)
+                monitor_histories["gram_unmasked"].append(tot_gram_unmasked / n_gram_diag)
 
         if save_interval and (epoch + 1) % save_interval == 0:
             _save_bundle(output_dir, epoch + 1, model, optimizer, loss_history,
                          config, meta, method,
-                         dino_loss_history=dino_loss_history if method in ("dinov2", "dinov3") else None,
-                         ibot_loss_history=ibot_loss_history if method in ("dinov2", "dinov3") else None,
-                         koleo_loss_history=koleo_loss_history if method in ("dinov2", "dinov3") else None,
-                         gram_loss_history=gram_loss_history if method == "dinov3" else None,
-                         head_std_history=head_std_history if method == "dinov3" else None,
-                         head_entropy_history=head_entropy_history if method == "dinov3" else None,
-                         teacher_student_sim_history=sts_history if method == "dinov3" else None,
-                         gram_masked_history=gram_masked_history if method == "dinov3" else None,
-                         gram_unmasked_history=gram_unmasked_history if method == "dinov3" else None)
+                         component_histories=component_histories,
+                         monitor_histories=monitor_histories)
             if umap_check_loader is not None:
                 try:
                     _run_umap_check(model, method, umap_check_loader, device, epoch + 1, seed,
@@ -996,9 +962,7 @@ def pretrain_ssl(config, config_path=None):
                 except Exception as e:
                     logger.error("UMAP check failed at epoch %d: %s", epoch + 1, e)
             _run_diag_plots(model, method, umap_check_loader, device, output_dir,
-                            epoch + 1, head_std_history, head_entropy_history,
-                            sts_history, gram_masked_history, gram_unmasked_history,
-                            monitoring_cfg, tracker)
+                            epoch + 1, monitor_histories, monitoring_cfg, tracker)
 
     logger.info("SSL pretraining done. Final loss: %.6f",
                 loss_history[-1] if loss_history else 0.0)
@@ -1009,15 +973,8 @@ def pretrain_ssl(config, config_path=None):
     last_epoch = epochs if start_epoch < epochs else start_epoch
     _save_bundle(output_dir, last_epoch, model, optimizer, loss_history,
                  config, meta, method, final=True,
-                 dino_loss_history=dino_loss_history if method in ("dinov2", "dinov3") else None,
-                 ibot_loss_history=ibot_loss_history if method in ("dinov2", "dinov3") else None,
-                 koleo_loss_history=koleo_loss_history if method in ("dinov2", "dinov3") else None,
-                 gram_loss_history=gram_loss_history if method == "dinov3" else None,
-                 head_std_history=head_std_history if method == "dinov3" else None,
-                 head_entropy_history=head_entropy_history if method == "dinov3" else None,
-                 teacher_student_sim_history=sts_history if method == "dinov3" else None,
-                 gram_masked_history=gram_masked_history if method == "dinov3" else None,
-                 gram_unmasked_history=gram_unmasked_history if method == "dinov3" else None)
+                 component_histories=component_histories,
+                 monitor_histories=monitor_histories)
     if umap_check_loader is not None and last_umap_epoch != last_epoch:
         try:
             _run_umap_check(model, method, umap_check_loader, device, last_epoch, seed,
@@ -1026,9 +983,7 @@ def pretrain_ssl(config, config_path=None):
             logger.error("UMAP check failed at final epoch %d: %s", last_epoch, e)
     if last_umap_epoch != last_epoch:
         _run_diag_plots(model, method, umap_check_loader, device, output_dir,
-                        last_epoch, head_std_history, head_entropy_history,
-                        sts_history, gram_masked_history, gram_unmasked_history,
-                        monitoring_cfg, tracker)
+                        last_epoch, monitor_histories, monitoring_cfg, tracker)
     bundle_path = os.path.join(output_dir, "model.pt")
 
     if loss_history:
@@ -1036,10 +991,7 @@ def pretrain_ssl(config, config_path=None):
         try:
             plot_pretrain_loss(
                 loss_history,
-                dino_history=dino_loss_history if method in ("dinov2", "dinov3") else None,
-                ibot_history=ibot_loss_history if method in ("dinov2", "dinov3") else None,
-                koleo_history=koleo_loss_history if method in ("dinov2", "dinov3") else None,
-                gram_history=gram_loss_history if method == "dinov3" else None,
+                component_histories=component_histories,
                 save_path=os.path.join(output_dir, "loss_curve.pdf"))
         except Exception as e:
             logger.error("Loss curve plot failed: %s", e)
@@ -1051,17 +1003,18 @@ def pretrain_ssl(config, config_path=None):
 
 
 def _run_diag_plots(model, method, loader, device, output_dir, epoch,
-                    head_std_history, head_entropy_history, sts_history,
-                    gram_masked_history, gram_unmasked_history,
-                    monitoring_cfg, tracker):
+                    monitor_histories, monitoring_cfg, tracker):
     """DINOv3 diagnostic PDFs at save_interval / final epochs (best-effort)."""
     if method != "dinov3" or tracker is None:
         return
     try:
         from .vis import plot_head_track
         plot_head_track(
-            head_std_history, head_entropy_history, sts_history,
-            gram_masked_history, gram_unmasked_history,
+            monitor_histories.get("head_std", []),
+            monitor_histories.get("head_entropy", []),
+            monitor_histories.get("teacher_student_sim", []),
+            monitor_histories.get("gram_masked", []),
+            monitor_histories.get("gram_unmasked", []),
             save_path=os.path.join(output_dir, "head_track.pdf"))
     except Exception as e:
         logger.error("Head-track plot failed at epoch %d: %s", epoch, e)
@@ -1139,10 +1092,16 @@ def vis_attention(config, config_path=None):
     logger.info("vis-attention: %d images, bundle=%s", n_samples, resume_path)
 
     # ---- Load bundle into a dinov3 model (gram keys handled) ----
+    # Architecture comes from the bundle meta (locked at training time); the
+    # config carries no backbone block.
     ckpt = torch.load(resume_path, map_location=device, weights_only=False)
     meta = ckpt.get("meta") or {}
-    backbone_cfg = dict(config["backbone"])
-    backbone_cfg["in_chans"] = meta.get("in_chans", len(resolved_channels))
+    if not meta.get("backbone"):
+        print(f"Error: bundle {resume_path} meta lacks 'backbone' — not an "
+              f"SSL bundle", file=sys.stderr)
+        sys.exit(1)
+    backbone_cfg = {"name": meta["backbone"], "pretrained": False,
+                    "in_chans": meta.get("in_chans", len(resolved_channels))}
     if backbone_cfg["in_chans"] != len(resolved_channels):
         print(
             f"Error: bundle in_chans={backbone_cfg['in_chans']} does not match "
@@ -1172,7 +1131,7 @@ def vis_attention(config, config_path=None):
                 amaps, grid, anchors = compute_patch_similarity_maps(
                     model, x1, n_anchors=4)
                 att_maps, _ = compute_cls_attention_maps(
-                    model.student_backbone, x1)
+                    model.teacher_backbone, x1)
                 if amaps and att_maps:
                     samples.append({"anchors": amaps, "attn": att_maps[0]})
                     all_inputs.append(_to_display_rgb(x[i].detach().cpu()))

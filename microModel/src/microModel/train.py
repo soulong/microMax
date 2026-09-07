@@ -1,12 +1,14 @@
 """Classification training from SSL backbone or scratch.
 
 Loads an SSL bundle (model.pt) or a timm pretrained backbone, adds a
-ClassificationHead, and trains with FocalLoss. Saves a train bundle
-(model.pt) compatible with infer.py's classify mode.
+ClassificationHead, and trains it. The loss follows the label form — a plain
+single label per file trains with FocalLoss, ';'-joined categories train
+multi-label with BCELoss (no config key). Saves a train bundle (model.pt)
+compatible with infer.py's classify mode.
 
-If the SSL bundle's method is "dinov2", the ViT is rebuilt via timm directly
+If the SSL bundle's method is "dinov3", the ViT is rebuilt via timm directly
 with special init args (pos_embed, dynamic_img_size, init_values) and cls-token
-pooling is used. Otherwise (BYOL or conv), build_backbone is used.
+pooling is used. Otherwise (conv), build_backbone is used.
 """
 
 import os
@@ -24,38 +26,42 @@ from .utils import (logger, set_seed, select_device, load_label_csv, copy_config
                     resolve_channels, resolve_max_value, build_cell_datasets)
 from .dataset import SingleCellDataset, stratified_split, subsample
 from .backbone import (
-    build_backbone, build_dinov2_vit, cls_token_pool_fn,
-    ClassificationHead, FocalLoss, Model, load_backbone_weights,
+    build_backbone, build_dino_vit, cls_token_pool_fn,
+    ClassificationHead, FocalLoss, BCELoss, Model, load_backbone_weights,
 )
 
 
 def _save_bundle(output_dir, epoch, state_dict, meta, config, opt, best_state,
                  best_val, train_loss_history, val_acc_history, val_f1_history,
                  final=False):
-    """Save a complete train bundle: state_dict, meta, config, optimizer
-    state, epoch, histories, best_val, best_state.
+    """Save a train bundle: state_dict, meta, config, epoch, histories,
+    best_val. `epoch` is 1-BASED (the last completed epoch), matching the
+    filename and the pretrain bundles — the package-wide convention is
+    "internal loop indices 0-based, everything written/displayed 1-based".
 
-    final=True writes model.pt (final epoch, eval/best weights); otherwise
-    model_{epoch}.pt (every save_interval epoch; filename epoch is 1-based,
-    no zero padding — model_9.pt = 9th epoch completed; the bundle 'epoch'
-    key stays 0-based last-completed, matching the final bundle). Interval
-    bundles store the raw training weights at that epoch so the optimizer
-    state matches for exact resume. Every saved .pt is a complete bundle —
-    usable for exact resume (resume.sl_model) and inference.
+    final=True writes model.pt (final epoch) whose state_dict IS the rebuilt
+    best weights — so best_state would be a duplicate and the optimizer is
+    dead weight (~2x model size) for anything but resume: neither is saved.
+    Resuming from model.pt warm-starts a fresh optimizer (the resume code
+    tolerates the missing keys). final=False writes model_{epoch}.pt (every
+    save_interval) with the raw training weights + optimizer state + best_state
+    for exact resume.
     """
     bundle = {
         "state_dict": state_dict,
         "meta": meta,
         "config": config,
-        "optimizer_state_dict": opt.state_dict(),
         "epoch": epoch,
         "train_loss_history": train_loss_history,
         "val_acc_history": val_acc_history,
         "val_f1_history": val_f1_history,
         "best_val": best_val,
-        "best_state": best_state,
     }
-    fname = "model.pt" if final else f"model_{epoch + 1}.pt"
+    if not final:
+        # Exact-resume state — only the interval bundles carry it.
+        bundle["optimizer_state_dict"] = opt.state_dict()
+        bundle["best_state"] = best_state
+    fname = "model.pt" if final else f"model_{epoch}.pt"
     path = os.path.join(output_dir, fname)
     atomic_torch_save(bundle, path)
     logger.info("Train bundle saved to %s (epoch %d)", path, epoch)
@@ -103,9 +109,11 @@ def _try_resume(config, device):
         print(f"Error: train checkpoint at {resume_path} has no 'config' key", file=sys.stderr)
         sys.exit(1)
 
-    # Locked model-specific settings (bundle wins)
+    # Locked model-specific settings (bundle wins). The loss is NOT here —
+    # it is auto-detected from the label form at every run.
     locked = [
         ("model", "backbone"), ("model", "pretrained"), ("model", "focal_gamma"),
+        ("model", "label_smoothing"),
     ]
     for section, key in locked:
         sv = saved_cfg.get(section, {}).get(key)
@@ -187,20 +195,20 @@ def _build_records_from_cell_dataset(cell_ds, root, label_from_dir, label_csv):
 def _build_model_from_ssl(ssl_bundle, model_cfg, num_classes, device):
     """Build a classification Model from an SSL pretrain bundle.
 
-    For DINOv2: rebuild ViT via build_dinov2_vit + cls-token pooling.
-    For BYOL/conv: use build_backbone + global mean pool.
+    For DINOv3: rebuild ViT via build_dino_vit + cls-token pooling.
+    For conv backbones: use build_backbone + global mean pool.
     Returns (model, method, meta).
     """
     meta = ssl_bundle["meta"]
     method = meta.get("method")
     in_chans = meta["in_chans"]
 
-    if method in ("dinov2", "dinov3"):
-        backbone = build_dinov2_vit(meta["backbone"], in_chans, pretrained=False)
+    if method == "dinov3":
+        backbone = build_dino_vit(meta["backbone"], in_chans, pretrained=False)
         feat_dim = backbone.num_features
         pool_fn = cls_token_pool_fn
     else:
-        # BYOL / conv backbone
+        # Conv backbone
         backbone, feat_dim, pool_fn = build_backbone(
             meta["backbone"], in_chans, pretrained=False)
 
@@ -304,7 +312,7 @@ def train(config, config_path=None):
         sys.exit(1)
     resolved_channels = list(next(iter(unique_resolved))) if unique_resolved else channels
 
-    # Drop unlabeled
+    # Drop records without any label (mode-independent).
     n_unlabeled = sum(1 for r in all_records if r["label"] is None)
     if n_unlabeled > 0:
         logger.warning("Dropping %d records with no label", n_unlabeled)
@@ -314,13 +322,47 @@ def train(config, config_path=None):
             sys.exit(1)
 
     labels = [r["label"] for r in all_records]
-    logger.info("Found %d records, %d classes, channels=%s",
-                len(all_records), len(set(labels)), resolved_channels)
-    logger.info("Class distribution: %s", dict(Counter(labels)))
 
-    all_labels = sorted(set(labels))
+    # The loss follows the label form — there is no config key for it:
+    #   plain single label per file       -> FocalLoss (one exclusive class)
+    #   ';'-joined category list per file -> BCELoss (multi-hot target)
+    multi_label = any(";" in lab for lab in labels)
+
+    # Multi-label only: a label with no category at all (empty /
+    # separator-only) is equally untrainable — drop it too.
+    if multi_label:
+        n_empty = sum(1 for lab in labels
+                      if not any(c.strip() for c in lab.split(";")))
+        if n_empty > 0:
+            logger.warning("Dropping %d records with an empty label", n_empty)
+            all_records = [r for r in all_records
+                           if any(c.strip() for c in r["label"].split(";"))]
+            labels = [r["label"] for r in all_records]
+            if not all_records:
+                print("Error: all records are unlabeled", file=sys.stderr)
+                sys.exit(1)
+
+    # Multi-label: classes are the UNION of ';'-separated categories over all
+    # records — the record keeps the joined label string and is split again
+    # in the dataset (multi-hot target) and metrics. Single-label: one class
+    # per label string.
+    if multi_label:
+        all_labels = sorted({c.strip() for lab in labels
+                             for c in lab.split(";") if c.strip()})
+        dist = Counter(c.strip() for lab in labels
+                       for c in lab.split(";") if c.strip())
+    else:
+        all_labels = sorted(set(labels))
+        dist = Counter(labels)
     label_to_idx = {lab: i for i, lab in enumerate(all_labels)}
     num_classes = len(label_to_idx)
+    loss_name = "BCE" if multi_label else "FocalLoss"
+    label_kind = ("multi-label (';'-joined categories)" if multi_label
+                  else "single-label")
+    logger.info("Found %d records, %d classes, channels=%s",
+                len(all_records), num_classes, resolved_channels)
+    logger.info("Labels: %s -> loss=%s", label_kind, loss_name)
+    logger.info("Class distribution: %s", dict(dist))
 
     # Subsample
     sample_max = data_cfg.get("sample_max")
@@ -330,7 +372,11 @@ def train(config, config_path=None):
         logger.info("Sub-sampled to %d records (sample_max=%s, sample_by=%s)",
                     len(all_records), sample_max, sample_by)
         labels = [r["label"] for r in all_records]
-        all_labels = sorted(set(labels))
+        if multi_label:
+            all_labels = sorted({c.strip() for lab in labels
+                                 for c in lab.split(";") if c.strip()})
+        else:
+            all_labels = sorted(set(labels))
         label_to_idx = {lab: i for i, lab in enumerate(all_labels)}
         num_classes = len(label_to_idx)
 
@@ -364,7 +410,8 @@ def train(config, config_path=None):
         clip_low=clip_low, clip_high=clip_high,
         with_masking=with_masking,
         fixed_reference=fixed_reference,
-        max_value=max_value)
+        max_value=max_value,
+        multi_label=multi_label)
     val_ds = SingleCellDataset(
         [(r["cell_dataset"], r["idx"]) for r in val_records],
         label_to_idx,
@@ -375,7 +422,8 @@ def train(config, config_path=None):
         clip_low=clip_low, clip_high=clip_high,
         with_masking=with_masking,
         fixed_reference=fixed_reference,
-        max_value=max_value)
+        max_value=max_value,
+        multi_label=multi_label)
 
     # ---- Build model ----
     ssl_bundle_path = config.get("resume", {}).get("ssl_model")
@@ -448,14 +496,39 @@ def train(config, config_path=None):
         "clip_high": clip_high,
         "image_pattern": image_pattern,
         "ssl_method": ssl_method,
+        "loss": "bce" if multi_label else "focal",
+        # Provenance: which data + label table produced this bundle (same
+        # convention as pretrain meta.data_root).
+        "data_root": roots,
+        "label_csv": label_csv,
     }
 
+    # freeze_backbone=true = linear probe: only the head receives gradients.
+    # The backbone stays in the state_dict either way, so bundles are
+    # structurally identical.
+    trainable_params = list(model.parameters())
+    if model_cfg.get("freeze_backbone", False):
+        for p in model.backbone.parameters():
+            p.requires_grad_(False)
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        n_train = sum(p.numel() for p in trainable_params)
+        logger.info("Backbone frozen (freeze_backbone=true) — training head "
+                    "only (%.1fM params)", n_train / 1e6)
+
     opt = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=train_cfg.get("lr", 1e-4),
         weight_decay=train_cfg.get("weight_decay", 0.01),
         betas=tuple(train_cfg.get("betas", (0.9, 0.999))))
-    criterion = FocalLoss(gamma=model_cfg.get("focal_gamma", 2.0))
+    label_smoothing = float(model_cfg.get("label_smoothing", 0.0))
+    if multi_label:
+        # focal_gamma doubles as the multi-label focal exponent (0 = plain
+        # BCE) — same imbalance knob as the single-label FocalLoss.
+        criterion = BCELoss(label_smoothing=label_smoothing,
+                            gamma=float(model_cfg.get("focal_gamma", 0.0)))
+    else:
+        criterion = FocalLoss(gamma=model_cfg.get("focal_gamma", 2.0),
+                              label_smoothing=label_smoothing)
 
     amp_enabled = train_cfg.get("amp", True) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda") if amp_enabled else None
@@ -491,8 +564,11 @@ def train(config, config_path=None):
     patience_counter = 0
 
     if checkpoint is not None:
-        start_epoch = checkpoint.get("epoch", -1) + 1
-        logger.info("Resuming from epoch %d", start_epoch)
+        # Bundle 'epoch' is 1-based (last completed epoch), which equals the
+        # next 0-based loop index to continue from.
+        start_epoch = checkpoint.get("epoch", 0)
+        logger.info("Resuming: %d epochs completed, continuing at epoch %d",
+                    start_epoch, start_epoch + 1)
         if "model_state_dict" in checkpoint:
             model.load_state_dict(checkpoint["model_state_dict"])
         if "optimizer_state_dict" in checkpoint:
@@ -508,7 +584,7 @@ def train(config, config_path=None):
         model.train()
         tot_loss = 0.0
         n_batches = 0
-        for x, y in tqdm(train_loader, desc=f"Epoch {epoch}"):
+        for x, y in tqdm(train_loader, desc=f"Epoch {epoch + 1}"):
             x, y = x.to(device), y.to(device)
             opt.zero_grad()
             if amp_enabled:
@@ -536,8 +612,16 @@ def train(config, config_path=None):
                 for x, y in val_loader:
                     x = x.to(device)
                     logits, _ = model(x)
-                    yt.extend(y.tolist())
-                    yp.extend(logits.argmax(1).cpu().tolist())
+                    if multi_label:
+                        # Multi-hot indicator matrices — sklearn's
+                        # accuracy_score becomes subset accuracy and macro F1
+                        # averages the per-class F1 over all categories.
+                        preds = (torch.sigmoid(logits) >= 0.5).long()
+                        yt.extend(y.long().tolist())
+                        yp.extend(preds.cpu().tolist())
+                    else:
+                        yt.extend(y.tolist())
+                        yp.extend(logits.argmax(1).cpu().tolist())
         acc = float(accuracy_score(yt, yp)) if yt else 0.0
         f1 = float(f1_score(yt, yp, average="macro", zero_division=0)) if yt else 0.0
         val_acc_history.append(acc)
@@ -549,19 +633,23 @@ def train(config, config_path=None):
             patience_counter = 0
             marker = " *"
         else:
-            patience_counter += 1
+            # Early stopping needs a validation signal: with val_ratio: 0 the
+            # accuracy is a constant 0.0, so counting would abort the run
+            # after `patience` epochs regardless of training.epochs.
+            if val_records:
+                patience_counter += 1
             marker = ""
 
         if save_interval and (epoch + 1) % save_interval == 0:
-            _save_bundle(output_dir, epoch, model.state_dict(), meta, config,
+            _save_bundle(output_dir, epoch + 1, model.state_dict(), meta, config,
                          opt, best_state, best_acc,
                          train_loss_history, val_acc_history, val_f1_history)
 
-        logger.info("  loss=%.4f  val_acc=%.4f  val_f1=%.4f  patience=%d/%d%s",
-                    avg_loss, acc, f1, patience_counter, patience, marker)
+        logger.info("  epoch=%d  loss=%.4f  val_acc=%.4f  val_f1=%.4f  patience=%d/%d%s",
+                    epoch + 1, avg_loss, acc, f1, patience_counter, patience, marker)
 
-        if patience_counter >= patience:
-            logger.info("Early stopping at epoch %d", epoch)
+        if val_records and patience_counter >= patience:
+            logger.info("Early stopping at epoch %d", epoch + 1)
             break
 
     logger.info("Training done. Best val accuracy: %.4f", best_acc)
@@ -571,9 +659,9 @@ def train(config, config_path=None):
     # trained_in_chans), not model_cfg — a config/bundle mismatch otherwise
     # builds the wrong architecture and load_state_dict fails or the eval
     # model silently has random weights.
-    if ssl_method in ("dinov2", "dinov3"):
-        eval_backbone = build_dinov2_vit(trained_backbone, trained_in_chans,
-                                         pretrained=False)
+    if ssl_method == "dinov3":
+        eval_backbone = build_dino_vit(trained_backbone, trained_in_chans,
+                                       pretrained=False)
         eval_feat_dim = eval_backbone.num_features
         eval_pool_fn = cls_token_pool_fn
     else:
@@ -595,7 +683,8 @@ def train(config, config_path=None):
     result = plot_training_results(
             eval_model, device, val_loader, num_classes,
             label_to_idx, train_loss_history, val_acc_history,
-            save_path=os.path.join(output_dir, "training_plot.pdf"))
+            save_path=os.path.join(output_dir, "training_plot.pdf"),
+            multi_label=multi_label)
 
     if result is not None:
         report_path = os.path.join(output_dir, "training_report.txt")
@@ -614,26 +703,34 @@ def train(config, config_path=None):
             f.write(f"{'Epoch':>6}  {'Train Loss':>11}  {'Val Acc':>8}  {'Val F1':>8}\n")
             f.write("-" * 42 + "\n")
             for e in range(len(train_loss_history)):
-                f.write(f"{e:>6}  {train_loss_history[e]:>11.6f}  {val_acc_history[e]:>8.4f}  {val_f1_history[e]:>8.4f}\n")
+                f.write(f"{e + 1:>6}  {train_loss_history[e]:>11.6f}  {val_acc_history[e]:>8.4f}  {val_f1_history[e]:>8.4f}\n")
             f.write("\n")
             f.write("Final metrics (on full validation set):\n")
             f.write(f"  Train loss: {result['final_loss']:.6f}\n")
             f.write(f"  Validation accuracy: {result['final_acc']:.4f}\n")
             f.write(f"  Validation F1 (macro): {result['final_val_f1']:.4f}\n\n")
-            f.write("Confusion matrix:\n")
-            cm = result["cm"]
-            header = "true\\pred\t" + "\t".join(str(i) for i in range(num_classes))
-            f.write(header + "\n")
-            for i in range(cm.shape[0]):
-                row_str = f"{class_names_sorted[i] if i < len(class_names_sorted) else i}\t"
-                row_str += "\t".join(str(int(cm[i, j])) for j in range(cm.shape[1]))
-                f.write(row_str + "\n")
+            if multi_label:
+                # No confusion matrix exists for multi-label — report the
+                # per-class F1 at the 0.5 threshold instead.
+                f.write("Per-class F1 (threshold 0.5):\n")
+                for name in class_names_sorted:
+                    f.write(f"  {name}: {result['per_class_f1'].get(name, 0.0):.4f}\n")
+            else:
+                f.write("Confusion matrix:\n")
+                cm = result["cm"]
+                header = "true\\pred\t" + "\t".join(str(i) for i in range(num_classes))
+                f.write(header + "\n")
+                for i in range(cm.shape[0]):
+                    row_str = f"{class_names_sorted[i] if i < len(class_names_sorted) else i}\t"
+                    row_str += "\t".join(str(int(cm[i, j])) for j in range(cm.shape[1]))
+                    f.write(row_str + "\n")
         logger.info("Training report saved to %s", report_path)
 
     # ---- Save final train bundle ----
     bundle_path = os.path.join(output_dir, "model.pt")
     _save_bundle(
-        output_dir, epoch if start_epoch < epochs else start_epoch - 1,
+        output_dir,
+        epoch + 1 if start_epoch < epochs else start_epoch,
         eval_model.state_dict(), meta, config, opt, best_state, best_acc,
         train_loss_history, val_acc_history, val_f1_history, final=True)
     logger.info("Train bundle saved to %s", bundle_path)

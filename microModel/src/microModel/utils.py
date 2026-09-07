@@ -78,13 +78,35 @@ def set_seed(seed=42):
 
 
 def load_label_csv(path):
-    """Load a label CSV mapping absolute file path -> label string."""
+    """Load a label CSV mapping absolute file path -> label string.
+
+    Relative `filepath` entries are resolved against the CSV's own directory
+    (NOT the process CWD), so a CSV using paths relative to a dataset root
+    keeps working no matter where training is launched from. Absolute entries
+    are used as-is.
+    """
     import pandas as pd
+    base = os.path.dirname(os.path.abspath(path))
     label_map = {}
     df = pd.read_csv(path)
     for _, r in df.iterrows():
-        label_map[os.path.abspath(r["filepath"])] = str(r["label"])
+        fp = str(r["filepath"])
+        if not os.path.isabs(fp):
+            fp = os.path.join(base, fp)
+        label_map[os.path.abspath(fp)] = str(r["label"])
     return label_map
+
+
+def parse_pred_prob(value):
+    """Parse the infer.db `pred_prob` column into a single float.
+
+    pred_prob holds the highest per-class probability (REAL), or NULL for
+    features-only rows (SSL bundles). Returns 0.0 when absent or unparseable.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def shorten_labels(paths):
@@ -164,15 +186,18 @@ def resolve_output_paths(data_roots, output_dir):
 def merge_locked_normalize(saved_cfg, config):
     """Bundle wins on mismatch for the normalize.* locked keys.
 
-    Shared by pretrain and train resume (identical behavior in both).
+    Shared by pretrain and train resume (identical behavior in both). Keys
+    absent from the run config are adopted silently — a warning there would
+    be pure noise.
     """
     for key in ("method", "with_masking", "clip_low", "clip_high", "fixed_reference"):
         sv = saved_cfg.get("normalize", {}).get(key)
-        if sv is not None:
-            cv = config.get("normalize", {}).get(key)
-            if str(cv) != str(sv):
-                logger.warning("Locked normalize.%s differs; using bundle value", key)
-                config.setdefault("normalize", {})[key] = sv
+        if sv is None:
+            continue
+        cv = config.get("normalize", {}).get(key)
+        if cv is not None and str(cv) != str(sv):
+            logger.warning("Locked normalize.%s differs; using bundle value", key)
+        config.setdefault("normalize", {})[key] = sv
 
 
 def resolve_channels(channels, n_avail, root):
@@ -272,19 +297,20 @@ def load_reducer(path):
     return obj
 
 
-def validate_pca(pca, n_features, name="reducer_pca"):
-    if hasattr(pca, "n_features_in_") and pca.n_features_in_ != n_features:
+def validate_pca(pca, n_features, name="reduction_pca"):
+    n_in = getattr(pca, "n_features_in_", None)
+    if n_in is not None and n_in != n_features:
         print(
-            f"Error: {name} n_features_in_={pca.n_features_in_} "
+            f"Error: {name} n_features_in_={n_in} "
             f"does not match input feature dimension {n_features}",
             file=sys.stderr,
         )
         sys.exit(1)
     if hasattr(pca, "n_components"):
-        logger.info("%s: %d components, %d features", name, pca.n_components, pca.n_features_in_)
+        logger.info("%s: %d components, %d features", name, pca.n_components, n_in)
 
 
-def validate_umap_pipeline(pipeline, n_features, name="reducer_umap"):
+def validate_umap_pipeline(pipeline, n_features, name="reduction_umap"):
     pca_pre = pipeline.get("pca_pre")
     if pca_pre is not None:
         validate_pca(pca_pre, n_features, name=f"{name}.pca_pre")

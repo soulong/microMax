@@ -18,7 +18,7 @@ microMax/
 | microBase | 0.7.0 | — (library) |
 | microProfiler | 1.5.0 | `microprofiler` |
 | microVis | 1.2.0 | `microvis` |
-| microModel | 0.4.0 | `micromodel` |
+| microModel | 0.5.0 | `micromodel` |
 
 - `microBase` is the only shared dependency — the three consumers never
   import each other (the one documented exception: microProfiler lazily
@@ -152,8 +152,8 @@ Typical flow:
 All commands are config-driven (`micromodel <subcommand> --config <file>`):
 
 ```
-micromodel pretrain --config configs/pretrain_dinov2.yml    # SSL backbone (BYOL or DINOv2)
-micromodel vis-augment --config configs/pretrain_dinov2.yml # preview the augmentation views
+micromodel pretrain --config configs/pretrain_dinov3_phase1.yml  # SSL backbone (DINOv3)
+micromodel vis-augment --config configs/pretrain_dinov3_phase1.yml # preview the augmentation views
 micromodel train --config configs/train.yml                 # classifier (from SSL backbone or scratch)
 micromodel infer --config configs/infer_whole_image.yml     # predictions + features -> infer.db
 micromodel vis-reduction --config configs/infer_whole_image.yml

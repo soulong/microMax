@@ -184,4 +184,5 @@ cython_debug/
 .trae
 .workbuddy
 .opencode
+.zcode
 AGENTS.md

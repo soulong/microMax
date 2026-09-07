@@ -31,8 +31,8 @@ from .utils import logger
 #: Column order of metrics.csv (missing keys are written as blanks so
 #: appending across continue-resume runs keeps a consistent header).
 COLUMNS = [
-    "tag", "step", "epoch", "loss", "dino", "ibot", "koleo", "gram",
-    "gram_masked", "gram_unmasked", "head_logits_std", "head_entropy",
+    "tag", "step", "epoch", "loss", "dino", "ibot", "koleo", "recon", "dist",
+    "gram", "gram_masked", "gram_unmasked", "head_logits_std", "head_entropy",
     "teacher_student_sim", "lr", "momentum", "weight_decay", "teacher_temp",
 ]
 
@@ -182,11 +182,12 @@ def gram_split_metrics(gram_criterion, student_patches, teacher_patches, mask_pa
 def compute_patch_similarity_maps(model, x, n_anchors=4):
     """-> (maps, grid) for one input image.
 
-    model: DINOv3 (uses student_backbone). x: (1, C, H, W) normalized tensor
-    on the right device. maps: list of n_anchors (grid, grid) cosine-sim maps.
+    model: DINOv3 (uses teacher_backbone, the EMA branch official evaluation
+    uses). x: (1, C, H, W) normalized tensor on the right device. maps: list
+    of n_anchors (grid, grid) cosine-sim maps.
     """
-    n_prefix = model.student_backbone.vit.num_prefix_tokens
-    features = model.student_backbone.encode(x)  # (1, N, D)
+    n_prefix = model.teacher_backbone.vit.num_prefix_tokens
+    features = model.teacher_backbone.encode(x)  # (1, N, D)
     patches = features[:, n_prefix:]  # drop class/reg tokens
     patches = F.normalize(patches[0].float(), dim=-1)  # (P, D)
     p = patches.shape[0]

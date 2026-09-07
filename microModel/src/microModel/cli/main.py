@@ -62,7 +62,7 @@ def main():
     parser.add_argument("--version", action="version", version=f"microModel {__version__}")
     sub = parser.add_subparsers(dest="command")
 
-    p_pretrain = sub.add_parser("pretrain", help="SSL pretrain (BYOL / DINOv2 / DINOv3)")
+    p_pretrain = sub.add_parser("pretrain", help="SSL pretrain (DINOv3)")
     p_pretrain.add_argument("--config", required=True, help="Path to pretrain YAML config")
     p_pretrain.set_defaults(func=cmd_pretrain)
 

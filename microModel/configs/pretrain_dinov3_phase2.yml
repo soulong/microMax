@@ -17,7 +17,7 @@
 #   - augmentation_views 末尾追加 2 个 448px gram teacher crop 视图
 #   - 更保守的调度：LR/动量/权重衰减取常数，LR 降低到 5e-5，轮数约为 Phase 1 的 1/3
 # 数据特征沿用 Phase 1：crop 129–224 px、~5K–50K 细胞、单通道 16-bit 荧光；
-# head 32768、4 个 local 视图与 Phase 1 保持一致（bundle 会锁定架构，resume 时以 bundle 为准）。
+# head 21845、4 个 local 视图与 Phase 1 保持一致（bundle 会锁定架构，resume 时以 bundle 为准）。
 # =============================================================================
 
 mode: single_cell
@@ -38,8 +38,6 @@ data:
   max_value: 65535
   channels: [1]
   channel_layout: null
-  label_from_dir: true
-  label_csv: null
   sample_max: null
   sample_by: per_dataset
 
@@ -55,7 +53,6 @@ backbone:
   pretrained: true                    # Phase 2 由 resume 接管权重，此值仅影响首次创建
 
 dinov3:
-  input_dim: null
   drop_path_rate: 0.1
 
   # ---- DINO head（与 Phase 1 21845 原型；由 bundle 锁定）----
@@ -105,8 +102,9 @@ dinov3:
     ema_teacher: false                # 用 ckpt 冻结教师（推荐）；如想省一张骨干显存可改 true
                                       # （true 时勿设 crops_size，下方两个 gram 视图也不需要）
     it_load_ema_teacher: -1
-    rep_update: true                  # 周期用当前 EMA teacher 刷新 gram teacher（官方行为）
-    update_frequency: 20000           # 20k global steps 刷新一次
+    rep_update: true                  # 周期用当前 EMA teacher 刷新 gram teacher（官方机制；
+                                      # 论文每 10k 步，这里 20k 为显存/时间折衷）
+    update_frequency: 10000           # 刷新间隔（global steps）
     it_first_update: 0
     max_updates: null
     normalized: true

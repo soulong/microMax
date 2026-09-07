@@ -7,7 +7,7 @@
 # 运行环境假设：RTX 5070Ti 16G / Windows 11 / 单通道 16-bit 荧光单细胞 crop。
 # 数据特征：crop 典型尺寸 129–224 px；训练集 ~5K–50K 细胞。
 # 本配置已按上述数据调优：global 224 (patch16→14×14)、local 112、4 个 local 视图、
-# head 原型 32768（中等数据规模更稳更省内存）、有效 batch 256、常数 WD 0.04。
+# head 原型 21845（中等数据规模更稳更省内存）、有效 batch 256、常数 WD 0.04。
 # 预训练完成后，用 Phase 1 保存的 model.pt 作为：
 #   - 下游分类/特征提取的 backbone（train / infer），或
 #   - Phase 2（Gram 锚定）的 resume.ssl_model + dinov3.gram.ckpt。
@@ -16,7 +16,8 @@
 #   - 首次在自有数据上训练（用 timm DINOv3 权重初始化）：backbone.pretrained: true，
 #     resume.ssl_model: null。
 #   - 在同一批数据上继续上一次运行（断点续训）：resume.ssl_model: <上次 model.pt>、
-#     resume.type: continue（epochs 表示总轮数，从上次 epoch 续到 epochs）。
+#     resume.type: continue（epochs 表示总轮数，从上次 epoch 续到 epochs；
+#     dinov3 块调度键以 bundle 为准，config 显式改写的除外——日志会注明）。
 #   - 把已有 bundle 迁移到新数据：resume.ssl_model: <bundle>、resume.type: transfer
 #     （epoch 归 0、优化器与调度重置，仅带权重）。
 # =============================================================================
@@ -40,8 +41,6 @@ data:
                                       # 加载时图像除以它归一化到 [0,1]
   channels: [1]                       # 1-based 通道下标；单细胞荧光通常单通道；null = 全部
   channel_layout: null                # CHW | HWC | null（一文件一通道）
-  label_from_dir: true                # 预训练无监督，忽略（仅格式兼容）
-  label_csv: null                     # 预训练无监督，忽略
   sample_max: null                    # null = 不限制；5K 以下小数据集别设上限；
                                       # 数据集很大(>100K)想加速迭代可设 20000
   sample_by: per_dataset              # per_dataset | per_class（配合 sample_max）
@@ -61,7 +60,7 @@ backbone:
   # timm DINOv3 预训练权重（LVD 蒸馏，Eva 架构，RoPE + 4 register tokens，参数量 ~22M）。
   # 可选同族：vit_small_plus_patch16_dinov3（29M，更强）、
   #           vit_base_patch16_dinov3（86M，16G 显存也能跑但更慢）。
-  # 注意：这些是 DINOv3 家族（非 DINOv2）；单通道由 timm adapt_input_conv 自动适配。
+  # 注意：这些是 DINOv3 家族；单通道由 timm adapt_input_conv 自动适配。
   name: vit_small_patch16_dinov3
   pretrained: true                    # 首次运行自动从 timm hub 下载权重
 
@@ -69,8 +68,6 @@ backbone:
 # dinov3: —— 方法/head/loss/调度/gram 的全部参数
 # =============================================================================
 dinov3:
-  input_dim: null                     # 投影头输入维度；null = 从 ViT embed_dim 自动推导
-
   # ---- 骨干 (backbone) ----
   drop_path_rate: 0.1                 # 随机深度（仅 student）。小模型+预训练迁移 0.05~0.1 均可；
                                       # 若担心过拟合/训练不稳可降到 0.05

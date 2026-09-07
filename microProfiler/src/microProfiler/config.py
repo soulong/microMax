@@ -180,19 +180,26 @@ class ObjectProfileConfig:
 
 @dataclass
 class InferenceReductionConfig:
-    """Optional PCA + UMAP reduction after inference (per inference block).
+    """Optional dimensionality reduction after inference (per inference block).
 
-    var_threshold selects PCA components covering this fraction of the
-    variance (0.95 default). When reducer_pca/reducer_umap are provided the
-    fitted reducers are used to transform directly (no refit).
+    method lists the DR methods to run (subset of pca/umap/pacmap/localmap;
+    null = microModel default [pca, umap]). cluster_k lists KMeans cluster
+    counts for the find_cluster table (null/[] = no cluster finding).
+    reduction_<method> take pre-fitted reducer pickles (transform directly,
+    no refit); cluster takes a pre-fitted cluster.pkl whose stored KMeans
+    models predict every stored k (no refit, cluster_k ignored).
     """
 
     enabled: bool = False
-    var_threshold: float = 0.95
+    method: Optional[List[str]] = None
     color_by: str = "pred_class"
+    cluster: Optional[str] = None
+    cluster_k: Optional[List[int]] = None
     sample_per_class: int = 10000
-    reducer_pca: Optional[str] = None
-    reducer_umap: Optional[str] = None
+    reduction_pca: Optional[str] = None
+    reduction_umap: Optional[str] = None
+    reduction_pacmap: Optional[str] = None
+    reduction_localmap: Optional[str] = None
 
 
 @dataclass
