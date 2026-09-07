@@ -12,4 +12,4 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 warnings.filterwarnings("ignore", message="Found Intel OpenMP",
                         category=RuntimeWarning)
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"

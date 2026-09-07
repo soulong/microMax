@@ -2,8 +2,8 @@
 
 Reads the reduction_<method> tables (pca/umap/pacmap/localmap), the optional
 find_cluster table and the inference table from infer.db. One plot tab is
-offered per method that actually has a table; cluster_<k> columns from
-find_cluster are exposed as categorical color_by options.
+offered per method that actually has a table; the cluster_res<resolution>
+columns from find_cluster are exposed as categorical color_by options.
 The bundle meta uses the same field names for augmentation_infer,
 normalize_method, normalize_with_masking, clip_low, clip_high, channels,
 channel_layout.
@@ -177,8 +177,10 @@ class VisInteractiveServer:
         self._dr_methods = ([m for m in canonical if m in self._dr_methods]
                             + [m for m in self._dr_methods if m not in canonical])
 
-        # find_cluster: one 1-based cluster_<k> column per KMeans k; exposed
-        # to the frontend as categorical color_by options.
+        # find_cluster: one 1-based cluster_res<resolution> column per Leiden
+        # resolution; exposed to the frontend as categorical color_by options.
+        # Resolution tags may contain a dot ("cluster_res0.5"), so every
+        # identifier is quoted in the SELECT.
         cluster_by_uid = {}
         cluster_cols = []
         has_fc = conn.execute(
@@ -188,7 +190,7 @@ class VisInteractiveServer:
             all_cols = [row[1] for row in conn.execute("PRAGMA table_info(find_cluster)")]
             cluster_cols = [c for c in all_cols if c.startswith("cluster_")]
             if cluster_cols:
-                sel = ", ".join(["uid"] + cluster_cols)
+                sel = ", ".join(["uid"] + [f'"{c}"' for c in cluster_cols])
                 for row in conn.execute(f"SELECT {sel} FROM find_cluster"):
                     d = cluster_by_uid.setdefault(int(row[0]), {})
                     for col, val in zip(cluster_cols, row[1:]):
@@ -269,7 +271,8 @@ class VisInteractiveServer:
             }
             # One <method>_x/<method>_y pair per available DR method.
             point.update(coords)
-            # Cluster assignments (cluster_<k> columns) for color_by support.
+            # Cluster assignments (cluster_res<resolution> columns) for
+            # color_by support.
             point.update(cluster_by_uid.get(uid, {}))
             # Add all inference table columns for color_by support
             _exclude_point = {"uid", "directory", "filename", "label", "mask_filename",

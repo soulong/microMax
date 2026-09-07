@@ -36,16 +36,16 @@ def expected_reduction_tables(entry) -> frozenset:
     """Tables show_reduction will write for one entry's reduction config.
 
     One reduction_<method> table per configured method (default [pca, umap])
-    plus find_cluster when cluster_k is set — the completeness check must not
-    demand tables for methods the entry doesn't run.
+    plus find_cluster when cluster_res is set — the completeness check must
+    not demand tables for methods the entry doesn't run.
     """
     if not (entry.reduction and entry.reduction.enabled):
         return frozenset()
     methods = entry.reduction.method if entry.reduction.method else ["pca", "umap"]
     tables = {f"reduction_{m}" for m in methods if m in _DR_METHODS}
-    # find_cluster is written both by a fresh cluster_k fit and by a
+    # find_cluster is written both by a fresh cluster_res fit and by a
     # baseline cluster.pkl predict.
-    if entry.reduction.cluster_k or entry.reduction.cluster:
+    if entry.reduction.cluster_res or entry.reduction.cluster:
         tables.add("find_cluster")
     return frozenset(tables)
 
@@ -258,7 +258,7 @@ def _build_mm_inference_config(entry, cfg: PipelineConfig, ds, root_dir: Path) -
             "method": entry.reduction.method if entry.reduction.method is not None else ["pca", "umap"],
             "color_by": entry.reduction.color_by,
             "cluster": entry.reduction.cluster,
-            "cluster_k": entry.reduction.cluster_k,
+            "cluster_res": entry.reduction.cluster_res,
             "sample_per_class": entry.reduction.sample_per_class if entry.reduction.sample_per_class is not None else 10000,
             "reduction_pca": entry.reduction.reduction_pca,
             "reduction_umap": entry.reduction.reduction_umap,

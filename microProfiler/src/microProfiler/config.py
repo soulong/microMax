@@ -183,18 +183,19 @@ class InferenceReductionConfig:
     """Optional dimensionality reduction after inference (per inference block).
 
     method lists the DR methods to run (subset of pca/umap/pacmap/localmap;
-    null = microModel default [pca, umap]). cluster_k lists KMeans cluster
-    counts for the find_cluster table (null/[] = no cluster finding).
-    reduction_<method> take pre-fitted reducer pickles (transform directly,
-    no refit); cluster takes a pre-fitted cluster.pkl whose stored KMeans
-    models predict every stored k (no refit, cluster_k ignored).
+    null = microModel default [pca, umap]). cluster_res lists Leiden
+    resolutions for the find_cluster table (null/[] = no cluster finding;
+    higher resolution = more clusters). reduction_<method> take pre-fitted
+    reducer pickles (transform directly, no refit); cluster takes a
+    pre-fitted cluster.pkl whose stored kNN classifiers predict every stored
+    resolution (no refit, cluster_res ignored).
     """
 
     enabled: bool = False
     method: Optional[List[str]] = None
     color_by: str = "pred_class"
     cluster: Optional[str] = None
-    cluster_k: Optional[List[int]] = None
+    cluster_res: Optional[List[float]] = None
     sample_per_class: int = 10000
     reduction_pca: Optional[str] = None
     reduction_umap: Optional[str] = None

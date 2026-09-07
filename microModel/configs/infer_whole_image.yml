@@ -48,21 +48,23 @@ inference:
 # Multi-method DR — run via `micromodel vis-reduction --config <this_file>`.
 # Reducers are fit once on merged features from all DBs, then applied per-DB.
 # Per DR method: one multi-page PDF (reduction_<method>.pdf — one page per
-# color_by entry, then one per cluster k; color_by null = a single
+# color_by entry, then one per cluster resolution; color_by null = a single
 # light-blue page) + a reduction_<method> table (pca: pc_1/pc_2, others:
 # <method>_1/<method>_2). Reducers persist to reduction_<method>.pkl.
-# With cluster_k: KMeans clustering -> a find_cluster table per DB
-# (cluster_<k>, 1-based IDs ordered by UMAP centroid distance from the plot
-# origin), extra cluster color pages, and one representative-cell sheet per
-# k (cluster_k<k>.pdf, cells rendered as their inference-mode input ->
-# uniform size; needs the model bundle). Models persist to cluster.pkl.
-# cluster: <path to a baseline cluster.pkl> predicts ALL stored k for this
-# dataset instead of re-fitting — cluster IDs stay baseline-aligned
-# (cluster_k is ignored then).
+# With cluster_res: Leiden clustering on a kNN graph of the whitened feature
+# space -> a find_cluster table per DB (cluster_res<resolution>, 1-based IDs
+# ordered by UMAP centroid distance from the plot origin), extra cluster
+# color pages, and one representative-cell sheet per resolution
+# (cluster_res<resolution>.pdf, cells rendered as their inference-mode input
+# -> uniform size; needs the model bundle). Per-resolution kNN classifiers
+# persist to cluster.pkl.
+# cluster: <path to a baseline cluster.pkl> kNN-predicts ALL stored
+# resolutions for this dataset instead of re-fitting — cluster IDs stay
+# baseline-aligned (cluster_res is ignored then).
 reduction:
   method: [umap]                      # list, DR methods to run (subset of pca/umap/pacmap/localmap)
   color_by: null                      # list, null = single light-blue page; first = stratification column
-  cluster_k: null                     # list, KMeans cluster counts; null/empty = no cluster finding (ignored when cluster is set)
+  cluster_res: null                   # list, Leiden resolutions (higher = more clusters); null/empty = no cluster finding (ignored when cluster is set)
   sample_per_class: null              # max points per class to fit reducers; 0/null = all
   # reduction_pca: null                 # path to a pre-fitted reduction_pca.pkl; null = fit new
   # reduction_umap: null                # path to a pre-fitted reduction_umap.pkl; null = fit new

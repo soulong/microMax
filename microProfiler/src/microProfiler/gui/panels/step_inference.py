@@ -62,7 +62,7 @@ class InferenceBlockWidget(QWidget):
         # No-widget reduction keys, round-tripped verbatim from YAML.
         self._method = None
         self._cluster = None
-        self._cluster_k = None
+        self._cluster_res = None
         self._reduction_pacmap = None
         self._reduction_localmap = None
         self._build_ui()
@@ -461,7 +461,7 @@ class InferenceBlockWidget(QWidget):
                 "method": self._method,
                 "color_by": self._color_by.currentText(),
                 "cluster": self._cluster,
-                "cluster_k": self._cluster_k,
+                "cluster_res": self._cluster_res,
                 "sample_per_class": self._sample_per_class.value(),
                 "reduction_pca": self._reducer_pca_path.text().strip() or None,
                 "reduction_umap": self._reducer_umap_path.text().strip() or None,
@@ -568,12 +568,12 @@ class InferenceStepPanel(BlockContainerPanel):
             block.set_channel_state(order, set(channels_cfg))
         red = cfg.get("reduction") or {}
         block._reduction_group.setChecked(bool(red.get("enabled", False)))
-        # method / cluster / cluster_k / reduction_pacmap / reduction_localmap
-        # have no GUI widget — keep the config values verbatim so a YAML with
-        # custom values survives a round-trip.
+        # method / cluster / cluster_res / reduction_pacmap /
+        # reduction_localmap have no GUI widget — keep the config values
+        # verbatim so a YAML with custom values survives a round-trip.
         block._method = red.get("method")
         block._cluster = red.get("cluster")
-        block._cluster_k = red.get("cluster_k")
+        block._cluster_res = red.get("cluster_res")
         block._reduction_pacmap = red.get("reduction_pacmap")
         block._reduction_localmap = red.get("reduction_localmap")
         if red.get("reduction_pca"):

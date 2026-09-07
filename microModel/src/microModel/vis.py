@@ -26,7 +26,9 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from sklearn.metrics import confusion_matrix
 from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
+from sklearn.neighbors import KNeighborsClassifier, kneighbors_graph
+import igraph as ig
+import leidenalg
 import umap
 import pacmap
 
@@ -271,6 +273,10 @@ DR_AXIS_NAMES = {"pca": "PC", "umap": "UMAP", "pacmap": "PaCMAP",
 #: space as the label-refinement clustering workflow).
 UMAP_PRE_COMPONENTS = 50
 
+#: Neighbors per point in the kNN graph feeding Leiden clustering; the same
+#: k is the vote pool when a baseline cluster.pkl predicts new data.
+LEIDEN_N_NEIGHBORS = 15
+
 #: Default scatter color when color_by is null (light blue).
 SINGLE_COLOR = "#87CEEB"
 
@@ -288,6 +294,11 @@ CONTACT_SHEET_MIN_FOREGROUND = 0.10
 
 #: Cap on candidates scanned per cluster while skipping degenerate crops.
 CONTACT_SHEET_MAX_SCAN = 60
+
+#: Max cluster count that still gets a representative-cell contact sheet —
+#: Leiden at high resolution can return hundreds of micro-clusters, which
+#: would blow up the sheet layout (and PDF page size).
+CONTACT_SHEET_MAX_CLUSTERS = 60
 
 
 def _foreground_fraction(img_u8):
@@ -308,6 +319,35 @@ def _build_palette():
         cmap_obj = plt.colormaps[cmap_name]
         palette.extend([cmap_obj(i) for i in range(cmap_obj.N)])
     return palette
+
+
+def _res_tag(res):
+    """Compact resolution tag for table columns / file names (1.0 -> '1')."""
+    return f"{float(res):g}"
+
+
+def _quote_col(name):
+    """Double-quote a SQLite identifier (resolution tags may contain a dot)."""
+    return '"' + name + '"'
+
+
+def _leiden_partition(W, resolution, seed):
+    """Leiden communities over a kNN graph of W (one 0-based label per row).
+
+    Each point is connected to its LEIDEN_N_NEIGHBORS nearest neighbors; the
+    union of the directed kNN edges forms an undirected unweighted graph.
+    Leiden's RBConfiguration model puts `resolution` in the modularity term:
+    higher resolutions yield more, tighter clusters, and the cluster count
+    emerges from the data instead of being configured.
+    """
+    n_neighbors = min(LEIDEN_N_NEIGHBORS, W.shape[0] - 1)
+    A = kneighbors_graph(W, n_neighbors, mode="connectivity", include_self=False)
+    A = A.maximum(A.T).tocoo()  # undirected graph: keep an edge from either side
+    g = ig.Graph(n=W.shape[0], edges=list(zip(A.row.tolist(), A.col.tolist())))
+    part = leidenalg.find_partition(
+        g, leidenalg.RBConfigurationVertexPartition,
+        resolution_parameter=float(resolution), seed=seed)
+    return np.asarray(part.membership, dtype=int)
 
 
 def _plot_reduction_page(X, title, xlabel, ylabel, pdf, labels=None,
@@ -404,8 +444,8 @@ def _plot_reduction_page(X, title, xlabel, ylabel, pdf, labels=None,
 
         # Legend = colored text only (invisible handles carry no marker).
         # With many classes the tall legend stretches the tight bbox and
-        # dwarfs the plot — the centroid annotations identify everything
-        # then, so the legend is limited to readable sizes.
+        # dwarfs the plot, and per-class annotations would overlap into
+        # noise — beyond MAX_LABELED_CLASSES both are skipped.
         if n_cls <= 30:
             handles = [Line2D([], [], linestyle="none") for _ in unique_classes]
             leg = ax.legend(handles, [label_name_map[cls] for cls in unique_classes],
@@ -413,12 +453,12 @@ def _plot_reduction_page(X, title, xlabel, ylabel, pdf, labels=None,
             for text, cls in zip(leg.get_texts(), unique_classes):
                 text.set_color(assigned_color[cls])
 
-        for cls in unique_classes:
-            center = X[labels_arr == cls].mean(axis=0)
-            ax.annotate(label_name_map[cls], center, fontsize=9, weight="bold",
-                        ha="center", va="center", color=assigned_color[cls],
-                        bbox=dict(boxstyle="round,pad=0.3", fc="white",
-                                  ec="gray", alpha=0.8))
+            for cls in unique_classes:
+                center = X[labels_arr == cls].mean(axis=0)
+                ax.annotate(label_name_map[cls], center, fontsize=9, weight="bold",
+                            ha="center", va="center", color=assigned_color[cls],
+                            bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                                      ec="gray", alpha=0.8))
 
     ax.set_title(title)
     ax.set_xlabel(xlabel)
@@ -538,20 +578,21 @@ def _load_cell_image(d, mode, view):
         return None
 
 
-def _write_cluster_sheet(k, ids_all, W, km, dicts, path, mode, view):
-    """Contact-sheet PDF for one k: representative cells per cluster.
+def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
+    """Contact-sheet PDF for one Leiden partition: representative cells per cluster.
 
-    Representatives are the cells nearest each cluster centroid in the
+    Representatives are the cells nearest each cluster's mean in the
     whitened feature space (W), skipping crops whose foreground fraction is
     below CONTACT_SHEET_MIN_FOREGROUND; every cell is rendered as its
     inference-mode input (bundle augmentation_infer pipeline -> uniform
     size). Layout: CONTACT_SHEET_PER_CLUSTER images per cluster,
     CONTACT_SHEET_GROUPS_PER_ROW clusters per row; cluster blocks are ordered
-    by cluster ID.
+    by 1-based cluster ID.
     """
+    n_ids = int(ids_all.max())  # IDs are 1-based
     n_per = CONTACT_SHEET_PER_CLUSTER
     groups = CONTACT_SHEET_GROUPS_PER_ROW
-    rows = -(-k // groups)  # ceil
+    rows = -(-n_ids // groups)  # ceil
     # A narrow empty spacer column after each cluster group keeps adjacent
     # clusters visually separated.
     width_ratios = []
@@ -561,7 +602,7 @@ def _write_cluster_sheet(k, ids_all, W, km, dicts, path, mode, view):
         rows, groups * (n_per + 1),
         figsize=(1.15 * sum(width_ratios), 1.55 * rows),
         squeeze=False, gridspec_kw={"width_ratios": width_ratios})
-    for cid in range(1, k + 1):
+    for cid in range(1, n_ids + 1):
         member = np.where(ids_all == cid)[0]
         r, g = divmod(cid - 1, groups)
         base = g * (n_per + 1)
@@ -569,7 +610,8 @@ def _write_cluster_sheet(k, ids_all, W, km, dicts, path, mode, view):
             for j in range(n_per + 1):
                 axes[r][base + j].axis("off")
             continue
-        dist = np.linalg.norm(W[member] - km.cluster_centers_[cid - 1], axis=1)
+        cent = W[member].mean(axis=0)
+        dist = np.linalg.norm(W[member] - cent, axis=1)
         order = member[np.argsort(dist)]
         # Walk candidates nearest-first, skipping near-empty crops (see
         # CONTACT_SHEET_MIN_FOREGROUND) until n_per valid representatives.
@@ -597,8 +639,8 @@ def _write_cluster_sheet(k, ids_all, W, km, dicts, path, mode, view):
             if j == 0:
                 ax.set_title(f"cluster {cid} (n={member.size})", fontsize=8)
         axes[r][base + n_per].axis("off")  # spacer after the group
-    # Any trailing cluster slot beyond k stays empty.
-    for cid in range(k, rows * groups):
+    # Any trailing cluster slot beyond n_ids stays empty.
+    for cid in range(n_ids, rows * groups):
         r, g = divmod(cid, groups)
         base = g * (n_per + 1)
         for j in range(n_per + 1):
@@ -607,7 +649,7 @@ def _write_cluster_sheet(k, ids_all, W, km, dicts, path, mode, view):
     with PdfPages(path) as pdf:
         pdf.savefig(fig, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Cluster image sheet (k=%d) saved to %s", k, path)
+    logger.info("Cluster image sheet (%d clusters) saved to %s", n_ids, path)
 
 
 def _dr_transform(method, reducer, feats):
@@ -650,20 +692,23 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
     reduction_pca_variance table is no longer written (and dropped if a stale
     copy exists).
 
-    reduction.cluster_k lists KMeans cluster counts run on a whitened
-    PCA space of the features (same space as the label-refinement clustering).
-    Cluster IDs are 1-based and ordered by each cluster's centroid distance to
-    the origin of the reference DR plot (UMAP when present, else the first
-    configured method), so nearby-in-the-plot clusters get nearby IDs. The
-    fitted whitening PCA + per-k KMeans + ID maps persist to cluster.pkl.
+    reduction.cluster_res lists Leiden resolutions, each producing one
+    partition of a kNN graph over a whitened PCA space of the features (same
+    space as the label-refinement clustering; higher resolution = more
+    clusters, and the cluster count emerges from the data). Cluster IDs are
+    1-based and ordered by each cluster's centroid distance to the origin of
+    the reference DR plot (UMAP when present, else the first configured
+    method), so nearby-in-the-plot clusters get nearby IDs. The fitted
+    whitening PCA + per-resolution kNN classifiers persist to cluster.pkl.
     reduction.cluster pointing at a saved cluster.pkl switches to baseline
-    mode: every stored k is PREDICTED for the new data (cluster_k ignored),
-    so cluster IDs stay aligned with the baseline across datasets. IDs go
-    to the find_cluster table (cluster_<k> columns), become extra color pages
-    in every method's PDF, and get a representative-cell sheet per k
-    (cluster_k<k>.pdf — cells rendered as their inference-mode input
-    via the bundle's augmentation_infer pipeline, so all images share one
-    size).
+    mode: every stored resolution is PREDICTED for the new data by a kNN
+    vote over the baseline points (cluster_res ignored), so cluster IDs stay
+    aligned with the baseline across datasets. IDs go to the find_cluster
+    table (one cluster_res<resolution> column per resolution), become extra
+    color pages in every method's PDF, and get a representative-cell sheet
+    per resolution (cluster_res<resolution>.pdf — cells rendered as their
+    inference-mode input via the bundle's augmentation_infer pipeline, so
+    all images share one size).
 
     One multi-page PDF per method (reduction_<method>.pdf): one page per
     color_by entry, then one per cluster k. color_by null = a single page
@@ -715,11 +760,13 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
     color_by_vals = [cb for cb in color_by_vals if cb in valid_color_by]
     first_cb = color_by_vals[0] if color_by_vals else None
 
-    # cluster_k: list of KMeans cluster counts; null/empty/0 entries = skip.
-    cluster_ks = []
-    for k in (red_cfg.get("cluster_k") or []):
-        if k and int(k) not in cluster_ks:
-            cluster_ks.append(int(k))
+    # cluster_res: list of Leiden resolutions; null/empty/nonpositive entries
+    # are dropped. Ignored entirely when `cluster` (baseline predict) is set.
+    cluster_res_list = []
+    for res in (red_cfg.get("cluster_res") or []):
+        res_f = float(res)
+        if res_f > 0 and res_f not in cluster_res_list:
+            cluster_res_list.append(res_f)
 
     # Phase 1: load all DBs and merge features
     out_pairs = resolve_output_paths(data_roots, base_output_dir)
@@ -846,13 +893,14 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
     X_all = X_fit if not sampled else {
         m: _dr_transform(m, reducers[m], feats_all) for m in methods}
 
-    # Phase 5: cluster finding (whitened PCA space, KMeans per k). IDs are
-    # 1-based, ordered by cluster-centroid distance to the origin of the
-    # reference DR plot (UMAP preferred) so plot-nearby clusters get nearby
-    # IDs. Fit fresh (cluster: null — models persisted to cluster.pkl) or
-    # load a baseline cluster.pkl and PREDICT, so new datasets inherit the
-    # baseline's cluster IDs (cluster_k is ignored then; every stored k is
-    # predicted).
+    # Phase 5: cluster finding — Leiden over a kNN graph in a whitened PCA
+    # space, one partition per resolution. IDs are 1-based, ordered by
+    # cluster-centroid distance to the origin of the reference DR plot (UMAP
+    # preferred) so plot-nearby clusters get nearby IDs. Fit fresh (cluster:
+    # null — per-resolution kNN classifiers persisted to cluster.pkl) or
+    # load a baseline cluster.pkl and kNN-predict, so new datasets inherit
+    # the baseline's cluster IDs (cluster_res is ignored then; every stored
+    # resolution is predicted).
     cluster_ids = {}
     cluster_path = red_cfg.get("cluster")
     if cluster_path:
@@ -866,33 +914,45 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                      name="cluster.pkl pca_whiten")
         W = cluster_obj["pca_whiten"].transform(feats_all)
         W = W / np.maximum(np.linalg.norm(W, axis=1, keepdims=True), 1e-8)
-        cluster_ks = sorted(cluster_obj["models"])
-        logger.info("Clustering: loaded baseline %s — predicting all stored "
-                    "k=%s (cluster_k ignored)", cluster_path, cluster_ks)
-        for k in cluster_ks:
-            entry = cluster_obj["models"][k]
-            km, id_map = entry["kmeans"], entry["id_map"]
-            cluster_ids[k] = (id_map[km.predict(W)], km)
-    elif cluster_ks:
+        cluster_res_list = sorted(cluster_obj["models"])
+        logger.info("Clustering: loaded baseline %s — kNN-predicting all stored "
+                    "resolutions %s (cluster_res ignored)",
+                    cluster_path, cluster_res_list)
+        for res in cluster_res_list:
+            cluster_ids[res] = cluster_obj["models"][res]["knn"].predict(W).astype(int)
+    elif cluster_res_list:
         dim = feats_fit.shape[1]
         n_white = min(UMAP_PRE_COMPONENTS, feats_fit.shape[0], dim)
         pca_w = PCA(n_components=n_white, whiten=True).fit(feats_fit)
         W = pca_w.transform(feats_all)
         W = W / np.maximum(np.linalg.norm(W, axis=1, keepdims=True), 1e-8)
         ref = "umap" if "umap" in methods else methods[0]
-        logger.info("Clustering: whitened PCA %dd -> KMeans k=%s (ID order ref: %s)",
-                    n_white, cluster_ks, ref)
+        logger.info("Clustering: whitened PCA %dd -> Leiden on kNN graph, "
+                    "resolutions=%s (ID order ref: %s)",
+                    n_white, cluster_res_list, ref)
         cluster_obj = {"pca_whiten": pca_w, "models": {}}
-        for k in cluster_ks:
-            km = KMeans(n_clusters=k, random_state=seed, n_init=10).fit(W)
-            ref_fit_ids = km.labels_[fit_indices]
-            cent = np.array([X_fit[ref][ref_fit_ids == c].mean(axis=0)
-                             for c in range(k)])
+        for res in cluster_res_list:
+            raw_ids = _leiden_partition(W, res, seed)
+            n_cl = int(raw_ids.max()) + 1
+            # Order clusters by their centroid distance to the reference
+            # plot's origin. A cluster absent from the fit subset (reducer
+            # sampling) sorts last via an infinite distance.
+            ref_fit_ids = raw_ids[fit_indices]
+            cent = np.array([
+                X_fit[ref][ref_fit_ids == c].mean(axis=0)
+                if np.any(ref_fit_ids == c) else np.full(2, np.inf)
+                for c in range(n_cl)])
             order = np.argsort(np.linalg.norm(cent, axis=1))
-            id_map = np.empty(k, dtype=int)
-            id_map[order] = np.arange(1, k + 1)
-            cluster_ids[k] = (id_map[km.labels_], km)
-            cluster_obj["models"][k] = {"kmeans": km, "id_map": id_map}
+            id_map = np.empty(n_cl, dtype=int)
+            id_map[order] = np.arange(1, n_cl + 1)
+            ids = id_map[raw_ids]
+            # Baseline handle: a kNN vote over these very points lets future
+            # datasets inherit this partition's IDs (predict branch above).
+            knn = KNeighborsClassifier(
+                n_neighbors=min(LEIDEN_N_NEIGHBORS, n_all - 1)).fit(W, ids)
+            cluster_ids[res] = ids
+            cluster_obj["models"][res] = {"knn": knn, "n_clusters": n_cl}
+            logger.info("Clustering: resolution %g -> %d clusters", res, n_cl)
         for d in save_dirs:
             save_reducer(cluster_obj, os.path.join(d, "cluster.pkl"))
 
@@ -903,7 +963,7 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                 axis_name = DR_AXIS_NAMES[m]
                 pdf_path = os.path.join(d, f"reduction_{m}.pdf")
                 with PdfPages(pdf_path) as pdf:
-                    if not color_by_vals and not cluster_ks:
+                    if not color_by_vals and not cluster_res_list:
                         _plot_reduction_page(
                             X_fit[m], f"{axis_name} of feature vectors",
                             f"{axis_name} 1", f"{axis_name} 2", pdf)
@@ -915,28 +975,35 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                             f"{axis_name} 1", f"{axis_name} 2", pdf,
                             labels=labels, label_names=label_names,
                             pred_probs=probs_fit, continuous=(cb == "pred_prob"))
-                    for k in cluster_ks:
-                        ids_fit = cluster_ids[k][0][fit_indices]
+                    for res in cluster_res_list:
+                        ids_fit = cluster_ids[res][fit_indices]
+                        n_cl = len(np.unique(ids_fit))
                         _plot_reduction_page(
                             X_fit[m],
-                            f"{axis_name} of feature vectors (colored by cluster, k={k})",
+                            f"{axis_name} of feature vectors (colored by Leiden "
+                            f"cluster, res={_res_tag(res)}, n={n_cl})",
                             f"{axis_name} 1", f"{axis_name} 2", pdf,
                             labels=list(ids_fit),
                             label_names=[str(i) for i in ids_fit])
                 logger.info("Reduction plot saved to %s", pdf_path)
-        # Representative-cell sheet per k (5 inference-mode inputs per
-        # cluster, 5 clusters per row, uniform cell size).
+        # Representative-cell sheet per resolution (5 inference-mode inputs
+        # per cluster, 5 clusters per row, uniform cell size).
         mode = config.get("mode", "single_cell")
         channels_cfg = config["data"].get("channels")
         channels = list(channels_cfg) if channels_cfg else [1]
         channel_layout = config["data"].get("channel_layout")
         cell_view = _build_cell_view(config, mode, channels, channel_layout)
         for d in save_dirs:
-            for k in cluster_ks:
-                ids_all_k, km = cluster_ids[k]
+            for res in cluster_res_list:
+                n_cl = int(cluster_ids[res].max())
+                if n_cl > CONTACT_SHEET_MAX_CLUSTERS:
+                    logger.info("Skipping cluster sheet for resolution %g: "
+                                "%d clusters > %d", res, n_cl,
+                                CONTACT_SHEET_MAX_CLUSTERS)
+                    continue
                 _write_cluster_sheet(
-                    k, ids_all_k, W, km, dicts_all,
-                    os.path.join(d, f"cluster_k{k}.pdf"),
+                    cluster_ids[res], W, dicts_all,
+                    os.path.join(d, f"cluster_res{_res_tag(res)}.pdf"),
                     mode, cell_view)
 
     # Phase 7: write per-DB tables
@@ -971,18 +1038,22 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                 f"VALUES (?, ?, ?)",
                 list(zip(uids, arr[:, 0].tolist(), arr[:, 1].tolist())))
 
-        if cluster_ks:
-            cols = ", ".join(f"cluster_{k} INTEGER NOT NULL" for k in cluster_ks)
-            col_names = ", ".join(f"cluster_{k}" for k in cluster_ks)
-            ph = ", ".join("?" * len(cluster_ks))
+        if cluster_res_list:
+            # Resolution tags may contain a dot ("0.5"), so every identifier
+            # is quoted.
+            cols = ", ".join(f'{_quote_col(f"cluster_res{_res_tag(r)}")} INTEGER NOT NULL'
+                             for r in cluster_res_list)
+            col_names = ", ".join(_quote_col(f"cluster_res{_res_tag(r)}")
+                                  for r in cluster_res_list)
+            ph = ", ".join("?" * len(cluster_res_list))
             conn.execute("DROP TABLE IF EXISTS find_cluster")
             conn.execute(
                 f"CREATE TABLE find_cluster (uid INTEGER PRIMARY KEY, {cols})")
             conn.executemany(
                 f"INSERT OR REPLACE INTO find_cluster (uid, {col_names}) "
                 f"VALUES (?, {ph})",
-                list(zip(uids, *[cluster_ids[k][0][start:end].tolist()
-                                 for k in cluster_ks])))
+                list(zip(uids, *[cluster_ids[r][start:end].tolist()
+                                 for r in cluster_res_list])))
 
         conn.commit()
         conn.close()
@@ -990,9 +1061,9 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                     "/".join(methods), end - start, db_path,
                     time.perf_counter() - t_db0)
 
-    logger.info("Reduction complete: methods=%s, cluster_k=%s, fitted on %d "
+    logger.info("Reduction complete: methods=%s, cluster_res=%s, fitted on %d "
                 "samples, transformed %d DB(s), outputs in %s",
-                methods, cluster_ks or None, feats_fit.shape[0], len(db_entries),
+                methods, cluster_res_list or None, feats_fit.shape[0], len(db_entries),
                 save_dirs)
 
 
