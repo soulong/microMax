@@ -78,7 +78,8 @@ def main():
     p_aug.add_argument("--config", required=True, help="Path to pretrain or train YAML config")
     p_aug.set_defaults(func=cmd_vis_augment)
 
-    p_red = sub.add_parser("vis-reduction", help="Visualize PCA and UMAP reduction of feature vectors")
+    p_red = sub.add_parser("vis-reduction",
+                           help="Fit DR reductions (pca/umap/pacmap/localmap) on feature vectors + optional Leiden clustering; writes reduction_<method>/find_cluster tables and multi-page PDFs")
     p_red.add_argument("--config", required=True, help="Path to inference YAML config")
     p_red.set_defaults(func=cmd_vis_reduction)
 

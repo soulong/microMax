@@ -23,26 +23,27 @@ image_subdir_pattern: Images
 # `timepoint`/extra columns instead.
 filter: null
 
-# pre-processing
+# pre-processing (each step has a `run` flag — default false, nothing runs
+# unless enabled; steps modify the source TIFFs IN PLACE, once each)
 resize:
   run: false
-  scale_factor: 0.5
+  scale_factor: 0.5                   # isotropic rescale of every image
 
 zproject:
   run: false
-  method: max
+  method: max                         # z-stack projection (needs a `stack` column)
 
 basic:
   run: false
-  mode: fit-transform
-  n_image: 100
-  working_size: 64
-  enable_darkfield: false
+  mode: fit-transform                 # fit shading models + apply them
+  n_image: 100                        # images sampled to fit the models
+  working_size: 64                    # downscaled width used while fitting
+  enable_darkfield: false             # also estimate + remove darkfield offset
 
 tile:
   run: false
-  tile_width: 1024
-  tile_height: 1024
+  tile_width: 1024                    # needs a `field` column; only complete
+  tile_height: 1024                   # tiles are written
 
 # segmentation
 segment:
@@ -50,17 +51,17 @@ segment:
   configs:
     - object_name: cell
       model_name: cpdino
-      chan1:
+      chan1:                           # cytoplasm channel(s); averaged if several
         - ch1
         - ch2
-      chan2: null
-      merge1: mean
+      chan2: null                      # nuclear channel (cellpose two-channel mode)
+      merge1: mean                     # how chan1 channels combine before the model
       merge2: mean
-      resize_factor: 0.5
-      diameter: null
+      resize_factor: 0.5               # images are downscaled before segmentation
+      diameter: null                   # null = cellpose auto diameter
       flow_threshold: 0.4
       cellprob_threshold: 0.0
-      gpu_batch_size: 32
+      gpu_batch_size: 32               # images per GPU batch (0/1 = no batching)
     - object_name: nuclei
       model_name: cpdino
       chan1:
@@ -74,7 +75,7 @@ segment:
       cellprob_threshold: 0.0
       gpu_batch_size: 32
 
-# image profiling
+# image profiling (per-site whole-image intensity table in result.db)
 # image_channels: null/absent/[] skips the step entirely (like the GUI's
 # blocked Run with no selection). To profile channels, list them explicitly.
 image_profile:
@@ -82,28 +83,28 @@ image_profile:
   n_workers: 6
   image_channels:
     - ch1
-  image_thresholds: null
+  image_thresholds: null               # optional per-channel foreground thresholds
 
-# object profiling
+# object profiling (one result.db table per block; features per single cell)
 object_profile:
   run: true
   n_workers: 8
   configs:
-    - mask_name: cell
-      parent_mask_name: null
-      output_table_name: cell
-      intensity_channels:
+    - mask_name: cell                 # which masks to crop objects from
+      parent_mask_name: null          # parent objects this one lives in (e.g. cell for nuclei)
+      output_table_name: cell         # table name in result.db
+      intensity_channels:             # per-channel mean/std/intensity stats
         - ch1
-      radial_channels: null
+      radial_channels: null           # radial distribution profiles; null = off
       radial_bins: 4
-      gran_channels:
+      gran_channels:                  # granularity (texture spectra) channels
         - ch1
       gran_spectrum_length: 8
-      gran_subsample_ratio: 0.5
+      gran_subsample_ratio: 0.5       # pixel subsampling inside the object
       gran_background_subsample_ratio: 0.25
-      gran_background_radius: 10
-      glcm_channels: null
-      correlation_pairs: null
+      gran_background_radius: 10      # background ring width around the object
+      glcm_channels: null             # GLCM texture features; null = off
+      correlation_pairs: null         # channel-pair correlations; null = off
     - mask_name: nuclei
       parent_mask_name: cell
       output_table_name: nuclei
@@ -132,8 +133,11 @@ object_profile:
 #       output_db: infer.db
 #       max_value: 65535
 #       reduction:                # omit/null = no dimension reduction
-#         enabled: true           # runs BOTH pca (0.95 var) + umap
+#         enabled: true
+#         method: [pca, umap]     # subset of pca/umap/pacmap/localmap; null = [pca, umap]
 #         color_by: pred_class    # pred_class | directory | pred_prob | ground_truth
+#         cluster_res: [0.5, 1]   # Leiden resolutions (higher = more clusters); null/[] = no cluster finding
 #         sample_per_class: 10000
-#         reducer_pca: null       # provided -> transform only, else fit+save
-#         reducer_umap: null
+#         reduction_pca: null     # provided -> transform only, else fit+save
+#         reduction_umap: null
+#         cluster: null           # baseline cluster.pkl -> kNN-predict its stored resolutions
