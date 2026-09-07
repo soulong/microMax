@@ -214,7 +214,10 @@ def segment_dataset(
     device = _get_device()
     normalize = normalize or {"percentile": [0.1, 99.9]}
 
-    progress.report("Segment", 0, 1, "Loading Cellpose model...")
+    # Report under the step key the pipeline started ("segment (<obj>)"),
+    # not a bare "Segment" — the GUI status bar groups by key.
+    step_key = f"segment ({object_name})"
+    progress.report(step_key, 0, 1, "Loading Cellpose model...")
     logger.info("Loading Cellpose model '%s'...", model_name)
     model = models.CellposeModel(device=device, pretrained_model=model_name)
     diameter_val = None if diameter is None or diameter <= 0 else int(diameter * resize_factor)
@@ -223,7 +226,7 @@ def segment_dataset(
 
     metadata = ds.metadata
     for idx in tqdm(range(len(metadata)), desc="Cellpose", unit="img", disable=(sys.stdout is None and sys.stderr is None)):
-        progress.report("Segment", idx, len(metadata), f"Image {idx}")
+        progress.report(step_key, idx, len(metadata), f"Image {idx}")
         row = metadata.iloc[idx]
         stem_ch = chan1[0]
         stem_val = row[stem_ch] if stem_ch in row.index else None

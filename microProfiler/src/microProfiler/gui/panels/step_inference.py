@@ -30,7 +30,7 @@ DEFAULT_MAX_VALUE = 65535.0
 # Image dtype -> max possible intensity (matches microVis's DTYPE_MAX).
 _DTYPE_MAX = {
     "uint8": 255.0,
-    "int8": 255.0,
+    "int8": 127.0,
     "uint16": 65535.0,
     "uint32": 4294967295.0,
     "float32": 1.0,
@@ -219,7 +219,7 @@ class InferenceBlockWidget(QWidget):
         row_red2.addSpacing(10)
         row_red2.addWidget(QLabel("Samples per class:"))
         self._sample_per_class = QSpinBox()
-        self._sample_per_class.setRange(1, 1000000)
+        self._sample_per_class.setRange(0, 1000000)
         self._sample_per_class.setValue(10000)
         self._sample_per_class.setFixedWidth(80)
         self._sample_per_class.setButtonSymbols(QAbstractSpinBox.NoButtons)

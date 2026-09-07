@@ -12,7 +12,6 @@ from microProfiler.config import config_to_dict, load_config, PipelineConfig, re
 from microProfiler.io import Database
 from microProfiler.log_utils import set_default_logging_level, setup_logging
 from microProfiler.pipeline import apply_filters, run_pipeline
-from microProfiler.pipeline.errors import MetadataValidationError
 from microProfiler.pipeline._micromodel_bridge import (
     INFERENCE_TABLE,
     expected_reduction_tables,
@@ -256,43 +255,44 @@ def main(argv: list[str] | None = None) -> int:
         processed = 0
         skipped = 0
 
-        for dataset_dir in datasets:
-            if _is_dataset_complete(cfg, dataset_dir):
-                logger.info("Skipping %s — already processed (delete result.db to re-run)", dataset_dir)
+        for ds_dir in datasets:
+            if _is_dataset_complete(cfg, ds_dir):
+                logger.info("Skipping %s — already processed (delete result.db to re-run)", ds_dir)
                 skipped += 1
                 continue
 
-            logger.info("Processing dataset: %s", dataset_dir)
+            logger.info("Processing dataset: %s", ds_dir)
             try:
                 # applied_steps are persisted inside run_pipeline (per executed
                 # step), so a later failure never loses the in-place steps.
                 ds, _ = run_pipeline(
-                    cfg, root_dir=dataset_dir, log_file=args.log_file,
+                    cfg, root_dir=ds_dir, log_file=args.log_file,
                 )
                 cfg_dict = config_to_dict(cfg)
-                sf = SessionFile(dataset_dir)
+                sf = SessionFile(ds_dir)
                 sf.save(cfg_dict)
-                logger.info("Dataset complete: %s", dataset_dir)
+                logger.info("Dataset complete: %s", ds_dir)
                 processed += 1
                 print()
-            except MetadataValidationError as e:
-                print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
             except (ValueError, TypeError) as e:
-                # Invalid config / bad types (e.g. scale_factor: "2") — clean
-                # hard-exit, not a raw traceback.
-                print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
+                # Per-dataset failures (e.g. zproject needs a 'stack' column
+                # this dataset's pattern doesn't capture, BaSiC shape
+                # mismatch). Config-level ValueErrors already hard-exited at
+                # load_config above — treat everything in-loop as dataset-
+                # specific so one bad dataset never aborts a plate scan.
+                logger.error("Dataset failed: %s — %s", ds_dir, e)
+                logger.info("Continuing to next dataset...")
+                print()
             except SystemExit as e:
                 # microBase hard-exits (sys.exit) on bad dataset state (missing
                 # files, invalid filter column, corrupt TIFF). Treat it as a
                 # per-dataset failure so one bad dataset never aborts a plate
                 # scan — the same policy _is_dataset_complete applies above.
-                logger.error("Dataset failed: %s — %s", dataset_dir, e)
+                logger.error("Dataset failed: %s — %s", ds_dir, e)
                 logger.info("Continuing to next dataset...")
                 print()
             except Exception as e:
-                logger.error("Dataset failed: %s — %s", dataset_dir, e)
+                logger.error("Dataset failed: %s — %s", ds_dir, e)
                 logger.info("Continuing to next dataset...")
                 print()
 

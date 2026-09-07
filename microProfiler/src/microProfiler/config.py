@@ -42,27 +42,40 @@ class FilterEntry:
 
 @dataclass
 class ResizeConfig:
+    """Rescale every image (in place) by an isotropic factor."""
+
     run: bool = False
-    scale_factor: float = 1.0
+    scale_factor: float = 1.0          # > 0; e.g. 0.5 halves both dimensions
 
 
 @dataclass
 class BasicConfig:
+    """BaSiC illumination correction (in place). Models live under
+    <dataset>/.microprofiler/BaSiC_model/."""
+
     run: bool = False
-    mode: str = "fit-transform"
-    n_image: int = 100
-    working_size: int = 64
-    enable_darkfield: bool = False
+    mode: str = "fit-transform"        # fit | transform | fit-transform
+    n_image: int = 100                 # images sampled to fit the shading models
+    working_size: int = 64             # downscaled width used while fitting
+    enable_darkfield: bool = False     # also estimate + remove darkfield offset
 
 
 @dataclass
 class ZProjectConfig:
+    """Project each z-stack to a single plane (in place; needs a `stack` column)."""
+
     run: bool = False
-    method: ProjectionMethod = ProjectionMethod.max
+    method: ProjectionMethod = ProjectionMethod.max   # projection method name
 
 
 @dataclass
 class TileConfig:
+    """Split each image into tiles (in place; needs a `field` column).
+
+    Only complete tiles are written — right/bottom remainders (and images
+    smaller than the tile size) are intentionally dropped.
+    """
+
     run: bool = False
     tile_width: int = 1024
     tile_height: int = 1024
@@ -70,18 +83,20 @@ class TileConfig:
 
 @dataclass
 class SegmentEntry:
-    object_name: str = "cell"
-    model_name: str = "cpdino"
-    chan1: List[str] = field(default_factory=list)
-    chan2: Optional[List[str]] = None
-    merge1: str = "mean"
+    """One Cellpose run over the dataset, writing <stem>_cp_masks_<object_name>.png."""
+
+    object_name: str = "cell"          # mask name, used by profiling/inference
+    model_name: str = "cpdino"         # cellpose model (cpdino / cpdino-vitb / ...)
+    chan1: List[str] = field(default_factory=list)   # cytoplasm channel(s); [] = block skipped (never "all")
+    chan2: Optional[List[str]] = None  # nuclear channel(s) for two-channel models
+    merge1: str = "mean"               # how chan1 channels combine before the model
     merge2: str = "mean"
-    resize_factor: float = 0.5
-    diameter: Optional[float] = None
-    flow_threshold: float = 0.4
-    cellprob_threshold: float = 0.0
-    gpu_batch_size: int = 32
-    overwrite_mask: bool = False
+    resize_factor: float = 0.5         # images are downscaled by this before segmentation
+    diameter: Optional[float] = None   # object diameter in px; null = cellpose auto
+    flow_threshold: float = 0.4        # cellpose flow-error threshold
+    cellprob_threshold: float = 0.0    # cellpose cell-probability threshold
+    gpu_batch_size: int = 32           # images per GPU batch (<= 1 = no batching)
+    overwrite_mask: bool = False       # re-segment when a mask file already exists
 
 
 @dataclass
@@ -92,30 +107,38 @@ class SegmentConfig:
 
 @dataclass
 class ImageProfileConfig:
+    """Per-site whole-image intensity table (`image` in result.db)."""
+
     run: bool = False
     n_workers: int = field(default_factory=default_n_workers)
-    image_channels: Optional[List[str]] = None
-    image_thresholds: Optional[Dict[str, float]] = None
+    image_channels: Optional[List[str]] = None   # channels to profile; null/[] = step skipped (never "all")
+    image_thresholds: Optional[Dict[str, float]] = None   # optional per-channel foreground thresholds
 
 
 @dataclass
 class ObjectProfileEntry:
-    mask_name: Optional[str] = None
-    parent_mask_name: Optional[str] = None
-    output_table_name: Optional[str] = None
-    overwrite_db: bool = False
-    intensity_channels: Optional[List[str]] = None
-    radial_channels: Optional[List[str]] = None
-    radial_bins: int = 4
-    gran_channels: Optional[List[str]] = None
-    gran_spectrum_length: Optional[int] = None
-    gran_subsample_ratio: Optional[float] = None
-    gran_background_subsample_ratio: Optional[float] = None
-    gran_background_radius: Optional[int] = None
-    glcm_channels: Optional[List[str]] = None
-    glcm_distances: Optional[List[int]] = None
-    glcm_levels: Optional[int] = None
-    correlation_pairs: Optional[List[List[str]]] = None
+    """Per-object features for one mask type — one table in result.db.
+
+    All channel lists mean "these channels"; null/[] skips that feature
+    group (never an implicit "all channels").
+    """
+
+    mask_name: Optional[str] = None                 # which masks to crop objects from
+    parent_mask_name: Optional[str] = None          # parent objects this one lives in (e.g. cell for nuclei)
+    output_table_name: Optional[str] = None         # result.db table name; null = mask_name
+    overwrite_db: bool = False                      # drop + rewrite the table on re-run
+    intensity_channels: Optional[List[str]] = None  # per-channel intensity stats; null/[] = block skipped
+    radial_channels: Optional[List[str]] = None     # radial distribution profile channels
+    radial_bins: int = 4                            # radial bins per profile
+    gran_channels: Optional[List[str]] = None       # granularity (texture spectrum) channels
+    gran_spectrum_length: Optional[int] = None      # spectrum length (resolved default 8)
+    gran_subsample_ratio: Optional[float] = None    # (0, 1] pixel subsample inside the object
+    gran_background_subsample_ratio: Optional[float] = None   # (0, 1] subsample of the background ring
+    gran_background_radius: Optional[int] = None    # background ring width (px) around the object
+    glcm_channels: Optional[List[str]] = None       # GLCM texture feature channels
+    glcm_distances: Optional[List[int]] = None      # GLCM offsets in px (resolved default [2])
+    glcm_levels: Optional[int] = None               # GLCM gray levels (resolved default 256)
+    correlation_pairs: Optional[List[List[str]]] = None   # channel pairs for Pearson correlation
 
     def resolved(self) -> "ResolvedProfiling":
         gran_spectrum_length = self.gran_spectrum_length if self.gran_spectrum_length is not None else 8
@@ -299,14 +322,28 @@ def _dict_to_config(d: Dict) -> PipelineConfig:
 
 
 def _coerce_bool(value: Any, attr: str) -> bool:
-    """Strict boolean parse — a YAML 'run' flag must be a real bool.
+    """Strict boolean parse — a config bool must be a real bool.
 
     Quoted strings like "false" are rejected (no lenient dual-form parsing);
     the user is responsible for writing config values with correct types.
+    Without this, a "false" string is truthy in Python and silently ENABLES
+    the flag it names.
     """
     if isinstance(value, bool):
         return value
     raise ValueError(f"'{attr}' must be a real boolean (true/false), got {value!r}")
+
+
+def _coerce_bool_fields(attr: str, cls, values: Dict) -> Dict:
+    """Strictly validate every bool-typed dataclass field present in values.
+
+    Applied to all sections/entries (not just `run`): a YAML `overwrite_db:
+    "false"` must be rejected, not silently treated as enabled.
+    """
+    for name, f in cls.__dataclass_fields__.items():
+        if f.type in (bool, "bool") and name in values and values[name] is not None:
+            values[name] = _coerce_bool(values[name], f"{attr}.{name}")
+    return values
 
 
 def _check_keys(attr: str, section: Dict, known: set) -> None:
@@ -382,6 +419,20 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
                    "'object_profile.configs[].gran_spectrum_length' must be >= 1")
             _check(entry.glcm_levels is None or entry.glcm_levels >= 2,
                    "'object_profile.configs[].glcm_levels' must be >= 2")
+            # Range-validate the granularity/GLCM knobs here rather than per
+            # row: the profiler skips failing rows silently, so an
+            # out-of-range YAML value would otherwise yield empty tables
+            # with no error.
+            _check(entry.gran_subsample_ratio is None or 0 < entry.gran_subsample_ratio <= 1,
+                   "'object_profile.configs[].gran_subsample_ratio' must be in (0, 1]")
+            _check(entry.gran_background_subsample_ratio is None
+                   or 0 < entry.gran_background_subsample_ratio <= 1,
+                   "'object_profile.configs[].gran_background_subsample_ratio' must be in (0, 1]")
+            _check(entry.gran_background_radius is None or entry.gran_background_radius >= 1,
+                   "'object_profile.configs[].gran_background_radius' must be >= 1")
+            _check(entry.glcm_distances is None
+                   or all(d >= 1 for d in entry.glcm_distances),
+                   "'object_profile.configs[].glcm_distances' values must be >= 1")
             entries.append(entry)
         n_workers = section.get("n_workers")
         if n_workers is None:
@@ -408,6 +459,16 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
                 _dataclass_from_section(attr, InferenceReductionConfig, red)
                 if red else None
             )
+            if red_obj is not None and red_obj.method:
+                # Reject typos here (not silently filter downstream), so a
+                # bad method can never make the completeness check pass
+                # without the matching table existing.
+                bad = [m for m in red_obj.method
+                       if m not in ("pca", "umap", "pacmap", "localmap")]
+                if bad:
+                    raise ValueError(
+                        f"'inference.configs[].reduction.method' has unknown "
+                        f"entries {bad}; valid: ['pca', 'umap', 'pacmap', 'localmap']")
             entry.reduction = red_obj
             entries.append(entry)
         return InferenceConfig(
@@ -434,6 +495,7 @@ def _dataclass_from_section(attr: str, cls, section: Dict):
         k: (None if isinstance(v, list) and not v else v)
         for k, v in section.items()
     }
+    coerced = _coerce_bool_fields(attr, cls, coerced)
     if "run" in coerced:
         coerced["run"] = _coerce_bool(coerced["run"], f"{attr}.run")
     return cls(**coerced)
@@ -452,10 +514,11 @@ def _entry_from_section(attr: str, cls, entry: Dict):
             f"Unknown keys in '{attr}.configs' entry: {sorted(unknown)}. "
             f"Valid keys: {sorted(known)}"
         )
-    return cls(**{
+    coerced = {
         k: (None if isinstance(v, list) and not v else v)
         for k, v in entry.items()
-    })
+    }
+    return cls(**_coerce_bool_fields(f"{attr}.configs", cls, coerced))
 
 
 def config_to_dict(cfg: PipelineConfig) -> Dict:

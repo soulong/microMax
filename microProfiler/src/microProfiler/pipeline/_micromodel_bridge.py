@@ -29,20 +29,19 @@ REDUCTION_TABLES = frozenset({
     "find_cluster",
 })
 
-_DR_METHODS = ("pca", "umap", "pacmap", "localmap")
-
 
 def expected_reduction_tables(entry) -> frozenset:
     """Tables show_reduction will write for one entry's reduction config.
 
     One reduction_<method> table per configured method (default [pca, umap])
     plus find_cluster when cluster_res is set — the completeness check must
-    not demand tables for methods the entry doesn't run.
+    not demand tables for methods the entry doesn't run. Methods are
+    validated at config-parse time, so no filtering here.
     """
     if not (entry.reduction and entry.reduction.enabled):
         return frozenset()
     methods = entry.reduction.method if entry.reduction.method else ["pca", "umap"]
-    tables = {f"reduction_{m}" for m in methods if m in _DR_METHODS}
+    tables = {f"reduction_{m}" for m in methods}
     # find_cluster is written both by a fresh cluster_res fit and by a
     # baseline cluster.pkl predict.
     if entry.reduction.cluster_res or entry.reduction.cluster:

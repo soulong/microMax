@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,25 @@ from microProfiler.gui.workers.pipeline_worker import PipelineWorker
 from microProfiler.io import clone_dataset
 
 logger = logging.getLogger(__name__)
+
+
+def _config_error_dialog(method):
+    """Turn config-validation ValueErrors into a dialog instead of a stack trace.
+
+    section_to_dataclass raises ValueError for invalid panel state; raised
+    inside a Qt slot that only prints (and is completely silent under
+    pythonw). Some entry points also set running=True BEFORE building the
+    config, so the handler resets the running state as well.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except ValueError as e:
+            self._view.set_running(False)
+            logger.warning("Config error: %s", e)
+            QMessageBox.warning(self._view.widget(), "Invalid Configuration", str(e))
+    return wrapper
 
 
 class PipelineController(QObject):
@@ -242,6 +262,7 @@ class PipelineController(QObject):
                 )
         return None
 
+    @_config_error_dialog
     def run_preprocessing(self) -> None:
         if self._view.running or self._missing_input():
             return
@@ -251,15 +272,15 @@ class PipelineController(QObject):
         self._view.set_running(True)
 
         cfg = self._build_base_config()
-        executed_steps = []
+        enabled_panels = []
         for step in self._view.get_preprocessing_steps():
             section = step.to_config()
             if section and step.is_enabled():
                 attr = step.step_name
                 setattr(cfg, attr, section_to_dataclass(attr, section))
-                executed_steps.append(step)
+                enabled_panels.append(step)
 
-        if not executed_steps:
+        if not enabled_panels:
             QMessageBox.information(
                 self._view.widget(), "No Steps To Run",
                 "Check the checkbox on each step panel to enable it."
@@ -285,6 +306,7 @@ class PipelineController(QObject):
         logger.info("Preprocessing complete.")
         self._save_session_yml(executed_steps=self._worker._applied_steps)
 
+    @_config_error_dialog
     def run_segmentation(self) -> None:
         if self._view.running or self._missing_input():
             return
@@ -318,6 +340,7 @@ class PipelineController(QObject):
         self._save_session_yml(executed_steps=self._worker._applied_steps)
         self._update_dataset_after_step("segment")
 
+    @_config_error_dialog
     def run_profiling(self) -> None:
         if self._view.running or self._missing_input():
             return
@@ -382,6 +405,7 @@ class PipelineController(QObject):
         # a section with no channels is skipped and never marked applied).
         self._save_session_yml(executed_steps=self._worker._applied_steps)
 
+    @_config_error_dialog
     def run_inference(self) -> None:
         if self._view.running or self._missing_input():
             return
@@ -424,6 +448,7 @@ class PipelineController(QObject):
         # the worker's _applied_steps is None then and nothing is recorded.
         self._save_session_yml(executed_steps=self._worker._applied_steps)
 
+    @_config_error_dialog
     def run_all(self) -> None:
         if self._view.running or self._missing_input():
             return
@@ -500,6 +525,7 @@ class PipelineController(QObject):
         self._save_session_yml(executed_steps=self._worker._applied_steps)
         self._update_dataset_after_step("pipeline")
 
+    @_config_error_dialog
     def apply_step(self, step) -> None:
         if self._view.running:
             return
@@ -694,10 +720,13 @@ class PipelineController(QObject):
             raise
         if not started:
             # Worker thread still busy — it silently declined to start; the
-            # pending flag and override cursor must not stay stuck forever.
+            # pending markers and override cursor must not stay stuck forever.
             QApplication.restoreOverrideCursor()
             self._preview_running = False
+            self._preview_pending_step = None
+            self._preview_block_index = None
 
+    @_config_error_dialog
     def preview_step(self, step) -> None:
         if self._preview_running:
             return

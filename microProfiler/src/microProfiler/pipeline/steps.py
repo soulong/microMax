@@ -3,8 +3,8 @@
 The step keys ARE the config section names (``resize``, ``zproject``,
 ``basic``, ``tile``, ``segment``, ``image_profile``, ``object_profile``,
 ``inference``) and match the ``applied_steps`` entries, so a step that ran
-via ``run_pipeline`` can be re-run via ``run_step`` and vice versa. Keep
-``STEP_ORDER`` in sync with ``config.SECTION_ATTRS``.
+via ``run_pipeline`` can be re-run via ``run_step`` and vice versa.
+``STEP_ORDER`` is derived from ``config.SECTION_ATTRS``.
 """
 
 from __future__ import annotations
@@ -15,19 +15,20 @@ from pathlib import Path
 
 from microBase import ImageDataset
 
-from microProfiler.config import PipelineConfig, resolve_inference_db
+from microProfiler.config import (
+    SECTION_ATTRS,
+    PipelineConfig,
+    resolve_inference_db,
+)
 from microProfiler.io import Database
 from microProfiler.pipeline.errors import MetadataValidationError
 from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
 
 logger = logging.getLogger(__name__)
 
-# Canonical step order — the single source of truth for run_pipeline's loop
-# (must mirror config.SECTION_ATTRS).
-STEP_ORDER = [
-    "resize", "zproject", "basic", "tile", "segment",
-    "image_profile", "object_profile", "inference",
-]
+# Canonical step order — derived from config.SECTION_ATTRS (the single
+# source of truth) so the two lists can never drift apart.
+STEP_ORDER = list(SECTION_ATTRS)
 
 # In-place preprocessing steps: gated by applied_steps (never re-run on
 # already-processed files). segment/profile/inference are non-destructive
@@ -357,7 +358,7 @@ def _run_inference(
         progress.step_end(f"inference ({label})", f"Inference complete ({label})")
         if "reduction" in mm_cfg:
             progress.step_start(
-                f"reduction ({label})", f"Fitting PCA + UMAP ({label})...",
+                f"reduction ({label})", f"Fitting DR reduction ({label})...",
             )
             _call_micromodel(
                 run_mm_reduction, mm_cfg,
@@ -381,11 +382,14 @@ _STEP_FUNCTIONS = {
 }
 
 
-def _step_will_execute(cfg: PipelineConfig, step_name: str) -> bool:
+def _step_will_execute(cfg: PipelineConfig, step_name: str, root_dir=None) -> bool:
     """True when the section is enabled AND at least one unit will run.
 
     A block whose channel list is empty is skipped at runtime (empty means
     "skip", never "all"), so it must not be recorded in applied_steps.
+    Transform-only BaSiC with no fitted models likewise transforms nothing
+    (every channel is skipped with a warning) and must not be recorded —
+    recording it would permanently gate future fit-transform runs.
     """
     section = getattr(cfg, step_name, None)
     if not section or not section.run:
@@ -398,6 +402,13 @@ def _step_will_execute(cfg: PipelineConfig, step_name: str) -> bool:
         return any(e.chan1 for e in section.configs)
     if step_name == "inference":
         return any(e.channels for e in section.configs)
+    if step_name == "basic":
+        if getattr(section, "mode", None) != "transform":
+            # "fit" is never recorded (fit-only intent); "fit-transform"
+            # fits fresh models first, so the transform has work to do.
+            return True
+        model_dir = Path(root_dir) / ".microprofiler" / "BaSiC_model" if root_dir else None
+        return bool(model_dir and any(model_dir.glob("*.pkl")))
     return True
 
 

@@ -61,15 +61,14 @@ class PreviewWorker(QObject):
                 return
 
             row = self._dataset.metadata.iloc[self._row_idx]
-            row_dir = Path(row["directory"])
 
-            # Always collect before images
+            # Always collect before images. Channel columns hold absolute
+            # file paths (microBase convention) — use them directly.
             before_channels: List[Tuple[str, np.ndarray]] = []
             for ch in self._dataset.intensity_colnames:
                 if self._cancel_event.is_set():
                     raise InterruptedError
-                path = row_dir / row[ch]
-                before_channels.append((ch, read_image(path)))
+                before_channels.append((ch, read_image(row[ch])))
 
             after_channels: List[Tuple[str, np.ndarray]] = []
             extra: dict = {}

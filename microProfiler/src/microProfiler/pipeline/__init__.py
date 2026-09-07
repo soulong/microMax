@@ -76,7 +76,7 @@ def run_step(
         ds = _build_dataset(cfg, root_dir)
     kwargs = {"result_db": result_db} if step_name in _PROFILE_STEPS else {}
     ds = fn(cfg, ds, root_dir, progress, **kwargs)
-    if _step_will_execute(cfg, step_name) and not (
+    if _step_will_execute(cfg, step_name, root_dir) and not (
         step_name == "basic" and _is_fit_only_basic(cfg)
     ):
         _persist_applied(root_dir, [step_name])
@@ -134,7 +134,7 @@ def run_pipeline(
             continue
         kwargs = {"result_db": result_db} if step_name in _PROFILE_STEPS else {}
         ds = _STEP_FUNCTIONS[step_name](cfg, ds, root_dir, progress, **kwargs)
-        if _step_will_execute(cfg, step_name) and not fit_only:
+        if _step_will_execute(cfg, step_name, root_dir) and not fit_only:
             logger.info("%s step done", step_name)
             applied_steps.append(step_name)
             # Persist per completed step so a later failure or cancel keeps

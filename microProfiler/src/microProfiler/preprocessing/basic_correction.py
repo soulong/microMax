@@ -94,7 +94,7 @@ def fit_models(
     logger.info("BaSiC fitting channels")
     fitted_any = False
     for ci, chan in enumerate(channels):
-        progress.report("BaSiC Fit", ci, len(channels), f"Fitting channel {chan}")
+        progress.report("basic", ci, len(channels), f"Fit: channel {chan}")
         paths = [
             Path(metadata.iloc[i][chan])
             for i in range(len(metadata))
@@ -121,7 +121,7 @@ def fit_models(
                 model.darkfield.astype(np.float32),
             )
 
-    progress.report("BaSiC Fit", len(channels), len(channels), "Fit complete")
+    progress.report("basic", len(channels), len(channels), "Fit complete")
     # Only mark the fit-order when at least one model was actually fitted —
     # an all-skipped run must not advertise fresh models.
     if fitted_any:
@@ -146,7 +146,7 @@ def transform_images(
         # Channel-level progress (2/4 style), mirroring fit_models — reported
         # for every channel (skipped ones still advance the counter). The
         # per-image tqdm below keeps the fine-grained view in the terminal.
-        progress.report("BaSiC Transform", ci, len(channels), f"Channel {chan}")
+        progress.report("basic", ci, len(channels), f"Transform: channel {chan}")
 
         model_path = root / ".microprofiler" / "BaSiC_model" / f"{chan}.pkl"
         if not model_path.exists():
@@ -178,7 +178,7 @@ def transform_images(
             corrected = corrected.astype(dtype_in)
             write_image(src, corrected)
 
-    progress.report("BaSiC Transform", len(channels), len(channels), "Transform complete")
+    progress.report("basic", len(channels), len(channels), "Transform complete")
 
     return rebuild_dataset(ds)
 
@@ -189,8 +189,10 @@ def _validate_shapes(ds: ImageDataset, n_image: int = 100) -> None:
     metadata = ds.metadata
     sample_paths: List[Path] = []
     for chan in channels:
+        # Channel columns hold absolute file paths (microBase convention) —
+        # never join them with the (root-relative) directory column.
         paths = [
-            Path(metadata.iloc[i]["directory"]) / metadata.iloc[i][chan]
+            Path(metadata.iloc[i][chan])
             for i in range(len(metadata))
             if pd.notna(metadata.iloc[i].get(chan))
         ]
