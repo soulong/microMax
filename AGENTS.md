@@ -43,8 +43,9 @@ Console scripts after install:
 
 * `microBase` is the only package the three consumers (`microProfiler`,
   `microVis`, `microModel`) import. `microModel` additionally depends on
-  `lightly` (SSL heads/losses), `timm` (backbones) and `pacmap`
-  (PaCMAP/LocalMAP dimensionality reduction).
+  `lightly` (SSL heads/losses), `timm` (backbones), `pacmap`
+  (PaCMAP/LocalMAP dimensionality reduction) and `leidenalg`/`igraph`
+  (Leiden cluster finding on a kNN graph).
 
 * The three consumers never import each other directly, with ONE exception:
   `microProfiler` lazily imports `microModel` in its inference step.
@@ -179,7 +180,7 @@ The pipeline:
   bars/signals for GUI). Workers are cancellable at checkpoints.
 
 * The optional inference step lazily imports microModel to run per-object
-  inference and optional PCA/UMAP reduction, writing a per-block DB under the
+  inference and optional DR reduction (pca/umap/pacmap/localmap), writing a per-block DB under the
   dataset dir.
 
 * Outputs: in-place processed TIFFs, `<stem>_cp_masks_<obj>.png` masks,
