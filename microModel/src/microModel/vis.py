@@ -270,9 +270,20 @@ DR_METHODS = ("pca", "umap", "pacmap", "localmap")
 DR_AXIS_NAMES = {"pca": "PC", "umap": "UMAP", "pacmap": "PaCMAP",
                  "localmap": "LocalMAP"}
 
-#: PCA component count feeding UMAP and the cluster finder (same whitened
-#: space as the label-refinement clustering workflow).
+#: PCA component count feeding UMAP (visualization only — a fixed 50 keeps
+#: the embedding input stable; the clustering space has its own
+#: variance-based rule below).
 UMAP_PRE_COMPONENTS = 50
+
+#: Whitened clustering space dimensionality: the smallest component count k
+#: covering CLUSTER_VARIANCE_TARGET of the feature variance (adaptive across
+#: backbones/feature dims, measured on the fit subset), capped at
+#: CLUSTER_MAX_COMPONENTS. The cap matters because whiten=True rescales EVERY
+#: retained component to unit variance — an uncapped tail (e.g. 95% of a
+#: 384-d DINOv3 embedding needs ~133 comps) would noise-amplify directions
+#: carrying ~0.1% variance each to the same footing as the signal.
+CLUSTER_VARIANCE_TARGET = 0.95
+CLUSTER_MAX_COMPONENTS = 100
 
 #: Neighbors per point in the kNN graph feeding Leiden clustering; the same
 #: k is the vote pool when a baseline cluster.pkl predicts new data.
@@ -281,9 +292,27 @@ LEIDEN_N_NEIGHBORS = 15
 #: Default scatter color when color_by is null (light blue).
 SINGLE_COLOR = "#87CEEB"
 
-#: Points-per-category / categories-per-row in the cluster contact sheet.
-CONTACT_SHEET_PER_CLUSTER = 5
+#: Images-per-cluster / clusters-per-row in the cluster contact sheet.
+CONTACT_SHEET_PER_CLUSTER = 8
 CONTACT_SHEET_GROUPS_PER_ROW = 5
+
+#: Sheet representatives are drawn RANDOMLY from the densest
+#: CONTACT_SHEET_DENSITY_KEEP fraction of each cluster (local density =
+#: mean distance to the nearest reference members). The sparse tail is
+#: outlier morphology, not the cluster's typical look; the random draw
+#: inside the dense core keeps natural variety instead of near-duplicates
+#: of the centroid.
+CONTACT_SHEET_DENSITY_KEEP = 0.75
+
+#: Reference-subsample cap for the density estimate (exact within-cluster
+#: kNN density via cKDTree costs seconds on 18k-member clusters; distances
+#: to a fixed random subsample rank members identically at a fraction of
+#: the cost).
+CONTACT_SHEET_DENSITY_REF = 2000
+
+#: Fixed RNG seed for the sheet sampling (per-cluster streams derive from
+#: it), so regenerated sheets are reproducible.
+CONTACT_SHEET_SEED = 42
 
 #: Minimum foreground (nonzero-pixel) fraction for a sheet representative.
 #: Near-empty segmentation slivers carry almost no information, so their
@@ -611,19 +640,19 @@ def _load_cell_image(d, mode, view):
 def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
     """Contact-sheet PDF for one Leiden partition: representative cells per cluster.
 
-    Representative ORDER is farthest-point sampling in the whitened feature
-    space (W): the first pick is the archetype (member nearest the cluster
-    mean), then each next pick is the member farthest from ALL already-picked
-    ones — the sheet therefore spans the cluster's internal diversity instead
-    of showing near-duplicates of its centroid (pure nearest-first ordering).
+    Representatives are CONTACT_SHEET_PER_CLUSTER members drawn RANDOMLY from
+    the cluster's dense core: local density is each member's mean distance to
+    the CONTACT_SHEET_DENSITY_REF-nearest reference members (a fixed random
+    subsample — exact cKDTree kNN costs seconds on 18k-member clusters), and
+    only the densest CONTACT_SHEET_DENSITY_KEEP fraction is eligible, so the
+    sheet shows what a TYPICAL member looks like (the sparse tail is outlier
+    morphology) while the random draw keeps natural within-cluster variety.
     Candidates whose crop foreground fraction is below
-    CONTACT_SHEET_MIN_FOREGROUND are skipped during the walk (their generic
-    DINOv3 features land near the centroid and would otherwise dominate the
-    archetype slots). Every cell is rendered as its inference-mode input
-    (bundle augmentation_infer pipeline -> uniform image size). Layout:
-    CONTACT_SHEET_PER_CLUSTER images per cluster,
-    CONTACT_SHEET_GROUPS_PER_ROW clusters per row; cluster blocks are ordered
-    by 1-based cluster ID.
+    CONTACT_SHEET_MIN_FOREGROUND are skipped during the walk. Every cell is
+    rendered as its inference-mode input (bundle augmentation_infer pipeline
+    -> uniform image size). Layout: CONTACT_SHEET_PER_CLUSTER images per
+    cluster, CONTACT_SHEET_GROUPS_PER_ROW clusters per row; cluster blocks
+    are ordered by 1-based cluster ID.
     """
     n_ids = int(ids_all.max())  # IDs are 1-based
     n_per = CONTACT_SHEET_PER_CLUSTER
@@ -646,22 +675,29 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
             for j in range(n_per + 1):
                 axes[r][base + j].axis("off")
             continue
+        # Per-cluster RNG stream: deterministic across regeneration.
+        rng = np.random.default_rng([CONTACT_SHEET_SEED, cid])
         member_W = W[member]
-        # Farthest-point sampling over the scan pool: seed with the archetype,
-        # then greedily add the point maximizing the distance to the closest
-        # already-chosen point. The full pool is ordered up front so the
-        # foreground-filter walk below stays a simple sequential scan.
-        pool = min(CONTACT_SHEET_MAX_SCAN, member.size)
-        d_min = np.linalg.norm(member_W - member_W[np.argmin(
-            np.linalg.norm(member_W - member_W.mean(axis=0), axis=1))], axis=1)
-        fp_order = [int(np.argmin(d_min))]
-        for _ in range(pool - 1):
-            nxt = int(np.argmax(d_min))
-            fp_order.append(nxt)
-            d_min = np.minimum(
-                d_min, np.linalg.norm(member_W - member_W[nxt], axis=1))
-        order = member[fp_order]
-        # Walk candidates in farthest-point order, skipping near-empty crops
+        # Local density: mean distance to the k nearest reference members
+        # (squared distances via the ||a-b||^2 expansion, chunked to cap the
+        # m x ref matrix; smaller = denser). Ranking against a fixed random
+        # reference subsample matches exact-kNN ranking at much lower cost.
+        ref = member_W[rng.choice(member.size, size=min(
+            CONTACT_SHEET_DENSITY_REF, member.size), replace=False)]
+        k_near = min(LEIDEN_N_NEIGHBORS, ref.shape[0])
+        ref_sq = (ref ** 2).sum(axis=1)
+        density = np.empty(member.size)
+        for chunk in np.array_split(np.arange(member.size),
+                                    max(1, -(-member.size // 4096))):
+            d2 = ((member_W[chunk] ** 2).sum(axis=1)[:, None] + ref_sq
+                  - 2.0 * member_W[chunk] @ ref.T)
+            nearest_sq = np.partition(d2, k_near - 1, axis=1)[:, :k_near]
+            density[chunk] = np.sqrt(np.maximum(nearest_sq, 0.0)).mean(axis=1)
+        # Eligible pool = the densest fraction; walk it in random order.
+        cutoff = np.quantile(density, CONTACT_SHEET_DENSITY_KEEP)
+        core = np.where(density <= cutoff)[0]
+        order = member[rng.permutation(core)[:CONTACT_SHEET_MAX_SCAN]]
+        # Walk candidates in random core order, skipping near-empty crops
         # (see CONTACT_SHEET_MIN_FOREGROUND) until n_per valid representatives.
         imgs = []
         scanned = 0
@@ -741,9 +777,11 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
     copy exists).
 
     reduction.cluster_res lists Leiden resolutions, each producing one
-    partition of a kNN graph over a whitened PCA space of the features (same
-    space as the label-refinement clustering; higher resolution = more
-    clusters, and the cluster count emerges from the data). Cluster IDs are
+    partition of a kNN graph over a whitened PCA space of the features (the
+    space keeps the smallest component count covering
+    CLUSTER_VARIANCE_TARGET of the variance, capped at
+    CLUSTER_MAX_COMPONENTS; higher resolution = more clusters, and the
+    cluster count emerges from the data). Cluster IDs are
     1-based and ordered by each cluster's centroid distance to the origin of
     the reference DR plot (UMAP when present, else the first configured
     method), so nearby-in-the-plot clusters get nearby IDs. The fitted
@@ -756,10 +794,12 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
     cluster_prob<resolution> column holding the kNN vote confidence (max
     class probability in [0, 1], the assignment's reliability score). IDs
     become extra color pages in every method's PDF, and each resolution gets
-    a representative-cell sheet (cluster_res<resolution>.pdf — cells rendered
-    as their inference-mode input via the bundle's augmentation_infer
-    pipeline, so all images share one size) unless
-    reduction.show_cluster_image is false.
+    a representative-cell sheet (cluster_res<resolution>.pdf) unless
+    reduction.show_cluster_image is false: CONTACT_SHEET_PER_CLUSTER members
+    per cluster, drawn randomly from its densest
+    CONTACT_SHEET_DENSITY_KEEP fraction (typical look + natural variety),
+    rendered as their inference-mode input via the bundle's
+    augmentation_infer pipeline so all images share one size.
 
     One multi-page PDF per method (reduction_<method>.pdf): one page per
     color_by entry, then one per cluster resolution. color_by accepts ANY
@@ -994,14 +1034,26 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
             cluster_probs[res] = knn.predict_proba(W).max(axis=1)
     elif cluster_res_list:
         dim = feats_fit.shape[1]
-        n_white = min(UMAP_PRE_COMPONENTS, feats_fit.shape[0], dim)
+        # Clustering-space dimensionality: smallest k covering
+        # CLUSTER_VARIANCE_TARGET of the feature variance (measured on the
+        # fit subset), capped at CLUSTER_MAX_COMPONENTS (see the constants'
+        # whiten noise-amplification note).
+        n_cap = min(CLUSTER_MAX_COMPONENTS, feats_fit.shape[0], dim)
+        probe = PCA(n_components=n_cap).fit(feats_fit)
+        n_white = int(np.searchsorted(
+            np.cumsum(probe.explained_variance_ratio_),
+            CLUSTER_VARIANCE_TARGET) + 1)
+        n_white = max(1, min(n_white, n_cap))
         pca_w = PCA(n_components=n_white, whiten=True).fit(feats_fit)
         W = pca_w.transform(feats_all)
         W = W / np.maximum(np.linalg.norm(W, axis=1, keepdims=True), 1e-8)
         ref = "umap" if "umap" in methods else methods[0]
-        logger.info("Clustering: whitened PCA %dd -> Leiden on kNN graph, "
-                    "resolutions=%s (ID order ref: %s)",
-                    n_white, cluster_res_list, ref)
+        logger.info("Clustering: whitened PCA %dd (%.0f%% variance, target "
+                    "%.0f%%, cap %d) -> Leiden on kNN graph, resolutions=%s "
+                    "(ID order ref: %s)",
+                    n_white, 100 * float(pca_w.explained_variance_ratio_.sum()),
+                    100 * CLUSTER_VARIANCE_TARGET, CLUSTER_MAX_COMPONENTS,
+                    cluster_res_list, ref)
         cluster_obj = {"pca_whiten": pca_w, "models": {}}
         for res in cluster_res_list:
             raw_ids = _leiden_partition(W, res, seed)
@@ -1083,8 +1135,8 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                             labels=list(ids_fit),
                             label_names=[str(i) for i in ids_fit])
                 logger.info("Reduction plot saved to %s", pdf_path)
-        # Representative-cell sheet per resolution (5 inference-mode inputs
-        # per cluster, 5 clusters per row, uniform cell size). Gated by
+        # Representative-cell sheet per resolution (CONTACT_SHEET_PER_CLUSTER
+        # random dense-core members per cluster, uniform cell size). Gated by
         # reduction.show_cluster_image — false skips the sheets entirely,
         # including the model-bundle load they need.
         if not red_cfg.get("show_cluster_image", True):
