@@ -26,6 +26,9 @@ from microProfiler.pipeline._micromodel_bridge import read_bundle_meta
 
 DEFAULT_MAX_VALUE = 65535.0
 
+# DR methods offered in the Dimension-reduction group (canonical order).
+_DR_METHOD_OPTIONS = ["pca", "umap", "pacmap", "localmap"]
+
 # Image dtype -> max possible intensity (matches microVis's DTYPE_MAX).
 _DTYPE_MAX = {
     "uint8": 255.0,
@@ -59,7 +62,6 @@ class InferenceBlockWidget(QWidget):
         # color_by / sample_per_class only shape the reducer fit and the
         # PDF plots (which this pipeline never writes) — the tables always
         # contain every object, so neither has a GUI widget.
-        self._method = None
         self._color_by = "pred_class"
         self._cluster_res = None
         self._sample_per_class = 10000
@@ -208,20 +210,51 @@ class InferenceBlockWidget(QWidget):
         self._reduction_group.setToolTip(
             "Write reduction_<method> tables for every object (the tables "
             "ALWAYS contain every object — a reducer or subset only shapes "
-            "the plots, which this pipeline does not write). Provide ONE "
-            "pre-fitted reducer pickle (pca/umap/pacmap/localmap — the type "
-            "is detected automatically); leave empty to fit pca+umap fresh.")
+            "the plots, which this pipeline does not write). Provide one or "
+            "more pre-fitted reducer pickles (pca/umap/pacmap/localmap — "
+            "the type of each is detected automatically, multiple are "
+            "separated with ';' and run in order); with reducers given the "
+            "DR-method selection is ignored; leave empty to fit the "
+            "selected methods fresh.")
         red_layout = QVBoxLayout(self._reduction_group)
         row_red = QHBoxLayout()
         row_red.addWidget(_row_label("Reducer:"))
         self._reducer_path = QLineEdit()
         self._reducer_path.setObjectName("reducer_path")
-        self._reducer_path.setPlaceholderText("reducer pickle (*.pkl) — pca/umap/pacmap/localmap; empty = fit pca+umap")
-        enable_path_drop(self._reducer_path)
+        self._reducer_path.setPlaceholderText("reducer pickles (*.pkl), ';'-separated — empty = fit the selected methods")
+        self._reducer_path.setToolTip(
+            "One or more pre-fitted reducer pickles (pca/umap/pacmap/"
+            "localmap), separated with ';' and run in order. When any "
+            "reducer is given, the DR-method checkboxes are ignored.")
+        enable_path_drop(self._reducer_path, multi=True)
         row_red.addWidget(self._reducer_path, 1)
-        self._reducer_browse_btn = _browse_button()
+        self._reducer_browse_btn = QPushButton("...")
+        self._reducer_browse_btn.setFixedWidth(browse_w)
+        self._reducer_browse_btn.setProperty("class", "secondary")
+        self._reducer_browse_btn.setToolTip(
+            "Browse... (multi-select; you can also drag files onto the box)")
         row_red.addWidget(self._reducer_browse_btn)
         red_layout.addLayout(row_red)
+        # DR-method selection — only used when NO reducer file is given.
+        row_meth = QHBoxLayout()
+        meth_lbl = QLabel("DR methods:")
+        meth_lbl.setFixedWidth(label_w)
+        row_meth.addWidget(meth_lbl)
+        self._method_cbs = {}
+        for m in _DR_METHOD_OPTIONS:
+            cb = QCheckBox(m)
+            cb.setChecked(m in ("pca", "umap"))
+            cb.setToolTip(
+                "Methods fitted fresh when no reducer file is given "
+                "(all unchecked = default pca+umap). Ignored entirely "
+                "when reducer file(s) are provided.")
+            row_meth.addWidget(cb)
+            self._method_cbs[m] = cb
+        row_meth.addStretch()
+        red_layout.addLayout(row_meth)
+        # Dim the method checkboxes while reducers are in charge.
+        self._reducer_path.textChanged.connect(self._update_method_enabled)
+        self._update_method_enabled()
         layout.addWidget(self._reduction_group)
 
         # Row 5: cluster prediction group
@@ -315,13 +348,23 @@ class InferenceBlockWidget(QWidget):
         if err:
             QMessageBox.warning(self, "Model Bundle", err)
 
+    def _update_method_enabled(self, *_):
+        """DR-method checkboxes matter only without reducer files."""
+        has_reducer = bool(self._reducer_path.text().strip())
+        for cb in self._method_cbs.values():
+            cb.setEnabled(not has_reducer)
+
+    def _selected_methods(self) -> List[str]:
+        return [m for m, cb in self._method_cbs.items() if cb.isChecked()]
+
     def _on_browse_reducer(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select Pre-fitted Reducer", "",
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select Pre-fitted Reducer(s)", "",
             "Pickle files (*.pkl);;All files (*)",
         )
-        if path:
-            self._reducer_path.setText(path)
+        if paths:
+            existing = [p for p in self._reducer_path.text().split(";") if p.strip()]
+            self._reducer_path.setText(";".join(existing + paths))
 
     def _on_browse_cluster(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -474,15 +517,21 @@ class InferenceBlockWidget(QWidget):
             "max_value": self._max_value,
         }
         if self.is_reduction_or_cluster_enabled():
+            reducers = [p.strip() for p in self._reducer_path.text().split(";")
+                        if p.strip()]
             section["reduction"] = {
                 # enabled = the Dimension-reduction group; the Cluster group
                 # is its own flag (prediction needs cluster_enabled + file).
                 "enabled": self._reduction_group.isChecked(),
-                "reducer": self._reducer_path.text().strip() or None,
+                "reducer": reducers or None,
                 "cluster_enabled": self._cluster_group.isChecked(),
                 "cluster": self._cluster_path.text().strip() or None,
+                # Method checkboxes apply only without reducers (the bridge
+                # ignores them otherwise — serialize None so the YAML stays
+                # honest). None = default [pca, umap].
+                "method": (None if reducers
+                           else self._selected_methods() or None),
                 # No-widget YAML keys, round-tripped verbatim.
-                "method": self._method,
                 "color_by": self._color_by,
                 "cluster_res": self._cluster_res,
                 "sample_per_class": self._sample_per_class,
@@ -508,7 +557,8 @@ class InferenceStepPanel(BlockContainerPanel):
         super()._connect_block_signals(block)
         for w in (block._model_path, block._output_db, block._mask_combo,
                   block._feature_cb, block._pred_class_cb,
-                  block._reducer_path, block._cluster_path):
+                  block._reducer_path, block._cluster_path,
+                  *block._method_cbs.values()):
             self._wire_param_signal(w)
         for grp in (block._reduction_group, block._cluster_group):
             grp.toggled.connect(self.parameter_changed, Qt.UniqueConnection)
@@ -544,6 +594,8 @@ class InferenceStepPanel(BlockContainerPanel):
             block._cluster_group.setChecked(src._cluster_group.isChecked())
             block._reducer_path.setText(src._reducer_path.text())
             block._cluster_path.setText(src._cluster_path.text())
+            for m, cb in src._method_cbs.items():
+                block._method_cbs[m].setChecked(cb.isChecked())
             if src._ch_cbs:
                 src_order = [cb.text() for cb in src._ch_cbs]
                 block.set_channel_state(src_order, set(src.get_checked_channels()))
@@ -589,15 +641,20 @@ class InferenceStepPanel(BlockContainerPanel):
         # which the bridge enforces).
         block._reduction_group.setChecked(bool(red.get("enabled", False)))
         block._cluster_group.setChecked(bool(red.get("cluster_enabled", False)))
-        # method / color_by / cluster_res / sample_per_class have no GUI
-        # widget — keep the config values verbatim so a YAML with custom
-        # values survives a round-trip.
-        block._method = red.get("method")
+        # color_by / cluster_res / sample_per_class have no GUI widget —
+        # keep the config values verbatim so a YAML with custom values
+        # survives a round-trip.
         block._color_by = red.get("color_by", "pred_class")
         block._cluster_res = red.get("cluster_res")
         block._sample_per_class = red.get("sample_per_class", 10000)
-        if red.get("reducer"):
-            block._reducer_path.setText(str(red["reducer"]))
+        reducer = red.get("reducer") or []
+        if isinstance(reducer, str):
+            reducer = [reducer]
+        if reducer:
+            block._reducer_path.setText(";".join(str(p) for p in reducer))
+        method = red.get("method") or ["pca", "umap"]  # null = effective default
+        for m, cb in block._method_cbs.items():
+            cb.setChecked(m in method)
         if red.get("cluster"):
             block._cluster_path.setText(str(red["cluster"]))
 

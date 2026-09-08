@@ -439,22 +439,30 @@ def _plot_reduction_page(X, title, xlabel, ylabel, pdf, labels=None,
                    rasterized=True)
 
         # Legend = colored text only (invisible handles carry no marker).
-        # With many classes the tall legend stretches the tight bbox and
-        # dwarfs the plot, and per-class annotations would overlap into
-        # noise — beyond MAX_LABELED_CLASSES both are skipped.
+        # With many classes the tall legend dwarfs the plot and per-class
+        # annotations overlap, so BOTH scale their font down with the class
+        # count instead of disappearing; beyond 60 classes the legend is
+        # dropped entirely (the centroid annotations still label everything).
         if n_cls <= 30:
+            leg_fs, ann_fs, ann_pad = 7, 9, 0.3
+        elif n_cls <= 60:
+            leg_fs, ann_fs, ann_pad = 5.5, 6.5, 0.2
+        else:
+            leg_fs, ann_fs, ann_pad = None, 5, 0.15
+        if leg_fs is not None:
             handles = [Line2D([], [], linestyle="none") for _ in unique_classes]
             leg = ax.legend(handles, [label_name_map[cls] for cls in unique_classes],
-                            fontsize=7, loc="best", framealpha=0.85)
+                            fontsize=leg_fs, loc="best", framealpha=0.85)
             for text, cls in zip(leg.get_texts(), unique_classes):
                 text.set_color(assigned_color[cls])
 
-            for cls in unique_classes:
-                center = X[labels_arr == cls].mean(axis=0)
-                ax.annotate(label_name_map[cls], center, fontsize=9, weight="bold",
-                            ha="center", va="center", color=assigned_color[cls],
-                            bbox=dict(boxstyle="round,pad=0.3", fc="white",
-                                      ec="gray", alpha=0.8))
+        for cls in unique_classes:
+            center = X[labels_arr == cls].mean(axis=0)
+            ax.annotate(label_name_map[cls], center, fontsize=ann_fs,
+                        weight="bold", ha="center", va="center",
+                        color=assigned_color[cls],
+                        bbox=dict(boxstyle=f"round,pad={ann_pad}", fc="white",
+                                  ec="gray", alpha=0.8))
 
     ax.set_title(title)
     ax.set_xlabel(xlabel)

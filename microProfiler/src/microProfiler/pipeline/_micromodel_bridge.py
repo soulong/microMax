@@ -88,12 +88,15 @@ def expected_reduction_tables(entry) -> frozenset:
         return frozenset()
     red = entry.reduction
     if red.reducer:
-        try:
-            methods = {_detect_reducer_kind(red.reducer)}
-        except OSError:
-            # Unreadable pickle: the run itself will fail loudly; demanding
-            # no tables keeps the completeness check from false-skipping.
-            return frozenset()
+        methods = set()
+        for path in red.reducer:
+            try:
+                methods.add(_detect_reducer_kind(path))
+            except OSError:
+                # Unreadable pickle: the run itself will fail loudly;
+                # demanding no tables keeps the completeness check from
+                # false-skipping.
+                return frozenset()
     elif enabled and not cluster_active:
         methods = set(red.method if red.method else ["pca", "umap"])
     else:
@@ -318,12 +321,21 @@ def _build_mm_inference_config(entry, cfg: PipelineConfig, ds, root_dir: Path) -
             "sample_per_class": entry.reduction.sample_per_class if entry.reduction.sample_per_class is not None else 10000,
         }
         if entry.reduction.reducer:
-            # ONE user-chosen reducer pickle — detect its kind and map to
-            # microModel's per-method pre-fit key (raises ValueError for an
-            # unrecognized pickle).
-            kind = _detect_reducer_kind(os.path.abspath(entry.reduction.reducer))
-            red_cfg[f"reduction_{kind}"] = os.path.abspath(entry.reduction.reducer)
-            red_cfg["method"] = [kind]
+            # One or more user-chosen reducer pickles — detect each kind and
+            # map to microModel's per-method pre-fit keys (raises ValueError
+            # for an unrecognized pickle). The DR-method selection is ignored
+            # in this mode: every listed reducer transforms directly, in order.
+            kinds = []
+            for path in entry.reduction.reducer:
+                kind = _detect_reducer_kind(os.path.abspath(str(path)))
+                if kind in kinds:
+                    raise ValueError(
+                        f"Two reducer pickles share the DR method '{kind}' "
+                        f"(one reduction_<method> table per method) — "
+                        f"remove the duplicate: {path}")
+                kinds.append(kind)
+                red_cfg[f"reduction_{kind}"] = os.path.abspath(str(path))
+            red_cfg["method"] = kinds
         else:
             # No reducer: fit fresh. Cluster-only runs keep it cheap — PCA
             # alone provides the ID-ordering reference (a reduction table

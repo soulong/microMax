@@ -206,9 +206,11 @@ class InferenceReductionConfig:
     """Optional dimensionality reduction / cluster prediction (per block).
 
     enabled: the Dimension-reduction group — write reduction_<method>
-        tables. `reducer` takes ONE pre-fitted reducer pickle (pca / umap /
-        pacmap / localmap; the type is detected when the microModel config
-        is built); null = fit `method` fresh (default [pca, umap]).
+        tables. `reducer` takes one or MORE pre-fitted reducer pickles
+        (pca / umap / pacmap / localmap; the type of each is detected when
+        the microModel config is built, and they run in listed order);
+        null = fit `method` fresh (default [pca, umap]). When reducers are
+        given, the `method` selection is ignored entirely (transform only).
     cluster_enabled + cluster: the Cluster group — predict-only clustering
         from a baseline cluster.pkl (its stored kNN models label every
         object, cluster IDs stay baseline-aligned) writing the find_cluster
@@ -220,7 +222,7 @@ class InferenceReductionConfig:
     """
 
     enabled: bool = False
-    reducer: Optional[str] = None
+    reducer: Optional[List[str]] = None
     cluster_enabled: bool = False
     cluster: Optional[str] = None
     method: Optional[List[str]] = None
@@ -462,6 +464,8 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
                 _dataclass_from_section(attr, InferenceReductionConfig, red)
                 if red else None
             )
+            if red_obj is not None and isinstance(red_obj.reducer, str):
+                red_obj.reducer = [red_obj.reducer]
             if red_obj is not None and red_obj.method:
                 # Reject typos here (not silently filter downstream), so a
                 # bad method can never make the completeness check pass

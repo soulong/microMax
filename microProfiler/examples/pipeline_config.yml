@@ -134,8 +134,9 @@ object_profile:
 #       max_value: 65535
 #       reduction:                # omit/null = no dimension reduction
 #         enabled: true           # dimension-reduction group: write reduction_<method> tables
-#         reducer: null           # ONE pre-fitted reducer pickle (pca/umap/pacmap/localmap —
-#                                 #   type detected); null = fit pca+umap fresh
+#         reducer: null           # one or MORE pre-fitted reducer pickles (pca/umap/pacmap/localmap —
+#                                 #   types detected, run in order); null = fit `method` fresh;
+#                                 #   when set, `method` is ignored entirely
 #         cluster_enabled: true   # cluster group: predict from a baseline cluster.pkl
 #         cluster: null           # baseline cluster.pkl -> find_cluster table (kNN-predicted IDs;
 #                                 #   prediction runs only when cluster_enabled AND cluster are set)
