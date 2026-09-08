@@ -282,7 +282,7 @@ UMAP_PRE_COMPONENTS = 50
 #: retained component to unit variance — an uncapped tail (e.g. 95% of a
 #: 384-d DINOv3 embedding needs ~133 comps) would noise-amplify directions
 #: carrying ~0.1% variance each to the same footing as the signal.
-CLUSTER_VARIANCE_TARGET = 0.95
+CLUSTER_VARIANCE_TARGET = 0.90
 CLUSTER_MAX_COMPONENTS = 100
 
 #: Neighbors per point in the kNN graph feeding Leiden clustering; the same
@@ -292,9 +292,13 @@ LEIDEN_N_NEIGHBORS = 15
 #: Default scatter color when color_by is null (light blue).
 SINGLE_COLOR = "#87CEEB"
 
-#: Images-per-cluster / clusters-per-row in the cluster contact sheet.
-CONTACT_SHEET_PER_CLUSTER = 8
-CONTACT_SHEET_GROUPS_PER_ROW = 5
+#: Images-per-cluster in the cluster contact sheet.
+CONTACT_SHEET_PER_CLUSTER = 10
+
+#: Max cluster rows in the cluster contact sheet; cluster blocks fill
+#: COLUMN-major (top -> bottom, then the next column) with as many columns
+#: as the cluster count needs.
+CONTACT_SHEET_MAX_ROWS = 10
 
 #: Sheet representatives are drawn RANDOMLY from the densest
 #: CONTACT_SHEET_DENSITY_KEEP fraction of each cluster (local density =
@@ -648,16 +652,20 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
     sheet shows what a TYPICAL member looks like (the sparse tail is outlier
     morphology) while the random draw keeps natural within-cluster variety.
     Candidates whose crop foreground fraction is below
-    CONTACT_SHEET_MIN_FOREGROUND are skipped during the walk. Every cell is
-    rendered as its inference-mode input (bundle augmentation_infer pipeline
-    -> uniform image size). Layout: CONTACT_SHEET_PER_CLUSTER images per
-    cluster, CONTACT_SHEET_GROUPS_PER_ROW clusters per row; cluster blocks
-    are ordered by 1-based cluster ID.
+    CONTACT_SHEET_MIN_FOREGROUND are skipped during the walk; clusters where
+    EVERY candidate fails it (glass scratches / dust — Leiden groups debris
+    coherently) fall back to their unfiltered crops, still titled "no
+    cell-like crops". Every cell is rendered as its inference-mode input
+    (bundle augmentation_infer pipeline -> uniform image size). Layout:
+    CONTACT_SHEET_PER_CLUSTER images per cluster; cluster blocks fill
+    COLUMN-major (top -> bottom, then the next column), at most
+    CONTACT_SHEET_MAX_ROWS rows, as many columns as the cluster count needs;
+    blocks are ordered by 1-based cluster ID.
     """
     n_ids = int(ids_all.max())  # IDs are 1-based
     n_per = CONTACT_SHEET_PER_CLUSTER
-    groups = CONTACT_SHEET_GROUPS_PER_ROW
-    rows = -(-n_ids // groups)  # ceil
+    rows = min(n_ids, CONTACT_SHEET_MAX_ROWS)
+    groups = -(-n_ids // rows)  # ceil -> number of cluster-block columns
     # A narrow empty spacer column after each cluster group keeps adjacent
     # clusters visually separated.
     width_ratios = []
@@ -669,7 +677,7 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
         squeeze=False, gridspec_kw={"width_ratios": width_ratios})
     for cid in range(1, n_ids + 1):
         member = np.where(ids_all == cid)[0]
-        r, g = divmod(cid - 1, groups)
+        g, r = divmod(cid - 1, rows)  # column-major: fill down, then next column
         base = g * (n_per + 1)
         if member.size == 0:
             for j in range(n_per + 1):
@@ -709,6 +717,17 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
             if img is None or _foreground_fraction(img) < CONTACT_SHEET_MIN_FOREGROUND:
                 continue
             imgs.append(img)
+        debris = not imgs
+        if debris:
+            # Debris clusters (glass scratches, dust — Leiden groups them
+            # coherently) fail the foreground filter wholesale. Show their
+            # real crops anyway — an empty row would read like a bug.
+            for idx in order:
+                if len(imgs) >= n_per:
+                    break
+                img = _load_cell_image(dicts[idx], mode, view)
+                if img is not None:
+                    imgs.append(img)
         if len(imgs) < n_per:
             logger.warning("Cluster %d: only %d/%d representatives pass the "
                            "%.0f%% foreground filter (scanned %d candidates)",
@@ -722,15 +741,13 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
                 ax.imshow(imgs[j])
             if j == 0:
                 title = f"cluster {cid} (n={member.size})"
-                if not imgs:
-                    # Every candidate was filtered as debris/sliver — say so
-                    # explicitly instead of showing a silently empty row.
+                if debris:
                     title += "\nno cell-like crops"
                 ax.set_title(title, fontsize=8)
         axes[r][base + n_per].axis("off")  # spacer after the group
     # Any trailing cluster slot beyond n_ids stays empty.
     for cid in range(n_ids, rows * groups):
-        r, g = divmod(cid, groups)
+        g, r = divmod(cid, rows)
         base = g * (n_per + 1)
         for j in range(n_per + 1):
             axes[r][base + j].axis("off")
