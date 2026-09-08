@@ -92,13 +92,10 @@ CONTACT_SHEET_PER_CLUSTER = 10
 #: as the cluster count needs.
 CONTACT_SHEET_MAX_ROWS = 10
 
-#: Fixed cluster-sheet page geometry. The aspect ratio (~2.31:1, measured on
-#: the reference 22-cluster / 10-row sheet) is the SAME for every
-#: cluster_res<res>.pdf regardless of cluster count — grids with more or
-#: fewer block columns stretch/shrink inside the fixed page (saved without
-#: bbox tightening, so the page size is exactly this figure).
-CONTACT_SHEET_FIG_ASPECT = 2.31
-CONTACT_SHEET_FIG_HEIGHT = 1.55 * CONTACT_SHEET_MAX_ROWS
+#: The cluster-sheet page hugs its content: rows fill first (up to
+#: CONTACT_SHEET_MAX_ROWS), then each extra block-column widens the page —
+#: saved without bbox tightening, so there is no blank page margin around
+#: the grid.
 
 #: Sheet representatives are drawn RANDOMLY from the densest
 #: CONTACT_SHEET_DENSITY_KEEP fraction of each cluster (local density =
@@ -297,14 +294,14 @@ def _plot_reduction_page(X, title, xlabel, ylabel, pdf, labels=None,
                    rasterized=True)
 
         # Legend = colored text only (invisible handles carry no marker).
-        # With many classes the tall legend dwarfs the plot and per-class
-        # annotations overlap, so BOTH scale their font down with the class
-        # count instead of disappearing; beyond 60 classes the legend is
-        # dropped entirely (the centroid annotations still label everything).
-        if n_cls <= 30:
+        # Beyond 20 classes the legend outgrows the plot area entirely, so it
+        # is dropped and classes are labeled by the centroid annotations
+        # alone; those scale their font down with the class count and, past
+        # 60, disappear as well (pairwise centroid colors then go away too).
+        if n_cls <= 20:
             leg_fs, ann_fs, ann_pad = 7, 9, 0.3
         elif n_cls <= 60:
-            leg_fs, ann_fs, ann_pad = 5.5, 6.5, 0.2
+            leg_fs, ann_fs, ann_pad = None, 6.5, 0.2
         else:
             leg_fs, ann_fs, ann_pad = None, 5, 0.15
         if leg_fs is not None:
@@ -460,9 +457,9 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
     CONTACT_SHEET_PER_CLUSTER images per cluster; cluster blocks fill
     COLUMN-major (top -> bottom, then the next column), at most
     CONTACT_SHEET_MAX_ROWS rows, as many columns as the cluster count needs;
-    blocks are ordered by 1-based cluster ID. The page size is FIXED (see
-    CONTACT_SHEET_FIG_ASPECT) so every resolution's sheet shares one aspect
-    ratio.
+    blocks are ordered by 1-based cluster ID. The page hugs the grid: the
+    vertical is filled first (up to CONTACT_SHEET_MAX_ROWS rows) and each
+    extra block-column widens the page, so there is no blank margin.
     """
     n_ids = int(ids_all.max())  # IDs are 1-based
     n_per = CONTACT_SHEET_PER_CLUSTER
@@ -475,8 +472,7 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
         width_ratios += [1.0] * n_per + [0.45]
     fig, axes = plt.subplots(
         rows, groups * (n_per + 1),
-        figsize=(CONTACT_SHEET_FIG_ASPECT * CONTACT_SHEET_FIG_HEIGHT,
-                 CONTACT_SHEET_FIG_HEIGHT),
+        figsize=(1.15 * groups * (n_per + 0.45), 1.35 * rows),
         squeeze=False, gridspec_kw={"width_ratios": width_ratios})
     for cid in range(1, n_ids + 1):
         member = np.where(ids_all == cid)[0]
@@ -554,7 +550,9 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
         base = g * (n_per + 1)
         for j in range(n_per + 1):
             axes[r][base + j].axis("off")
-    fig.subplots_adjust(wspace=0.06, hspace=0.3)
+    # Near-zero page margins: the grid owns the whole page.
+    fig.subplots_adjust(left=0.005, right=0.995, top=0.97, bottom=0.01,
+                        wspace=0.06, hspace=0.15)
     with PdfPages(path) as pdf:
         # No bbox tightening: the page is exactly CONTACT_SHEET_FIGSIZE, so
         # every sheet keeps the same fixed aspect ratio.
