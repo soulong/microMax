@@ -203,27 +203,30 @@ class ObjectProfileConfig:
 
 @dataclass
 class InferenceReductionConfig:
-    """Optional dimensionality reduction after inference (per inference block).
+    """Optional dimensionality reduction / cluster prediction (per block).
 
-    method lists the DR methods to run (subset of pca/umap/pacmap/localmap;
-    null = microModel default [pca, umap]). cluster_res lists Leiden
-    resolutions for the find_cluster table (null/[] = no cluster finding;
-    higher resolution = more clusters). reduction_<method> take pre-fitted
-    reducer pickles (transform directly, no refit); cluster takes a
-    pre-fitted cluster.pkl whose stored kNN classifiers predict every stored
-    resolution (no refit, cluster_res ignored).
+    enabled: the Dimension-reduction group — write reduction_<method>
+        tables. `reducer` takes ONE pre-fitted reducer pickle (pca / umap /
+        pacmap / localmap; the type is detected when the microModel config
+        is built); null = fit `method` fresh (default [pca, umap]).
+    cluster_enabled + cluster: the Cluster group — predict-only clustering
+        from a baseline cluster.pkl (its stored kNN models label every
+        object, cluster IDs stay baseline-aligned) writing the find_cluster
+        table. Runs only when BOTH are set.
+    color_by / sample_per_class / method / cluster_res: no-widget YAML keys,
+        round-tripped verbatim. color_by and sample_per_class only shape
+        the reducer FIT and the PDF plots (which this pipeline never
+        writes) — the reduction_<method> tables always contain EVERY object.
     """
 
     enabled: bool = False
+    reducer: Optional[str] = None
+    cluster_enabled: bool = False
+    cluster: Optional[str] = None
     method: Optional[List[str]] = None
     color_by: str = "pred_class"
-    cluster: Optional[str] = None
     cluster_res: Optional[List[float]] = None
     sample_per_class: int = 10000
-    reduction_pca: Optional[str] = None
-    reduction_umap: Optional[str] = None
-    reduction_pacmap: Optional[str] = None
-    reduction_localmap: Optional[str] = None
 
 
 @dataclass

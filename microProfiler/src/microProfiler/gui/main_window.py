@@ -35,6 +35,7 @@ from microBase import (
     DEFAULT_MASK_PATTERN,
     DEFAULT_IMAGE_SUBDIR_PATTERN,
 )
+from microProfiler.gui.path_drop import enable_path_drop
 from microProfiler.gui.pipeline_controller import PipelineController
 from microProfiler.gui.state import PipelineState
 from microProfiler.gui.workers.preview_worker import PreviewWorker
@@ -306,6 +307,7 @@ class MainWindow(QMainWindow):
         input_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self._input_dir = QLineEdit()
+        enable_path_drop(self._input_dir)
         self._input_browse = QPushButton("Browse...")
         self._input_browse.setProperty("class", "secondary")
         input_row = QHBoxLayout()
@@ -314,6 +316,7 @@ class MainWindow(QMainWindow):
         input_form.addRow("Input dir:", input_row)
 
         self._output_dir = QLineEdit()
+        enable_path_drop(self._output_dir)
         self._output_browse = QPushButton("Browse...")
         self._output_browse.setProperty("class", "secondary")
         output_row = QHBoxLayout()

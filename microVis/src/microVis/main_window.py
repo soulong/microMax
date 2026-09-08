@@ -38,6 +38,7 @@ from microVis._settings import (
 from microVis.io.data_module import DataModule, _safe_str
 from microVis.log_utils import get_logger
 from microVis.widgets._event_filter import RotatedLabel
+from microVis.widgets.path_drop import enable_path_drop
 from microVis.widgets.data_view import DataView
 from microVis.widgets.image_controls import ImageControls
 from microVis.widgets.image_display import ImageDisplay
@@ -410,6 +411,14 @@ class MainWindow(QMainWindow):
 
         # Data view
         self._data_view.dataset_browse_clicked.connect(self._on_dataset_browse)
+        # Dropping a folder/file onto the three selector buttons takes the
+        # exact same code path as the Browse dialogs.
+        enable_path_drop(self._data_view.dataset_browse_button,
+                         on_path=self.select_dataset_dir)
+        enable_path_drop(self._data_view.db_browse_button,
+                         on_path=self.load_db_file)
+        enable_path_drop(self._data_view.metadata_browse_button,
+                         on_path=self.load_metadata_file)
         self._data_view.db_browse_clicked.connect(self._on_db_browse)
         self._data_view.load_dataset_clicked.connect(self._on_load_dataset_clicked)
         self._data_view.pygwalker_open_clicked.connect(self._on_pygwalker_open)
@@ -482,7 +491,11 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select Dataset Directory")
         if not path:
             return
+        self.select_dataset_dir(path)
 
+    def select_dataset_dir(self, path: str) -> None:
+        """Select (not load) a dataset directory — shared by the Browse
+        button and directory drops onto the Select Dataset button."""
         p = Path(path)
         # Re-selecting the same directory preserves the user's GUI edits —
         # session.yml is not re-read, display state is not cleared.
@@ -522,6 +535,11 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self.load_db_file(path)
+
+    def load_db_file(self, path: str) -> None:
+        """Switch the profiling DB — shared by the Browse button and drops
+        onto the Select DB button."""
         try:
             self._dm.load_db(path)
         except Exception as e:
@@ -967,6 +985,11 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self.load_metadata_file(path)
+
+    def load_metadata_file(self, path: str) -> None:
+        """Load a plate-metadata Excel file — shared by the Browse button
+        and file drops onto the Select Metadata button."""
         try:
             from microVis.io.data_module import parse_plate_metadata
             self._metadata_df = parse_plate_metadata(path)

@@ -30,21 +30,76 @@ REDUCTION_TABLES = frozenset({
 })
 
 
+def _detect_reducer_kind(path) -> str:
+    """Probe a pickled reducer and return its DR method (pca/umap/pacmap/localmap).
+
+    microModel's pre-fit reducer keys are per-method (reduction_<method>),
+    so the single user-chosen reducer file must be mapped to the right key.
+    Detection is by runtime type name — no umap/pacmap import needed:
+      PCA instance                 -> pca
+      {"pca_pre": PCA, "umap": …}  -> umap (microModel's UMAP pipeline dict)
+      PaCMAP / LocalMAP instance   -> pacmap / localmap
+    Raises ValueError for anything else (callers surface it as a per-dataset
+    failure / GUI popup).
+    """
+    import pickle
+
+    with open(path, "rb") as f:
+        obj = pickle.load(f)
+    name = type(obj).__name__
+    if name == "PCA":
+        return "pca"
+    if isinstance(obj, dict) and obj.get("umap") is not None:
+        return "umap"
+    if name == "PaCMAP":
+        return "pacmap"
+    if name == "LocalMAP":
+        return "localmap"
+    raise ValueError(
+        f"Not a recognized reducer pickle (pca/umap/pacmap/localmap): {path} "
+        f"(got {type(obj).__name__})"
+    )
+
+
+def _reduction_run_state(entry):
+    """(enabled, cluster_active) — whether reduction and/or cluster prediction runs.
+
+    enabled: the Dimension-reduction group. cluster_active: the Cluster
+    group checked AND a cluster.pkl chosen (prediction needs both).
+    """
+    red = entry.reduction
+    cluster_active = bool(red.cluster_enabled and red.cluster)
+    return bool(red.enabled or cluster_active), cluster_active
+
+
 def expected_reduction_tables(entry) -> frozenset:
     """Tables show_reduction will write for one entry's reduction config.
 
-    One reduction_<method> table per configured method (default [pca, umap])
-    plus find_cluster when cluster_res is set — the completeness check must
-    not demand tables for methods the entry doesn't run. Methods are
-    validated at config-parse time, so no filtering here.
+    One reduction_<method> table per configured method plus find_cluster
+    when cluster prediction runs. For a single provided reducer pickle the
+    method is detected from the pickle itself; a cluster-only run uses the
+    cheap default [pca] (a table is unavoidable — show_reduction always
+    writes one per method — but no UMAP is fitted just for ordering).
     """
-    if not (entry.reduction and entry.reduction.enabled):
+    if not entry.reduction:
         return frozenset()
-    methods = entry.reduction.method if entry.reduction.method else ["pca", "umap"]
+    enabled, cluster_active = _reduction_run_state(entry)
+    if not enabled:
+        return frozenset()
+    red = entry.reduction
+    if red.reducer:
+        try:
+            methods = {_detect_reducer_kind(red.reducer)}
+        except OSError:
+            # Unreadable pickle: the run itself will fail loudly; demanding
+            # no tables keeps the completeness check from false-skipping.
+            return frozenset()
+    elif enabled and not cluster_active:
+        methods = set(red.method if red.method else ["pca", "umap"])
+    else:
+        methods = {"pca"}
     tables = {f"reduction_{m}" for m in methods}
-    # find_cluster is written both by a fresh cluster_res fit and by a
-    # baseline cluster.pkl predict.
-    if entry.reduction.cluster_res or entry.reduction.cluster:
+    if cluster_active or red.cluster_res:
         tables.add("find_cluster")
     return frozenset(tables)
 
@@ -252,18 +307,32 @@ def _build_mm_inference_config(entry, cfg: PipelineConfig, ds, root_dir: Path) -
             "batch_size": 128,
         },
     }
-    if entry.reduction and entry.reduction.enabled:
-        mm_cfg["reduction"] = {
-            "method": entry.reduction.method if entry.reduction.method is not None else ["pca", "umap"],
+    if entry.reduction:
+        enabled, cluster_active = _reduction_run_state(entry)
+        if not enabled:
+            return mm_cfg
+        red_cfg = {
             "color_by": entry.reduction.color_by,
-            "cluster": entry.reduction.cluster,
+            "cluster": entry.reduction.cluster if cluster_active else None,
             "cluster_res": entry.reduction.cluster_res,
             "sample_per_class": entry.reduction.sample_per_class if entry.reduction.sample_per_class is not None else 10000,
-            "reduction_pca": entry.reduction.reduction_pca,
-            "reduction_umap": entry.reduction.reduction_umap,
-            "reduction_pacmap": entry.reduction.reduction_pacmap,
-            "reduction_localmap": entry.reduction.reduction_localmap,
         }
+        if entry.reduction.reducer:
+            # ONE user-chosen reducer pickle — detect its kind and map to
+            # microModel's per-method pre-fit key (raises ValueError for an
+            # unrecognized pickle).
+            kind = _detect_reducer_kind(os.path.abspath(entry.reduction.reducer))
+            red_cfg[f"reduction_{kind}"] = os.path.abspath(entry.reduction.reducer)
+            red_cfg["method"] = [kind]
+        else:
+            # No reducer: fit fresh. Cluster-only runs keep it cheap — PCA
+            # alone provides the ID-ordering reference (a reduction table
+            # per method is always a byproduct of show_reduction).
+            red_cfg["method"] = (
+                entry.reduction.method if entry.reduction.method is not None
+                else (["pca", "umap"] if entry.reduction.enabled else ["pca"])
+            )
+        mm_cfg["reduction"] = red_cfg
     return mm_cfg
 
 

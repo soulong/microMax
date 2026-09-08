@@ -133,11 +133,13 @@ object_profile:
 #       output_db: infer.db
 #       max_value: 65535
 #       reduction:                # omit/null = no dimension reduction
-#         enabled: true
-#         method: [pca, umap]     # subset of pca/umap/pacmap/localmap; null = [pca, umap]
-#         color_by: pred_class    # pred_class | directory | pred_prob | ground_truth
-#         cluster_res: [0.5, 1]   # Leiden resolutions (higher = more clusters); null/[] = no cluster finding
-#         sample_per_class: 10000
-#         reduction_pca: null     # provided -> transform only, else fit+save
-#         reduction_umap: null
-#         cluster: null           # baseline cluster.pkl -> kNN-predict its stored resolutions
+#         enabled: true           # dimension-reduction group: write reduction_<method> tables
+#         reducer: null           # ONE pre-fitted reducer pickle (pca/umap/pacmap/localmap —
+#                                 #   type detected); null = fit pca+umap fresh
+#         cluster_enabled: true   # cluster group: predict from a baseline cluster.pkl
+#         cluster: null           # baseline cluster.pkl -> find_cluster table (kNN-predicted IDs;
+#                                 #   prediction runs only when cluster_enabled AND cluster are set)
+#         method: [pca, umap]     # methods to fit when reducer is null (subset of pca/umap/pacmap/localmap)
+#         color_by: pred_class    # plot-only; the tables always contain EVERY object
+#         cluster_res: [0.5, 1]   # fresh Leiden resolutions (higher = more clusters); null/[] = none
+#         sample_per_class: 10000 # fit-only subsampling; plot-only concern, tables stay complete

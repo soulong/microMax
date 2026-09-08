@@ -280,6 +280,20 @@ class DataView(QWidget):
             self._pattern_subdir_edit.text().strip(),
         )
 
+    # Selector buttons double as drag-and-drop drop targets (wired by
+    # main_window with enable_path_drop); exposed read-only on purpose.
+    @property
+    def dataset_browse_button(self) -> QPushButton:
+        return self._btn_dataset_browse
+
+    @property
+    def db_browse_button(self) -> QPushButton:
+        return self._btn_db_browse
+
+    @property
+    def metadata_browse_button(self) -> QPushButton:
+        return self._btn_meta_browse
+
     def set_dataset_label(self, text: str) -> None:
         self._dataset_label.setText(text)
 

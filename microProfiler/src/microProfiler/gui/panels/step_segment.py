@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from microProfiler.gui.path_drop import enable_path_drop
 from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp
 from microProfiler.gui.panels._block_container import BlockContainerPanel
 from microProfiler.gui.image_widgets import ImageViewer
@@ -53,6 +54,9 @@ class SegmentBlockWidget(QWidget):
         row1.addWidget(QLabel("Model:"))
         self._model_name = QComboBox()
         self._model_name.setEditable(True)
+        # Dragging a model file onto the combo fills its path (the inner
+        # QLineEdit owns the drop events of an editable combo).
+        enable_path_drop(self._model_name.lineEdit())
         self._model_name.addItems(cp_models.MODEL_NAMES)
         self._model_name.setCurrentText("cpdino")
         self._model_name.setToolTip("Built-in cellpose model or path to custom model file")

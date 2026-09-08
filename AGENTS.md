@@ -180,8 +180,9 @@ The pipeline:
   bars/signals for GUI). Workers are cancellable at checkpoints.
 
 * The optional inference step lazily imports microModel to run per-object
-  inference and optional DR reduction (pca/umap/pacmap/localmap), writing a per-block DB under the
-  dataset dir.
+  inference and optional DR reduction / cluster prediction (one reducer
+  pickle of any DR method, or a baseline cluster.pkl that kNN-predicts the
+  find_cluster table), writing a per-block DB under the dataset dir.
 
 * Outputs: in-place processed TIFFs, `<stem>_cp_masks_<obj>.png` masks,
   `result.db` (image + per-object tables), `<dataset>/<output_db>`

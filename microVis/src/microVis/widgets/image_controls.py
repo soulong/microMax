@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from microVis.widgets.path_drop import enable_path_drop
 from microVis._settings import CONTRAST_METHODS
 from microVis.widgets._event_filter import NoScrollComboBox, NoScrollDoubleSpinBox, NoScrollSlider
 from microVis.widgets.channel_controls import ChannelControls
@@ -462,6 +463,7 @@ class ImageControls(QScrollArea):
         lbl_dir.setFixedWidth(60)
         dir_row.addWidget(lbl_dir)
         self._export_dir_input = QLineEdit()
+        enable_path_drop(self._export_dir_input)
         self._export_dir_input.setPlaceholderText("objects_exported")
         self._export_dir_input.setStyleSheet(
             "min-height: 18px; max-height: 22px; font-size: 8pt; padding: 2px 3px;"

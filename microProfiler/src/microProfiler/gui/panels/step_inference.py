@@ -6,7 +6,6 @@ import numpy as np
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -16,13 +15,13 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from microProfiler.gui.panels.base_step_panel import BaseStepPanel, make_hsep
 from microProfiler.gui.panels._block_container import BlockContainerPanel
+from microProfiler.gui.path_drop import enable_path_drop
 from microProfiler.pipeline._micromodel_bridge import read_bundle_meta
 
 DEFAULT_MAX_VALUE = 65535.0
@@ -36,8 +35,6 @@ _DTYPE_MAX = {
     "float32": 1.0,
     "float64": 1.0,
 }
-
-_COLOR_BY_OPTIONS = ["pred_class", "directory", "pred_prob", "ground_truth"]
 
 
 class InferenceBlockWidget(QWidget):
@@ -54,17 +51,18 @@ class InferenceBlockWidget(QWidget):
         self.setProperty("class", "block-card")
         self._classify_capable: Optional[bool] = None
         self._capability_checked_path: Optional[str] = None
-        self._color_by_auto = True
         self._max_value = DEFAULT_MAX_VALUE
         # True once a max_value came from an explicit source (config restore
         # or block copy) — the dataset-dtype default must never overwrite it.
         self._max_value_explicit = False
         # No-widget reduction keys, round-tripped verbatim from YAML.
+        # color_by / sample_per_class only shape the reducer fit and the
+        # PDF plots (which this pipeline never writes) — the tables always
+        # contain every object, so neither has a GUI widget.
         self._method = None
-        self._cluster = None
+        self._color_by = "pred_class"
         self._cluster_res = None
-        self._reduction_pacmap = None
-        self._reduction_localmap = None
+        self._sample_per_class = 10000
         self._build_ui()
 
     # ── UI ──────────────────────────────────────────────────────────────
@@ -83,6 +81,7 @@ class InferenceBlockWidget(QWidget):
         self._model_path.setPlaceholderText("Path to a microModel bundle (*.pt)")
         self._model_path.setToolTip(
             "Trained microModel bundle (SSL pretrain model.pt or train model.pt)")
+        enable_path_drop(self._model_path, on_path=lambda _: self.ensure_capability())
         row_model.addWidget(self._model_path, 1)
         self._browse_btn = QPushButton("Browse...")
         self._browse_btn.setProperty("class", "secondary")
@@ -180,63 +179,59 @@ class InferenceBlockWidget(QWidget):
         row_out.addStretch()
         layout.addLayout(row_out)
 
-        # Row 4: reduction group
+        # Row 4: dimension reduction group
         layout.addWidget(make_hsep())
         self._reduction_group = QGroupBox("Dimension reduction")
         self._reduction_group.setCheckable(True)
         self._reduction_group.setChecked(False)
         self._reduction_group.setToolTip(
-            "Fit the configured DR methods (pca/umap/pacmap/localmap) on the "
-            "features and write reduction_<method> / find_cluster tables. "
-            "No plots are produced. Provided reducers transform directly; "
-            "otherwise reducers are fit (and saved) per dataset.")
+            "Write reduction_<method> tables for every object (the tables "
+            "ALWAYS contain every object — a reducer or subset only shapes "
+            "the plots, which this pipeline does not write). Provide ONE "
+            "pre-fitted reducer pickle (pca/umap/pacmap/localmap — the type "
+            "is detected automatically); leave empty to fit pca+umap fresh.")
         red_layout = QVBoxLayout(self._reduction_group)
         row_red = QHBoxLayout()
-        row_red.addWidget(QLabel("PCA reducer:"))
-        self._reducer_pca_path = QLineEdit()
-        self._reducer_pca_path.setObjectName("reducer_path")
-        self._reducer_pca_path.setPlaceholderText("reducer_pca.pkl (optional — fit if empty)")
-        row_red.addWidget(self._reducer_pca_path, 1)
-        self._pca_browse_btn = QPushButton("Browse...")
-        self._pca_browse_btn.setProperty("class", "secondary")
-        row_red.addWidget(self._pca_browse_btn)
-        row_red.addSpacing(10)
-        row_red.addWidget(QLabel("UMAP reducer:"))
-        self._reducer_umap_path = QLineEdit()
-        self._reducer_umap_path.setObjectName("reducer_path")
-        self._reducer_umap_path.setPlaceholderText("reducer_umap.pkl (optional — fit if empty)")
-        row_red.addWidget(self._reducer_umap_path, 1)
-        self._umap_browse_btn = QPushButton("Browse...")
-        self._umap_browse_btn.setProperty("class", "secondary")
-        row_red.addWidget(self._umap_browse_btn)
+        row_red.addWidget(QLabel("Reducer:"))
+        self._reducer_path = QLineEdit()
+        self._reducer_path.setObjectName("reducer_path")
+        self._reducer_path.setPlaceholderText("reducer pickle (*.pkl) — pca/umap/pacmap/localmap; empty = fit pca+umap")
+        enable_path_drop(self._reducer_path)
+        row_red.addWidget(self._reducer_path, 1)
+        self._reducer_browse_btn = QPushButton("Browse...")
+        self._reducer_browse_btn.setProperty("class", "secondary")
+        row_red.addWidget(self._reducer_browse_btn)
         red_layout.addLayout(row_red)
-        row_red2 = QHBoxLayout()
-        row_red2.addWidget(QLabel("Color by:"))
-        self._color_by = QComboBox()
-        self._color_by.addItems(_COLOR_BY_OPTIONS)
-        self._color_by.setToolTip("Stratification column for reducer fitting (pred_class for SL, directory for SSL)")
-        row_red2.addWidget(self._color_by)
-        row_red2.addSpacing(10)
-        row_red2.addWidget(QLabel("Samples per class:"))
-        self._sample_per_class = QSpinBox()
-        self._sample_per_class.setRange(0, 1000000)
-        self._sample_per_class.setValue(10000)
-        self._sample_per_class.setFixedWidth(80)
-        self._sample_per_class.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self._sample_per_class.setToolTip("Stratified sample size used to FIT the reducers (0 = no sampling)")
-        row_red2.addWidget(self._sample_per_class)
-        row_red2.addStretch()
-        red_layout.addLayout(row_red2)
         layout.addWidget(self._reduction_group)
+
+        # Row 5: cluster prediction group
+        self._cluster_group = QGroupBox("Cluster")
+        self._cluster_group.setCheckable(True)
+        self._cluster_group.setChecked(False)
+        self._cluster_group.setToolTip(
+            "Predict clusters for every object from a baseline cluster.pkl "
+            "(kNN vote over its stored points — cluster IDs stay "
+            "baseline-aligned) and write the find_cluster table. Requires "
+            "a cluster.pkl produced by `micromodel vis-reduction`; checked "
+            "without a file does nothing.")
+        cl_layout = QVBoxLayout(self._cluster_group)
+        row_cl = QHBoxLayout()
+        row_cl.addWidget(QLabel("Cluster file:"))
+        self._cluster_path = QLineEdit()
+        self._cluster_path.setObjectName("reducer_path")
+        self._cluster_path.setPlaceholderText("cluster.pkl — empty = no prediction")
+        enable_path_drop(self._cluster_path)
+        row_cl.addWidget(self._cluster_path, 1)
+        self._cluster_browse_btn = QPushButton("Browse...")
+        self._cluster_browse_btn.setProperty("class", "secondary")
+        row_cl.addWidget(self._cluster_browse_btn)
+        cl_layout.addLayout(row_cl)
+        layout.addWidget(self._cluster_group)
 
         # ── behavior wiring ──
         self._browse_btn.clicked.connect(self._on_browse)
-        self._pca_browse_btn.clicked.connect(self._on_browse_pca)
-        self._umap_browse_btn.clicked.connect(self._on_browse_umap)
-        self._color_by.currentIndexChanged.connect(self._on_color_by_changed)
-
-    def _on_color_by_changed(self, *_):
-        self._color_by_auto = False
+        self._reducer_browse_btn.clicked.connect(self._on_browse_reducer)
+        self._cluster_browse_btn.clicked.connect(self._on_browse_cluster)
 
     def _update_capability_ui(self) -> None:
         if self._classify_capable is None:
@@ -244,15 +239,10 @@ class InferenceBlockWidget(QWidget):
             return
         if self._classify_capable:
             self._pred_class_cb.setEnabled(True)
-            if self._color_by_auto:
-                self._color_by.setCurrentText("pred_class")
-                self._color_by_auto = False
         else:
+            # SSL bundles extract features only — no predictions to gate on.
             self._pred_class_cb.setChecked(False)
             self._pred_class_cb.setEnabled(False)
-            if self._color_by_auto:
-                self._color_by.setCurrentText("directory")
-                self._color_by_auto = False
 
     # ── Capability (bundle meta) ────────────────────────────────────────
 
@@ -306,21 +296,21 @@ class InferenceBlockWidget(QWidget):
         if err:
             QMessageBox.warning(self, "Model Bundle", err)
 
-    def _on_browse_pca(self) -> None:
+    def _on_browse_reducer(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Pre-fitted PCA Reducer", "",
+            self, "Select Pre-fitted Reducer", "",
             "Pickle files (*.pkl);;All files (*)",
         )
         if path:
-            self._reducer_pca_path.setText(path)
+            self._reducer_path.setText(path)
 
-    def _on_browse_umap(self) -> None:
+    def _on_browse_cluster(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Pre-fitted UMAP Reducer", "",
+            self, "Select Baseline cluster.pkl", "",
             "Pickle files (*.pkl);;All files (*)",
         )
         if path:
-            self._reducer_umap_path.setText(path)
+            self._cluster_path.setText(path)
 
     # ── Accessors ───────────────────────────────────────────────────────
 
@@ -400,8 +390,12 @@ class InferenceBlockWidget(QWidget):
             self._channels_row.insertWidget(k, cb)
         self._update_move_buttons()
 
-    def is_reduction_enabled(self) -> bool:
-        return self._reduction_group.isChecked()
+    def is_reduction_or_cluster_enabled(self) -> bool:
+        """True when the reduction run should happen at all (DR group, or the
+        Cluster group with a cluster.pkl chosen)."""
+        return (self._reduction_group.isChecked()
+                or (self._cluster_group.isChecked()
+                    and bool(self._cluster_path.text().strip())))
 
     # ── Population ──────────────────────────────────────────────────────
 
@@ -455,18 +449,19 @@ class InferenceBlockWidget(QWidget):
             "output_db": self.get_output_db(),
             "max_value": self._max_value,
         }
-        if self._reduction_group.isChecked():
+        if self.is_reduction_or_cluster_enabled():
             section["reduction"] = {
-                "enabled": True,
+                # enabled = the Dimension-reduction group; the Cluster group
+                # is its own flag (prediction needs cluster_enabled + file).
+                "enabled": self._reduction_group.isChecked(),
+                "reducer": self._reducer_path.text().strip() or None,
+                "cluster_enabled": self._cluster_group.isChecked(),
+                "cluster": self._cluster_path.text().strip() or None,
+                # No-widget YAML keys, round-tripped verbatim.
                 "method": self._method,
-                "color_by": self._color_by.currentText(),
-                "cluster": self._cluster,
+                "color_by": self._color_by,
                 "cluster_res": self._cluster_res,
-                "sample_per_class": self._sample_per_class.value(),
-                "reduction_pca": self._reducer_pca_path.text().strip() or None,
-                "reduction_umap": self._reducer_umap_path.text().strip() or None,
-                "reduction_pacmap": self._reduction_pacmap,
-                "reduction_localmap": self._reduction_localmap,
+                "sample_per_class": self._sample_per_class,
             }
         return section
 
@@ -489,11 +484,10 @@ class InferenceStepPanel(BlockContainerPanel):
         super()._connect_block_signals(block)
         for w in (block._model_path, block._output_db, block._mask_combo,
                   block._feature_cb, block._pred_class_cb,
-                  block._color_by, block._sample_per_class,
-                  block._reducer_pca_path, block._reducer_umap_path):
+                  block._reducer_path, block._cluster_path):
             self._wire_param_signal(w)
-        block._reduction_group.toggled.connect(
-            self.parameter_changed, Qt.UniqueConnection)
+        for grp in (block._reduction_group, block._cluster_group):
+            grp.toggled.connect(self.parameter_changed, Qt.UniqueConnection)
         # Channel row: check/uncheck AND ◀/▶ reorder both persist to config.
         for cb in block._ch_cbs:
             cb.toggled.connect(self.parameter_changed, Qt.UniqueConnection)
@@ -522,11 +516,10 @@ class InferenceStepPanel(BlockContainerPanel):
             for i in range(src._mask_combo.count()):
                 block._mask_combo.addItem(src._mask_combo.itemText(i))
             block._mask_combo.setCurrentText(src.get_mask_name())
-            block._reduction_group.setChecked(src.is_reduction_enabled())
-            block._reducer_pca_path.setText(src._reducer_pca_path.text())
-            block._reducer_umap_path.setText(src._reducer_umap_path.text())
-            block._color_by.setCurrentText(src._color_by.currentText())
-            block._sample_per_class.setValue(src._sample_per_class.value())
+            block._reduction_group.setChecked(src._reduction_group.isChecked())
+            block._cluster_group.setChecked(src._cluster_group.isChecked())
+            block._reducer_path.setText(src._reducer_path.text())
+            block._cluster_path.setText(src._cluster_path.text())
             if src._ch_cbs:
                 src_order = [cb.text() for cb in src._ch_cbs]
                 block.set_channel_state(src_order, set(src.get_checked_channels()))
@@ -567,22 +560,22 @@ class InferenceStepPanel(BlockContainerPanel):
             )
             block.set_channel_state(order, set(channels_cfg))
         red = cfg.get("reduction") or {}
+        # enabled = the Dimension-reduction group; cluster_enabled = the
+        # Cluster group (prediction additionally needs the cluster file,
+        # which the bridge enforces).
         block._reduction_group.setChecked(bool(red.get("enabled", False)))
-        # method / cluster / cluster_res / reduction_pacmap /
-        # reduction_localmap have no GUI widget — keep the config values
-        # verbatim so a YAML with custom values survives a round-trip.
+        block._cluster_group.setChecked(bool(red.get("cluster_enabled", False)))
+        # method / color_by / cluster_res / sample_per_class have no GUI
+        # widget — keep the config values verbatim so a YAML with custom
+        # values survives a round-trip.
         block._method = red.get("method")
-        block._cluster = red.get("cluster")
+        block._color_by = red.get("color_by", "pred_class")
         block._cluster_res = red.get("cluster_res")
-        block._reduction_pacmap = red.get("reduction_pacmap")
-        block._reduction_localmap = red.get("reduction_localmap")
-        if red.get("reduction_pca"):
-            block._reducer_pca_path.setText(str(red["reduction_pca"]))
-        if red.get("reduction_umap"):
-            block._reducer_umap_path.setText(str(red["reduction_umap"]))
-        BaseStepPanel._set_widget(block._color_by, red.get("color_by", "pred_class"), "color_by")
-        BaseStepPanel._set_widget(block._sample_per_class, red.get("sample_per_class", 10000), "sample_per_class")
-        block._color_by_auto = False
+        block._sample_per_class = red.get("sample_per_class", 10000)
+        if red.get("reducer"):
+            block._reducer_path.setText(str(red["reducer"]))
+        if red.get("cluster"):
+            block._cluster_path.setText(str(red["cluster"]))
 
     def set_dataset_dtype(self, dtype) -> None:
         """Refresh per-block max_value defaults from the dataset dtype.
@@ -629,10 +622,10 @@ class InferenceStepPanel(BlockContainerPanel):
                     f"Rename one of them."
                 )
             seen[db] = True
-            if block.is_reduction_enabled() and not block._feature_cb.isChecked():
+            if block.is_reduction_or_cluster_enabled() and not block._feature_cb.isChecked():
                 return (
-                    "Dimension reduction requires the 'feature' output. "
-                    "Check 'feature' in the block before running."
+                    "Dimension reduction / Cluster require the 'feature' "
+                    "output. Check 'feature' in the block before running."
                 )
             # NOTE: a block with no checked channels is NOT an error — it is
             # skipped at runtime (empty channels = skip, never "all").

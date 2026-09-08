@@ -3,7 +3,7 @@
 from microBase import ImageDataset
 from microProfiler.io.database import Database
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 __all__ = [
     "__version__",
