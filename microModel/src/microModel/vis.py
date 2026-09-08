@@ -825,8 +825,8 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
     mode: every stored resolution is PREDICTED for the new data by a kNN vote
     over the baseline points (cluster_res ignored), so cluster IDs stay
     aligned with the baseline across datasets. Both go to the find_cluster
-    table — one cluster_res<resolution> ID column per resolution plus one
-    cluster_prob<resolution> column holding the kNN vote confidence (max
+    table — one cluster_res_<resolution> ID column per resolution plus one
+    cluster_prob_<resolution> column holding the kNN vote confidence (max
     class probability in [0, 1], the assignment's reliability score). IDs
     become extra color pages in every method's PDF, and each resolution gets
     a representative-cell sheet (cluster_res<resolution>.pdf) unless
@@ -1230,12 +1230,12 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                 list(zip(uids, arr[:, 0].tolist(), arr[:, 1].tolist())))
 
         if cluster_res_list:
-            # One cluster_res<tag> ID column plus one cluster_prob<tag>
+            # One cluster_res_<tag> ID column plus one cluster_prob_<tag>
             # confidence column (kNN vote fraction, [0, 1]) per resolution.
             # Resolution tags may contain a dot ("0.5"), so every identifier
             # is quoted.
-            id_cols = [f"cluster_res{_res_tag(r)}" for r in cluster_res_list]
-            prob_cols = [f"cluster_prob{_res_tag(r)}" for r in cluster_res_list]
+            id_cols = [f"cluster_res_{_res_tag(r)}" for r in cluster_res_list]
+            prob_cols = [f"cluster_prob_{_res_tag(r)}" for r in cluster_res_list]
             cols = ", ".join(
                 [f"{sql_ident(c)} INTEGER NOT NULL" for c in id_cols]
                 + [f"{sql_ident(c)} REAL NOT NULL" for c in prob_cols])
@@ -1290,8 +1290,8 @@ def _load_inference_features(db_path, raise_on_error=False):
             logger.error("No rows in inference table in %s.", db_path)
             return None, None
         dicts = [dict(zip(col_names, r)) for r in rows]
-        # Merge the find_cluster columns (cluster_res<resolution> IDs +
-        # cluster_prob<resolution> confidences) into the row dicts so every
+        # Merge the find_cluster columns (cluster_res_<resolution> IDs +
+        # cluster_prob_<resolution> confidences) into the row dicts so every
         # one of them can serve as a color_by variable. Resolution tags may
         # contain a dot, so identifiers are quoted. Rows missing from a stale
         # find_cluster table simply keep no keys (d.get -> None downstream).
@@ -1332,12 +1332,12 @@ def _load_inference_features(db_path, raise_on_error=False):
 def _color_column_continuous(cb, dicts):
     """Classify a color_by column: True = continuous page, False = categorical.
 
-    Probability columns (pred_prob, cluster_prob<tag>) are always continuous
+    Probability columns (pred_prob, cluster_prob_<tag>) are always continuous
     — kNN vote confidences only take ~15 distinct fractions, which the
     distinct-count heuristic below would misread as categories. Other
     columns qualify as continuous when every non-null value parses as a
     number AND there are more distinct values than
-    CONTINUOUS_COLOR_MAX_CLASSES. cluster_res<tag> columns hold Leiden IDs
+    CONTINUOUS_COLOR_MAX_CLASSES. cluster_res_<tag> columns hold Leiden IDs
     whose numeric order encodes plot distance, not magnitude — they stay
     categorical no matter how many clusters a resolution produced.
     """

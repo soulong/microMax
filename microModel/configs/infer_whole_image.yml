@@ -52,9 +52,9 @@ inference:
 # light-blue page) + a reduction_<method> table (pca: pc_1/pc_2, others:
 # <method>_1/<method>_2). Reducers persist to reduction_<method>.pkl.
 # With cluster_res: Leiden clustering on a kNN graph of the whitened feature
-# space -> a find_cluster table per DB (cluster_res<resolution>, 1-based IDs
+# space -> a find_cluster table per DB (cluster_res_<resolution>, 1-based IDs
 # ordered by UMAP centroid distance from the plot origin, plus
-# cluster_prob<resolution> = kNN vote confidence in [0,1]), extra cluster
+# cluster_prob_<resolution> = kNN vote confidence in [0,1]), extra cluster
 # color pages, and one representative-cell sheet per resolution
 # (cluster_res<resolution>.pdf, cells rendered as their inference-mode input
 # -> uniform size; needs the model bundle; skipped when show_cluster_image is

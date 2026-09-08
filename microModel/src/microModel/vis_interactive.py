@@ -177,7 +177,7 @@ class VisInteractiveServer:
         self._dr_methods = ([m for m in canonical if m in self._dr_methods]
                             + [m for m in self._dr_methods if m not in canonical])
 
-        # find_cluster: one 1-based cluster_res<resolution> column per Leiden
+        # find_cluster: one 1-based cluster_res_<resolution> column per Leiden
         # resolution; exposed to the frontend as categorical color_by options.
         # Resolution tags may contain a dot ("cluster_res0.5"), so every
         # identifier is quoted in the SELECT.
@@ -194,8 +194,8 @@ class VisInteractiveServer:
                 for row in conn.execute(f"SELECT {sel} FROM find_cluster"):
                     d = cluster_by_uid.setdefault(int(row[0]), {})
                     for col, val in zip(cluster_cols, row[1:]):
-                        # cluster_res<tag> holds integer IDs; the
-                        # cluster_prob<tag> confidence columns are floats.
+                        # cluster_res_<tag> holds integer IDs; the
+                        # cluster_prob_<tag> confidence columns are floats.
                         if col.startswith("cluster_prob"):
                             d[col] = float(val) if val is not None else None
                         else:
