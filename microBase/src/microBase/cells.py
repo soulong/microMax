@@ -105,3 +105,56 @@ def crop_all_cells(volume, mask, padding=4, labels=None):
         crop, cell_mask, bbox = crop_cell(volume, mask, cid, padding=padding)
         results.append((crop, cell_mask, bbox, cid))
     return results
+
+
+def edge_pixel_ratio(mask, edge_tolerance: int = 2):
+    """Per-object edge-pixel / perimeter-pixel ratio for a (H, W) label mask.
+
+    For each label:
+    - Perimeter pixels = the object's inner outline (pixels with at least one
+      4-neighbor of a different label; out-of-bounds counts as different, so
+      image-border pixels are perimeter).
+    - Edge pixels = perimeter pixels within `edge_tolerance` of any image edge.
+    - ratio = edge_pixels / perimeter_pixels (0.0 to 1.0).
+
+    An object half-clipped by the image border scores ~0.5; a fully interior
+    object scores 0.0 — a high ratio therefore flags objects that are mostly
+    outside the frame (segmentation filters them out; profiling reports them).
+
+    Returns {label: ratio} for every non-zero label in the mask. Vectorized
+    (whole-mask outline + bincount — identical values to a per-label
+    scipy.ndimage.binary_erosion formulation, without needing scipy).
+    """
+    mask = np.asarray(mask)
+    H, W = mask.shape
+
+    # Inner outline of every object at once: a labeled pixel is perimeter iff
+    # any 4-neighbor differs (out-of-bounds neighbors read as 0).
+    left = np.zeros_like(mask); left[:, 1:] = mask[:, :-1]
+    right = np.zeros_like(mask); right[:, :-1] = mask[:, 1:]
+    up = np.zeros_like(mask); up[1:, :] = mask[:-1, :]
+    down = np.zeros_like(mask); down[:-1, :] = mask[1:, :]
+    perimeter = (mask != 0) & ((mask != left) | (mask != right)
+                               | (mask != up) | (mask != down))
+
+    # Band of pixels within edge_tolerance of any image edge.
+    n = edge_tolerance + 1
+    edge_band = np.zeros((H, W), dtype=bool)
+    edge_band[:n, :] = True
+    edge_band[-n:, :] = True
+    edge_band[:, :n] = True
+    edge_band[:, -n:] = True
+
+    labels = np.unique(mask[perimeter])
+    labels = labels[labels > 0]
+    result = {int(lbl): 0.0 for lbl in np.unique(mask) if lbl > 0}
+    if labels.size == 0:
+        return result
+
+    lab = mask[perimeter]
+    perim_counts = np.bincount(lab)
+    edge_counts = np.bincount(lab, weights=edge_band[perimeter].astype(np.float64))
+    for lbl in labels:
+        total = int(perim_counts[lbl])
+        result[int(lbl)] = float(edge_counts[lbl]) / total if total else 0.0
+    return result

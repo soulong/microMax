@@ -89,6 +89,18 @@ class SegmentBlockWidget(QWidget):
         self._diameter.setSpecialValueText("Auto")
         self._diameter.setToolTip("Expected object diameter in pixels (0 = auto-detect)")
         row2.addWidget(self._diameter)
+        row2.addWidget(QLabel("Edge ratio:"))
+        self._edge_ratio = QDoubleSpinBox()
+        self._edge_ratio.setRange(0.0, 1.0)
+        self._edge_ratio.setValue(0.4)
+        self._edge_ratio.setSingleStep(0.05)
+        self._edge_ratio.setDecimals(2)
+        self._edge_ratio.setToolTip(
+            "Drop masks whose edge-pixel/perimeter ratio exceeds this "
+            "(1 = keep everything): mostly-clipped objects score ~0.5, "
+            "interior objects 0.0. Applies to the saved mask AND the "
+            "preview overlay.")
+        row2.addWidget(self._edge_ratio)
         row2.addWidget(QLabel("Flow thresh:"))
         self._flow_threshold = QDoubleSpinBox()
         self._flow_threshold.setRange(0.0, 10.0)
@@ -333,6 +345,7 @@ class SegmentBlockWidget(QWidget):
             "diameter": self._diameter.value() if self._diameter.value() > 0 else None,
             "flow_threshold": self._flow_threshold.value(),
             "cellprob_threshold": self._cellprob_threshold.value(),
+            "edge_pixel_ratio": self._edge_ratio.value(),
             "gpu_batch_size": self._gpu_batch_size.value(),
             "overwrite_mask": self._overwrite_mask.isChecked(),
         }
@@ -396,6 +409,7 @@ class SegmentStepPanel(BlockContainerPanel):
         self._wire_param_signal(block._resize_factor)
         self._wire_param_signal(block._diameter)
         self._wire_param_signal(block._flow_threshold)
+        self._wire_param_signal(block._edge_ratio)
         self._wire_param_signal(block._cellprob_threshold)
         self._wire_param_signal(block._gpu_batch_size)
         self._wire_param_signal(block._model_name)
@@ -427,6 +441,7 @@ class SegmentStepPanel(BlockContainerPanel):
         BaseStepPanel._set_widget(block._resize_factor, cfg.get("resize_factor", 0.5), "resize_factor")
         BaseStepPanel._set_widget(block._diameter, cfg.get("diameter", 0), "diameter")
         BaseStepPanel._set_widget(block._flow_threshold, cfg.get("flow_threshold", 0.4), "flow_threshold")
+        BaseStepPanel._set_widget(block._edge_ratio, cfg.get("edge_pixel_ratio", 0.4), "edge_pixel_ratio")
         BaseStepPanel._set_widget(block._cellprob_threshold, cfg.get("cellprob_threshold", 0.0), "cellprob_threshold")
         BaseStepPanel._set_widget(block._gpu_batch_size, cfg.get("gpu_batch_size", 32), "gpu_batch_size")
         merge1 = cfg.get("merge1", "")

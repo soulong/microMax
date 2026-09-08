@@ -200,6 +200,7 @@ def _run_segment(
             flow_threshold=entry.flow_threshold,
             cellprob_threshold=entry.cellprob_threshold,
             gpu_batch_size=entry.gpu_batch_size,
+            edge_pixel_ratio=entry.edge_pixel_ratio,
             overwrite_mask=entry.overwrite_mask,
             progress=progress,
         )

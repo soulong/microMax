@@ -95,6 +95,7 @@ class SegmentEntry:
     diameter: Optional[float] = None   # object diameter in px; null = cellpose auto
     flow_threshold: float = 0.4        # cellpose flow-error threshold
     cellprob_threshold: float = 0.0    # cellpose cell-probability threshold
+    edge_pixel_ratio: float = 0.4      # drop masks whose edge-pixel/perimeter ratio exceeds this ([0, 1]; 1 = off)
     gpu_batch_size: int = 32           # images per GPU batch (<= 1 = no batching)
     overwrite_mask: bool = False       # re-segment when a mask file already exists
 
@@ -402,6 +403,8 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
             _check(entry.gpu_batch_size >= 1, "'segment.configs[].gpu_batch_size' must be >= 1")
             _check(entry.resize_factor > 0, "'segment.configs[].resize_factor' must be > 0")
             _check(entry.flow_threshold >= 0, "'segment.configs[].flow_threshold' must be >= 0")
+            _check(0 <= entry.edge_pixel_ratio <= 1,
+                   "'segment.configs[].edge_pixel_ratio' must be in [0, 1]")
             entries.append(entry)
         return SegmentConfig(
             run=_coerce_bool(section.get("run", False), "segment.run"),

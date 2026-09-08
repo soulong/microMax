@@ -91,6 +91,24 @@ def build_cellpose_image(
     return c1[np.newaxis, ...]
 
 
+def _filter_edge_objects(masks: np.ndarray, max_ratio: float) -> np.ndarray:
+    """Drop labels whose edge-pixel ratio exceeds `max_ratio`.
+
+    Objects mostly outside the frame (half-clipped cells score ~0.5) would
+    pollute profiling and overlay; remaining labels keep their ids (gaps are
+    fine — consumers iterate the labels present in the mask).
+    """
+    from microBase import edge_pixel_ratio
+
+    ratios = edge_pixel_ratio(masks)
+    dropped = [lbl for lbl, r in ratios.items() if r > max_ratio]
+    if not dropped:
+        return masks
+    masks = np.where(np.isin(masks, dropped, invert=True), masks, 0).astype(masks.dtype)
+    logger.debug("Edge filter: dropped %d object(s) (ratio > %g)", len(dropped), max_ratio)
+    return masks
+
+
 def segment_single(
     row: pd.Series,
     chan1: List[str],
@@ -104,6 +122,7 @@ def segment_single(
     cellprob_threshold: float = 0.0,
     resize_factor: float = 1.0,
     gpu_batch_size: int = 16,
+    edge_pixel_ratio: float = 0.4,
     model=None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
     """Segment a single image row using Cellpose-SAM."""
@@ -148,6 +167,8 @@ def segment_single(
     # number wins and moving object boundaries. expand_labels preserves label
     # identity while filling small background gaps.
     masks = expand_labels(masks, distance=1)
+    # Preview overlay shows the SAME mask that a full run would save.
+    masks = _filter_edge_objects(masks, edge_pixel_ratio)
     return c1_img, c2_img, masks
 
 
@@ -177,6 +198,7 @@ def segment_dataset(
     flow_threshold: float = 0.4,
     cellprob_threshold: float = 0.0,
     gpu_batch_size: int = 16,
+    edge_pixel_ratio: float = 0.4,
     progress: ProgressCollector = NullProgressCollector(),
 ) -> ImageDataset:
     """Run Cellpose-SAM segmentation on every image in the dataset."""
@@ -278,6 +300,9 @@ def segment_dataset(
             # counted AFTER the fill so n_objects always matches the mask
             # that is actually saved.
             masks = expand_labels(masks, distance=1)
+            # Drop mostly-clipped objects BEFORE counting/saving, so the
+            # saved mask (and every downstream overlay) is the filtered one.
+            masks = _filter_edge_objects(masks, edge_pixel_ratio)
             n_objects = len(np.unique(masks)) - 1
             if n_objects <= 0:
                 summary["processed"] += 1

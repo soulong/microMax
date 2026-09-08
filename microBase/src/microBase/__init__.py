@@ -6,6 +6,7 @@ Provides:
 - crop_cell       : pure function for cropping a single cell
 - crop_all_cells  : convenience wrapper to crop every cell in a mask
 - get_labels      : pure function for listing cell labels in a mask
+- edge_pixel_ratio: per-object edge-pixel/perimeter-pixel ratio
 - read_tiff, read_tiff_channels, read_mask
 - load_yaml, save_yaml, SessionFile
 - build_pipeline, apply (augmentation)
@@ -13,7 +14,7 @@ Provides:
 - derive_well, MetadataSchema
 """
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 import os as _os
 _os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -31,6 +32,7 @@ from .io import (
 from .cells import (
     crop_cell,
     crop_all_cells,
+    edge_pixel_ratio,
     get_labels,
 )
 from .config import (
@@ -58,6 +60,7 @@ __all__ = [
     "CellDataset",
     "crop_cell",
     "crop_all_cells",
+    "edge_pixel_ratio",
     "get_labels",
     "read_image",
     "read_tiff_channels",

@@ -94,7 +94,7 @@ Module map (overview):
 | `__init__.py`      | Re-exports public names; sets env vars disabling albumentations update/telemetry         |
 | `schema.py`        | Classifies regex-captured columns (structural vs extra); derives `well` from `row`+`col` |
 | `io.py`            | TIFF/mask readers, normalized to `(H, W, C)`; no writers                                 |
-| `cells.py`         | Pure functions to crop single cells from labeled masks                                   |
+| `cells.py`         | Pure functions for labeled masks: single-cell cropping, per-object edge-pixel ratio        |
 | `config.py`        | YAML load/save + per-dataset `SessionFile` (deep-merge into `session.yml`)               |
 | `augment.py`       | Registry-driven augmentation pipeline over AlbumentationsX                               |
 | `normalize.py`     | Per-channel percentile clip + min-max rescale + optional z-score                         |

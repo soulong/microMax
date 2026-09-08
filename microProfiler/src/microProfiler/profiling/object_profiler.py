@@ -13,7 +13,7 @@ import pandas as pd
 from scipy.ndimage import find_objects
 from skimage.measure import regionprops_table
 
-from microBase import ImageDataset
+from microBase import ImageDataset, edge_pixel_ratio
 from microProfiler.profiling import resolve_source_directory
 from microProfiler.profiling.batch_writer import BatchWriter
 from microProfiler.profiling.extras import (
@@ -148,58 +148,6 @@ def _relate_masks(
     return mapping
 
 
-def _shape_edge_pixel_ratio(
-    mask: np.ndarray,
-    edge_tolerance: int = 2,
-) -> Dict[int, float]:
-    """Compute edge-pixel / perimeter-pixel ratio for each object.
-
-    For each cell:
-    - Perimeter pixels = cell pixels adjacent to non-cell (inner outline),
-      computed as `cell & ~binary_erosion(cell)`.
-    - Edge pixels = perimeter pixels within `edge_tolerance` of any image edge.
-    - ratio = edge_pixels / perimeter_pixels (0.0 to 1.0).
-
-    A half-clipped cell has ~0.5; an interior cell has 0.0.
-
-    Args:
-        mask: 2D label mask.
-        edge_tolerance: pixels within this distance of any image edge
-            count as edge pixels.
-    """
-    from scipy.ndimage import binary_erosion
-
-    H, W = mask.shape
-    labels = np.unique(mask)
-    labels = labels[labels != 0]
-    result: Dict[int, float] = {}
-    slices = find_objects(mask)
-
-    # Boolean edge mask: True for pixels within `edge_tolerance` of any image edge.
-    edge_mask = np.zeros((H, W), dtype=bool)
-    n = edge_tolerance + 1
-    edge_mask[:n, :] = True
-    edge_mask[-n:, :] = True
-    edge_mask[:, :n] = True
-    edge_mask[:, -n:] = True
-
-    for lbl in labels:
-        sl = slices[lbl - 1]
-        if sl is None:
-            result[int(lbl)] = 0.0
-            continue
-        cell = mask[sl] == lbl
-        perimeter = cell & ~binary_erosion(cell)
-        perim_count = int(perimeter.sum())
-        if perim_count == 0:
-            result[int(lbl)] = 0.0
-            continue
-        edge_count = int(np.count_nonzero(perimeter & edge_mask[sl]))
-        result[int(lbl)] = edge_count / perim_count
-
-    return result
-
-
 def _run_per_channel_regionprops(
     mask: np.ndarray,
     img: np.ndarray,
@@ -299,8 +247,9 @@ def measure_objects(
         columns={k: v for k, v in _SHAPE_RENAMES.items() if k in shape_props}
     )
 
-    # Step 2: Edge pixel ratio (edge_pixels / perimeter_pixels)
-    ratio_map = _shape_edge_pixel_ratio(mask)
+    # Step 2: Edge pixel ratio (edge_pixels / perimeter_pixels) — the same
+    # function segmentation uses to drop mostly-clipped objects.
+    ratio_map = edge_pixel_ratio(mask)
     df["shape_edge_pixel_ratio"] = df["label"].map(ratio_map)
 
     # Step 3: Parent relationship

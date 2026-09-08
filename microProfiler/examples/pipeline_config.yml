@@ -71,6 +71,7 @@ segment:
       merge2: mean
       resize_factor: 0.5
       diameter: null
+      edge_pixel_ratio: 0.4     # drop masks whose edge-pixel/perimeter ratio exceeds this ([0, 1]; 1 = keep all)
       flow_threshold: 0.4
       cellprob_threshold: 0.0
       gpu_batch_size: 32
