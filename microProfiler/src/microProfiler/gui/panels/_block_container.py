@@ -78,7 +78,8 @@ class BlockContainerPanel(BaseStepPanel):
         idx = len(self._blocks)
         block = self._block_widget_class(idx, channels, parent=self._block_container, **kwargs)
         self._connect_block_signals(block)
-        self._compact_block(block)
+        self._compact_block(
+            block, excluded=getattr(self, "_compact_excluded_object_names", ()) or ())
         # Move add button to bottom
         self._blocks_layout.removeItem(self._add_btn_layout)
         if self._blocks:
@@ -171,7 +172,8 @@ class BlockContainerPanel(BaseStepPanel):
             block = self._block_widget_class(len(self._blocks), last_channels, parent=self._block_container)
             self._connect_block_signals(block)
             self._apply_block_config(block, cfg)
-            self._compact_block(block)
+            self._compact_block(
+            block, excluded=getattr(self, "_compact_excluded_object_names", ()) or ())
             self._blocks.append(block)
             self._blocks_layout.addWidget(block)
 

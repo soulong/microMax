@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from microProfiler.gui.panels.base_step_panel import BaseStepPanel, make_hsep
+from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp, make_hsep
 from microProfiler.gui.panels._block_container import BlockContainerPanel
 from microProfiler.gui.path_drop import enable_path_drop
 from microProfiler.pipeline._micromodel_bridge import read_bundle_meta
@@ -71,11 +71,32 @@ class InferenceBlockWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 4)
         layout.setSpacing(4)
-        layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        # Rows stretch to the full card width (no AlignLeft) so the path
+        # boxes — not the buttons — absorb the extra space.
+        layout.setAlignment(Qt.AlignTop)
 
-        # Row 1: model path + browse + remove
+        # Common width for row-leading labels: every input starts at the
+        # same x, right after its label column.
+        label_w = dp(80)
+        # Compact browse buttons: the path box is the wide part of the row.
+        browse_w = dp(36)
+
+        def _row_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setFixedWidth(label_w)
+            return lbl
+
+        def _browse_button() -> QPushButton:
+            btn = QPushButton("...")
+            btn.setFixedWidth(browse_w)
+            btn.setProperty("class", "secondary")
+            btn.setToolTip("Browse... (you can also drag a file onto the input box)")
+            return btn
+
+        # Row 1: model path + browse (the path box absorbs all extra width,
+        # so Browse sits right after it and Remove ends up right-aligned)
         row_model = QHBoxLayout()
-        row_model.addWidget(QLabel("Model:"))
+        row_model.addWidget(_row_label("Model:"))
         self._model_path = QLineEdit()
         self._model_path.setObjectName("checkpoint_path")
         self._model_path.setPlaceholderText("Path to a microModel bundle (*.pt)")
@@ -83,9 +104,9 @@ class InferenceBlockWidget(QWidget):
             "Trained microModel bundle (SSL pretrain model.pt or train model.pt)")
         enable_path_drop(self._model_path, on_path=lambda _: self.ensure_capability())
         row_model.addWidget(self._model_path, 1)
-        self._browse_btn = QPushButton("Browse...")
-        self._browse_btn.setProperty("class", "secondary")
-        self._browse_btn.setToolTip("Pick a bundle; capabilities are read from its meta")
+        self._browse_btn = _browse_button()
+        self._browse_btn.setToolTip(
+            "Pick a bundle; capabilities are read from its meta")
         row_model.addWidget(self._browse_btn)
         self._remove_btn = QPushButton("✕ Remove")
         self._remove_btn.setProperty("class", "danger")
@@ -112,7 +133,7 @@ class InferenceBlockWidget(QWidget):
         # Row 2: mask + channels (checkable row, ◀/▶ to reorder)
         row_mask = QHBoxLayout()
         self._mask_row = row_mask
-        row_mask.addWidget(QLabel("Mask:"))
+        row_mask.addWidget(_row_label("Mask:"))
         self._mask_combo = QComboBox()
         self._mask_combo.setEditable(True)
         self._mask_combo.setToolTip("Mask type to infer objects from (dataset mask columns)")
@@ -192,14 +213,13 @@ class InferenceBlockWidget(QWidget):
             "is detected automatically); leave empty to fit pca+umap fresh.")
         red_layout = QVBoxLayout(self._reduction_group)
         row_red = QHBoxLayout()
-        row_red.addWidget(QLabel("Reducer:"))
+        row_red.addWidget(_row_label("Reducer:"))
         self._reducer_path = QLineEdit()
         self._reducer_path.setObjectName("reducer_path")
         self._reducer_path.setPlaceholderText("reducer pickle (*.pkl) — pca/umap/pacmap/localmap; empty = fit pca+umap")
         enable_path_drop(self._reducer_path)
         row_red.addWidget(self._reducer_path, 1)
-        self._reducer_browse_btn = QPushButton("Browse...")
-        self._reducer_browse_btn.setProperty("class", "secondary")
+        self._reducer_browse_btn = _browse_button()
         row_red.addWidget(self._reducer_browse_btn)
         red_layout.addLayout(row_red)
         layout.addWidget(self._reduction_group)
@@ -216,14 +236,13 @@ class InferenceBlockWidget(QWidget):
             "without a file does nothing.")
         cl_layout = QVBoxLayout(self._cluster_group)
         row_cl = QHBoxLayout()
-        row_cl.addWidget(QLabel("Cluster file:"))
+        row_cl.addWidget(_row_label("Cluster file:"))
         self._cluster_path = QLineEdit()
         self._cluster_path.setObjectName("reducer_path")
         self._cluster_path.setPlaceholderText("cluster.pkl — empty = no prediction")
         enable_path_drop(self._cluster_path)
         row_cl.addWidget(self._cluster_path, 1)
-        self._cluster_browse_btn = QPushButton("Browse...")
-        self._cluster_browse_btn.setProperty("class", "secondary")
+        self._cluster_browse_btn = _browse_button()
         row_cl.addWidget(self._cluster_browse_btn)
         cl_layout.addLayout(row_cl)
         layout.addWidget(self._cluster_group)
@@ -343,6 +362,11 @@ class InferenceBlockWidget(QWidget):
 
     def set_channel_state(self, order: List[str], checked) -> None:
         """Rebuild the channel checkboxes with an explicit order + checked set."""
+        if self._chan_placeholder is not None:
+            # Channels arrived — the "Load a dataset to configure" hint goes.
+            self._channels_row.removeWidget(self._chan_placeholder)
+            self._chan_placeholder.deleteLater()
+            self._chan_placeholder = None
         for cb in self._ch_cbs:
             self._channels_row.removeWidget(cb)
             cb.deleteLater()

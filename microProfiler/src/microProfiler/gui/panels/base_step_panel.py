@@ -115,18 +115,28 @@ class BaseStepPanel(QGroupBox):
             widget.currentIndexChanged.connect(self.parameter_changed, Qt.UniqueConnection)
 
     @staticmethod
-    def _compact_block(block: QWidget, max_width: int = 200) -> None:
+    def _compact_block(widget: QWidget, max_width: int = 200,
+                       excluded: "frozenset | set | None" = None) -> None:
+        """Cap spin/combo/line-edit widths so block cards stay compact.
+
+        excluded: object names of line edits that must keep their natural
+        (stretching) width — path boxes. When not given explicitly it is
+        read from the widget itself; block containers pass the STEP PANEL's
+        set, since the attribute lives on the panel class while `widget` is
+        the block.
+        """
         from PySide6.QtWidgets import QAbstractSpinBox
-        excluded = getattr(block, "_compact_excluded_object_names", ()) or ()
-        for child in block.findChildren(QSpinBox):
+        if excluded is None:
+            excluded = getattr(widget, "_compact_excluded_object_names", ()) or ()
+        for child in widget.findChildren(QSpinBox):
             child.setMaximumWidth(max_width)
             child.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        for child in block.findChildren(QDoubleSpinBox):
+        for child in widget.findChildren(QDoubleSpinBox):
             child.setMaximumWidth(max_width)
             child.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        for child in block.findChildren(QComboBox):
+        for child in widget.findChildren(QComboBox):
             child.setMaximumWidth(max_width)
-        for child in block.findChildren(QLineEdit):
+        for child in widget.findChildren(QLineEdit):
             name = child.objectName()
             if name in excluded:
                 continue
