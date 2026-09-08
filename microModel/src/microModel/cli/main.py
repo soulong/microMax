@@ -1,4 +1,4 @@
-"""CLI entry point: micromodel pretrain / train / infer / vis-augment / reduction / reduction-vis / vis-attention."""
+"""CLI entry point: micromodel pretrain / train / infer / augment-vis / reduction / reduction-vis / attention-vis."""
 
 import argparse
 import sys
@@ -7,11 +7,11 @@ import time
 from .. import __version__
 from ..utils import setup_logging, load_yaml, logger
 from ..pretrain import pretrain_ssl
-from ..vis_attention import vis_attention
+from ..attention_vis import vis_attention
 from ..train import train
 from ..infer import run_inference
 from ..reduction import show_reduction
-from ..vis_augment import show_augmentation
+from ..augment_vis import show_augmentation
 from ..reduction_vis import main as main_interactive
 
 
@@ -21,7 +21,7 @@ def cmd_pretrain(args):
     pretrain_ssl(cfg, config_path=args.config)
 
 
-def cmd_vis_attention(args):
+def cmd_attention_vis(args):
     logger.info("Loading pretrain config from %s for attention visualization", args.config)
     cfg = load_yaml(args.config)
     vis_attention(cfg, config_path=args.config)
@@ -39,7 +39,7 @@ def cmd_infer(args):
     run_inference(cfg, config_path=args.config)
 
 
-def cmd_vis_augment(args):
+def cmd_augment_vis(args):
     logger.info("Loading config from %s for augmentation preview", args.config)
     cfg = load_yaml(args.config)
     show_augmentation(cfg)
@@ -76,9 +76,9 @@ def main():
     p_infer.add_argument("--config", required=True, help="Path to inference YAML config")
     p_infer.set_defaults(func=cmd_infer)
 
-    p_aug = sub.add_parser("vis-augment", help="Visualize multi-view augmentation preview (no model needed)")
+    p_aug = sub.add_parser("augment-vis", help="Visualize multi-view augmentation preview (no model needed)")
     p_aug.add_argument("--config", required=True, help="Path to pretrain or train YAML config")
-    p_aug.set_defaults(func=cmd_vis_augment)
+    p_aug.set_defaults(func=cmd_augment_vis)
 
     p_red = sub.add_parser("reduction",
                            help="Fit DR reductions (pca/umap/pacmap/localmap) on feature vectors + optional Leiden clustering; writes reduction_<method>/find_cluster tables and multi-page PDFs")
@@ -90,10 +90,10 @@ def main():
     p_int.add_argument("--port", type=int, default=5000, help="Server port (default 5000)")
     p_int.set_defaults(func=cmd_reduction_vis)
 
-    p_att = sub.add_parser("vis-attention",
+    p_att = sub.add_parser("attention-vis",
                            help="Offline attention/patch-similarity visualization from a trained SSL bundle (needs resume.ssl_model in the config)")
     p_att.add_argument("--config", required=True, help="Path to pretrain YAML config (resume.ssl_model -> trained bundle)")
-    p_att.set_defaults(func=cmd_vis_attention)
+    p_att.set_defaults(func=cmd_attention_vis)
 
     args = parser.parse_args()
     if not args.command:

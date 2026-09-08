@@ -248,8 +248,8 @@ data through `self._dm`; wrap heavy work in a `QRunnable` under `worker.py`.
 ## 7. microModel — SSL pretrain + train + infer
 
 **Path:** `microMax/microModel/` · **Entry:** `micromodel` (CLI subcommands:
-`pretrain`, `train`, `infer`, `vis-augment`, `reduction`,
-`reduction-vis`, `vis-attention`).
+`pretrain`, `train`, `infer`, `augment-vis`, `reduction`,
+`reduction-vis`, `attention-vis`).
 
 Additional deps: `lightly` (SSL projection heads/losses), `timm` (backbones +
 ViT rebuild), `pacmap` (PaCMAP/LocalMAP DR).
@@ -275,10 +275,10 @@ Package layout (overview):
 * `reduction_vis.py` — Flask server for interactive point inspection (the
   `reduction-vis` command).
 
-* `vis_augment.py` — augmentation preview (the `vis-augment` command).
+* `augment_vis.py` — augmentation preview (the `augment-vis` command).
 
-* `vis_attention.py` — offline attention/patch-similarity PDF from a
-  trained SSL bundle (the `vis-attention` command).
+* `attention_vis.py` — offline attention/patch-similarity PDF from a
+  trained SSL bundle (the `attention-vis` command).
 
 * `plots.py` — training/pretrain monitoring plots shared by the loops and
   the commands above.

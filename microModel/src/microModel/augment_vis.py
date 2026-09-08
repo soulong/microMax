@@ -1,4 +1,4 @@
-"""Augmentation preview (CLI: micromodel vis-augment).
+"""Augmentation preview (CLI: micromodel augment-vis).
 
 show_augmentation adapts to both pretrain configs (augmentation_views) and
 train configs (augmentation_train + augmentation_infer): it renders one

@@ -1,4 +1,4 @@
-"""Offline DINOv3 attention diagnostics (CLI: micromodel vis-attention).
+"""Offline DINOv3 attention diagnostics (CLI: micromodel attention-vis).
 
 vis_attention loads a trained SSL bundle (config.resume.ssl_model), recomputes
 per-head/mean CLS attention maps and patch-similarity anchor maps on a fixed
@@ -30,7 +30,7 @@ def vis_attention(config, config_path=None):
     ({output_dir}/vis_attention.pdf) — no training happens.
     """
     if config.get("method") != "dinov3":
-        print("Error: vis-attention currently supports method 'dinov3' only",
+        print("Error: attention-vis currently supports method 'dinov3' only",
               file=sys.stderr)
         sys.exit(1)
     resume_path = (config.get("resume") or {}).get("ssl_model")
@@ -46,7 +46,7 @@ def vis_attention(config, config_path=None):
     output_dir = config.get("output_dir", "runs")
     os.makedirs(output_dir, exist_ok=True)
     add_file_logging(output_dir)
-    logger.info("microModel %s vis-attention (config=%s, device=%s)",
+    logger.info("microModel %s attention-vis (config=%s, device=%s)",
                 __version__, config_path, device)
     set_seed(seed)
 
@@ -82,7 +82,7 @@ def vis_attention(config, config_path=None):
         check_datasets[0] if len(check_datasets) == 1
         else ConcatDataset(check_datasets),
         batch_size=32, shuffle=False, num_workers=0)
-    logger.info("vis-attention: %d images, bundle=%s", n_samples, resume_path)
+    logger.info("attention-vis: %d images, bundle=%s", n_samples, resume_path)
 
     # ---- Load bundle into a dinov3 model (gram keys handled) ----
     # Architecture comes from the bundle meta (locked at training time); the
@@ -135,12 +135,12 @@ def vis_attention(config, config_path=None):
             if len(samples) >= n_samples:
                 break
     if not samples:
-        logger.warning("vis-attention produced no samples")
+        logger.warning("attention-vis produced no samples")
         return
     save_path = os.path.join(output_dir, "vis_attention.pdf")
     plot_attention_combined(samples, save_path, inputs=all_inputs,
                             anchor_idx=anchor_idx,
                             title=f"Attention + patch similarity "
                                   f"(offline, {len(samples)} samples)")
-    logger.info("vis-attention PDF saved to %s (%d samples)",
+    logger.info("attention-vis PDF saved to %s (%d samples)",
                 save_path, len(samples))

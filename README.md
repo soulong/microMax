@@ -153,7 +153,7 @@ All commands are config-driven (`micromodel <subcommand> --config <file>`):
 
 ```
 micromodel pretrain --config configs/pretrain_dinov3_phase1.yml  # SSL backbone (DINOv3)
-micromodel vis-augment --config configs/pretrain_dinov3_phase1.yml # preview the augmentation views
+micromodel augment-vis --config configs/pretrain_dinov3_phase1.yml # preview the augmentation views
 micromodel train --config configs/train_from_pretrain.yml   # classifier (from SSL backbone or scratch)
 micromodel infer --config configs/infer_whole_image.yml     # predictions + features -> infer.db
 micromodel reduction --config configs/infer_whole_image.yml

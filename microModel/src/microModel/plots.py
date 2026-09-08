@@ -1,9 +1,9 @@
-"""Training / diagnostic plots shared by pretrain, train and vis-attention.
+"""Training / diagnostic plots shared by pretrain, train and attention-vis.
 
 No CLI of its own: plot_training_results serves the train loop,
 plot_pretrain_loss / plot_head_track feed the pretrain loop's per-epoch
 monitoring, and the patch-similarity / attention-map renderers back both the
-in-training summary and the offline vis-attention command.
+in-training summary and the offline attention-vis command.
 """
 
 import numpy as np
