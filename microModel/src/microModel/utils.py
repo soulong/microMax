@@ -265,7 +265,7 @@ def stratified_sample_indices(n, labels, sample_per_class, seed, uniform=False):
 
     uniform=True samples without stratification (used for pred_prob). The
     chosen indices are sorted. Shared by vis.show_reduction (reducer fitting)
-    and vis_interactive (browser subsampling) — identical sampling semantics.
+    and reduction_vis (browser subsampling) — identical sampling semantics.
     """
     rng = np.random.default_rng(seed)
     if uniform:

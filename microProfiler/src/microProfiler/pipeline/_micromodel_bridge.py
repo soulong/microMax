@@ -114,8 +114,8 @@ def run_mm_inference(mm_cfg, **kwargs):
 
 
 def run_mm_reduction(mm_cfg, **kwargs):
-    """Lazily import and call microModel.vis.show_reduction (see _call_micromodel)."""
-    from microModel.vis import show_reduction
+    """Lazily import and call microModel.reduction.show_reduction (see _call_micromodel)."""
+    from microModel.reduction import show_reduction
     return show_reduction(mm_cfg, **kwargs)
 
 

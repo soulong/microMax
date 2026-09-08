@@ -268,12 +268,20 @@ Package layout (overview):
 * `models/` — SSL method implementations: DINOv3 (lightly + own
   DINO/iBOT/KoLeo/Gram components), behind a small registry.
 
-* `vis.py` — augmentation preview, multi-method DR reduction plots
-  (pca/umap/pacmap/localmap) + optional Leiden cluster finding (kNN graph,
-  one partition per resolution; a baseline cluster.pkl kNN-predicts new
-  datasets).
+* `reduction.py` — DR reduction + Leiden cluster finding over infer.db
+  features (pca/umap/pacmap/localmap; a baseline cluster.pkl kNN-predicts
+  new datasets). Implements the `reduction` command.
 
-* `vis_interactive.py` — Flask server for interactive point inspection.
+* `reduction_vis.py` — Flask server for interactive point inspection (the
+  `reduction-vis` command).
+
+* `vis_augment.py` — augmentation preview (the `vis-augment` command).
+
+* `vis_attention.py` — offline attention/patch-similarity PDF from a
+  trained SSL bundle (the `vis-attention` command).
+
+* `plots.py` — training/pretrain monitoring plots shared by the loops and
+  the commands above.
 
 * `utils.py` — logging, seed/device, label resolution, reducer pickling.
 

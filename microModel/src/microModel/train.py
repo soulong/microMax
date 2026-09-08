@@ -688,7 +688,7 @@ def train(config, config_path=None):
     eval_model.eval()
 
     # ---- Plots + report ----
-    from .vis import plot_training_results
+    from .plots import plot_training_results
     eval_model.to(device)
     result = plot_training_results(
             eval_model, device, val_loader, num_classes,

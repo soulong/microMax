@@ -6,11 +6,13 @@ import time
 
 from .. import __version__
 from ..utils import setup_logging, load_yaml, logger
-from ..pretrain import pretrain_ssl, vis_attention
+from ..pretrain import pretrain_ssl
+from ..vis_attention import vis_attention
 from ..train import train
 from ..infer import run_inference
-from ..vis import show_augmentation, show_reduction
-from ..vis_interactive import main as main_interactive
+from ..reduction import show_reduction
+from ..vis_augment import show_augmentation
+from ..reduction_vis import main as main_interactive
 
 
 def cmd_pretrain(args):
