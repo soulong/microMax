@@ -265,7 +265,7 @@ class InferenceBlockWidget(QWidget):
             "Predict clusters for every object from a baseline cluster.pkl "
             "(kNN vote over its stored points — cluster IDs stay "
             "baseline-aligned) and write the find_cluster table. Requires "
-            "a cluster.pkl produced by `micromodel vis-reduction`; checked "
+            "a cluster.pkl produced by `micromodel reduction`; checked "
             "without a file does nothing.")
         cl_layout = QVBoxLayout(self._cluster_group)
         row_cl = QHBoxLayout()

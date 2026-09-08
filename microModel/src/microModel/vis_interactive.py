@@ -139,7 +139,7 @@ class VisInteractiveServer:
 
     def _load_coords(self, db_path):
         conn = sqlite3.connect(db_path)
-        # Discover every reduction_<method> table written by vis-reduction.
+        # Discover every reduction_<method> table written by `micromodel reduction`.
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name LIKE 'reduction_%'")
@@ -147,7 +147,7 @@ class VisInteractiveServer:
         if not tables:
             logger.warning(
                 "No reduction_* tables found in %s. "
-                "Run 'micromodel vis-reduction' first.", db_path)
+                "Run 'micromodel reduction' first.", db_path)
             conn.close()
             return
 

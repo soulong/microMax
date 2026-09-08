@@ -156,12 +156,12 @@ micromodel pretrain --config configs/pretrain_dinov3_phase1.yml  # SSL backbone 
 micromodel vis-augment --config configs/pretrain_dinov3_phase1.yml # preview the augmentation views
 micromodel train --config configs/train_from_pretrain.yml   # classifier (from SSL backbone or scratch)
 micromodel infer --config configs/infer_whole_image.yml     # predictions + features -> infer.db
-micromodel vis-reduction --config configs/infer_whole_image.yml
-micromodel vis-reduction-interactive --config configs/infer_whole_image.yml --port 5000
+micromodel reduction --config configs/infer_whole_image.yml
+micromodel reduction-vis --config configs/infer_whole_image.yml --port 5000
 ```
 
 The end-to-end flow: **pretrain → train → infer**, with the interactive
-PCA/UMAP viewer (`vis-reduction-interactive`, served at
+PCA/UMAP viewer (`reduction-vis`, served at
 `http://127.0.0.1:5000`) for clicking through individual cells. Training
 inputs can be the exported cells from microVis, or whole images with their
 segmentation masks.

@@ -248,8 +248,8 @@ data through `self._dm`; wrap heavy work in a `QRunnable` under `worker.py`.
 ## 7. microModel — SSL pretrain + train + infer
 
 **Path:** `microMax/microModel/` · **Entry:** `micromodel` (CLI subcommands:
-`pretrain`, `train`, `infer`, `vis-augment`, `vis-reduction`,
-`vis-reduction-interactive`, `vis-attention`).
+`pretrain`, `train`, `infer`, `vis-augment`, `reduction`,
+`reduction-vis`, `vis-attention`).
 
 Additional deps: `lightly` (SSL projection heads/losses), `timm` (backbones +
 ViT rebuild), `pacmap` (PaCMAP/LocalMAP DR).

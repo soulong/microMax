@@ -1,4 +1,4 @@
-"""CLI entry point: micromodel pretrain / train / infer / vis-augment / vis-reduction / vis-reduction-interactive / vis-attention."""
+"""CLI entry point: micromodel pretrain / train / infer / vis-augment / reduction / reduction-vis / vis-attention."""
 
 import argparse
 import sys
@@ -43,13 +43,13 @@ def cmd_vis_augment(args):
     show_augmentation(cfg)
 
 
-def cmd_vis_reduction(args):
+def cmd_reduction(args):
     logger.info("Loading inference config from %s for reduction view", args.config)
     cfg = load_yaml(args.config)
     show_reduction(cfg)
 
 
-def cmd_vis_reduction_interactive(args):
+def cmd_reduction_vis(args):
     logger.info("Loading inference config from %s for interactive reduction view", args.config)
     cfg = load_yaml(args.config)
     main_interactive(cfg, port=args.port)
@@ -78,15 +78,15 @@ def main():
     p_aug.add_argument("--config", required=True, help="Path to pretrain or train YAML config")
     p_aug.set_defaults(func=cmd_vis_augment)
 
-    p_red = sub.add_parser("vis-reduction",
+    p_red = sub.add_parser("reduction",
                            help="Fit DR reductions (pca/umap/pacmap/localmap) on feature vectors + optional Leiden clustering; writes reduction_<method>/find_cluster tables and multi-page PDFs")
     p_red.add_argument("--config", required=True, help="Path to inference YAML config")
-    p_red.set_defaults(func=cmd_vis_reduction)
+    p_red.set_defaults(func=cmd_reduction)
 
-    p_int = sub.add_parser("vis-reduction-interactive", help="Launch interactive PCA/UMAP viewer with live image inspection")
+    p_int = sub.add_parser("reduction-vis", help="Launch interactive PCA/UMAP viewer with live image inspection")
     p_int.add_argument("--config", required=True, help="Path to inference YAML config")
     p_int.add_argument("--port", type=int, default=5000, help="Server port (default 5000)")
-    p_int.set_defaults(func=cmd_vis_reduction_interactive)
+    p_int.set_defaults(func=cmd_reduction_vis)
 
     p_att = sub.add_parser("vis-attention",
                            help="Offline attention/patch-similarity visualization from a trained SSL bundle (needs resume.ssl_model in the config)")

@@ -39,11 +39,11 @@ dataloader:
 
 inference:
   pred_class: true                    # write pred_class/pred_prob; train bundle only (SSL: warning, skipped)
-  feature: true                       # write features BLOB; needed by vis-reduction
+  feature: true                       # write features BLOB; needed by reduction
   db_name: infer.db
   batch_size: 128
 
-# Multi-method DR — run via `micromodel vis-reduction --config <this_file>`.
+# Multi-method DR — run via `micromodel reduction --config <this_file>`.
 # Reducers are fit once on merged features from all DBs, then applied per-DB.
 # Per DR method: one multi-page PDF (reduction_<method>.pdf — one page per
 # color_by entry, then one per cluster resolution; color_by null = a single
@@ -69,7 +69,7 @@ reduction:
   color_by: null                      # list, null = single light-blue page; first = stratification column
   cluster_res: [0.5, 1, 2, 4]         # list, Leiden resolutions (higher = more clusters); null/empty = no cluster finding (ignored when cluster is set)
   sample_per_class: null              # max points per class to fit reducers; 0/null = all
-  show_cluster_image: false           # output per-resolution representative-image sheets (cluster_res<res>.pdf); false = skip (faster, no model bundle load)
+  show_cluster_image: true           # output per-resolution representative-image sheets (cluster_res<res>.pdf); false = skip (faster, no model bundle load)
   reduction_pca: null                 # path to a pre-fitted reduction_pca.pkl; null = fit new
   reduction_umap: null                # path to a pre-fitted reduction_umap.pkl; null = fit new
   reduction_pacmap: null              # path to a pre-fitted reduction_pacmap.pkl; null = fit new

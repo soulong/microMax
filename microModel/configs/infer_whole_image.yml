@@ -41,11 +41,11 @@ dataloader:
 
 inference:
   pred_class: true                    # write pred_class/pred_prob; train bundle only (SSL: warning, skipped)
-  feature: true                       # write features BLOB; needed by vis-reduction
+  feature: true                       # write features BLOB; needed by reduction
   db_name: infer.db
   batch_size: 128
 
-# Multi-method DR — run via `micromodel vis-reduction --config <this_file>`.
+# Multi-method DR — run via `micromodel reduction --config <this_file>`.
 # Reducers are fit once on merged features from all DBs, then applied per-DB.
 # Per DR method: one multi-page PDF (reduction_<method>.pdf — one page per
 # color_by entry, then one per cluster resolution; color_by null = a single
