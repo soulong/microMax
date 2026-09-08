@@ -721,7 +721,12 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
             if j < len(imgs):
                 ax.imshow(imgs[j])
             if j == 0:
-                ax.set_title(f"cluster {cid} (n={member.size})", fontsize=8)
+                title = f"cluster {cid} (n={member.size})"
+                if not imgs:
+                    # Every candidate was filtered as debris/sliver — say so
+                    # explicitly instead of showing a silently empty row.
+                    title += "\nno cell-like crops"
+                ax.set_title(title, fontsize=8)
         axes[r][base + n_per].axis("off")  # spacer after the group
     # Any trailing cluster slot beyond n_ids stays empty.
     for cid in range(n_ids, rows * groups):
@@ -969,11 +974,11 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
             logger.info("%s: loaded reducer from %s", m.upper(), pre_path)
             continue
         if m == "pca":
-            reducers[m] = PCA(n_components=2).fit(feats_fit)
+            reducers[m] = PCA(n_components=2, random_state=seed).fit(feats_fit)
         elif m == "umap":
             dim = feats_fit.shape[1]
             n_pre = min(UMAP_PRE_COMPONENTS, feats_fit.shape[0], dim)
-            pca_pre = (PCA(n_components=n_pre).fit(feats_fit)
+            pca_pre = (PCA(n_components=n_pre, random_state=seed).fit(feats_fit)
                        if n_pre < dim else None)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="n_jobs value", category=UserWarning)
@@ -1039,12 +1044,13 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
         # fit subset), capped at CLUSTER_MAX_COMPONENTS (see the constants'
         # whiten noise-amplification note).
         n_cap = min(CLUSTER_MAX_COMPONENTS, feats_fit.shape[0], dim)
-        probe = PCA(n_components=n_cap).fit(feats_fit)
+        probe = PCA(n_components=n_cap, random_state=seed).fit(feats_fit)
         n_white = int(np.searchsorted(
             np.cumsum(probe.explained_variance_ratio_),
             CLUSTER_VARIANCE_TARGET) + 1)
         n_white = max(1, min(n_white, n_cap))
-        pca_w = PCA(n_components=n_white, whiten=True).fit(feats_fit)
+        pca_w = PCA(n_components=n_white, whiten=True,
+                    random_state=seed).fit(feats_fit)
         W = pca_w.transform(feats_all)
         W = W / np.maximum(np.linalg.norm(W, axis=1, keepdims=True), 1e-8)
         ref = "umap" if "umap" in methods else methods[0]
