@@ -51,19 +51,25 @@ inference:
 # <method>_1/<method>_2). Reducers persist to reduction_<method>.pkl.
 # With cluster_res: Leiden clustering on a kNN graph of the whitened feature
 # space -> a find_cluster table per DB (cluster_res<resolution>, 1-based IDs
-# ordered by UMAP centroid distance from the plot origin), extra cluster
+# ordered by UMAP centroid distance from the plot origin, plus
+# cluster_prob<resolution> = kNN vote confidence in [0,1]), extra cluster
 # color pages, and one representative-cell sheet per resolution
 # (cluster_res<resolution>.pdf, cells rendered as their inference-mode input
-# -> uniform size; needs the model bundle). Per-resolution kNN classifiers
-# persist to cluster.pkl.
+# -> uniform size; needs the model bundle; skipped when show_cluster_image is
+# false). Per-resolution kNN classifiers persist to cluster.pkl.
 # cluster: <path to a baseline cluster.pkl> kNN-predicts ALL stored
 # resolutions for this dataset instead of re-fitting — cluster IDs stay
 # baseline-aligned (cluster_res is ignored then).
+# color_by accepts ANY inference-table or find_cluster column except
+# uid/features (pred_class/pred_prob/prob_<class>/directory/ground_truth/
+# cluster_res<res>/cluster_prob<res>/label/...); numeric columns with many
+# distinct values render as continuous viridis pages, the rest categorical.
 reduction:
   method: [pca, umap, pacmap, localmap]    # list, DR methods to run (subset of pca/umap/pacmap/localmap)
   color_by: null                      # list, null = single light-blue page; first = stratification column
   cluster_res: [0.5, 1, 2, 4]         # list, Leiden resolutions (higher = more clusters); null/empty = no cluster finding (ignored when cluster is set)
   sample_per_class: null              # max points per class to fit reducers; 0/null = all
+  show_cluster_image: false           # output per-resolution representative-image sheets (cluster_res<res>.pdf); false = skip (faster, no model bundle load)
   reduction_pca: null                 # path to a pre-fitted reduction_pca.pkl; null = fit new
   reduction_umap: null                # path to a pre-fitted reduction_umap.pkl; null = fit new
   reduction_pacmap: null              # path to a pre-fitted reduction_pacmap.pkl; null = fit new

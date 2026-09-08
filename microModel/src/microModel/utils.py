@@ -5,6 +5,7 @@ import sys
 import pickle
 import random
 import logging
+import warnings
 from collections import defaultdict
 import numpy as np
 import torch
@@ -12,6 +13,17 @@ import torch
 from microBase import load_yaml, CellDataset  # re-exported from microBase
 
 logger = logging.getLogger("microModel")
+
+# numpy/torch pull in Intel OpenMP (MKL's libiomp) while the python-igraph /
+# leidenalg wheels bundle LLVM OpenMP (libomp); when sklearn's threadpoolctl
+# first scans the process it warns about the pair. The incompatibility only
+# bites on Linux (per the warning's own text) — on Windows it is noise during
+# every clustering run, so silence exactly that message. The text starts with
+# a newline, hence the (?s) dot-all prefix match.
+warnings.filterwarnings(
+    "ignore", message=r"(?s).*Found Intel OpenMP \('libiomp'\) and "
+                      r"LLVM OpenMP \('libomp'\)",
+    category=RuntimeWarning)
 
 
 def setup_logging(level=logging.INFO):

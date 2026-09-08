@@ -301,6 +301,13 @@ CONTACT_SHEET_MAX_SCAN = 60
 #: would blow up the sheet layout (and PDF page size).
 CONTACT_SHEET_MAX_CLUSTERS = 60
 
+#: A color_by column with more distinct numeric values than this renders as
+#: a continuous viridis page instead of one category per value (which would
+#: explode the legend/annotations). Integer ID columns that must stay
+#: categorical regardless (cluster_res<tag>) are forced so in
+#: _color_column_continuous.
+CONTINUOUS_COLOR_MAX_CLASSES = 20
+
 
 def _foreground_fraction(img_u8):
     """Fraction of pixels with any nonzero channel in a (H, W, 3) uint8 image.
@@ -347,7 +354,8 @@ def _leiden_partition(W, resolution, seed):
 
 
 def _plot_reduction_page(X, title, xlabel, ylabel, pdf, labels=None,
-                         label_names=None, pred_probs=None, continuous=False):
+                         label_names=None, pred_probs=None, continuous=False,
+                         cont_values=None, cont_range=None, cont_label=""):
     """Write one DR scatter page into an open PdfPages.
 
     Data points are rasterized (non-editable bitmap, rendered at the dpi
@@ -355,34 +363,48 @@ def _plot_reduction_page(X, title, xlabel, ylabel, pdf, labels=None,
     editable vector objects. The legend shows colored TEXT only (no marker
     dots). labels=None draws every point in the default light blue with no
     legend/annotations (the color_by: null case).
+
+    continuous=True renders a viridis-colored page from cont_values (any
+    numeric color_by column) with the cont_range color limits and a colorbar
+    titled cont_label; pred_probs still controls draw order (low first, so
+    high-confidence points stay on top).
     """
-    fig, ax = plt.subplots(figsize=(7.5, 6.5))
-    # Keep the plotting area square regardless of data ranges or colorbar.
-    ax.set_box_aspect(1)
+    # Plot region 1.2x wider than tall. set_box_aspect takes HEIGHT/WIDTH,
+    # so the wider-than-square box asks for 1/1.2; the figsize leaves the
+    # width for it.
+    fig, ax = plt.subplots(figsize=(9.0, 6.5))
+    ax.set_box_aspect(1 / 1.2)
 
     if labels is None:
         ax.scatter(X[:, 0], X[:, 1], c=SINGLE_COLOR, alpha=0.8, s=10,
                    edgecolors="none", rasterized=True)
     elif continuous:
-        # Continuous scatter is only used for pred_prob, whose values always
-        # come from the DB rows (pred_probs) — never fall back to `labels`
-        # (class-name strings would raise inside np.array(..., float64)).
-        if pred_probs is None:
-            raise ValueError("continuous scatter requires pred_probs")
-        prob_arr = np.array(pred_probs, dtype=np.float64)
-        sort_idx = np.argsort(prob_arr)
-        sc = ax.scatter(X[sort_idx, 0], X[sort_idx, 1], c=prob_arr[sort_idx],
+        if cont_values is None:
+            raise ValueError("continuous scatter requires cont_values")
+        vals = np.asarray(cont_values, dtype=np.float64)
+        # Draw ascending (NaN/missing first) so the largest values stay on top.
+        order = np.argsort(np.where(np.isnan(vals), -np.inf, vals))
+        if cont_range is not None:
+            cmin, cmax = cont_range
+        else:
+            cmin, cmax = float(np.nanmin(vals)), float(np.nanmax(vals))
+        sc = ax.scatter(X[order, 0], X[order, 1], c=vals[order],
                         cmap="viridis", alpha=0.8, s=10, edgecolors="none",
-                        vmin=0, vmax=1, rasterized=True)
+                        vmin=cmin, vmax=cmax, rasterized=True)
         cbar = fig.colorbar(sc, ax=ax)
-        cbar.set_label("Prediction Probability")
+        cbar.set_label(cont_label or "value")
     else:
         labels_arr = np.asarray(labels)
         unique_classes = sorted(set(labels))
-        centroids = np.array([X[labels_arr == cls].mean(axis=0)
-                              for cls in unique_classes])
         n_cls = len(unique_classes)
-        if n_cls > 1:
+        # Beyond 60 categories (e.g. coloring by a high-cardinality column
+        # like filename) the legend and centroid annotations would drown in
+        # noise and the pairwise centroid distances below would not fit
+        # memory — fall back to plain palette cycling with no annotations.
+        huge = n_cls > 60
+        if 1 < n_cls <= 60:
+            centroids = np.array([X[labels_arr == cls].mean(axis=0)
+                                  for cls in unique_classes])
             from sklearn.metrics import pairwise_distances
             dists = pairwise_distances(centroids)
             neighbor_mask = np.zeros_like(dists, dtype=bool)
@@ -400,6 +422,9 @@ def _plot_reduction_page(X, title, xlabel, ylabel, pdf, labels=None,
         order = sorted(range(n_cls), key=lambda i: sizes[i], reverse=True)
         for idx in order:
             cls = unique_classes[idx]
+            if huge:
+                assigned_color[cls] = palette[len(assigned_color) % len(palette)]
+                continue
             if n_cls > 1:
                 neighbor_colors = [assigned_color[unique_classes[nb]]
                                    for nb in range(n_cls)
@@ -456,13 +481,14 @@ def _plot_reduction_page(X, title, xlabel, ylabel, pdf, labels=None,
             for text, cls in zip(leg.get_texts(), unique_classes):
                 text.set_color(assigned_color[cls])
 
-        for cls in unique_classes:
-            center = X[labels_arr == cls].mean(axis=0)
-            ax.annotate(label_name_map[cls], center, fontsize=ann_fs,
-                        weight="bold", ha="center", va="center",
-                        color=assigned_color[cls],
-                        bbox=dict(boxstyle=f"round,pad={ann_pad}", fc="white",
-                                  ec="gray", alpha=0.8))
+        if not huge:
+            for cls in unique_classes:
+                center = X[labels_arr == cls].mean(axis=0)
+                ax.annotate(label_name_map[cls], center, fontsize=ann_fs,
+                            weight="bold", ha="center", va="center",
+                            color=assigned_color[cls],
+                            bbox=dict(boxstyle=f"round,pad={ann_pad}", fc="white",
+                                      ec="gray", alpha=0.8))
 
     ax.set_title(title)
     ax.set_xlabel(xlabel)
@@ -585,11 +611,17 @@ def _load_cell_image(d, mode, view):
 def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
     """Contact-sheet PDF for one Leiden partition: representative cells per cluster.
 
-    Representatives are the cells nearest each cluster's mean in the
-    whitened feature space (W), skipping crops whose foreground fraction is
-    below CONTACT_SHEET_MIN_FOREGROUND; every cell is rendered as its
-    inference-mode input (bundle augmentation_infer pipeline -> uniform
-    size). Layout: CONTACT_SHEET_PER_CLUSTER images per cluster,
+    Representative ORDER is farthest-point sampling in the whitened feature
+    space (W): the first pick is the archetype (member nearest the cluster
+    mean), then each next pick is the member farthest from ALL already-picked
+    ones — the sheet therefore spans the cluster's internal diversity instead
+    of showing near-duplicates of its centroid (pure nearest-first ordering).
+    Candidates whose crop foreground fraction is below
+    CONTACT_SHEET_MIN_FOREGROUND are skipped during the walk (their generic
+    DINOv3 features land near the centroid and would otherwise dominate the
+    archetype slots). Every cell is rendered as its inference-mode input
+    (bundle augmentation_infer pipeline -> uniform image size). Layout:
+    CONTACT_SHEET_PER_CLUSTER images per cluster,
     CONTACT_SHEET_GROUPS_PER_ROW clusters per row; cluster blocks are ordered
     by 1-based cluster ID.
     """
@@ -614,11 +646,23 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
             for j in range(n_per + 1):
                 axes[r][base + j].axis("off")
             continue
-        cent = W[member].mean(axis=0)
-        dist = np.linalg.norm(W[member] - cent, axis=1)
-        order = member[np.argsort(dist)]
-        # Walk candidates nearest-first, skipping near-empty crops (see
-        # CONTACT_SHEET_MIN_FOREGROUND) until n_per valid representatives.
+        member_W = W[member]
+        # Farthest-point sampling over the scan pool: seed with the archetype,
+        # then greedily add the point maximizing the distance to the closest
+        # already-chosen point. The full pool is ordered up front so the
+        # foreground-filter walk below stays a simple sequential scan.
+        pool = min(CONTACT_SHEET_MAX_SCAN, member.size)
+        d_min = np.linalg.norm(member_W - member_W[np.argmin(
+            np.linalg.norm(member_W - member_W.mean(axis=0), axis=1))], axis=1)
+        fp_order = [int(np.argmin(d_min))]
+        for _ in range(pool - 1):
+            nxt = int(np.argmax(d_min))
+            fp_order.append(nxt)
+            d_min = np.minimum(
+                d_min, np.linalg.norm(member_W - member_W[nxt], axis=1))
+        order = member[fp_order]
+        # Walk candidates in farthest-point order, skipping near-empty crops
+        # (see CONTACT_SHEET_MIN_FOREGROUND) until n_per valid representatives.
         imgs = []
         scanned = 0
         for idx in order:
@@ -705,19 +749,25 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
     method), so nearby-in-the-plot clusters get nearby IDs. The fitted
     whitening PCA + per-resolution kNN classifiers persist to cluster.pkl.
     reduction.cluster pointing at a saved cluster.pkl switches to baseline
-    mode: every stored resolution is PREDICTED for the new data by a kNN
-    vote over the baseline points (cluster_res ignored), so cluster IDs stay
-    aligned with the baseline across datasets. IDs go to the find_cluster
-    table (one cluster_res<resolution> column per resolution), become extra
-    color pages in every method's PDF, and get a representative-cell sheet
-    per resolution (cluster_res<resolution>.pdf — cells rendered as their
-    inference-mode input via the bundle's augmentation_infer pipeline, so
-    all images share one size).
+    mode: every stored resolution is PREDICTED for the new data by a kNN vote
+    over the baseline points (cluster_res ignored), so cluster IDs stay
+    aligned with the baseline across datasets. Both go to the find_cluster
+    table — one cluster_res<resolution> ID column per resolution plus one
+    cluster_prob<resolution> column holding the kNN vote confidence (max
+    class probability in [0, 1], the assignment's reliability score). IDs
+    become extra color pages in every method's PDF, and each resolution gets
+    a representative-cell sheet (cluster_res<resolution>.pdf — cells rendered
+    as their inference-mode input via the bundle's augmentation_infer
+    pipeline, so all images share one size) unless
+    reduction.show_cluster_image is false.
 
     One multi-page PDF per method (reduction_<method>.pdf): one page per
-    color_by entry, then one per cluster k. color_by null = a single page
-    with all points in the default light blue. Scatter labels use the class
-    color on a luminance-adaptive text box.
+    color_by entry, then one per cluster resolution. color_by accepts ANY
+    inference-table or find_cluster column except uid/features; columns whose
+    values are numeric with more than CONTINUOUS_COLOR_MAX_CLASSES distinct
+    values render as continuous viridis pages, everything else as labeled
+    categorical pages. color_by null = a single page with all points in the
+    default light blue.
 
     save_plots=False skips the PDF outputs (tables are still written) —
     used by microProfiler, which is a data-only analysis suite.
@@ -750,19 +800,8 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
         logger.error("No valid reduction.method; aborting reduction.")
         return
 
-    # color_by: null = default light-blue single-color pages. Otherwise the
-    # same valid values as before; cluster pages are appended later.
-    color_by_vals = red_cfg.get("color_by")
-    if color_by_vals is None:
-        color_by_vals = []
-    elif isinstance(color_by_vals, str):
-        color_by_vals = [color_by_vals]
-    valid_color_by = {"pred_class", "directory", "pred_prob", "ground_truth"}
-    dropped = [cb for cb in color_by_vals if cb not in valid_color_by]
-    if dropped:
-        logger.warning("Unknown color_by %s; dropping (valid: %s)", dropped, sorted(valid_color_by))
-    color_by_vals = [cb for cb in color_by_vals if cb in valid_color_by]
-    first_cb = color_by_vals[0] if color_by_vals else None
+    # color_by is validated AFTER the DBs are loaded: any inference-table or
+    # find_cluster column (uid/features excepted) is a valid variable.
 
     # cluster_res: list of Leiden resolutions; null/empty/nonpositive entries
     # are dropped. Ignored entirely when `cluster` (baseline predict) is set.
@@ -815,6 +854,29 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
     n_all = feats_all.shape[0]
     logger.info("Merged %d feature vectors from %d DB(s)", n_all, len(db_entries))
 
+    # color_by: null = a single light-blue page. Any inference-table or
+    # find_cluster column (uid/features excepted) is valid; unknown names are
+    # dropped with a warning. Numeric columns with more distinct values than
+    # CONTINUOUS_COLOR_MAX_CLASSES render as continuous pages.
+    color_by_vals = red_cfg.get("color_by")
+    if color_by_vals is None:
+        color_by_vals = []
+    elif isinstance(color_by_vals, str):
+        color_by_vals = [color_by_vals]
+    valid_color_by = set()
+    for _, _, dicts in db_entries:
+        for d in dicts:
+            valid_color_by.update(d.keys())
+    valid_color_by -= {"uid", "features"}
+    dropped = [cb for cb in color_by_vals if cb not in valid_color_by]
+    if dropped:
+        logger.warning("Unknown color_by %s; dropping (valid: %s)",
+                       dropped, sorted(valid_color_by))
+    color_by_vals = [cb for cb in color_by_vals if cb in valid_color_by]
+    first_cb = color_by_vals[0] if color_by_vals else None
+    cb_continuous = {cb: _color_column_continuous(cb, dicts_all)
+                     for cb in color_by_vals}
+
     # Phase 2: sample subset for fitting (null/0 = use all points)
     sample_per_class = red_cfg.get("sample_per_class") or 0
     # Sampling gates whichever reducer still needs FITTING.
@@ -828,7 +890,8 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
         else:
             first_labels_all = None
         fit_indices = _sample_fit_indices(
-            n_all, first_labels_all, first_cb, sample_per_class, seed)
+            n_all, first_labels_all, sample_per_class, seed,
+            uniform=(first_cb is None or cb_continuous.get(first_cb, False)))
         feats_fit = feats_all[fit_indices]
         dicts_fit = [dicts_all[i] for i in fit_indices]
         dirs_fit = [dirs_all[i] for i in fit_indices]
@@ -906,6 +969,7 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
     # the baseline's cluster IDs (cluster_res is ignored then; every stored
     # resolution is predicted).
     cluster_ids = {}
+    cluster_probs = {}
     cluster_path = red_cfg.get("cluster")
     if cluster_path:
         if not os.path.exists(cluster_path):
@@ -923,7 +987,11 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                     "resolutions %s (cluster_res ignored)",
                     cluster_path, cluster_res_list)
         for res in cluster_res_list:
-            cluster_ids[res] = cluster_obj["models"][res]["knn"].predict(W).astype(int)
+            knn = cluster_obj["models"][res]["knn"]
+            cluster_ids[res] = knn.predict(W).astype(int)
+            # Assignment confidence: the fraction of the k nearest baseline
+            # points voting for the winning cluster (max class probability).
+            cluster_probs[res] = knn.predict_proba(W).max(axis=1)
     elif cluster_res_list:
         dim = feats_fit.shape[1]
         n_white = min(UMAP_PRE_COMPONENTS, feats_fit.shape[0], dim)
@@ -951,10 +1019,12 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
             id_map[order] = np.arange(1, n_cl + 1)
             ids = id_map[raw_ids]
             # Baseline handle: a kNN vote over these very points lets future
-            # datasets inherit this partition's IDs (predict branch above).
+            # datasets inherit this partition's IDs (predict branch above);
+            # predict_proba doubles as each point's own assignment confidence.
             knn = KNeighborsClassifier(
                 n_neighbors=min(LEIDEN_N_NEIGHBORS, n_all - 1)).fit(W, ids)
             cluster_ids[res] = ids
+            cluster_probs[res] = knn.predict_proba(W).max(axis=1)
             cluster_obj["models"][res] = {"knn": knn, "n_clusters": n_cl}
             logger.info("Clustering: resolution %g -> %d clusters", res, n_cl)
         for d in save_dirs:
@@ -974,11 +1044,34 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                     for cb in color_by_vals:
                         labels, label_names = _extract_color_data(
                             cb, dicts_fit, dirs_fit, probs_fit)
-                        _plot_reduction_page(
-                            X_fit[m], f"{axis_name} of feature vectors (colored by {cb})",
-                            f"{axis_name} 1", f"{axis_name} 2", pdf,
-                            labels=labels, label_names=label_names,
-                            pred_probs=probs_fit, continuous=(cb == "pred_prob"))
+                        if cb_continuous[cb]:
+                            # Continuous page: pred_prob keeps its fixed [0,1]
+                            # scale and title; other numeric columns scale to
+                            # their own range.
+                            vals = np.array(
+                                [np.nan if v is None else float(v) for v in labels],
+                                dtype=np.float64)
+                            if cb == "pred_prob":
+                                cmin, cmax, clabel = 0.0, 1.0, "Prediction Probability"
+                            else:
+                                cmin = float(np.nanmin(vals))
+                                cmax = float(np.nanmax(vals))
+                                if not cmax > cmin:
+                                    cmax = cmin + 1.0
+                                clabel = cb
+                            _plot_reduction_page(
+                                X_fit[m], f"{axis_name} of feature vectors (colored by {cb})",
+                                f"{axis_name} 1", f"{axis_name} 2", pdf,
+                                labels=labels, label_names=label_names,
+                                pred_probs=probs_fit, continuous=True,
+                                cont_values=vals, cont_range=(cmin, cmax),
+                                cont_label=clabel)
+                        else:
+                            _plot_reduction_page(
+                                X_fit[m], f"{axis_name} of feature vectors (colored by {cb})",
+                                f"{axis_name} 1", f"{axis_name} 2", pdf,
+                                labels=labels, label_names=label_names,
+                                pred_probs=probs_fit)
                     for res in cluster_res_list:
                         ids_fit = cluster_ids[res][fit_indices]
                         n_cl = len(np.unique(ids_fit))
@@ -991,24 +1084,30 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                             label_names=[str(i) for i in ids_fit])
                 logger.info("Reduction plot saved to %s", pdf_path)
         # Representative-cell sheet per resolution (5 inference-mode inputs
-        # per cluster, 5 clusters per row, uniform cell size).
-        mode = config.get("mode", "single_cell")
-        channels_cfg = config["data"].get("channels")
-        channels = list(channels_cfg) if channels_cfg else [1]
-        channel_layout = config["data"].get("channel_layout")
-        cell_view = _build_cell_view(config, mode, channels, channel_layout)
-        for d in save_dirs:
-            for res in cluster_res_list:
-                n_cl = int(cluster_ids[res].max())
-                if n_cl > CONTACT_SHEET_MAX_CLUSTERS:
-                    logger.info("Skipping cluster sheet for resolution %g: "
-                                "%d clusters > %d", res, n_cl,
-                                CONTACT_SHEET_MAX_CLUSTERS)
-                    continue
-                _write_cluster_sheet(
-                    cluster_ids[res], W, dicts_all,
-                    os.path.join(d, f"cluster_res{_res_tag(res)}.pdf"),
-                    mode, cell_view)
+        # per cluster, 5 clusters per row, uniform cell size). Gated by
+        # reduction.show_cluster_image — false skips the sheets entirely,
+        # including the model-bundle load they need.
+        if not red_cfg.get("show_cluster_image", True):
+            logger.info("reduction.show_cluster_image is false — skipping "
+                        "cluster_res*.pdf sheets")
+        elif cluster_res_list:
+            mode = config.get("mode", "single_cell")
+            channels_cfg = config["data"].get("channels")
+            channels = list(channels_cfg) if channels_cfg else [1]
+            channel_layout = config["data"].get("channel_layout")
+            cell_view = _build_cell_view(config, mode, channels, channel_layout)
+            for d in save_dirs:
+                for res in cluster_res_list:
+                    n_cl = int(cluster_ids[res].max())
+                    if n_cl > CONTACT_SHEET_MAX_CLUSTERS:
+                        logger.info("Skipping cluster sheet for resolution %g: "
+                                    "%d clusters > %d", res, n_cl,
+                                    CONTACT_SHEET_MAX_CLUSTERS)
+                        continue
+                    _write_cluster_sheet(
+                        cluster_ids[res], W, dicts_all,
+                        os.path.join(d, f"cluster_res{_res_tag(res)}.pdf"),
+                        mode, cell_view)
 
     # Phase 7: write per-DB tables
     t0 = time.perf_counter()
@@ -1043,21 +1142,30 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
                 list(zip(uids, arr[:, 0].tolist(), arr[:, 1].tolist())))
 
         if cluster_res_list:
+            # One cluster_res<tag> ID column plus one cluster_prob<tag>
+            # confidence column (kNN vote fraction, [0, 1]) per resolution.
             # Resolution tags may contain a dot ("0.5"), so every identifier
             # is quoted.
-            cols = ", ".join(f'{sql_ident(f"cluster_res{_res_tag(r)}")} INTEGER NOT NULL'
-                             for r in cluster_res_list)
-            col_names = ", ".join(sql_ident(f"cluster_res{_res_tag(r)}")
-                                  for r in cluster_res_list)
-            ph = ", ".join("?" * len(cluster_res_list))
+            id_cols = [f"cluster_res{_res_tag(r)}" for r in cluster_res_list]
+            prob_cols = [f"cluster_prob{_res_tag(r)}" for r in cluster_res_list]
+            cols = ", ".join(
+                [f"{sql_ident(c)} INTEGER NOT NULL" for c in id_cols]
+                + [f"{sql_ident(c)} REAL NOT NULL" for c in prob_cols])
+            col_names = ", ".join(sql_ident(c) for c in id_cols + prob_cols)
+            # The uid placeholder is written literally below; ph covers the
+            # id+prob columns only.
+            ph = ", ".join("?" * (len(id_cols) + len(prob_cols)))
             conn.execute("DROP TABLE IF EXISTS find_cluster")
             conn.execute(
                 f"CREATE TABLE find_cluster (uid INTEGER PRIMARY KEY, {cols})")
             conn.executemany(
                 f"INSERT OR REPLACE INTO find_cluster (uid, {col_names}) "
                 f"VALUES (?, {ph})",
-                list(zip(uids, *[cluster_ids[r][start:end].tolist()
-                                 for r in cluster_res_list])))
+                list(zip(uids,
+                         *[cluster_ids[r][start:end].tolist()
+                           for r in cluster_res_list],
+                         *[cluster_probs[r][start:end].tolist()
+                           for r in cluster_res_list])))
 
         conn.commit()
         conn.close()
@@ -1094,6 +1202,26 @@ def _load_inference_features(db_path, raise_on_error=False):
             logger.error("No rows in inference table in %s.", db_path)
             return None, None
         dicts = [dict(zip(col_names, r)) for r in rows]
+        # Merge the find_cluster columns (cluster_res<resolution> IDs +
+        # cluster_prob<resolution> confidences) into the row dicts so every
+        # one of them can serve as a color_by variable. Resolution tags may
+        # contain a dot, so identifiers are quoted. Rows missing from a stale
+        # find_cluster table simply keep no keys (d.get -> None downstream).
+        has_fc = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='find_cluster'"
+        ).fetchone()
+        if has_fc:
+            fc_cols = [row[1] for row in conn.execute("PRAGMA table_info(find_cluster)")
+                       if row[1] != "uid"]
+            if fc_cols:
+                sel = ", ".join(["uid"] + [sql_ident(c) for c in fc_cols])
+                fc_by_uid = {}
+                for row in conn.execute(f"SELECT {sel} FROM find_cluster"):
+                    fc_by_uid[int(row[0])] = dict(zip(fc_cols, row[1:]))
+                for d in dicts:
+                    extra = fc_by_uid.get(d["uid"])
+                    if extra:
+                        d.update(extra)
         feats_arr = []
         for d in dicts:
             f = d["features"]
@@ -1113,8 +1241,46 @@ def _load_inference_features(db_path, raise_on_error=False):
         conn.close()
 
 
+def _color_column_continuous(cb, dicts):
+    """Classify a color_by column: True = continuous page, False = categorical.
+
+    Probability columns (pred_prob, cluster_prob<tag>) are always continuous
+    — kNN vote confidences only take ~15 distinct fractions, which the
+    distinct-count heuristic below would misread as categories. Other
+    columns qualify as continuous when every non-null value parses as a
+    number AND there are more distinct values than
+    CONTINUOUS_COLOR_MAX_CLASSES. cluster_res<tag> columns hold Leiden IDs
+    whose numeric order encodes plot distance, not magnitude — they stay
+    categorical no matter how many clusters a resolution produced.
+    """
+    if cb.startswith("cluster_res"):
+        return False
+    if cb == "pred_prob" or cb.startswith("cluster_prob"):
+        return True
+    nums = set()
+    for d in dicts:
+        v = d.get(cb)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            try:
+                nums.add(float(str(v)))
+            except ValueError:
+                return False  # any non-numeric value -> categorical
+        else:
+            nums.add(float(v))
+        if len(nums) > CONTINUOUS_COLOR_MAX_CLASSES:
+            return True
+    return False
+
+
 def _extract_color_data(cb, dicts, dirs, probs):
-    """Extract (raw_values, display_names) for a color_by variable."""
+    """Extract (raw_values, display_names) for a color_by variable.
+
+    The curated columns keep their tailored handling; any other
+    inference-table / find_cluster column falls through to its raw values
+    (None -> "__missing__" so the categorical sort never sees mixed types).
+    """
     if cb == "pred_class":
         return ([d.get("pred_class") or "unknown" for d in dicts],
                 [d.get("pred_class") or "unknown" for d in dicts])
@@ -1126,18 +1292,19 @@ def _extract_color_data(cb, dicts, dirs, probs):
     if cb == "ground_truth":
         labs = [d.get("ground_truth") or "__unlabeled__" for d in dicts]
         return labs, labs
-    return ([d.get("pred_class") or "unknown" for d in dicts],
-            [d.get("pred_class") or "unknown" for d in dicts])
+    vals = [d.get(cb) for d in dicts]
+    return vals, ["__missing__" if v is None else str(v) for v in vals]
 
 
-def _sample_fit_indices(n_orig, labels, color_by, sample_per_class, seed):
+def _sample_fit_indices(n_orig, labels, sample_per_class, seed, uniform):
     """Select indices for reducer fitting, stratified by `labels`.
 
-    labels=None (color_by null) or pred_prob samples uniformly.
+    uniform=True samples without stratification (color_by null, or a
+    continuous column — stratifying by raw floats would create one stratum
+    per distinct value).
     """
-    return stratified_sample_indices(
-        n_orig, labels, sample_per_class, seed,
-        uniform=(color_by is None or color_by == "pred_prob"))
+    return stratified_sample_indices(n_orig, labels, sample_per_class, seed,
+                                     uniform=uniform)
 
 
 # ----------------------------------------------------------------------------

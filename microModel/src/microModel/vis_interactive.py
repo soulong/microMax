@@ -2,11 +2,11 @@
 
 Reads the reduction_<method> tables (pca/umap/pacmap/localmap), the optional
 find_cluster table and the inference table from infer.db. One plot tab is
-offered per method that actually has a table; the cluster_res<resolution>
-columns from find_cluster are exposed as categorical color_by options.
-The bundle meta uses the same field names for augmentation_infer,
-normalize_method, normalize_with_masking, clip_low, clip_high, channels,
-channel_layout.
+offered per method that actually has a table; color_by accepts every
+inference-table and find_cluster column except uid/features (cluster_res*
+columns color categorically, numeric columns continuously). The bundle meta
+uses the same field names for augmentation_infer, normalize_method,
+normalize_with_masking, clip_low, clip_high, channels, channel_layout.
 
 Image loading:
   - single_cell: load cell TIFF directly from {directory}/{filename}
@@ -194,18 +194,22 @@ class VisInteractiveServer:
                 for row in conn.execute(f"SELECT {sel} FROM find_cluster"):
                     d = cluster_by_uid.setdefault(int(row[0]), {})
                     for col, val in zip(cluster_cols, row[1:]):
-                        d[col] = int(val) if val is not None else None
+                        # cluster_res<tag> holds integer IDs; the
+                        # cluster_prob<tag> confidence columns are floats.
+                        if col.startswith("cluster_prob"):
+                            d[col] = float(val) if val is not None else None
+                        else:
+                            d[col] = int(val) if val is not None else None
             for col in cluster_cols:
                 if col not in self._color_by_cols:
                     self._color_by_cols.append(col)
 
-        # Get inference table columns dynamically
+        # Get inference table columns dynamically. Everything except uid and
+        # the features BLOB is a color_by candidate (and merged into the
+        # scatter payload) — prediction/probability/path columns included.
         cur = conn.execute("PRAGMA table_info(inference)")
         infer_cols = [row[1] for row in cur.fetchall()]
-        # Store for color_by options (exclude internal + path + prediction columns)
-        _exclude_color = {"uid", "filename", "label", "mask_filename",
-                          "directory", "ground_truth", "features",
-                          "pred_class", "pred_prob"}
+        _exclude_color = {"uid", "features"}
         for col in infer_cols:
             if col not in self._color_by_cols and col not in _exclude_color:
                 self._color_by_cols.append(col)
@@ -273,13 +277,10 @@ class VisInteractiveServer:
             }
             # One <method>_x/<method>_y pair per available DR method.
             point.update(coords)
-            # Cluster assignments (cluster_res<resolution> columns) for
-            # color_by support.
+            # Cluster assignments + every remaining inference column land in
+            # the point payload for color_by support (uid/features excluded).
             point.update(cluster_by_uid.get(uid, {}))
-            # Add all inference table columns for color_by support
-            _exclude_point = {"uid", "directory", "filename", "label", "mask_filename",
-                              "features", "pred_class",
-                              "pred_prob", "ground_truth"}
+            _exclude_point = {"uid", "features"}
             for col in infer_cols:
                 if col not in _exclude_point:
                     val = d.get(col)
@@ -425,11 +426,13 @@ class VisInteractiveServer:
             names = set(d["pred_class"] for d in self.scatter_data)
             class_names = sorted(names)
 
-        # Build color_by options: cells table columns + pred_class + pred_prob
-        color_by_cols = list(self._color_by_cols)
-        for extra in ("pred_class", "pred_prob"):
-            if extra not in color_by_cols:
-                color_by_cols.insert(0, extra)
+        # color_by options: every inference-table + find_cluster column
+        # except uid/features, with the two prediction columns first (the
+        # common choices).
+        all_cols = list(self._color_by_cols)
+        color_by_cols = ([c for c in ("pred_class", "pred_prob") if c in all_cols]
+                         + [c for c in all_cols
+                            if c not in ("pred_class", "pred_prob")])
 
         # DR methods with a table, already in canonical order
         methods = list(self._dr_methods)
@@ -760,11 +763,12 @@ function computeColors(points, colorBy) {
              type: 'none', categories: [], colorMap: {} };
   }
 
-  // pred_class is always categorical; cluster_* columns hold integer IDs
+  // pred_class is always categorical; cluster_res* columns hold integer IDs
   // from find_cluster but must also color categorically (cluster ID order
-  // encodes plot-distance, not magnitude). Everything else keeps the
-  // numeric-check heuristic (numeric -> viridis, else categorical).
-  if (colorBy !== 'pred_class' && colorBy.indexOf('cluster_') !== 0) {
+  // encodes plot-distance, not magnitude — cluster_prob* confidences stay
+  // numeric). Everything else keeps the numeric-check heuristic (numeric ->
+  // viridis, else categorical).
+  if (colorBy !== 'pred_class' && colorBy.indexOf('cluster_res') !== 0) {
     var values = points.map(function(d) { return d[colorBy]; });
     var numeric = isNumericColumn(points, colorBy);
 
