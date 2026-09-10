@@ -136,15 +136,18 @@ Typical flow:
 
 1. Type, browse, or drop the dataset directory, then **Load Dataset** to scan
    the images.
-2. **Select Profiler DB** (one or more `profiler.db` files) and/or **Select
-   Infer DB** (one or more `infer.db` files): each opens its own plot tab
-   (scatter / line mean±SEM / boxplot / barplot mean±SEM over any profiler
-   table; DR-method scatter for infer) with a free-form pandas-expression
-   filter. Every picker combo is editable — type to filter long lists. Plots
-   export vector PDFs with editable text.
-3. **Select Metadata** (Excel) then **Merge** to use the plate metadata columns
-   in every open plot tab (**Clear** removes it); **Write to DB** adds the
-   metadata columns to every loaded profiler and infer DB.
+2. **Select DB** (any number of `profiler.db` and/or `infer.db` files of this
+   dataset): their object rows are merged into ONE integrated table so
+   measurements and predictions can be cross-plotted. The single plot area
+   offers scatter / line mean±SEM / boxplot / barplot mean±SEM with a
+   free-form pandas-expression filter. Every picker combo is editable — type
+   to filter long lists. Left-click a scatter point to see the cropped
+   single cell next to the cursor (click empty space to hide). Plots export
+   vector PDFs with editable text.
+3. **Select Metadata** (Excel) then **Merge** to add the plate metadata
+   columns to the integrated table (**Clear** removes them); **Write to DB**
+   writes the integrated table into a NEW database (name editable next to
+   the button, default `merge.db`) — source DBs are never modified.
 4. Inspect images: thumbnail grid, well-plate grid, filters on well/field/
    stack/timepoint and any extra metadata columns, per-channel color and
    contrast controls, full-resolution zoom, pixel readout. Both **Color by**

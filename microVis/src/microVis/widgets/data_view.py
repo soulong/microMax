@@ -8,27 +8,30 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from microVis.widgets.ui_spec import FORM_LABEL_WIDTH_WIDE
+from microVis.widgets.ui_spec import COMPACT_LINE_EDIT_STYLE, FORM_LABEL_WIDTH_WIDE
+
+DEFAULT_MERGE_DB = "merge.db"
 
 
 class DataView(QWidget):
-    """Data tab: dataset selection + DB plot tabs.
+    """Data tab: dataset selection + DB selection + ONE integrated plot area.
 
     The dataset directory is a type/browse/drop line edit (same style as
-    microProfiler's Input dir). Two DB selectors open plot tabs in the area
-    below: the profiler DB (profiler.db object tables) and the infer DB
-    (microModel inference/reduction scatter).
+    microProfiler's Input dir). "Select DB" accepts any number of profiler
+    and/or infer DB files of the current dataset; their objects are merged
+    into one table rendered by the single plot view set via
+    :meth:`set_plot_view`. "Write to DB" persists the integrated table
+    (profiler + infer + merged Excel metadata) into a NEW database whose
+    file name the small edit after the button controls (default merge.db).
     """
 
     dataset_browse_clicked = Signal()
     load_dataset_clicked = Signal()
-    profiler_db_browse_clicked = Signal()
-    infer_db_browse_clicked = Signal()
+    select_db_clicked = Signal()
     metadata_browse_clicked = Signal()
     metadata_merge_clicked = Signal()
     metadata_clear_clicked = Signal()
@@ -111,7 +114,7 @@ class DataView(QWidget):
         )
         top_layout.addWidget(pat3)
 
-        # ── Button row: Load Dataset + two DB selectors + metadata actions ──
+        # ── Button row: Load Dataset + Select DB + metadata actions ──
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 4, 0, 0)
 
@@ -121,24 +124,16 @@ class DataView(QWidget):
         self._btn_load_dataset.clicked.connect(self.load_dataset_clicked)
         btn_row.addWidget(self._btn_load_dataset)
 
-        self._btn_profiler_db = QPushButton("Select Profiler DB")
-        self._btn_profiler_db.setProperty("class", "primary")
-        self._btn_profiler_db.setEnabled(False)
-        self._btn_profiler_db.setToolTip(
-            "Pick one or more microProfiler profiler.db files (object profiling). "
-            "Each DB opens its own plot tab; you can also drop files on this button.")
-        self._btn_profiler_db.clicked.connect(self.profiler_db_browse_clicked)
-        btn_row.addWidget(self._btn_profiler_db)
-
-        self._btn_infer_db = QPushButton("Select Infer DB")
-        self._btn_infer_db.setProperty("class", "primary")
-        self._btn_infer_db.setEnabled(False)
-        self._btn_infer_db.setToolTip(
-            "Pick one or more microModel infer.db files (inference + reduction "
-            "tables). Each DB opens its own scatter tab; you can also drop "
-            "files on this button.")
-        self._btn_infer_db.clicked.connect(self.infer_db_browse_clicked)
-        btn_row.addWidget(self._btn_infer_db)
+        self._btn_select_db = QPushButton("Select DB")
+        self._btn_select_db.setProperty("class", "primary")
+        self._btn_select_db.setEnabled(False)
+        self._btn_select_db.setToolTip(
+            "Pick one or more profiler.db and/or infer.db files of THIS "
+            "dataset (multi-select). Their object tables are merged into a "
+            "single integrated table so measurements and predictions can be "
+            "cross-plotted. You can also drop files on this button.")
+        self._btn_select_db.clicked.connect(self.select_db_clicked)
+        btn_row.addWidget(self._btn_select_db)
 
         btn_row.addStretch()
 
@@ -163,20 +158,33 @@ class DataView(QWidget):
         self._btn_write_db = QPushButton("Write to DB")
         self._btn_write_db.setProperty("class", "primary")
         self._btn_write_db.setEnabled(False)
+        self._btn_write_db.setToolTip(
+            "Write the integrated table (profiler + infer + merged metadata "
+            "columns) into a NEW database next to the dataset.")
         self._btn_write_db.clicked.connect(self._on_write_to_db)
         btn_row.addWidget(self._btn_write_db)
+
+        # Output DB name for Write to DB (relative to the dataset dir).
+        self._merge_db_edit = QLineEdit(DEFAULT_MERGE_DB)
+        self._merge_db_edit.setToolTip(
+            "File name of the database written by 'Write to DB' "
+            "(inside the dataset directory).")
+        self._merge_db_edit.setFixedWidth(110)
+        self._merge_db_edit.setStyleSheet(COMPACT_LINE_EDIT_STYLE)
+        btn_row.addWidget(self._merge_db_edit)
 
         top_layout.addLayout(btn_row)
 
         layout.addWidget(top)
-        # Pin the controls to the top even while the plot tabs are hidden
-        # (an empty hidden tab item must not shift them down/center them).
+        # Pin the controls to the top even while the plot area is hidden
+        # (an empty plot slot must not shift them down/center them).
         layout.setAlignment(top, Qt.AlignTop)
 
-        # ── Plot tabs (filled by MainWindow when a DB is selected) ──
-        self._plot_tabs = QTabWidget()
-        self._plot_tabs.setVisible(False)
-        layout.addWidget(self._plot_tabs, 1)
+        # ── Integrated plot area (single view, set by MainWindow) ──
+        self._plot_view: QWidget | None = None
+        self._plot_slot = QVBoxLayout()
+        self._plot_slot.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(self._plot_slot, 1)
 
     # ── Public methods ─────────────────────────────────────────────────────
 
@@ -205,12 +213,8 @@ class DataView(QWidget):
         return self._btn_dataset_browse
 
     @property
-    def profiler_db_browse_button(self) -> QPushButton:
-        return self._btn_profiler_db
-
-    @property
-    def infer_db_browse_button(self) -> QPushButton:
-        return self._btn_infer_db
+    def select_db_button(self) -> QPushButton:
+        return self._btn_select_db
 
     @property
     def metadata_browse_button(self) -> QPushButton:
@@ -229,37 +233,37 @@ class DataView(QWidget):
         has_meta = text is not None
         self._btn_merge.setEnabled(has_meta)
         self._btn_meta_clear.setEnabled(has_meta)
-        self._btn_write_db.setEnabled(has_meta)
+
+    def set_write_to_db_enabled(self, enabled: bool) -> None:
+        """Write to DB needs merged DB data (not the Excel metadata)."""
+        self._btn_write_db.setEnabled(enabled)
 
     def set_db_buttons_enabled(self, enabled: bool) -> None:
-        self._btn_profiler_db.setEnabled(enabled)
-        self._btn_infer_db.setEnabled(enabled)
+        self._btn_select_db.setEnabled(enabled)
 
-    # ── Plot tabs ──────────────────────────────────────────────────────────
+    def get_merge_db_name(self) -> str:
+        """Output DB file name for Write to DB (defaults to merge.db)."""
+        name = self._merge_db_edit.text().strip()
+        return name if name else DEFAULT_MERGE_DB
 
-    def show_plot_tab(self, title: str, widget: QWidget) -> None:
-        """Add (or activate) a plot tab. Re-showing the same widget activates
-        its existing tab instead of adding a duplicate."""
-        index = self._plot_tabs.indexOf(widget)
-        if index < 0:
-            index = self._plot_tabs.addTab(widget, title)
-        else:
-            self._plot_tabs.setTabText(index, title)
-        self._plot_tabs.setCurrentIndex(index)
-        self._plot_tabs.setVisible(True)
+    # ── Integrated plot area ───────────────────────────────────────────────
 
-    def clear_plot_tabs(self) -> None:
-        """Remove and delete every plot tab (dataset change / reset).
+    def set_plot_view(self, widget: QWidget) -> None:
+        """Install THE plot view (idempotent: re-installing is a no-op)."""
+        if self._plot_view is widget:
+            return
+        self.clear_plot_view()
+        self._plot_view = widget
+        self._plot_slot.addWidget(widget)
+        widget.setVisible(True)
 
-        Each tab is a per-DB widget owned by MainWindow, which drops its
-        references before calling this.
-        """
-        while self._plot_tabs.count():
-            w = self._plot_tabs.widget(0)
-            self._plot_tabs.removeTab(0)
-            if w is not None:
-                w.deleteLater()
-        self._plot_tabs.setVisible(False)
+    def clear_plot_view(self) -> None:
+        """Remove the plot view widget (ownership stays with MainWindow)."""
+        if self._plot_view is None:
+            return
+        self._plot_slot.removeWidget(self._plot_view)
+        self._plot_view.setVisible(False)
+        self._plot_view = None
 
     def reset(self) -> None:
         """Reset to initial startup state."""
@@ -269,21 +273,20 @@ class DataView(QWidget):
         self._pattern_subdir_edit.clear()
         self._btn_load_dataset.setEnabled(False)
         self._btn_reset.setEnabled(False)
-        self._btn_profiler_db.setEnabled(False)
-        self._btn_infer_db.setEnabled(False)
+        self._btn_select_db.setEnabled(False)
         self._btn_meta_browse.setEnabled(False)
         self._btn_merge.setEnabled(False)
         self._btn_meta_clear.setEnabled(False)
         self._btn_write_db.setEnabled(False)
-        self.clear_plot_tabs()
+        self.clear_plot_view()
 
     def _on_write_to_db(self) -> None:
         reply = QMessageBox.question(
             self,
-            "Write Metadata to Databases",
-            "This will add/update the merged metadata columns (matched by well) "
-            "in every loaded profiler DB and infer DB.\n\n"
-            "Existing columns and rows are preserved.\n\n"
+            "Write Merged Database",
+            "This writes the integrated table (profiler + infer objects plus "
+            "the merged metadata columns) into a NEW database file inside "
+            "the dataset directory. The source DBs are not modified.\n\n"
             "Are you sure you want to continue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,

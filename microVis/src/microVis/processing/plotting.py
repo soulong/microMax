@@ -293,6 +293,46 @@ def attach_hover(fig, canvas=None) -> None:
     fig._microvis_hover_cid = canvas.mpl_connect("motion_notify_event", _on_motion)
 
 
+def attach_click(fig, canvas=None, callback=None, radius=_HOVER_RADIUS_PX):
+    """Left-click picking on tagged scatter collections.
+
+    On a left click, the NEAREST tagged point within `radius` display pixels
+    wins (overlapping points included) and ``callback(row, x, y)`` fires with
+    that point's DataFrame row and the widget-local click position. A click
+    on empty space fires ``callback(None, x, y)`` so the caller can hide any
+    popup it showed. Returns the mpl connection id (dies with the canvas).
+    """
+    if callback is None:
+        return None
+    canvas = canvas if canvas is not None else fig.canvas
+
+    def _on_click(event):
+        if (event.x is None or event.y is None
+                or event.button != 1 or event.dblclick):
+            return
+        best = None  # (dist2, rows, point_index)
+        if event.inaxes is not None:
+            for coll in event.inaxes.collections:
+                rows = getattr(coll, "_microvis_rows", None)
+                if rows is None or len(rows) == 0:
+                    continue
+                offsets = np.asarray(coll.get_offsets(), dtype=float)
+                if offsets.size == 0:
+                    continue
+                disp = event.inaxes.transData.transform(offsets)
+                d2 = (disp[:, 0] - event.x) ** 2 + (disp[:, 1] - event.y) ** 2
+                i = int(np.argmin(d2))
+                if best is None or d2[i] < best[0]:
+                    best = (d2[i], rows, i)
+        if best is None or best[0] > radius ** 2:
+            callback(None, event.x, event.y)
+        else:
+            _, rows, i = best
+            callback(rows.iloc[i], event.x, event.y)
+
+    return canvas.mpl_connect("button_press_event", _on_click)
+
+
 def make_scatter(
     df: pd.DataFrame,
     x: str,

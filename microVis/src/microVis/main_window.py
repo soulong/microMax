@@ -37,18 +37,22 @@ from microVis._settings import (
     QUALITATIVE_PALETTES,
 )
 from microVis.io.data_module import DataModule, _safe_str, aggregate_by_well
-from microVis.io.infer_db import InferDB, is_numeric_type
-from microVis.io.profiler_db import ProfilerDB
+from microBase.db_contracts import DIRECTORY_COLUMN
+from microVis.io import merged_data
+from microVis.io.merged_data import (
+    MergedData,
+    merge_metadata_into,
+    write_merged_db,
+)
 from microVis.log_utils import get_logger
 from microVis.widgets._event_filter import RotatedLabel
 from microVis.widgets.path_drop import enable_path_drop
 from microVis.widgets.data_view import DataView
 from microVis.widgets.image_controls import ImageControls
 from microVis.widgets.image_display import ImageDisplay
-from microVis.widgets.infer_plot import InferPlotView
 from microVis.widgets.label_annotation import LabelAnnotationPanel, ObjectKey
 from microVis.widgets.pixel_info import PixelInfo
-from microVis.widgets.profiler_plot import ProfilerPlotView
+from microVis.widgets.data_plot import DataPlotView
 from microVis.widgets.ui_spec import (
     FORM_LABEL_WIDTH_WIDE,
     H_SPLITTER_SIZES,
@@ -58,7 +62,7 @@ from microVis.widgets.ui_spec import (
 )
 from microVis.widgets.well_grid_canvas import WellGridCanvas
 from microVis.widgets.well_grid_controls import WellGridControls
-from microVis.worker import CropWorker, ImageWorker, ImageWorkerConfig
+from microVis.worker import CropWorker, ImageWorker, ImageWorkerConfig, crop_object_rgb
 
 logger = get_logger("microVis.main_window")
 
@@ -176,6 +180,13 @@ def _build_meta_label(meta: "pd.DataFrame", row_idx: int,
 
 
 
+def _abs_norm_dir(p) -> str:
+    """Normalized absolute forward-slash form of a path (join/compare key)."""
+    import os
+    return os.path.normcase(
+        os.path.normpath(os.path.abspath(str(p))).replace("\\", "/"))
+
+
 class MainWindow(QMainWindow):
     """Top-level application window for microVis."""
 
@@ -243,13 +254,9 @@ class MainWindow(QMainWindow):
         self._metadata_df: pd.DataFrame | None = None
         self._metadata_merged: pd.DataFrame | None = None
 
-        # Selected DBs for the Data-page plot tabs: one reader + one plot view
-        # per selected file, keyed by resolved path, so multiple DBs of the
-        # same type can be open at once (each owns its own tab).
-        self._profiler_dbs: dict[str, ProfilerDB] = {}
-        self._profiler_views: dict[str, ProfilerPlotView] = {}
-        self._infer_dbs: dict[str, InferDB] = {}
-        self._infer_views: dict[str, InferPlotView] = {}
+        # Integrated Data-page table: any mix of profiler.db + infer.db
+        # files of the current dataset, merged per object (io/merged_data).
+        self._merged: MergedData | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -328,8 +335,10 @@ class MainWindow(QMainWindow):
         # ── Stacked content ──
         self._stack_content = QStackedWidget()
 
-        # Page 0: Data View
+        # Page 0: Data View (owns THE integrated plot view)
+        self._plot_view = DataPlotView()
         self._data_view = DataView()
+        self._data_view.set_plot_view(self._plot_view)
         self._stack_content.addWidget(self._data_view)
 
         # Page 1: Plate & Images
@@ -473,18 +482,15 @@ class MainWindow(QMainWindow):
                          on_path=self.select_dataset_dir)
         enable_path_drop(self._data_view.dataset_browse_button,
                          on_path=self.select_dataset_dir)
-        enable_path_drop(self._data_view.profiler_db_browse_button,
-                         on_path=self.load_profiler_db_files, multi=True)
-        enable_path_drop(self._data_view.infer_db_browse_button,
-                         on_path=self.load_infer_db_files, multi=True)
+        enable_path_drop(self._data_view.select_db_button,
+                         on_path=self.load_db_files, multi=True)
         enable_path_drop(self._data_view.metadata_browse_button,
                          on_path=self.load_metadata_file)
         self._data_view.dataset_path_edit.editingFinished.connect(
             self._on_dataset_path_edited)
-        self._data_view.profiler_db_browse_clicked.connect(
-            self._on_profiler_db_browse)
-        self._data_view.infer_db_browse_clicked.connect(self._on_infer_db_browse)
+        self._data_view.select_db_clicked.connect(self._on_select_db_browse)
         self._data_view.load_dataset_clicked.connect(self._on_load_dataset_clicked)
+        self._plot_view.point_picked.connect(self._on_plot_point_picked)
         self._data_view.metadata_browse_clicked.connect(self._on_metadata_browse)
         self._data_view.metadata_merge_clicked.connect(self._on_metadata_merge)
         self._data_view.metadata_clear_clicked.connect(self._on_metadata_clear)
@@ -531,8 +537,8 @@ class MainWindow(QMainWindow):
         if self._dm is not None:
             self._dm.close_db()
             self._dm = None
-        # Plot tabs are dataset-scoped: close every DB reader and drop them.
-        self._clear_plot_views()
+        # The merged DB table is dataset-scoped — drop it with the dataset.
+        self._reset_merged_data()
         self._loaded_dataset_dir = None
         self._update_window_title()
 
@@ -593,12 +599,7 @@ class MainWindow(QMainWindow):
         if path and str(Path(path)) != self._dataset_dir:
             self.select_dataset_dir(path)
 
-    # ── Profiler / infer DB tabs (one reader + tab per selected DB) ───────
-
-    @staticmethod
-    def _db_tab_title(path: str) -> str:
-        """Tab title: just the DB filename without the .db suffix."""
-        return Path(path).stem
+    # ── DB selection → ONE integrated table ──────────────────────────────────
 
     @staticmethod
     def _split_paths(paths) -> list[str]:
@@ -612,52 +613,67 @@ class MainWindow(QMainWindow):
                 out.append(p)
         return out
 
-    def _on_profiler_db_browse(self) -> None:
-        """Open a file dialog for one or more microProfiler profiler.db files."""
+    def _on_select_db_browse(self) -> None:
+        """Open a file dialog for profiler.db and/or infer.db files."""
         from PySide6.QtWidgets import QFileDialog
         if self._dm is None:
             return
         start_dir = self._dataset_dir or ""
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select Profiler DB(s)", start_dir, "SQLite DB (*.db)"
-        )
+            self, "Select DB(s)", start_dir, "SQLite DB (*.db)")
         if paths:
-            self.load_profiler_db_files(paths)
+            self.load_db_files(paths)
 
-    def load_profiler_db_files(self, paths) -> None:
-        """Open one plot tab per profiler DB (Browse / multi-file drop).
+    def load_db_files(self, paths) -> None:
+        """Merge any mix of profiler/infer DBs into ONE integrated table.
 
-        Selecting an already-open DB just activates its tab. The LAST file is
-        additionally loaded into the DataModule so the well-grid overlay and
-        metadata columns follow it.
+        Every call REPLACES the previous selection (re-select with more
+        files to extend it). The last profiler-type DB is additionally
+        loaded into the DataModule so the well-grid color-by keeps its
+        existing table-level sources.
         """
         if self._dm is None:
             return
-        opened: str | None = None
-        for path in self._split_paths(paths):
-            key = str(Path(path).resolve())
-            view = self._profiler_views.get(key)
-            if view is None:
-                try:
-                    db = ProfilerDB(path)
-                except Exception as e:
-                    logger.warning("Failed to open profiler DB %s: %s", path, e)
-                    from PySide6.QtWidgets import QMessageBox
-                    QMessageBox.warning(self, "Invalid Profiler DB", str(e))
-                    continue
-                view = ProfilerPlotView()
-                view.set_db(db, Path(path).name)
-                if self._metadata_merged is not None:
-                    view.set_metadata(self._metadata_merged)
-                self._profiler_dbs[key] = db
-                self._profiler_views[key] = view
-            self._data_view.show_plot_tab(
-                self._db_tab_title(path), view)
-            opened = path
-        if opened is not None:
-            self._load_profiler_db_into_dm(opened)
+        paths = self._split_paths(paths)
+        if not paths:
+            return
+        try:
+            self._merged = MergedData.load(paths)
+        except Exception as e:
+            logger.warning("Failed to merge DBs %s: %s", paths, e)
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Invalid DB", str(e))
+            return
 
-    def _load_profiler_db_into_dm(self, path: str) -> None:
+        self._refresh_merged_plot()
+        self._data_view.set_meta_browse_enabled(True)
+
+        # Well-grid / overlay machinery reads through the DataModule: keep
+        # pointing it at the newest profiler-type DB (infer DBs carry no
+        # well-keyed measurement tables).
+        for path in reversed(paths):
+            if not self._is_infer_db(path):
+                self._load_profiler_into_dm(path)
+                break
+        self._data_view.set_write_to_db_enabled(True)
+
+    @staticmethod
+    def _is_infer_db(path: str) -> bool:
+        """True when the SQLite file contains an `inference` table."""
+        import sqlite3
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='inference'").fetchone()
+                return row is not None
+            finally:
+                conn.close()
+        except Exception:
+            return False
+
+    def _load_profiler_into_dm(self, path: str) -> None:
         """Point the DataModule at a profiler DB for grid/overlay columns."""
         if self._dm is None:
             return
@@ -670,86 +686,32 @@ class MainWindow(QMainWindow):
         # is recomputed for the new database.
         self._overlay_cache = None
         self._overlay_cache_key = None
-        # Refresh all DB-dependent controls. NOTE: filters and channels are
-        # dataset-dependent — _populate_image_controls must NOT be called here
-        # (it would rebuild the filter widgets and reset the user's
-        # field/stack/timepoint selections).
-        self._data_view.set_meta_browse_enabled(True)
-        self._populate_data_controls()
+        # NOTE: filters and channels are dataset-dependent — never rebuild
+        # them here (that would reset the user's field/stack selections).
         self._update_grid_columns()
         self._populate_overlay_columns()
-        # Close persistent DB connection — cached data remains available
+        # Close persistent DB connection — cached data remains available.
         self._dm.close_db()
-        # Redraw the well grid with new DB columns (replaces clear+redraw)
-        self._update_grid()
         logger.info("Active profiler DB: %s", path)
 
-    def _on_infer_db_browse(self) -> None:
-        """Open a file dialog for one or more microModel infer.db files."""
-        from PySide6.QtWidgets import QFileDialog
-        start_dir = self._dataset_dir or ""
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select Infer DB(s)", start_dir, "SQLite DB (*.db)"
-        )
-        if paths:
-            self.load_infer_db_files(paths)
+    def _reset_merged_data(self) -> None:
+        """Drop the merged table and the plot view's data."""
+        self._merged = None
+        self._data_view.set_write_to_db_enabled(False)
+        self._plot_view.clear()
 
-    def load_infer_db_files(self, paths) -> None:
-        """Open one scatter tab per infer DB (Browse / multi-file drop)."""
-        for path in self._split_paths(paths):
-            key = str(Path(path).resolve())
-            view = self._infer_views.get(key)
-            if view is None:
-                try:
-                    db = InferDB(path)
-                except Exception as e:
-                    logger.warning("Failed to open infer DB %s: %s", path, e)
-                    from PySide6.QtWidgets import QMessageBox
-                    QMessageBox.warning(self, "Invalid Infer DB", str(e))
-                    continue
-                view = InferPlotView()
-                view.set_metadata(self._metadata_merged)
-                view.set_db(
-                    db,
-                    self._dm.directory_scopes() if self._dm else [self._dataset_dir],
-                )
-                self._infer_dbs[key] = db
-                self._infer_views[key] = view
-            self._data_view.show_plot_tab(
-                self._db_tab_title(path), view)
-            logger.info("Opened infer DB: %s", path)
-        # Infer columns are now part of both Image-panel Color-by dropdowns.
-        if self._infer_dbs and self._dm is not None:
-            self._overlay_cache = None
-            self._overlay_cache_key = None
-            self._populate_overlay_columns()
-            self._update_grid_columns()
-        # Excel plate metadata can also be merged/written into infer DBs
-        # (Write to DB updates the inference table), so enable the button
-        # whenever an infer DB is open even without a profiler DB.
-        if self._infer_dbs:
-            self._data_view.set_meta_browse_enabled(True)
+    def _refresh_merged_plot(self) -> None:
+        """Re-apply the Excel metadata merge and feed the plot view."""
+        self._plot_view.set_frame(
+            merge_metadata_into(self._merged, self._metadata_merged))
 
-    def _clear_plot_views(self) -> None:
-        """Close every profiler/infer DB reader and drop their plot tabs."""
-        # clear() closes each view's matplotlib figure (pyplot keeps figures
-        # alive globally otherwise — one leak per dataset switch).
-        for view in self._profiler_views.values():
-            view.clear()
-        for view in self._infer_views.values():
-            view.clear()
-        for db in self._profiler_dbs.values():
-            db.close()
-        self._profiler_dbs.clear()
-        self._profiler_views.clear()
-        for db in self._infer_dbs.values():
-            db.close()
-        self._infer_dbs.clear()
-        self._infer_views.clear()
-        # Overlay values may have come from an infer DB — drop the cache.
-        self._overlay_cache = None
-        self._overlay_cache_key = None
-        self._data_view.clear_plot_tabs()
+    def _merged_frame_for_dataset(self) -> pd.DataFrame:
+        """Directory-scoped view of the merged table (empty df if none)."""
+        if self._merged is None:
+            return pd.DataFrame()
+        scopes = (self._dm.directory_scopes() if self._dm
+                  else [self._dataset_dir or ""])
+        return self._merged.frame_for_dataset(scopes)
 
     def _load_dataset(
         self,
@@ -855,7 +817,6 @@ class MainWindow(QMainWindow):
             has_wells = len(self._dm.get_wells()) > 0
             self._well_grid_container.setVisible(has_wells)
             self._populate_image_controls()
-            self._populate_data_controls()
             self._populate_label_controls()
 
             # Close DB connection — cached data remains available
@@ -1043,24 +1004,17 @@ class MainWindow(QMainWindow):
         gw.palette.setCurrentText("Set1")
         gw.palette.blockSignals(False)
 
-    def _infer_color_entries(self) -> list[tuple[str, str, str, bool]]:
-        """Color-by entries for every column of every loaded infer DB.
+    def _merged_color_entries(self) -> list[tuple[str, str, str, bool]]:
+        """Color-by entries for every column of the merged DB table.
 
-        Returns ``(label, data_key, column, is_numeric)`` where data_key is
-        ``infer:<resolved path>`` (the reader lookup key). Labels are
-        ``<db-file-stem>/<column>``; duplicate stems get a numeric suffix.
+        Returns ``(label, data_key, column, is_numeric)`` with data_key
+        ``merge`` — values resolve through :meth:`_merged_frame_for_dataset`
+        (aggregated per well / per object like the infer sources were).
         """
-        entries: list[tuple[str, str, str, bool]] = []
-        used: dict[str, int] = {}
-        for key, db in self._infer_dbs.items():
-            stem = Path(key).stem
-            used[stem] = used.get(stem, 0) + 1
-            label_stem = stem if used[stem] == 1 else f"{stem} ({used[stem]})"
-            data_key = f"infer:{key}"
-            for name, ctype in db.list_columns():
-                entries.append((f"{label_stem}/{name}", data_key, name,
-                                is_numeric_type(ctype)))
-        return entries
+        if self._merged is None:
+            return []
+        return [(f"merge/{name}", "merge", name, is_num)
+                for name, is_num in self._merged.display_columns()]
 
     def _update_grid_columns(self) -> None:
         if self._dm is None:
@@ -1081,8 +1035,8 @@ class MainWindow(QMainWindow):
                 if col != "well":
                     is_num = pd.api.types.is_numeric_dtype(self._metadata_merged[col])
                     gw.column.addItem(f"metadata/{col}", ("metadata", col, is_num))
-        # Add loaded infer DB columns (all tables: inference + find_cluster)
-        for label, data_key, name, is_num in self._infer_color_entries():
+        # Add merged DB columns (profiler + infer, cross-joined per object)
+        for label, data_key, name, is_num in self._merged_color_entries():
             gw.column.addItem(label, (data_key, name, is_num))
         gw.column.blockSignals(False)
 
@@ -1149,8 +1103,8 @@ class MainWindow(QMainWindow):
             for col in self._metadata_merged.columns:
                 if col != "well":
                     ic.overlay_col.addItem(f"metadata/{col}", ("metadata", col))
-        # Add loaded infer DB columns (per-object overlay values)
-        for label, data_key, name, _is_num in self._infer_color_entries():
+        # Add merged DB columns (per-object overlay values)
+        for label, data_key, name, _is_num in self._merged_color_entries():
             ic.overlay_col.addItem(label, (data_key, name))
         ic.overlay_col.blockSignals(False)
 
@@ -1161,11 +1115,6 @@ class MainWindow(QMainWindow):
         ic.overlay_cmap.blockSignals(False)
 
         self._on_overlay_changed()
-
-    def _populate_data_controls(self) -> None:
-        """Refresh every profiler plot's table/column pickers."""
-        for view in self._profiler_views.values():
-            view.refresh_tables()
 
     def _populate_label_controls(self) -> None:
         """Populate mask dropdowns in label annotation + overlay controls."""
@@ -1209,11 +1158,8 @@ class MainWindow(QMainWindow):
         self._metadata_merged = self._metadata_df.copy()
         self._overlay_cache = None
 
-        # Merge into every open plot tab (profiler + infer).
-        for view in self._profiler_views.values():
-            view.set_metadata(self._metadata_merged)
-        for view in self._infer_views.values():
-            view.set_metadata(self._metadata_merged)
+        # Merge into the integrated table (left join by well) and refresh.
+        self._refresh_merged_plot()
         self._update_overlay_with_metadata()
 
     def _on_metadata_clear(self) -> None:
@@ -1222,10 +1168,7 @@ class MainWindow(QMainWindow):
         self._overlay_cache = None
         self._data_view.set_metadata_label(None)
 
-        for view in self._profiler_views.values():
-            view.set_metadata(None)
-        for view in self._infer_views.values():
-            view.set_metadata(None)
+        self._refresh_merged_plot()
         self._update_overlay_with_metadata()
 
     def _update_overlay_with_metadata(self) -> None:
@@ -1256,53 +1199,44 @@ class MainWindow(QMainWindow):
         self._update_grid_columns()
 
     def _on_write_to_db(self) -> None:
-        """Add/update the merged metadata columns in every loaded DB.
+        """Write the integrated table into a NEW database.
 
-        Profiler DBs: every table that has a `well` column. Infer DBs: the
-        `inference` table. Columns are added with ALTER TABLE and rows are
-        updated by well — no table is rewritten.
+        The table fuses profiler measurements, infer predictions/coordinates
+        and (if merged) the Excel metadata columns, one row per object.
+        The output file lives next to the dataset; its name comes from the
+        small edit next to the button (default merge.db). Source DBs are
+        never modified.
         """
-        if self._metadata_merged is None:
+        if self._merged is None:
+            logger.info("Write to DB: no DBs are merged")
             return
-        if not self._profiler_dbs and not self._infer_dbs:
-            logger.info("Write to DB: no profiler/infer DB is loaded")
-            return
+        df = merge_metadata_into(self._merged, self._metadata_merged)
+        out = str(Path(self._dataset_dir) / self._data_view.get_merge_db_name())
         try:
-            written = 0
-            for db in self._profiler_dbs.values():
-                written += db.write_metadata(self._metadata_merged)
-            for db in self._infer_dbs.values():
-                written += db.write_metadata(self._metadata_merged)
-            # Refresh the pickers so the new columns appear in the plot tabs.
-            self._refresh_profiler_plot()
-            for view in self._infer_views.values():
-                view.set_metadata(self._metadata_merged)
-            # DataModule caches schema + DataFrames; without this the grid and
-            # overlay dropdowns keep serving pre-write columns until the DB is
-            # re-selected.
-            if self._dm is not None:
-                self._dm.invalidate_table_cache()
-            self._update_grid_columns()
-            logger.info(
-                "Metadata written to %d profiler/infer DB(s) — %d column(s) updated",
-                len(self._profiler_dbs) + len(self._infer_dbs), written)
-            # Write-to-DB is an action button — persist patterns + channel
-            # colors to session.yml (write-on-action contract).
-            if self._session is not None:
-                image_pat, mask_pat, subdir_pat = self._data_view.get_patterns()
-                self._session.set_patterns(
-                    image_pattern=image_pat,
-                    mask_pattern=mask_pat,
-                    image_subdir_pattern=subdir_pat,
-                )
-                self._persist_channel_colors()
+            written_path = write_merged_db(df, out)
         except Exception:
-            logger.exception("Failed to write metadata to database")
-
-    def _refresh_profiler_plot(self) -> None:
-        """Repopulate every profiler plot's table/column pickers from its DB."""
-        for view in self._profiler_views.values():
-            view.refresh_tables()
+            logger.exception("Failed to write merged DB")
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Write Failed",
+                f"Could not write {out}. See log for details.")
+            return
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.information(
+            self, "Merged DB Written",
+            f"Wrote {len(df):,} rows ({len(df.columns)} columns) to "
+            f"{written_path} (table '{merged_data.MERGED_TABLE}').")
+        logger.info("Merged DB written: %s (%d rows)", written_path, len(df))
+        # Write-to-DB is an action button — persist patterns + channel
+        # colors to session.yml (write-on-action contract).
+        if self._session is not None:
+            image_pat, mask_pat, subdir_pat = self._data_view.get_patterns()
+            self._session.set_patterns(
+                image_pattern=image_pat,
+                mask_pattern=mask_pat,
+                image_subdir_pattern=subdir_pat,
+            )
+            self._persist_channel_colors()
 
     # ── Grid Handlers ────────────────────────────────────────────────────────
 
@@ -1360,17 +1294,14 @@ class MainWindow(QMainWindow):
             value_map = dict(
                 zip(self._metadata_merged["well"], self._metadata_merged[col_name], strict=False)
             )
-        elif table_name.startswith("infer:") and col_name is not None:
-            db = self._infer_dbs.get(table_name[len("infer:"):])
-            if db is not None:
-                try:
-                    idf = db.load_inference(
-                        self._dm.directory_scopes() if self._dm else [self._dataset_dir]
-                    )
-                    value_map = aggregate_by_well(idf, col_name, gw.aggregation.currentText())
-                except Exception:
-                    logger.warning("Failed to aggregate infer grid values", exc_info=True)
-                    value_map = {}
+        elif table_name == "merge" and col_name is not None:
+            try:
+                value_map = aggregate_by_well(
+                    self._merged_frame_for_dataset(), col_name,
+                    gw.aggregation.currentText())
+            except Exception:
+                logger.warning("Failed to aggregate merged grid values", exc_info=True)
+                value_map = {}
 
         self._grid_canvas.update_grid(
             self._dm,
@@ -1902,10 +1833,9 @@ class MainWindow(QMainWindow):
         from their `label` column when no profiler table does.
         """
         overlay_values: dict[str, float | str] = {}
+        # Object-level source frame (reused by the counts/per-object code
+        # below); set for infer-style sources with a `label` column.
         infer_frame: pd.DataFrame | None = None
-        infer_key = None
-        if self._overlay_table and self._overlay_table.startswith("infer:"):
-            infer_key = self._overlay_table[len("infer:"):]
 
         if self._overlay_col and self._overlay_table:
             if self._overlay_table == "metadata" and self._metadata_merged is not None:
@@ -1914,17 +1844,15 @@ class MainWindow(QMainWindow):
                     overlay_values = dict(
                         zip(meta["well"], meta[self._overlay_col], strict=False)
                     )
-            elif infer_key is not None:
-                db = self._infer_dbs.get(infer_key)
-                if db is not None:
-                    try:
-                        infer_frame = db.load_inference(
-                            self._dm.directory_scopes() if self._dm else [self._dataset_dir]
-                        )
-                        overlay_values = aggregate_by_well(
-                            infer_frame, self._overlay_col, "mean")
-                    except Exception:
-                        logger.warning("Failed to load infer overlay values", exc_info=True)
+            elif self._overlay_table == "merge":
+                try:
+                    scoped = self._merged_frame_for_dataset()
+                    overlay_values = aggregate_by_well(
+                        scoped, self._overlay_col, "mean")
+                    if "label" in scoped.columns:
+                        infer_frame = scoped
+                except Exception:
+                    logger.warning("Failed to load merged overlay values", exc_info=True)
             else:
                 try:
                     overlay_values = self._dm.aggregate(
@@ -2337,8 +2265,6 @@ class MainWindow(QMainWindow):
         try:
             self._dm.write_label_table(table_name, df)
             logger.info("Wrote %d label annotations to '%s'", len(df), table_name)
-            # Refresh data view to show new table
-            self._populate_data_controls()
         except Exception:
             logger.exception("Failed to write label annotations")
             QMessageBox.warning(
@@ -2424,6 +2350,98 @@ class MainWindow(QMainWindow):
             if box is not None and box.has_object(key):
                 box.set_object_pixmap(key, pixmap)
                 break
+
+    # ── Plot click → single-cell popup ──────────────────────────────────────
+
+    def _on_plot_point_picked(self, row: dict, global_pos) -> None:
+        """Answer the Data-plot's clicked point with the cropped single cell.
+
+        A miss (no dataset / no object label / row or mask not resolvable)
+        hides the popup instead of showing stale imagery.
+        """
+        pixmap = self._resolve_point_cell(row)
+        if pixmap is None:
+            self._plot_view.hide_cell_image()
+            return
+        self._plot_view.show_cell_image(pixmap)
+
+    def _resolve_point_cell(self, row: dict):
+        """Crop the single cell for a clicked merged-table row.
+
+        The physical object is located through the dataset metadata
+        (directory match first, then well + field/stack/timepoint) and
+        cropped from the selected object mask (fallback: first mask — this
+        is a read-only viewer, not annotation, so a substitute mask only
+        changes the outline shown, never written anywhere).
+        """
+        if self._dm is None:
+            return None
+        label = row.get("label")
+        if label is None:
+            logger.info("Plot click: row has no object label — nothing to crop")
+            return None
+        meta = self._dm.dataset.metadata
+        if meta is None:
+            return None
+
+        row_idx = None
+        directory = row.get("directory")
+        if directory and DIRECTORY_COLUMN in meta.columns:
+            # DB rows carry ABSOLUTE forward-slash directories while the
+            # dataset metadata stores root-RELATIVE dirs — compare both
+            # normalized to absolute forward-slash form.
+            row_dir = _abs_norm_dir(directory)
+            meta_dirs = meta[DIRECTORY_COLUMN].map(
+                lambda v: _abs_norm_dir(Path(self._dm.dataset.root) / str(v)))
+            match = meta.index[meta_dirs == row_dir]
+            if len(match):
+                row_idx = int(match[0])
+        if row_idx is None and "well" in meta.columns and row.get("well"):
+            cand = meta.index[meta["well"].astype(str) == str(row["well"])]
+            for col in ("field", "stack", "timepoint"):
+                v = row.get(col)
+                if v is not None and col in meta.columns:
+                    cand = cand[meta[col].astype(str) == str(v)]
+            if len(cand):
+                row_idx = int(cand[0])
+        if row_idx is None:
+            logger.info("Plot click: row does not match any dataset image")
+            return None
+
+        raw_data = self._raw_cache.get(row_idx)
+        if raw_data is None:
+            try:
+                raw_data = self._dm.get_imageset(row_idx)
+                self._raw_cache[row_idx] = raw_data
+            except Exception:
+                logger.warning("Plot click: image load failed for row %d",
+                               row_idx, exc_info=True)
+                return None
+        img_data, mask_dict = raw_data
+
+        mask_name = self._image_controls.get_selected_object_mask()
+        if not mask_name and self._dm.mask_names:
+            mask_name = self._dm.mask_names[0]
+        mask = mask_dict.get(f"mask_{mask_name}") if mask_name else None
+        if mask is None:
+            logger.info("Plot click: no object mask available for the crop")
+            return None
+
+        ch_config = self._image_controls.get_channel_config()
+        rgb = crop_object_rgb(
+            img_data, mask, int(label), list(ch_config.keys()), ch_config,
+            DTYPE_MAX.get(str(self._dm.img_dtype), 65535.0),
+            self._contrast_method, self._contrast_gamma, self._invert,
+            target_size=96, padding=4,
+        )
+        if rgb is None:
+            return None
+
+        from PySide6.QtGui import QImage, QPixmap
+        rgb = np.ascontiguousarray(rgb)
+        h, w, _ = rgb.shape
+        qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+        return QPixmap.fromImage(qimg.copy())
 
     # ── Object Export Handler ────────────────────────────────────────────────
 
@@ -2648,8 +2666,8 @@ class MainWindow(QMainWindow):
         self._metadata_df = None
         self._metadata_merged = None
 
-        # Close every DB reader + drop the plot tabs
-        self._clear_plot_views()
+        # Drop the integrated table and the plot view's data
+        self._reset_merged_data()
 
         # Clear caches
         self._raw_cache.clear()
@@ -2790,8 +2808,4 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         if self._dm is not None:
             self._dm.close_db()
-        for db in self._profiler_dbs.values():
-            db.close()
-        for db in self._infer_dbs.values():
-            db.close()
         super().closeEvent(event)

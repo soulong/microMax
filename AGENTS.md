@@ -232,18 +232,20 @@ Package layout (overview):
 * `io/data_module.py` — `DataModule`, the single facade over
   `microBase.ImageDataset` + `profiler.db`.
 
-* `io/infer_db.py` — `InferDB`, read-only reader for a microModel `infer.db`
-  (`inference` + `reduction_<method>` + `find_cluster`).
-
-* `io/profiler_db.py` — `ProfilerDB`, read-only reader for a microProfiler
-  `profiler.db` (one reader per open DB tab).
+* `io/merged_data.py` — `MergedData`, builds THE integrated per-object table
+  from any mix of profiler.db (object tables) and infer.db (`inference`
+  minus features, joined with every `reduction_<method>` on uid) files:
+  outer-merged per object on the identity columns (well/label/directory/...),
+  colliding columns prefixed `<db-stem>/`; also `write_merged_db` (the
+  Write-to-DB target, default merge.db, table `merged`).
 
 * `widgets/` — image display (thumbnail grid + full-res view), channel
   controls, image filters, well-grid canvas, label annotation panel, pixel
-  info, data view, profiler/infer DB plot tabs (shared skeleton in
-  `plot_tab_base.py`); `ui_spec.py` centralizes
-  the control-pane geometry tokens and small widget builders (form rows,
-  small buttons, checkbox strips) shared by the panel widgets.
+  info, data view, and `data_plot.py` — THE single plot view over the merged
+  table (all pickers editable, left-click a scatter point shows the cropped
+  single cell in a near-cursor popup, empty click hides it); `ui_spec.py`
+  centralizes the control-pane geometry tokens and small widget builders
+  (form rows, small buttons, checkbox strips) shared by the panel widgets.
 
 * `processing/` — multi-channel compositing, contrast, mask overlay; `plotting.py`
   builds facet-aware matplotlib figures (scatter / line mean±SEM / boxplot /
@@ -275,32 +277,34 @@ Data flow:
 
 * The Image panel's filters are labeled with their metadata column names
   (`field`/`stack`/`timepoint` + extra columns). Both "Color by" dropdowns
-  (well grid and Object Overlay) accept profiler tables, merged Excel metadata
-  and every loaded infer DB column (`<db-stem>/<column>`, directory-scoped
-  with fallback); infer columns also provide object counts when no profiler
-  table does.
+  (well grid and Object Overlay) accept profiler tables (via the DataModule's
+  active DB), merged Excel metadata and every merged-table column
+  (`merge/<column>`, directory-scoped with fallback); merged columns also
+  provide object counts when no profiler table does.
 
-* The Data page selects a dataset directory via a line edit (type/browse/drop)
-  and opens read-only plot tabs: `Select Profiler DB` (one or more `profiler.db`
-  files → an object table plotted as scatter / line mean±SEM / boxplot /
-  barplot mean±SEM with X/Y/color/size/facets and palette; X/Y accept every
-  meta + measurement variable, categoricals plotted on level ticks) and
-  `Select Infer DB` (one or more microModel `infer.db` files → DR-method
-  scatter colored/sized/faceted by chosen variables, filtered to the current
-  dataset). Every picker combo is editable — type to filter long column /
-  table / directory lists. Each selected DB gets its
-  own tab (re-selecting activates it). Every tab has a free-form pandas-
-  expression filter applied before plotting. Plot controls sit in a left column
-  with the interactive canvas on the right (hover shows the point's values,
-  minus the reduction coordinates on infer tabs); all plots export vector PDFs
-  with editable text. PyGwalker is not used.
+* The Data page selects a dataset directory via a line edit (type/browse/drop),
+  then **Select DB** accepts any number of profiler.db AND infer.db files of
+  that dataset. Their object rows are fused into ONE integrated table
+  (io/merged_data: outer merge on the identity columns — well, label,
+  directory, ... — so profiler measurements and infer predictions/
+  coordinates meet in a single row per object; colliding columns are
+  prefixed `<db-stem>/`). One plot area renders that table: scatter / line
+  mean±SEM / boxplot / barplot mean±SEM with X/Y/color/size/facets and
+  palette; X/Y accept every merged column, categoricals plotted on level
+  ticks. Every picker combo is editable — type to filter long column lists.
+  A free-form pandas-expression filter is applied before plotting. Plot
+  controls sit in a left column with the interactive canvas on the right;
+  hover shows a point's values and LEFT-CLICKING a scatter point shows the
+  corresponding cropped single cell in a near-cursor popup (nearest point
+  wins on overlap; clicking empty space hides it). All plots export vector
+  PDFs with editable text. PyGwalker is not used.
 
-* Excel plate metadata (`Select Metadata`) is merged by `well` into every open
-  plot tab on **Merge** (no DB write) and un-merged on **Clear**. **Write to
-  DB** persists it additively — missing columns are added with `ALTER TABLE`
-  and rows updated by `well` — in every loaded profiler DB (all tables with a
-  `well` column) and every loaded infer DB (`inference` table), preserving
-  primary keys and BLOB features.
+* Excel plate metadata (`Select Metadata`) is merged by `well` into the
+  integrated table on **Merge** (in memory — no DB write) and un-merged on
+  **Clear**. **Write to DB** writes the integrated table (profiler + infer +
+  merged metadata columns) into a NEW database next to the dataset — the
+  small edit after the button controls the file name (default merge.db,
+  table `merged`); the source DBs are never modified.
 
 **Adding a new widget:** add the class under `widgets/`, instantiate it in
 `MainWindow.__init__` and wire its signals to private `_on_*` handlers; access

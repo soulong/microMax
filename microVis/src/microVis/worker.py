@@ -321,6 +321,76 @@ class _CropSignals(QObject):
     error = Signal(str)
 
 
+def crop_object_rgb(
+    img_data: np.ndarray,
+    mask: np.ndarray,
+    label: int,
+    channel_names: list[str],
+    ch_config: dict,
+    dmax: float,
+    contrast_method: str = "none",
+    contrast_gamma: float = 1.0,
+    invert: bool = False,
+    target_size: int = 64,
+    padding: int = 4,
+) -> np.ndarray | None:
+    """Crop one masked object and composite it to a small RGB array.
+
+    Shared by CropWorker (background annotation crops) and the Data-page
+    plot's click-to-cell popup (synchronous single clicks). Returns None
+    when the label is absent from the mask.
+    """
+    from microVis.processing.compositing import composite_image
+
+    ys, xs = np.where(mask == label)
+    if len(ys) == 0:
+        return None
+
+    y_min, y_max = int(ys.min()), int(ys.max())
+    x_min, x_max = int(xs.min()), int(xs.max())
+
+    # Add padding
+    h, w = mask.shape
+    y_min = max(0, y_min - padding)
+    y_max = min(h, y_max + padding + 1)
+    x_min = max(0, x_min - padding)
+    x_max = min(w, x_max + padding + 1)
+
+    # Crop image and mask
+    crop_img = img_data[y_min:y_max, x_min:x_max, :].astype(np.float64)
+    crop_mask = mask[y_min:y_max, x_min:x_max]
+
+    # Apply mask: zero out pixels not belonging to this object
+    obj_mask = (crop_mask == label).astype(np.float64)
+    for ch in range(crop_img.shape[2]):
+        crop_img[:, :, ch] *= obj_mask
+
+    # Per-channel contrast
+    enhanced = _enhance_channels(
+        crop_img, channel_names, ch_config, dmax,
+        contrast_method, contrast_gamma, invert,
+    )
+
+    # Composite
+    comp_config = {ch: {**c, "vmin": 0, "vmax": 1} for ch, c in ch_config.items()}
+    rgb = composite_image(enhanced, channel_names, comp_config, None, None)
+
+    # Resize to target
+    ch_n, cw = rgb.shape[:2]
+    if ch_n > target_size or cw > target_size:
+        from skimage.transform import resize as sk_resize
+        scale = target_size / max(ch_n, cw)
+        rgb = sk_resize(
+            rgb,
+            (int(ch_n * scale), int(cw * scale), 3),
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(np.uint8)
+
+    # numpy array — QPixmap must be created on the main thread
+    return np.ascontiguousarray(rgb)
+
+
 class CropWorker(QRunnable):
     """Background worker that crops and masks a single object from an image."""
 
@@ -357,64 +427,12 @@ class CropWorker(QRunnable):
 
     def run(self) -> None:
         try:
-            from microVis.processing.compositing import composite_image
-
-            mask = self._mask
-            label = self._label
-
-            # Find bounding box of the object
-            ys, xs = np.where(mask == label)
-            if len(ys) == 0:
-                self.signals.finished.emit(None, self._key)
-                return
-
-            y_min, y_max = int(ys.min()), int(ys.max())
-            x_min, x_max = int(xs.min()), int(xs.max())
-
-            # Add padding
-            h, w = mask.shape
-            y_min = max(0, y_min - self._pad)
-            y_max = min(h, y_max + self._pad + 1)
-            x_min = max(0, x_min - self._pad)
-            x_max = min(w, x_max + self._pad + 1)
-
-            # Crop image and mask
-            crop_img = self._img[y_min:y_max, x_min:x_max, :].astype(np.float64)
-            crop_mask = mask[y_min:y_max, x_min:x_max]
-
-            # Apply mask: zero out pixels not belonging to this object
-            obj_mask = (crop_mask == label).astype(np.float64)
-            for ch in range(crop_img.shape[2]):
-                crop_img[:, :, ch] *= obj_mask
-
-            # Per-channel contrast
-            enhanced = _enhance_channels(
-                crop_img, self._ch_names, self._ch_config, self._dmax,
+            rgb = crop_object_rgb(
+                self._img, self._mask, self._label,
+                self._ch_names, self._ch_config, self._dmax,
                 self._contrast, self._gamma, self._invert,
+                self._target, self._pad,
             )
-
-            # Composite
-            comp_config = {
-                ch: {**c, "vmin": 0, "vmax": 1}
-                for ch, c in self._ch_config.items()
-            }
-            rgb = composite_image(enhanced, self._ch_names, comp_config, None, None)
-
-            # Resize to target
-            ch, cw = rgb.shape[:2]
-            if ch > self._target or cw > self._target:
-                from skimage.transform import resize as sk_resize
-                scale = self._target / max(ch, cw)
-                rgb = sk_resize(
-                    rgb,
-                    (int(ch * scale), int(cw * scale), 3),
-                    preserve_range=True,
-                    anti_aliasing=True,
-                ).astype(np.uint8)
-
-            # Return as numpy array (QPixmap must be created on main thread)
-            rgb = np.ascontiguousarray(rgb)
-
             self.signals.finished.emit(rgb, self._key)
         except SystemExit as e:
             logger.warning("Crop worker skipped %s: %s", self._key, e)
