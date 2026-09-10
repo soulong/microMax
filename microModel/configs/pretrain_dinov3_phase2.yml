@@ -42,7 +42,10 @@ data:
   sample_by: per_dataset
 
 # Phase 2 = Phase 1 的延续：指向 Phase 1 的 model.pt。
-# continue：模型+优化器+调度从断点继续（同数据）；transfer：仅权重、epoch 归 0（换数据）。
+# continue：模型+优化器+loss 历史从断点恢复（同数据）；transfer：仅权重、epoch 归 0（换数据）。
+# 注意 continue 的调度语义：Phase 1 结束 epoch ≥ 本 config 的 epochs 时，epochs 被
+# 视为"额外轮数"，total_steps 按延长后的区间重算——cosine LR/momentum/WD/temp 从
+# 延长曲线的中段继续，而非沿用 Phase 1 曲线终点的值（详见 phase1 config resume 注释）。
 resume:
   ssl_model: 20260830_dinov3_phase1/model.pt   # ← 改为 Phase 1 实际输出路径
   type: continue
@@ -85,7 +88,7 @@ dinov3:
   warmup_epochs: 2                    # 短 warmup 即可（权重已收敛）
   transfer_warmup_epochs: 1
   teacher_temp_start: 0.04
-  teacher_temp_end: 0.07              # start==end 即常数
+  teacher_temp_end: 0.07              # warmup 期内由 start 线性升至该值（设 start==end 则为常数）
   weight_decay_start: 0.04            # 常数 0.04（与 Phase 1 一致）
   weight_decay_end: 0.04
   momentum_start: 0.994               # Phase 2 教师 EMA 用常数 0.994（官方锚定阶段）

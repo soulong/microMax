@@ -12,7 +12,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp
+from microProfiler.gui.dpi import dp
+from microProfiler.gui.panels.base_step_panel import BaseStepPanel
+from microProfiler.gui.ui_spec import step_button
 from microProfiler.gui.image_widgets import ChannelTile
 
 
@@ -67,9 +69,7 @@ class BaSiCStepPanel(BaseStepPanel):
         self._preview_btn = QPushButton("Preview Transform")
         self._preview_btn.setProperty("class", "secondary")
         row2.addWidget(self._preview_btn)
-        self._apply_btn = QPushButton("▶ Apply")
-        self._apply_btn.setProperty("class", "primary")
-        self._apply_btn.setFixedHeight(dp(28))
+        self._apply_btn = step_button("▶ Apply")
         row2.addWidget(self._apply_btn)
         self._controls_layout.addLayout(row2)
 

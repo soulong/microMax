@@ -38,6 +38,13 @@ from microBase import (
 from microProfiler.gui.path_drop import enable_path_drop
 from microProfiler.gui.pipeline_controller import PipelineController
 from microProfiler.gui.state import PipelineState
+from microProfiler.gui.ui_spec import (
+    PAGE_MARGIN,
+    SCROLL_CONTENT_SPACING,
+    STATUS_BAR_HEIGHT,
+    WINDOW_SIZE,
+    run_button,
+)
 from microProfiler.gui.workers.preview_worker import PreviewWorker
 from microProfiler.gui.workers.dataset_load_worker import DatasetLoadWorker
 from microProfiler.gui.sidebar import Sidebar
@@ -98,8 +105,8 @@ class MainWindow(QMainWindow):
         self._pending_filters = None
 
         self.setWindowTitle("microProfiler")
-        self.resize(1200, 800)
-        self.setMinimumSize(1200, 800)
+        self.resize(*WINDOW_SIZE)
+        self.setMinimumSize(*WINDOW_SIZE)
         self._running = False
 
         setup_logging(clear_existing=False)
@@ -293,7 +300,8 @@ class MainWindow(QMainWindow):
         # ── Page 0: Input + Filter ────────────────────────────────────
         input_page = QWidget()
         input_layout = QVBoxLayout(input_page)
-        input_layout.setContentsMargins(4, 4, 4, 4)
+        input_layout.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN,
+                                        PAGE_MARGIN, PAGE_MARGIN)
 
         input_group = QGroupBox("Input")
         input_form = QFormLayout(input_group)
@@ -309,9 +317,7 @@ class MainWindow(QMainWindow):
         input_row.addWidget(self._input_browse)
         input_form.addRow("Input dir:", input_row)
 
-        self._load_dataset_btn = QPushButton("Load Dataset")
-        self._load_dataset_btn.setProperty("class", "primary")
-        self._load_dataset_btn.setFixedHeight(dp(32))
+        self._load_dataset_btn = run_button("Load Dataset")
         format_row = QHBoxLayout()
         format_row.addStretch()
         format_row.addWidget(self._load_dataset_btn)
@@ -350,96 +356,33 @@ class MainWindow(QMainWindow):
         input_layout.addStretch()
         self._stack.addWidget(input_page)
 
-        # ── Page 1: Pre-process ────────────────────────────────────────
-        pre_page = QWidget()
-        pre_layout = QVBoxLayout(pre_page)
-        pre_layout.setContentsMargins(4, 4, 4, 4)
+        # ── Pages 1-4: one scrollable page per pipeline stage ──────────
+        # Each page is the step card(s) inside a scroll area with the stage's
+        # Run button pinned BELOW the scroll area, so it stays reachable
+        # however long the card content grows.
+        self._run_pre_btn = run_button("Run Preprocessing")
+        self._stack.addWidget(self._make_step_page(
+            [self._resize_panel, self._zproject_panel,
+             self._basic_panel, self._tile_panel],
+            self._run_pre_btn))
 
-        self._pre_scroll = QScrollArea()
-        self._pre_scroll.setWidgetResizable(True)
-        pre_scroll_inner = QWidget()
-        pre_scroll_layout = QVBoxLayout(pre_scroll_inner)
-        pre_scroll_layout.setContentsMargins(0, 0, 0, 0)
-        pre_scroll_layout.setSpacing(12)
-        for p in self._preprocessing_steps:
-            pre_scroll_layout.addWidget(p)
-        self._run_pre_btn = QPushButton("Run Preprocessing")
-        self._run_pre_btn.setProperty("class", "primary")
-        self._run_pre_btn.setFixedHeight(dp(32))
-        pre_scroll_layout.addWidget(self._run_pre_btn)
-        pre_scroll_layout.addStretch()
-        self._pre_scroll.setWidget(pre_scroll_inner)
-        pre_layout.addWidget(self._pre_scroll, 1)
-        self._stack.addWidget(pre_page)
+        self._run_seg_btn = run_button("Run Segmentation")
+        self._stack.addWidget(self._make_step_page(
+            [self._segment_panel], self._run_seg_btn))
 
-        # ── Page 2: Segmentation ───────────────────────────────────────
-        seg_page = QWidget()
-        seg_layout = QVBoxLayout(seg_page)
-        seg_layout.setContentsMargins(4, 4, 4, 4)
+        self._run_prof_btn = run_button("Run Profiling")
+        self._stack.addWidget(self._make_step_page(
+            [self._image_profile_panel, self._object_profile_panel],
+            self._run_prof_btn))
 
-        self._seg_scroll = QScrollArea()
-        self._seg_scroll.setWidgetResizable(True)
-        seg_scroll_inner = QWidget()
-        seg_scroll_layout = QVBoxLayout(seg_scroll_inner)
-        seg_scroll_layout.setContentsMargins(0, 0, 0, 0)
-        seg_scroll_layout.setSpacing(12)
-        seg_scroll_layout.addWidget(self._segment_panel)
-        self._run_seg_btn = QPushButton("Run Segmentation")
-        self._run_seg_btn.setProperty("class", "primary")
-        self._run_seg_btn.setFixedHeight(dp(32))
-        seg_scroll_layout.addWidget(self._run_seg_btn)
-        seg_scroll_layout.addStretch()
-        self._seg_scroll.setWidget(seg_scroll_inner)
-        seg_layout.addWidget(self._seg_scroll, 1)
-        self._stack.addWidget(seg_page)
-
-        # ── Page 3: Profiling ──────────────────────────────────────────
-        prof_page = QWidget()
-        prof_layout = QVBoxLayout(prof_page)
-        prof_layout.setContentsMargins(4, 4, 4, 4)
-
-        self._prof_scroll = QScrollArea()
-        self._prof_scroll.setWidgetResizable(True)
-        prof_scroll_inner = QWidget()
-        prof_scroll_layout = QVBoxLayout(prof_scroll_inner)
-        prof_scroll_layout.setContentsMargins(0, 0, 0, 0)
-        prof_scroll_layout.setSpacing(12)
-        prof_scroll_layout.addWidget(self._image_profile_panel)
-        prof_scroll_layout.addWidget(self._object_profile_panel)
-        self._run_prof_btn = QPushButton("Run Profiling")
-        self._run_prof_btn.setProperty("class", "primary")
-        self._run_prof_btn.setFixedHeight(dp(32))
-        prof_scroll_layout.addWidget(self._run_prof_btn)
-        prof_scroll_layout.addStretch()
-        self._prof_scroll.setWidget(prof_scroll_inner)
-        prof_layout.addWidget(self._prof_scroll, 1)
-        self._stack.addWidget(prof_page)
-
-        # ── Page 4: Inference ──────────────────────────────────────────
-        infer_page = QWidget()
-        infer_layout = QVBoxLayout(infer_page)
-        infer_layout.setContentsMargins(4, 4, 4, 4)
-
-        self._infer_scroll = QScrollArea()
-        self._infer_scroll.setWidgetResizable(True)
-        infer_scroll_inner = QWidget()
-        infer_scroll_layout = QVBoxLayout(infer_scroll_inner)
-        infer_scroll_layout.setContentsMargins(0, 0, 0, 0)
-        infer_scroll_layout.setSpacing(12)
-        infer_scroll_layout.addWidget(self._inference_panel)
-        self._run_infer_btn = QPushButton("Run Inference")
-        self._run_infer_btn.setProperty("class", "primary")
-        self._run_infer_btn.setFixedHeight(dp(32))
-        infer_scroll_layout.addWidget(self._run_infer_btn)
-        infer_scroll_layout.addStretch()
-        self._infer_scroll.setWidget(infer_scroll_inner)
-        infer_layout.addWidget(self._infer_scroll, 1)
-        self._stack.addWidget(infer_page)
+        self._run_infer_btn = run_button("Run Inference")
+        self._stack.addWidget(self._make_step_page(
+            [self._inference_panel], self._run_infer_btn))
 
         # ── Progress bar at bottom ─────────────────────────────────────
         self._progress_label = QLabel("")
         self._progress_label.setVisible(False)
-        self._progress_label.setFixedHeight(dp(24))
+        self._progress_label.setFixedHeight(dp(STATUS_BAR_HEIGHT))
         self._progress_label.setProperty("class", "status-bar")
 
         right_layout.addWidget(self._stack, 1)
@@ -454,6 +397,32 @@ class MainWindow(QMainWindow):
         self._custom_image_pattern.setText(DEFAULT_IMAGE_PATTERN)
         self._custom_mask_pattern.setText(DEFAULT_MASK_PATTERN)
         self._custom_image_subdir_pattern.setText(DEFAULT_IMAGE_SUBDIR_PATTERN)
+
+    def _make_step_page(self, panels, run_btn: QPushButton) -> QWidget:
+        """Build one stacked page: step card(s) in a scroll area + Run button.
+
+        The button sits outside the scroll area (pinned to the page bottom)
+        so it never scrolls out of reach on long pages.
+        """
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN,
+                                       PAGE_MARGIN, PAGE_MARGIN)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        inner_layout.setSpacing(SCROLL_CONTENT_SPACING)
+        for p in panels:
+            inner_layout.addWidget(p)
+        inner_layout.addStretch()
+        scroll.setWidget(inner)
+
+        page_layout.addWidget(scroll, 1)
+        page_layout.addWidget(run_btn)
+        return page
 
     # ── Signal connections ────────────────────────────────────────────────
 

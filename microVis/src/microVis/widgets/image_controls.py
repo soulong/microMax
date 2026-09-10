@@ -10,7 +10,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPushButton,
     QRadioButton,
     QScrollArea,
     QVBoxLayout,
@@ -21,6 +20,21 @@ from microVis.widgets.path_drop import enable_path_drop
 from microVis._settings import CONTRAST_METHODS
 from microVis.widgets._event_filter import NoScrollComboBox, NoScrollDoubleSpinBox, NoScrollSlider
 from microVis.widgets.channel_controls import ChannelControls
+from microVis.widgets.ui_spec import (
+    BTN_MINI_WIDTH,
+    BTN_WIDE_WIDTH,
+    CONTROLS_MARGIN,
+    CONTROLS_MAX_WIDTH,
+    CONTROLS_MIN_WIDTH,
+    CONTROLS_SPACING,
+    COMPACT_LINE_EDIT_STYLE,
+    SMALL_CHECKBOX_STYLE,
+    centered_row,
+    check_strip,
+    controls_pane_style,
+    form_row,
+    small_button,
+)
 
 
 class _MultiSelectCombo(QWidget):
@@ -40,29 +54,18 @@ class _MultiSelectCombo(QWidget):
         header.setSpacing(4)
         header.addWidget(QLabel(label))
 
-        sel_all = QPushButton("All")
-        sel_all.setProperty("class", "secondary")
-        sel_all.setFixedSize(42, 18)
-        sel_all.setStyleSheet("font-size: 8pt; padding: 1px 4px;")
+        sel_all = small_button("All", width=42, height=18, mini_style=True)
         sel_all.clicked.connect(lambda: self.set_all_checked(True))
         header.addWidget(sel_all)
 
-        clear_btn = QPushButton("Clear")
-        clear_btn.setProperty("class", "secondary")
-        clear_btn.setFixedSize(48, 18)
-        clear_btn.setStyleSheet("font-size: 8pt; padding: 1px 4px;")
+        clear_btn = small_button("Clear", width=48, height=18, mini_style=True)
         clear_btn.clicked.connect(lambda: self.set_all_checked(False))
         header.addWidget(clear_btn)
         header.addStretch()
         layout.addLayout(header)
 
         # Checkboxes in a scrollable horizontal row
-        checks_scroll = QScrollArea()
-        checks_scroll.setWidgetResizable(True)
-        checks_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        checks_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        checks_scroll.setMaximumHeight(24)
-        checks_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        checks_scroll = check_strip()
 
         checks_inner = QWidget()
         self._checks_layout = QHBoxLayout(checks_inner)
@@ -71,7 +74,7 @@ class _MultiSelectCombo(QWidget):
         self._checkboxes: dict[str, QCheckBox] = {}
         for i, item_text in enumerate(items):
             cb = QCheckBox(item_text)
-            cb.setStyleSheet("QCheckBox { font-size: 7pt; spacing: 2px; } QCheckBox::indicator { width: 12px; height: 12px; }")
+            cb.setStyleSheet(SMALL_CHECKBOX_STYLE)
             cb.setChecked(i == 0 if checked_first else True)
             cb.toggled.connect(lambda: self.selection_changed.emit())
             self._checks_layout.addWidget(cb)
@@ -96,7 +99,13 @@ class _MultiSelectCombo(QWidget):
 
 
 class ImageControls(QScrollArea):
-    """Left sidebar controls for the image viewer."""
+    """Left sidebar controls for the image viewer.
+
+    Geometry lives in widgets/ui_spec.py: the pane width, the compact
+    input heights, the small-button sizes and the shared row builders all
+    come from there, so re-tuning the layout means editing ui_spec, not
+    this file.
+    """
 
     auto_all_clicked = Signal()
     auto_range_changed = Signal()
@@ -119,43 +128,15 @@ class ImageControls(QScrollArea):
         super().__init__(parent)
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setMinimumWidth(260)
-        self.setMaximumWidth(320)
+        self.setMinimumWidth(CONTROLS_MIN_WIDTH)
+        self.setMaximumWidth(CONTROLS_MAX_WIDTH)
 
         container = QWidget()
-        container.setStyleSheet("""
-            QComboBox, QDoubleSpinBox, QSpinBox, QSlider {
-                min-height: 18px;
-                max-height: 22px;
-                font-size: 8pt;
-                padding: 2px 3px;
-                min-width: 0;
-            }
-            QLabel {
-                font-size: 8pt;
-            }
-            QPushButton {
-                font-size: 9pt;
-                padding: 2px 6px;
-            }
-            QGroupBox {
-                font-size: 8pt;
-                font-weight: bold;
-                color: #5a8a9a;
-                border: 1px solid #3a3a4a;
-                border-radius: 4px;
-                margin-top: 8px;
-                padding-top: 14px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 8px;
-                padding: 0 4px;
-            }
-        """)
+        container.setStyleSheet(controls_pane_style(include_group_boxes=True))
         self._layout = QVBoxLayout(container)
-        self._layout.setContentsMargins(6, 6, 6, 6)
-        self._layout.setSpacing(4)
+        self._layout.setContentsMargins(CONTROLS_MARGIN, CONTROLS_MARGIN,
+                                        CONTROLS_MARGIN, CONTROLS_MARGIN)
+        self._layout.setSpacing(CONTROLS_SPACING)
 
         # ── Image Filters ──
         grp_filters = QGroupBox("Image Filters")
@@ -178,16 +159,6 @@ class ImageControls(QScrollArea):
         self._ch_container.setSpacing(2)
         ch_layout.addLayout(self._ch_container)
         self._channel_widgets: dict[str, ChannelControls] = {}
-
-        def _row(label_text, widget, target_layout=ch_layout):
-            r = QHBoxLayout()
-            r.setSpacing(4)
-            r.setContentsMargins(0, 0, 0, 0)
-            lbl = QLabel(label_text)
-            lbl.setFixedWidth(60)
-            r.addWidget(lbl)
-            r.addWidget(widget, stretch=1)
-            target_layout.addLayout(r)
 
         # Low / High
         lowhigh_row = QHBoxLayout()
@@ -216,21 +187,11 @@ class ImageControls(QScrollArea):
         self._auto_high.valueChanged.connect(lambda: self.auto_range_changed.emit())
 
         # Auto / Reset (centered)
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        btn_row.addStretch()
-        self._auto_all_btn = QPushButton("Auto")
-        self._auto_all_btn.setProperty("class", "secondary")
-        self._auto_all_btn.setFixedSize(64, 24)
+        self._auto_all_btn = small_button("Auto")
         self._auto_all_btn.clicked.connect(self.auto_all_clicked)
-        btn_row.addWidget(self._auto_all_btn)
-        self._reset_btn = QPushButton("Reset")
-        self._reset_btn.setProperty("class", "secondary")
-        self._reset_btn.setFixedSize(64, 24)
+        self._reset_btn = small_button("Reset")
         self._reset_btn.clicked.connect(self.reset_requested)
-        btn_row.addWidget(self._reset_btn)
-        btn_row.addStretch()
-        ch_layout.addLayout(btn_row)
+        ch_layout.addLayout(centered_row(self._auto_all_btn, self._reset_btn))
 
         # Image size
         self._image_size = NoScrollDoubleSpinBox()
@@ -240,13 +201,13 @@ class ImageControls(QScrollArea):
         self._image_size.setSingleStep(10)
         self._image_size.setButtonSymbols(QDoubleSpinBox.NoButtons)
         self._image_size.valueChanged.connect(lambda: self.image_size_changed.emit())
-        _row("Img size", self._image_size)
+        ch_layout.addLayout(form_row("Img size", self._image_size))
 
         # Contrast
         self._contrast = NoScrollComboBox()
         self._contrast.addItems(CONTRAST_METHODS)
         self._contrast.setCurrentIndex(2)
-        _row("Transform", self._contrast)
+        ch_layout.addLayout(form_row("Transform", self._contrast))
 
         # Gamma slider (below Transform)
         self._gamma_slider = NoScrollSlider(Qt.Horizontal)
@@ -289,43 +250,26 @@ class ImageControls(QScrollArea):
         overlay_layout = QVBoxLayout(grp_overlay)
         overlay_layout.setSpacing(3)
 
-        self._object_mask = NoScrollComboBox()
-        self._object_mask.setEditable(True)
-        self._object_mask.setInsertPolicy(QComboBox.NoInsert)
-        self._object_mask.completer().setFilterMode(Qt.MatchContains)
-        self._object_mask.completer().setCompletionMode(QCompleter.PopupCompletion)
+        self._object_mask = self._editable_combo("None = no overlay")
         self._object_mask.addItem("None")
         self._object_mask.setCurrentIndex(0)
-        self._object_mask.lineEdit().setPlaceholderText("None = no overlay")
         self._object_mask.currentTextChanged.connect(self._on_object_mask_changed)
-        _row("Select object", self._object_mask, overlay_layout)
+        overlay_layout.addLayout(form_row("Select object", self._object_mask))
 
-        self._overlay_col = NoScrollComboBox()
-        self._overlay_col.setEditable(True)
-        self._overlay_col.setInsertPolicy(QComboBox.NoInsert)
-        self._overlay_col.completer().setFilterMode(Qt.MatchContains)
-        self._overlay_col.completer().setCompletionMode(QCompleter.PopupCompletion)
-        self._overlay_col.lineEdit().setPlaceholderText("Type to filter...")
-        _row("Color by", self._overlay_col, overlay_layout)
+        self._overlay_col = self._editable_combo("Type to filter...")
+        overlay_layout.addLayout(form_row("Color by", self._overlay_col))
 
         self._overlay_cmap = NoScrollComboBox()
-        _row("Colors", self._overlay_cmap, overlay_layout)
+        overlay_layout.addLayout(form_row("Colors", self._overlay_cmap))
 
         self._overlay_alpha = NoScrollSlider(Qt.Horizontal)
         self._overlay_alpha.setRange(0, 100)
         self._overlay_alpha.setValue(0)
-        _row("Alpha", self._overlay_alpha, overlay_layout)
+        overlay_layout.addLayout(form_row("Alpha", self._overlay_alpha))
 
-        clear_btn_row = QHBoxLayout()
-        clear_btn_row.setSpacing(8)
-        clear_btn_row.addStretch()
-        self._overlay_clear_btn = QPushButton("Clear")
-        self._overlay_clear_btn.setProperty("class", "secondary")
-        self._overlay_clear_btn.setFixedSize(64, 24)
+        self._overlay_clear_btn = small_button("Clear")
         self._overlay_clear_btn.clicked.connect(lambda: self._overlay_col.setCurrentIndex(0))
-        clear_btn_row.addWidget(self._overlay_clear_btn)
-        clear_btn_row.addStretch()
-        overlay_layout.addLayout(clear_btn_row)
+        overlay_layout.addLayout(centered_row(self._overlay_clear_btn))
 
         self._layout.addWidget(grp_overlay)
 
@@ -334,31 +278,19 @@ class ImageControls(QScrollArea):
         label_layout = QVBoxLayout(grp_label)
         label_layout.setSpacing(3)
 
-        # Class name input + Add button
-        class_input_row = QHBoxLayout()
-        class_input_row.setSpacing(4)
-        class_input_row.setContentsMargins(0, 0, 0, 0)
-        lbl_class = QLabel("Class")
-        lbl_class.setFixedWidth(60)
-        class_input_row.addWidget(lbl_class)
+        # Class name input + Add / Del buttons
         self._class_input = QLineEdit()
         self._class_input.setPlaceholderText("New class name...")
-        self._class_input.setStyleSheet(
-            "min-height: 18px; max-height: 22px; font-size: 8pt; padding: 2px 3px;"
-        )
+        self._class_input.setStyleSheet(COMPACT_LINE_EDIT_STYLE)
         self._class_input.returnPressed.connect(self._on_add_class)
-        class_input_row.addWidget(self._class_input, stretch=1)
-        self._add_class_btn = QPushButton("Add")
-        self._add_class_btn.setProperty("class", "secondary")
-        self._add_class_btn.setFixedSize(36, 20)
-        self._add_class_btn.setStyleSheet("font-size: 8pt; padding: 1px 4px;")
+        self._add_class_btn = small_button("Add", width=BTN_MINI_WIDTH, height=20,
+                                           mini_style=True)
         self._add_class_btn.clicked.connect(self._on_add_class)
-        class_input_row.addWidget(self._add_class_btn)
-        self._remove_class_btn = QPushButton("Del")
-        self._remove_class_btn.setProperty("class", "secondary")
-        self._remove_class_btn.setFixedSize(36, 20)
-        self._remove_class_btn.setStyleSheet("font-size: 8pt; padding: 1px 4px;")
+        self._remove_class_btn = small_button("Del", width=BTN_MINI_WIDTH, height=20,
+                                              mini_style=True)
         self._remove_class_btn.clicked.connect(self._on_remove_class)
+        class_input_row = form_row("Class", self._class_input)
+        class_input_row.addWidget(self._add_class_btn)
         class_input_row.addWidget(self._remove_class_btn)
         label_layout.addLayout(class_input_row)
 
@@ -370,14 +302,7 @@ class ImageControls(QScrollArea):
         self._class_select_label.setVisible(False)
         label_layout.addWidget(self._class_select_label)
 
-        self._class_select_scroll = QScrollArea()
-        self._class_select_scroll.setWidgetResizable(True)
-        self._class_select_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._class_select_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._class_select_scroll.setMaximumHeight(24)
-        self._class_select_scroll.setStyleSheet(
-            "QScrollArea { border: none; background: transparent; }"
-        )
+        self._class_select_scroll = check_strip()
         self._class_select_scroll.setVisible(False)
 
         self._class_select_container = QWidget()
@@ -390,30 +315,14 @@ class ImageControls(QScrollArea):
         label_layout.addWidget(self._class_select_scroll)
 
         # Table name input
-        table_row = QHBoxLayout()
-        table_row.setSpacing(4)
-        table_row.setContentsMargins(0, 0, 0, 0)
-        lbl_table = QLabel("Table name")
-        lbl_table.setFixedWidth(60)
-        table_row.addWidget(lbl_table)
         self._label_table_name = QLineEdit()
-        self._label_table_name.setStyleSheet(
-            "min-height: 18px; max-height: 22px; font-size: 8pt; padding: 2px 3px;"
-        )
-        table_row.addWidget(self._label_table_name, stretch=1)
-        label_layout.addLayout(table_row)
+        self._label_table_name.setStyleSheet(COMPACT_LINE_EDIT_STYLE)
+        label_layout.addLayout(form_row("Table name", self._label_table_name))
 
         # Save Label button (centered)
-        write_btn_row = QHBoxLayout()
-        write_btn_row.setSpacing(8)
-        write_btn_row.addStretch()
-        self._write_labels_btn = QPushButton("Write Label to DB")
-        self._write_labels_btn.setProperty("class", "secondary")
-        self._write_labels_btn.setFixedSize(150, 24)
+        self._write_labels_btn = small_button("Write Label to DB", width=BTN_WIDE_WIDTH)
         self._write_labels_btn.clicked.connect(self.label_write_clicked)
-        write_btn_row.addWidget(self._write_labels_btn)
-        write_btn_row.addStretch()
-        label_layout.addLayout(write_btn_row)
+        label_layout.addLayout(centered_row(self._write_labels_btn))
         self._layout.addWidget(grp_label)
 
         # ── Object Export ──
@@ -423,26 +332,27 @@ class ImageControls(QScrollArea):
 
         # Object mask selection dropdown
         self._export_mask_combo = NoScrollComboBox()
-        _row("Object", self._export_mask_combo, export_layout)
+        export_layout.addLayout(form_row("Object", self._export_mask_combo))
 
         # Object range selection dropdown
         self._export_object_combo = NoScrollComboBox()
         self._export_object_combo.addItems([
-            "Selected images",
             "Selected wells",
+            "Selected wells (all objects)",
             "Annotated",
             "All",
         ])
         self._export_object_combo.setCurrentIndex(0)
         self._export_object_combo.setToolTip(
-            "Selected images: objects from currently selected wells, passing the "
-            "Image Filters (fields/stacks/timepoints/extra cols)\n"
-            "Selected wells: all objects from the currently selected wells, "
-            "ignoring the Image Filters\n"
+            "Selected wells: objects from the currently selected wells, passing "
+            "the Image Filters (fields/stacks/timepoints/extra cols) — same "
+            "scope as the images shown in the viewer\n"
+            "Selected wells (all objects): all objects from the currently "
+            "selected wells, ignoring the Image Filters\n"
             "Annotated: only manually class-labeled objects\n"
             "All: all objects from the entire dataset"
         )
-        _row("Obj range", self._export_object_combo, export_layout)
+        export_layout.addLayout(form_row("Obj range", self._export_object_combo))
 
         # Max objects per image
         self._export_max_obj = NoScrollDoubleSpinBox()
@@ -453,27 +363,16 @@ class ImageControls(QScrollArea):
         self._export_max_obj.setToolTip(
             "Max objects to randomly sample per image (0 = no limit)"
         )
-        _row("Max obj", self._export_max_obj, export_layout)
+        export_layout.addLayout(form_row("Max obj", self._export_max_obj))
 
         # Save directory selection
-        dir_row = QHBoxLayout()
-        dir_row.setSpacing(4)
-        dir_row.setContentsMargins(0, 0, 0, 0)
-        lbl_dir = QLabel("Save dir")
-        lbl_dir.setFixedWidth(60)
-        dir_row.addWidget(lbl_dir)
         self._export_dir_input = QLineEdit()
         enable_path_drop(self._export_dir_input)
         self._export_dir_input.setPlaceholderText("objects_exported")
-        self._export_dir_input.setStyleSheet(
-            "min-height: 18px; max-height: 22px; font-size: 8pt; padding: 2px 3px;"
-        )
-        dir_row.addWidget(self._export_dir_input, stretch=1)
-        self._export_dir_btn = QPushButton("...")
-        self._export_dir_btn.setProperty("class", "secondary")
-        self._export_dir_btn.setFixedSize(24, 20)
-        self._export_dir_btn.setStyleSheet("font-size: 8pt; padding: 1px 4px;")
+        self._export_dir_input.setStyleSheet(COMPACT_LINE_EDIT_STYLE)
+        self._export_dir_btn = small_button("...", width=24, height=20, mini_style=True)
         self._export_dir_btn.clicked.connect(self._on_browse_export_dir)
+        dir_row = form_row("Save dir", self._export_dir_input)
         dir_row.addWidget(self._export_dir_btn)
         export_layout.addLayout(dir_row)
 
@@ -485,23 +384,27 @@ class ImageControls(QScrollArea):
             "Yes: write images under per-well subdirectories (e.g. {save_dir}/{well}/)\n"
             "No: write images directly in the save directory"
         )
-        _row("Well dir", self._export_well_subdir, export_layout)
+        export_layout.addLayout(form_row("Well dir", self._export_well_subdir))
 
         # Export button (centered)
-        export_btn_row = QHBoxLayout()
-        export_btn_row.setSpacing(8)
-        export_btn_row.addStretch()
-        self._export_btn = QPushButton("Save object to Disk")
-        self._export_btn.setProperty("class", "secondary")
-        self._export_btn.setFixedSize(150, 24)
+        self._export_btn = small_button("Save object to Disk", width=BTN_WIDE_WIDTH)
         self._export_btn.clicked.connect(self.export_clicked)
-        export_btn_row.addWidget(self._export_btn)
-        export_btn_row.addStretch()
-        export_layout.addLayout(export_btn_row)
+        export_layout.addLayout(centered_row(self._export_btn))
         self._layout.addWidget(grp_export)
 
         self._layout.addStretch()
         self.setWidget(container)
+
+    @staticmethod
+    def _editable_combo(placeholder: str) -> NoScrollComboBox:
+        """Filterable editable combo used by the overlay selectors."""
+        combo = NoScrollComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.NoInsert)
+        combo.completer().setFilterMode(Qt.MatchContains)
+        combo.completer().setCompletionMode(QCompleter.PopupCompletion)
+        combo.lineEdit().setPlaceholderText(placeholder)
+        return combo
 
     def set_filter_options(
         self,
@@ -738,10 +641,7 @@ class ImageControls(QScrollArea):
         self._class_select_scroll.setVisible(True)
 
         cb = QCheckBox(name)
-        cb.setStyleSheet(
-            "QCheckBox { font-size: 7pt; spacing: 2px; } "
-            "QCheckBox::indicator { width: 12px; height: 12px; }"
-        )
+        cb.setStyleSheet(SMALL_CHECKBOX_STYLE)
         cb.setChecked(True)
         cb.toggled.connect(lambda: self.label_class_selection_changed.emit())
         # Insert before the trailing stretch
@@ -827,9 +727,9 @@ class ImageControls(QScrollArea):
         if item:
             item.setEnabled(has_annotations)
         # If current selection is "Annotated" but no annotations, switch to
-        # "Selected images" — NOT "All" or "Selected wells", which would
-        # silently export every object in the dataset.
+        # "Selected wells" — NOT "All" or "Selected wells (all objects)",
+        # which would silently export every object in the dataset.
         if not has_annotations and self._export_object_combo.currentText() == "Annotated":
             self._export_object_combo.setCurrentIndex(
-                self._export_object_combo.findText("Selected images")
+                self._export_object_combo.findText("Selected wells")
             )

@@ -48,8 +48,14 @@ data:
 # --- resume: 迁移/连续训练控制 ---
 # ssl_model: 微 model SSL bundle 路径（Phase1/其他方法/model.pt 均可）。
 # type:
-#   continue —— 精确续训：模型+优化器+epoch+loss 历史恢复，LR/momentum/WD/temp 调度
-#               从断点继续；epochs 为"总轮数"。
+#   continue —— 精确续训：模型+优化器+epoch+loss 历史恢复；epochs 为"总轮数"。
+#               调度（LR/momentum/WD/temp）按"绝对步位置"衔接：
+#               · checkpoint 未达 epochs：global_step = start_epoch × len(loader)，
+#                 数据集大小不变时曲线无缝续跑；换过数据集大小则调度点随之偏移。
+#               · checkpoint 已达/超过 epochs（阶段交接）：config 的 epochs 被视为
+#                 "额外轮数"（新目标 = 已完成 + epochs），total_steps 按延长后的区间
+#                 重算——cosine 曲线是从延长曲线中段继续，而非沿用原曲线终点的值；
+#                 warmup 按当前 config 的 warmup_epochs × 新 len(loader) 重算。
 #   transfer —— 领域迁移/换权重初始化：仅权重，epoch 归 0，调度与优化器重置，
 #               使用 transfer_warmup_epochs。
 resume:

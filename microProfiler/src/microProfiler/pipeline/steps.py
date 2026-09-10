@@ -86,6 +86,13 @@ def _run_basic(
         return ds
     # Import after the gate — the vendored basic package imports JAX.
     from microProfiler.preprocessing.basic_correction import apply_basic
+    from microBase import SessionFile
+
+    # The fit-order marker must reflect reality: models fitted before any
+    # z-projection ran were fit on raw stacks and must not advertise
+    # "zproject_first" (the GUI's Apply-downgrade trusts that marker).
+    zproject_applied = "zproject" in set(
+        SessionFile(root_dir).get_applied_steps())
 
     return _run_preprocessing_step(
         ds, "basic", cfg.basic, apply_basic,
@@ -95,6 +102,7 @@ def _run_basic(
             "working_size": cfg.basic.working_size,
             "enable_darkfield": cfg.basic.enable_darkfield,
             "root_dir": root_dir,
+            "zproject_applied": zproject_applied,
         },
         progress,
     )

@@ -96,7 +96,10 @@ def z_project_dataset(
             # per-channel mix caused by channel processing order).
             plane_paths = []  # [{channel: Path}], one entry per surviving plane
             plane_imgs = []   # [{channel: np.ndarray}]
-            for row_idx, row in group_df.iterrows():
+            # enumerate() keeps a POSITIONAL row index: quarantine_row indexes
+            # ds.metadata.iloc[...] and must not depend on the DataFrame's
+            # index labels coinciding with positions.
+            for pos, (row_idx, row) in enumerate(group_df.iterrows()):
                 paths = {}
                 imgs = {}
                 broken = False
@@ -105,13 +108,13 @@ def z_project_dataset(
                         continue
                     src = Path(row[ch])
                     if not src.exists():
-                        quarantine_row(ds, row_idx, f"missing {src.name}")
+                        quarantine_row(ds, pos, f"missing {src.name}")
                         broken = True
                         break
                     try:
                         imgs[ch] = read_image(src)
                     except ImageReadError as e:
-                        quarantine_row(ds, row_idx, str(e))
+                        quarantine_row(ds, pos, str(e))
                         broken = True
                         break
                     paths[ch] = src

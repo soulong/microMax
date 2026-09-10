@@ -612,6 +612,12 @@ QWidget[class="block-card"] {
     padding: 0 6px 4px;
 }
 
+/* Inner areas of a step card (parameter rows + preview) share the card
+   background so the card reads as one surface. */
+QWidget[class="card-inner"] {
+    background-color: #252536;
+}
+
 /* ── Tab Widget (fallback) ──────────────────────────────────────────────── */
 QTabWidget::pane {
     border: none;

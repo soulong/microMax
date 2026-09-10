@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from natsort import natsort_key
 from pathlib import Path
 from typing import Any
+import threading
 
 import numpy as np
 import pandas as pd
@@ -47,11 +49,93 @@ from microVis.widgets.infer_plot import InferPlotView
 from microVis.widgets.label_annotation import LabelAnnotationPanel, ObjectKey
 from microVis.widgets.pixel_info import PixelInfo
 from microVis.widgets.profiler_plot import ProfilerPlotView
+from microVis.widgets.ui_spec import (
+    FORM_LABEL_WIDTH_WIDE,
+    H_SPLITTER_SIZES,
+    LABEL_CLASS_RATIOS,
+    NO_LABEL_RATIOS,
+    V_SPLITTER_SIZES,
+)
 from microVis.widgets.well_grid_canvas import WellGridCanvas
 from microVis.widgets.well_grid_controls import WellGridControls
 from microVis.worker import CropWorker, ImageWorker, ImageWorkerConfig
 
 logger = get_logger("microVis.main_window")
+
+# Cap for the viewer's full-resolution row cache: "All wells" on a large
+# dataset must not pin every payload in RAM forever.
+RAW_CACHE_MAX_BYTES = 12 * 1024**3  # 12 GiB of payload bytes
+
+
+class _RowCache:
+    """row_idx → payload LRU cache capped by total CONTENT bytes.
+
+    The viewer memoizes each loaded row's full-resolution (image, masks) so
+    channel toggles, re-sorts and crops are instant. Unbounded retention let
+    a large "All wells" session exhaust RAM, so once the summed payload size
+    exceeds ``max_bytes`` the least-recently-used rows are evicted. A miss
+    is harmless — the refresh paths simply re-dispatch an image worker.
+
+    Methods mirror the dict subset the window uses (get / __setitem__ /
+    clear / __bool__), and a lock guards the bookkeeping because
+    _on_auto_all loads rows from a ThreadPoolExecutor.
+    """
+
+    def __init__(self, max_bytes: int = RAW_CACHE_MAX_BYTES):
+        self._max_bytes = max_bytes
+        self._entries: "OrderedDict[int, tuple]" = OrderedDict()  # row_idx → (payload, nbytes)
+        self._total = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _payload_bytes(value) -> int:
+        """Approximate payload size: sum ndarray nbytes across tuples/dicts."""
+        total = 0
+        stack = [value]
+        while stack:
+            obj = stack.pop()
+            if isinstance(obj, np.ndarray):
+                total += int(obj.nbytes)
+            elif isinstance(obj, (tuple, list)):
+                stack.extend(obj)
+            elif isinstance(obj, dict):
+                stack.extend(obj.values())
+        return total
+
+    def get(self, row_idx, default=None):
+        with self._lock:
+            entry = self._entries.get(row_idx)
+            if entry is None:
+                return default
+            self._entries.move_to_end(row_idx)  # touch → most recently used
+            return entry[0]
+
+    def __setitem__(self, row_idx, value) -> None:
+        nbytes = self._payload_bytes(value)
+        with self._lock:
+            old = self._entries.pop(row_idx, None)
+            if old is not None:
+                self._total -= old[1]
+            self._entries[row_idx] = (value, nbytes)
+            self._total += nbytes
+            while self._total > self._max_bytes and len(self._entries) > 1:
+                # Evict from the least-recently-used end; keep at least the
+                # entry just inserted even if it alone exceeds the cap.
+                _, (_, evicted_bytes) = self._entries.popitem(last=False)
+                self._total -= evicted_bytes
+
+    def __contains__(self, row_idx) -> bool:
+        with self._lock:
+            return row_idx in self._entries
+
+    def __bool__(self) -> bool:
+        with self._lock:
+            return bool(self._entries)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._total = 0
 
 
 def _build_meta_label(meta: "pd.DataFrame", row_idx: int,
@@ -131,7 +215,7 @@ class MainWindow(QMainWindow):
         self._debounce = QTimer(singleShot=True, interval=300, timeout=self._refresh_images)
 
         # Performance: caches and state tracking
-        self._raw_cache: dict[int, tuple] = {}  # row_idx → (img_data, mask_dict), unlimited, permanent until filter change
+        self._raw_cache = _RowCache()  # row_idx → (img_data, mask_dict), capped by RAW_CACHE_MAX_BYTES
         self._mask_cache: dict[int, np.ndarray] = {}  # row_idx → downscaled mask
         self._polygon_cache: dict[int, list] = {}  # row_idx → extracted polygons
         self._gen: int = 0  # generation counter for cancelling stale workers
@@ -274,6 +358,9 @@ class MainWindow(QMainWindow):
             w.style().polish(w)
 
     def _build_plate_images_tab(self) -> QWidget:
+        """Image page: [well-grid | canvas] above [controls | display],
+        with the label-annotation panel as a third (initially hidden)
+        vertical section. Splitter geometry tokens live in ui_spec."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(2, 2, 2, 2)
@@ -287,9 +374,7 @@ class MainWindow(QMainWindow):
 
         top_splitter.addWidget(self._grid_controls)
         top_splitter.addWidget(self._grid_canvas)
-        top_splitter.setStretchFactor(0, 0)
-        top_splitter.setStretchFactor(1, 1)
-        top_splitter.setSizes([280, 600])
+        self._configure_splitter(top_splitter, H_SPLITTER_SIZES)
         self._well_grid_container = top_splitter
 
         # ── Middle splitter: Image View ──
@@ -300,9 +385,7 @@ class MainWindow(QMainWindow):
 
         middle_splitter.addWidget(self._image_controls)
         middle_splitter.addWidget(self._image_display)
-        middle_splitter.setStretchFactor(0, 0)
-        middle_splitter.setStretchFactor(1, 1)
-        middle_splitter.setSizes([280, 600])
+        self._configure_splitter(middle_splitter, H_SPLITTER_SIZES)
 
         # ── Label Annotation Panel ──
         self._label_panel = LabelAnnotationPanel()
@@ -313,10 +396,24 @@ class MainWindow(QMainWindow):
         self._v_splitter.addWidget(top_splitter)
         self._v_splitter.addWidget(middle_splitter)
         self._v_splitter.addWidget(self._label_panel)
-        self._v_splitter.setSizes([250, 750, 0])
+        self._v_splitter.setSizes(list(V_SPLITTER_SIZES))
+        # The two image sections keep a visible minimum; only the label
+        # panel can be dragged shut (it also hides itself when empty).
+        self._v_splitter.setCollapsible(0, False)
+        self._v_splitter.setCollapsible(1, False)
 
         layout.addWidget(self._v_splitter)
         return tab
+
+    @staticmethod
+    def _configure_splitter(splitter: QSplitter,
+                            sizes: tuple[int, int]) -> None:
+        """Initial sizes for a `controls | canvas` splitter; the controls
+        pane cannot be collapsed away by dragging."""
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes(list(sizes))
+        splitter.setCollapsible(0, False)
 
     # ── Signal Connections ───────────────────────────────────────────────────
 
@@ -824,6 +921,9 @@ class MainWindow(QMainWindow):
         self._on_dataset_path_edited()
         if not self._dataset_dir:
             return
+        # Session persistence and the dataset load fail independently: a
+        # session.yml write error (DataError — a regular Exception) must be
+        # REPORTED, but must neither abort the load nor kill the app.
         try:
             image_pat, mask_pat, subdir_pat = self._data_view.get_patterns()
             # Write patterns to the SELECTED directory's session.yml, not
@@ -836,22 +936,20 @@ class MainWindow(QMainWindow):
                     image_subdir_pattern=subdir_pat,
                 )
                 self._persist_channel_colors()
-            self._load_dataset(
-                self._dataset_dir,
-                image_pattern=image_pat,
-                mask_pattern=mask_pat,
-                image_subdir_pattern=subdir_pat,
-            )
-        except SystemExit:
-            # SessionFile.save raises DataError on YAML write
-            # failure — SystemExit is a BaseException, so a bare
-            # `except Exception` would kill the whole app.
+        except Exception:
             logger.exception("Failed to persist session.yml")
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self, "Session Save Failed",
                 "Could not write session.yml (disk full or permission denied). "
-                "The dataset was not loaded.",
+                "Continuing with the dataset load.",
+            )
+        try:
+            self._load_dataset(
+                self._dataset_dir,
+                image_pattern=image_pat,
+                mask_pattern=mask_pat,
+                image_subdir_pattern=subdir_pat,
             )
         except Exception:
             logger.exception("Failed to load dataset")
@@ -2144,13 +2242,7 @@ class MainWindow(QMainWindow):
         # Show class boxes panel on first class creation
         if not self._label_panel.isVisible():
             self._label_panel.setVisible(True)
-            # Reallocate space: 25% well grid, 50% image view, 25% class boxes
-            total = sum(self._v_splitter.sizes())
-            self._v_splitter.setSizes([
-                int(total * 0.25),
-                int(total * 0.50),
-                int(total * 0.25),
-            ])
+            self._set_v_splitter_ratios(LABEL_CLASS_RATIOS)
         # Update export "Annotated" option availability
         self._image_controls.update_export_annotated_option(True)
 
@@ -2160,10 +2252,14 @@ class MainWindow(QMainWindow):
         # Hide panel if no classes remain
         if not self._label_panel.get_all_class_names():
             self._label_panel.setVisible(False)
-            total = sum(self._v_splitter.sizes())
-            self._v_splitter.setSizes([int(total * 0.30), int(total * 0.70), 0])
+            self._set_v_splitter_ratios(NO_LABEL_RATIOS)
             # Update export "Annotated" option availability
             self._image_controls.update_export_annotated_option(False)
+
+    def _set_v_splitter_ratios(self, ratios: tuple[float, float, float]) -> None:
+        """Redistribute the vertical splitter's current total by fractions."""
+        total = sum(self._v_splitter.sizes())
+        self._v_splitter.setSizes([int(total * r) for r in ratios])
 
     def _on_label_class_selection_changed(self) -> None:
         """Handle change in which classes are selected for display."""
@@ -2383,7 +2479,7 @@ class MainWindow(QMainWindow):
         # Get wells/fields based on mode
         annotated_keys = None  # set of row_idx for "Annotated"
         extra_filters: dict[str, list[str]] = {}
-        if object_mode == "Selected images":
+        if object_mode == "Selected wells":
             # Wells exist but none selected → warn, never export the whole
             # plate (matches the viewer's "wells exist but none selected →
             # show nothing" rule; "All" mode is the explicit whole-plate path).
@@ -2398,14 +2494,15 @@ class MainWindow(QMainWindow):
             fields = list(ic.get_selected_fields())
             stacks = list(ic.get_selected_stacks())
             timepoints = list(ic.get_selected_timepoints())
-            # Extra-col filters only apply to "Selected images" — "Selected
-            # wells" exports all images in the wells by user intent, "All"
-            # exports everything, "Annotated" is scoped to annotated images.
+            # Extra-col filters only apply to "Selected wells" — "Selected
+            # wells (all objects)" exports all images in the wells by user
+            # intent, "All" exports everything, "Annotated" is scoped to
+            # annotated images.
             for col, widget in ic.get_extra_widgets().items():
                 selected = widget.get_selected()
                 if selected:
                     extra_filters[col] = selected
-        elif object_mode == "Selected wells":
+        elif object_mode == "Selected wells (all objects)":
             # Selected wells only — the Image Filters (fields/stacks/
             # timepoints/extra cols) are intentionally ignored. Empty
             # wells/fields/stacks/timepoints means "no filter" in the worker.
@@ -2583,7 +2680,7 @@ class MainWindow(QMainWindow):
         self._image_display.reset_all_zoom()
         self._label_panel.clear_all()
         self._label_panel.setVisible(False)
-        self._v_splitter.setSizes([250, 750, 0])
+        self._v_splitter.setSizes(list(V_SPLITTER_SIZES))
         self._grid_canvas.clear()
         # Restore well grid visibility to default; next dataset load re-evaluates
         self._well_grid_container.setVisible(True)

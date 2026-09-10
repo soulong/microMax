@@ -109,28 +109,32 @@ def is_numeric_sql_type(decl) -> bool:
     return any(token in str(decl).upper() for token in _NUMERIC_TYPE_TOKENS)
 
 
-def canonical_directory(path, root) -> str:
-    """Store a directory relative to *root*, with forward slashes.
+def canonical_directory(path, root=None) -> str:
+    """The DB ``directory`` value: ABSOLUTE path with forward slashes.
 
     All DB writers use this so ``directory`` is comparable across packages
-    (microModel inference, microProfiler profiling, microVis scoping). The
-    root itself becomes ``"."``; a path outside the root keeps its ``..``
-    prefix (relpath semantics) so nothing is silently escaped.
+    (microModel inference, microProfiler profiling, microVis scoping) and
+    stays valid no matter where the dataset is mounted afterwards. A
+    relative ``path`` is anchored at ``root`` before absolutizing; an
+    absolute ``path`` ignores ``root``.
     """
-    path = os.path.abspath(str(path))
-    root = os.path.abspath(str(root))
-    return os.path.relpath(path, root).replace("\\", "/")
+    p = str(path)
+    if root is not None and not os.path.isabs(p):
+        p = os.path.join(str(root), p)
+    return os.path.abspath(p).replace("\\", "/")
 
 
 def resolve_directory(directory, root) -> str:
-    """Absolute path for a stored (canonical, root-relative) directory.
+    """Absolute native-separator path for a stored ``directory`` value.
 
-    Inverse of :func:`canonical_directory`. An already-absolute stored value
-    (legacy DB) wins over the root, so both forms resolve. Empty directory
-    means the dataset root itself.
+    Inverse of :func:`canonical_directory`. Empty means the dataset root
+    itself. Stored values are absolute forward-slash paths (normalized by
+    :func:`os.path.normpath`); legacy root-relative values are joined
+    against the root.
     """
     if not directory:
         return os.path.abspath(str(root))
-    if os.path.isabs(str(directory)):
-        return str(directory)
-    return os.path.abspath(os.path.join(str(root), str(directory)))
+    d = str(directory)
+    if os.path.isabs(d):
+        return os.path.normpath(d)
+    return os.path.abspath(os.path.join(str(root), d))

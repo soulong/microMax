@@ -178,8 +178,11 @@ def _load_checkpoint_state(model, ckpt, method=None):
         raise MicroMaxError("Error: bundle has no 'state_dict' key (unsupported pre-0.2.1 "
               "bundle format)")
     meta = ckpt.get("meta") or {}
-    if "method" not in meta:
-        raise MicroMaxError("Error: bundle is not an SSL bundle (meta has no 'method') — "
+    # Bundles written before the meta-key rename carry 'method'; current
+    # ones carry 'ssl_method' (pretrain saves meta["ssl_method"]). Either
+    # proves this is an SSL pretrain bundle.
+    if "ssl_method" not in meta and "method" not in meta:
+        raise MicroMaxError("Error: bundle is not an SSL bundle (meta has no 'ssl_method') — "
             "resume.ssl_model expects a pretrain checkpoint, not a train "
             "bundle.")
     state = ckpt["state_dict"]
@@ -367,7 +370,9 @@ def _build_step_info(method, method_cfg, train_cfg, global_step, total_steps, wa
     }
     if method == "dinov3":
         step_info.update({
-            "koleo_weight": method_cfg.get("koleo_weight", 0.1),
+            # Note: the KoLeo loss weight itself lives on the model
+            # (dinov3.koleo_loss_weight config) — schedules here only cover
+            # lr/momentum/teacher-temp/weight-decay.
             "teacher_temp_start": method_cfg.get("teacher_temp_start", 0.04),
             "teacher_temp_end": method_cfg.get("teacher_temp_end", 0.07),
             "weight_decay_start": method_cfg.get("weight_decay_start", 0.04),

@@ -870,8 +870,16 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
     # FRESHLY fitted nonlinear reducer's fit embedding IS the full embedding
     # (transform would only re-approximate it). A LOADED reducer's
     # .embedding_ belongs to its baseline fit set — never this dataset's
-    # rows — so loaded methods must always transform the current features.
-    X_fit = {m: _fit_embedding(m, reducers[m], feats_fit) for m in methods}
+    # rows — so loaded methods must always transform the current features,
+    # for BOTH the fit subset and the full merge.
+    X_fit = {
+        m: (
+            _dr_transform(m, reducers[m], feats_fit)
+            if m in loaded_methods
+            else _fit_embedding(m, reducers[m], feats_fit)
+        )
+        for m in methods
+    }
     X_all = {
         m: (
             _dr_transform(m, reducers[m], feats_all)

@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
 )
 
 from microProfiler.gui.path_drop import enable_path_drop
-from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp
+from microProfiler.gui.dpi import dp
+from microProfiler.gui.panels.base_step_panel import BaseStepPanel
 from microProfiler.gui.panels._block_container import BlockContainerPanel
 from microProfiler.gui.image_widgets import ImageViewer
 

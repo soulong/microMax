@@ -114,7 +114,17 @@ def edge_pixel_ratio(mask, edge_tolerance: int = 2):
     scipy.ndimage.binary_erosion formulation, without needing scipy).
     """
     mask = np.asarray(mask)
+    # A float-dtype mask (e.g. an unvalidated TIFF) would crash bincount
+    # with a raw TypeError deep below — fail with the contract's own error.
+    if not np.issubdtype(mask.dtype, np.integer):
+        raise DataError(
+            f"edge_pixel_ratio expects an integer-labeled mask, got dtype "
+            f"{mask.dtype} — re-save the mask or cast it to int."
+        )
     H, W = mask.shape
+    # A negative tolerance would make the edge band cover the whole image
+    # (every object scores 1.0 = "clipped"); clamp to the sane domain.
+    edge_tolerance = max(0, int(edge_tolerance))
 
     # Inner outline of every object at once: a labeled pixel is perimeter iff
     # any 4-neighbor differs (out-of-bounds neighbors read as 0).

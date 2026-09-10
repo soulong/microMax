@@ -7,7 +7,8 @@ from PySide6.QtWidgets import (
     QSpinBox,
 )
 
-from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp
+from microProfiler.gui.panels.base_step_panel import BaseStepPanel
+from microProfiler.gui.ui_spec import step_button
 
 
 class TileStepPanel(BaseStepPanel):
@@ -39,9 +40,7 @@ class TileStepPanel(BaseStepPanel):
         self._tile_height.setToolTip("Tile height in pixels")
         row.addWidget(self._tile_height)
         row.addStretch()
-        self._apply_btn = QPushButton("▶ Apply")
-        self._apply_btn.setProperty("class", "primary")
-        self._apply_btn.setFixedHeight(dp(28))
+        self._apply_btn = step_button("▶ Apply")
         row.addWidget(self._apply_btn)
         self._controls_layout.addLayout(row)
 

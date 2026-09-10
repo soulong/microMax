@@ -175,9 +175,17 @@ def make_radial_distribution(
 
     def _vector(mask, intensity):
         key = (id(mask), id(intensity))
-        if key not in cache:
-            cache[key] = _compute(mask, intensity)
-        return cache[key]
+        entry = cache.get(key)
+        if entry is None:
+            vec = _compute(mask, intensity)
+            # Store the arrays THEMSELVES next to the vector: holding a
+            # reference pins their memory, so a later object's crops can
+            # never be allocated at these addresses and read this entry by
+            # an id collision (id-keyed caches without refs return stale
+            # features from a previous object/image).
+            entry = (mask, intensity, vec)
+            cache[key] = entry
+        return entry[2]
 
     fns = []
     n_features = 3
@@ -617,9 +625,15 @@ def make_glcm(
 
     def _vector(mask, intensity):
         key = (id(mask), id(intensity))
-        if key not in cache:
-            cache[key] = _compute(mask, intensity)
-        return cache[key]
+        entry = cache.get(key)
+        if entry is None:
+            vec = _compute(mask, intensity)
+            # Store the arrays THEMSELVES next to the vector (see
+            # make_radial_distribution): pins their memory so id reuse can
+            # never hand another object's cached features to this column.
+            entry = (mask, intensity, vec)
+            cache[key] = entry
+        return entry[2]
 
     fns = []
     for di, d in enumerate(distances):

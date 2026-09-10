@@ -138,9 +138,10 @@ Typical flow:
    the images.
 2. **Select Profiler DB** (one or more `profiler.db` files) and/or **Select
    Infer DB** (one or more `infer.db` files): each opens its own plot tab
-   (boxplot / barplot mean±SD / scatter over any profiler table; DR-method
-   scatter for infer) with a free-form pandas-expression filter. Plots export
-   vector PDFs with editable text.
+   (scatter / line mean±SEM / boxplot / barplot mean±SEM over any profiler
+   table; DR-method scatter for infer) with a free-form pandas-expression
+   filter. Every picker combo is editable — type to filter long lists. Plots
+   export vector PDFs with editable text.
 3. **Select Metadata** (Excel) then **Merge** to use the plate metadata columns
    in every open plot tab (**Clear** removes it); **Write to DB** adds the
    metadata columns to every loaded profiler and infer DB.

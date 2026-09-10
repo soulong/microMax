@@ -50,10 +50,6 @@ from .config import (
     SessionFile,
     normalize_null_strings,
 )
-from .augment import (
-    build_pipeline,
-    apply,
-)
 from .normalize import normalize
 from .image_dataset import ImageDataset
 from .cell_dataset import CellDataset
@@ -155,3 +151,23 @@ __all__ = [
     "canonical_directory",
     "resolve_directory",
 ]
+
+
+# ── Lazy augmentation re-exports (PEP 562) ──────────────────────────────────
+# augment.py imports albumentations at module import — a heavyweight optional
+# dependency. Importing `microBase` (for IO/schema/datasets) must not require
+# it, so build_pipeline/apply are resolved on FIRST ATTRIBUTE ACCESS instead
+# of at package import.
+_AUGMENT_NAMES = {"build_pipeline", "apply"}
+
+
+def __getattr__(name):
+    if name in _AUGMENT_NAMES:
+        from . import augment as _augment
+
+        return getattr(_augment, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | _AUGMENT_NAMES)

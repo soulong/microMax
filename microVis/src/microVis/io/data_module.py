@@ -29,11 +29,15 @@ def _validate_table_name(name: str) -> None:
 
 
 def _safe_str(meta: pd.DataFrame, idx, col: str) -> str:
-    """Safely read a metadata cell as string. Returns '' if column missing or value NaN."""
+    """Safely read a metadata cell as string. Returns '' if column missing or value NA.
+
+    pd.isna covers float NaN, pd.NA and pd.NaT (nullable dtypes would
+    otherwise render as the literal '<NA>' in keys and labels).
+    """
     if col not in meta.columns:
         return ""
     v = meta.at[idx, col]
-    if v is None or (isinstance(v, float) and pd.isna(v)):
+    if v is None or pd.isna(v):
         return ""
     return str(v)
 
@@ -244,10 +248,11 @@ class DataModule:
     def directory_scopes(self) -> list[str]:
         """Directory values identifying this dataset in DB `directory` columns.
 
-        DB writers store directories relative to the dataset root with
-        forward slashes, so the dataset's metadata `directory` values are the
-        exact match keys; the absolute dataset dir and "." are included for
-        legacy absolute DBs and root-level files.
+        DB writers store absolute forward-slash directories, so the dataset's
+        metadata `directory` values are the exact match keys; the absolute
+        dataset dir and "." are included as fallback scopes (absolute for
+        path-prefix matching of sub-directories, "." for legacy root-level
+        rows).
         """
         scopes = [str(self._root_dir), "."]
         if self._metadata is not None and DIRECTORY_COLUMN in self._metadata.columns:

@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
 
 from microBase.db_contracts import INFER_DB_NAME
 
-from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp, make_hsep
+from microProfiler.gui.dpi import dp
+from microProfiler.gui.panels.base_step_panel import BaseStepPanel, make_hsep
 from microProfiler.gui.panels._block_container import BlockContainerPanel
 from microProfiler.gui.path_drop import enable_path_drop
 from microProfiler.pipeline._micromodel_bridge import read_bundle_meta

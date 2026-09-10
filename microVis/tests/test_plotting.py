@@ -82,11 +82,34 @@ def test_figures_build():
     df = _df()
     scatter = P.make_scatter(df, x="value", y="area", color="condition",
                              size="area", facet_cols=["well"], ncols=2)
+    line = P.make_line(df, y="value", x="well", color="condition",
+                       facet_cols=["field"], ncols=2)
     box = P.make_boxplot(df, y="value", x="condition", color="condition")
-    bar = P.make_barplot_mean_sd(df, y="value", x="well", color="condition")
-    for fig in (scatter, box, bar):
+    bar = P.make_barplot_mean_sem(df, y="value", x="well", color="condition")
+    for fig in (scatter, line, box, bar):
         assert fig is not None
         assert len(fig.axes) >= 1
+
+
+def test_line_groups_and_sem_points():
+    df = _df()
+    fig = P.make_line(df, y="value", x="well", color="condition")
+    ax = fig.axes[0]
+    # One errorbar collection (mean ± SEM nodes) + one raw-points scatter
+    # per color group.
+    assert len(ax.collections) >= 2
+    # One node per (well, condition) group, like the barplot's ticks.
+    ticks = {t.get_text() for t in ax.get_xticklabels()}
+    assert len(ticks) == 8
+    assert all(t.startswith(("A0", "A1", "A2", "A3")) for t in ticks)
+
+
+def test_make_line_requires_x_semantics():
+    df = _df()
+    # A single x level still renders (one node, no connecting line).
+    single = df[df["well"] == "A0"]
+    fig = P.make_line(single, y="value", x="well")
+    assert fig.axes[0].get_xticks().size == 1
 
 
 def test_pdf_export_editable_text(tmp_path):
@@ -145,5 +168,5 @@ def test_categorical_x_and_y_are_plottable():
     # Categorical Y works for box/bar too.
     box = P.make_boxplot(df, y="condition", x="well")
     assert box.axes[0].get_yticks().size == 2
-    bar = P.make_barplot_mean_sd(df, y="condition", x="well")
+    bar = P.make_barplot_mean_sem(df, y="condition", x="well")
     assert bar.axes[0].get_yticks().size == 2

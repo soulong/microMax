@@ -76,12 +76,19 @@ def fit_models(
     enable_darkfield: bool = False,
     root_dir: Union[str, Path, None] = None,
     progress: ProgressCollector = NullProgressCollector(),
+    zproject_applied: bool = True,
 ) -> Path:
     """Fit BaSiC models for specified channels.
 
     Defaults match BasicConfig.n_image (100) and the GUI's default. Missing
     or unreadable images quarantine their metadata row (all row files are
     deleted) instead of aborting the run.
+
+    zproject_applied: whether the z-project step has actually been applied
+    to this dataset's files. Only then may the models claim the
+    "zproject_first" fit order — a fit on never-projected images must not
+    advertise an order it was not fit under (the GUI's Apply-downgrade
+    trusts that marker).
     """
     channels = channels or ds.intensity_colnames
     metadata = ds.metadata
@@ -150,7 +157,13 @@ def fit_models(
         # Mark that these models were fit under the zproject-first
         # preprocessing order, so the GUI "Apply" downgrade path can refuse
         # to reuse stale models fit under the old (basic-before-zproject) order.
-        (model_dir / ".fit_order").write_text("zproject_first", encoding="utf-8")
+        # When zproject never ran, the models were fit on raw stacks: write
+        # the negative marker so a later Apply forces a fresh fit instead of
+        # trusting models that do not match the z-projected images.
+        (model_dir / ".fit_order").write_text(
+            "zproject_first" if zproject_applied else "raw_fit",
+            encoding="utf-8",
+        )
     return model_dir
 
 
@@ -255,10 +268,12 @@ def apply_basic(
     enable_darkfield: bool = False,
     root_dir: Union[str, Path, None] = None,
     progress: ProgressCollector = NullProgressCollector(),
+    zproject_applied: bool = True,
 ) -> ImageDataset:
     """Apply BaSiC shading correction (fit and/or transform).
 
     Defaults match BasicConfig.n_image (100) and the GUI's default.
+    zproject_applied flows through to fit_models' fit-order marker.
     """
     if mode in ("fit", "fit-transform"):
         _validate_shapes(ds, n_image)
@@ -269,6 +284,7 @@ def apply_basic(
             enable_darkfield=enable_darkfield,
             root_dir=root_dir,
             progress=progress,
+            zproject_applied=zproject_applied,
         )
 
     if mode in ("transform", "fit-transform"):

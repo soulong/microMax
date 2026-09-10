@@ -173,9 +173,9 @@ class InferDB:
 
         Each scope keeps rows whose stored `directory` equals it or starts
         with it (path prefix). Scopes may be the dataset's metadata directory
-        values (canonical relative form) or an absolute dataset dir (legacy
-        DBs). When no row matches any scope (DB written elsewhere) all rows
-        are returned so the overlay still has data.
+        values (absolute forward-slash form) or the absolute dataset dir.
+        When no row matches any scope (DB written elsewhere) all rows are
+        returned so the overlay still has data.
         """
         df = self._inference_frame()
         if not directories or DIRECTORY_COLUMN not in df.columns or df.empty:

@@ -44,15 +44,26 @@ def _read_or_raise(path, what="image"):
     """Read a file with PIL; missing/unreadable files raise ImageReadError.
 
     Error messages keep the caller's terminology via ``what`` (e.g. "image",
-    "mask").
+    "mask"). A multi-page TIFF would make PIL silently return only its FIRST
+    page as a 2D array — the exact silent mis-slicing the readers' contract
+    forbids — so it raises DatasetError instead.
     """
     path = _coerce_path(path)
     if not path.exists():
         raise ImageReadError(path, f"{what} file not found: {path}")
     try:
         with Image.open(path) as im:
+            n_frames = getattr(im, "n_frames", 1)
+            if n_frames > 1:
+                raise DatasetError(
+                    f"{what} file has {n_frames} pages (multi-page TIFF) at {path} "
+                    f"— single-{what} readers would silently take only the first "
+                    "page; use read_tiff_channels with an explicit channel_layout."
+                )
             return np.array(im)
     except Exception as e:
+        if isinstance(e, DatasetError):
+            raise
         raise ImageReadError(path, f"failed to read {what} {path}: {e}") from e
 
 

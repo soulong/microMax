@@ -488,3 +488,9 @@ QLabel[class="nav-tab"][active="true"] {
 QLabel[class="nav-tab"]:hover {
     color: #cccccc;
 }
+
+/* ── Data page: compact buttons (height just fits the text) ─────────── */
+QWidget#data-view QPushButton {
+    min-height: 0;
+    padding: 3px 12px;
+}

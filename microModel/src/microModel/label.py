@@ -884,8 +884,11 @@ class LabelServer:
         bundle = torch.load(model_path, map_location=device,
                             weights_only=False)
         meta = bundle["meta"]
+        # Same key convention as deduplication's cache: normcase+abspath so a
+        # relative `model:` config path and its absolute form hit the SAME
+        # shared features/ cache entry instead of silently re-extracting.
         bundle_id = json.dumps([
-            os.path.normcase(model_path),
+            os.path.normcase(os.path.abspath(model_path)),
             os.path.getmtime(model_path),
             os.path.getsize(model_path),
         ])

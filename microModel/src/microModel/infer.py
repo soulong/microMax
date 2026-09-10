@@ -369,7 +369,7 @@ def _run_single_cell(data_dir, meta, model, device,
         path = row["path"]
         abs_path = os.path.normcase(os.path.abspath(path))
         # Canonical directory form shared with microProfiler/microVis:
-        # relative to the dataset root, forward slashes.
+        # absolute path, forward slashes.
         file_dir = canonical_directory(os.path.dirname(path), data_dir)
         gt = _resolve_gt(label_map, label_from_dir, abs_path, file_dir)
         entry = {

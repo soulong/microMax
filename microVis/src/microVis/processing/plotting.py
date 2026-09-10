@@ -6,7 +6,7 @@ keeps text editable by embedding Type-42 fonts (``pdf.fonttype = 42``).
 
 Facet semantics: the selected facet variables form the full cartesian product
 of their levels (one subplot per combination). Point caps apply to scatter
-plots only; box/bar always use every row.
+plots only; box/bar/line always use every row.
 """
 
 from __future__ import annotations
@@ -481,7 +481,7 @@ def make_boxplot(
     return fig
 
 
-def make_barplot_mean_sd(
+def make_barplot_mean_sem(
     df: pd.DataFrame,
     y: str,
     x: str | None = None,
@@ -492,7 +492,7 @@ def make_barplot_mean_sd(
     title: str = "",
     max_combos: int = 24,
 ):
-    """Faceted barplot: bar height = mean, error bar = SD.
+    """Faceted barplot: bar height = mean, error bar = SEM.
 
     Y may be any variable: categorical values are placed on their level index
     with the level names as y-ticks.
@@ -510,7 +510,8 @@ def make_barplot_mean_sd(
         grouped = _group_series(sub, "__y__", keys)
         labels = [_group_label(k) for k, _ in grouped]
         means = [vals.mean() for _, vals in grouped]
-        stds = [vals.std(ddof=1) if len(vals) > 1 else 0.0 for _, vals in grouped]
+        sems = [vals.std(ddof=1) / math.sqrt(len(vals)) if len(vals) > 1 else 0.0
+                for _, vals in grouped]
         if not means:
             ax.set_visible(False)
             continue
@@ -521,7 +522,7 @@ def make_barplot_mean_sd(
                 colors.append(color_map.get(k[-1], SINGLE_COLOR))
             else:
                 colors.append(SINGLE_COLOR)
-        ax.bar(positions, means, yerr=stds, capsize=3, color=colors,
+        ax.bar(positions, means, yerr=sems, capsize=3, color=colors,
                edgecolor="#333333", linewidth=0.5, alpha=0.9)
         ax.set_xticks(positions)
         ax.set_xticklabels(labels, fontsize=7, rotation=30, ha="right")
@@ -534,6 +535,88 @@ def make_barplot_mean_sd(
     if color_map is not None:
         handles = [Line2D([], [], marker="s", linestyle="", markersize=6,
                           markerfacecolor=c, markeredgecolor="none", label=str(v))
+                   for v, c in color_map.items()]
+        fig.legend(handles=handles, loc="upper right", fontsize=7,
+                   title=color, frameon=False)
+    if title:
+        fig.suptitle(title, fontsize=11)
+    _finish_grid(fig, axes, len(groups), facet_cols, truncated)
+    return fig
+
+
+def make_line(
+    df: pd.DataFrame,
+    y: str,
+    x: str,
+    color: str | None = None,
+    facet_cols=(),
+    palette: str = "Set1",
+    ncols: int = 3,
+    title: str = "",
+    max_combos: int = 24,
+):
+    """Faceted line plot over categorical x groups: mean ± SEM.
+
+    One connected line per categorical-color group (one overall line
+    otherwise); each node is the group mean with SEM error bars, and the raw
+    observations are drawn as small dots behind. Y may be any variable:
+    categorical values are placed on their level index with the level names
+    as y-ticks.
+    """
+    yvals, yticks = axis_values(df[y])
+    work = df.assign(__y__=yvals)
+    groups, truncated = facet_groups(work, facet_cols, max_combos)
+    fig, axes = _new_grid(len(groups), ncols)
+    keys, _, split_color = _distribution_groups(work, "__y__", x, color)
+    color_map = None
+    if split_color:
+        color_map = _palette_map(work[color], palette)
+
+    for ax, (label, sub) in zip(axes, groups):
+        grouped = _group_series(sub, "__y__", keys)
+        labels = [_group_label(k) for k, _ in grouped]
+        means = [vals.mean() for _, vals in grouped]
+        sems = [vals.std(ddof=1) / math.sqrt(len(vals)) if len(vals) > 1 else 0.0
+                for _, vals in grouped]
+        if not means:
+            ax.set_visible(False)
+            continue
+        positions = np.arange(len(means))
+        group_colors = []
+        for k, _ in grouped:
+            if color_map is not None and keys and keys[-1] == color:
+                group_colors.append(color_map.get(k[-1], SINGLE_COLOR))
+            else:
+                group_colors.append(SINGLE_COLOR)
+        # Raw observations as dots behind the mean line (light jitter only
+        # spreads identical values; the node x stays the group position).
+        rng = np.random.default_rng(0)
+        for i, ((_, vals), c) in enumerate(zip(grouped, group_colors)):
+            jitter = rng.normal(0, 0.04, len(vals))
+            ax.scatter(np.full(len(vals), i) + jitter,
+                       vals.to_numpy(dtype=float), s=4, alpha=0.3, color=c,
+                       edgecolors="none", zorder=2)
+        for i in range(len(grouped) - 1):
+            # Connect consecutive nodes; when a categorical color splits the
+            # data, each color group is its OWN line (no cross-group links).
+            if split_color and grouped[i][0][-1] != grouped[i + 1][0][-1]:
+                continue
+            ax.plot(positions[i:i + 2], means[i:i + 2],
+                    color="#555555", linewidth=1.2, zorder=3)
+        ax.errorbar(positions, means, yerr=sems, fmt="o", markersize=5,
+                    capsize=3, color="#333333", ecolor="#333333",
+                    markerfacecolor="#333333", zorder=4)
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels, fontsize=7, rotation=30, ha="right")
+        ax.set_ylabel(y, fontsize=8)
+        if yticks is not None:
+            ax.set_yticks(range(len(yticks)))
+            ax.set_yticklabels(yticks, fontsize=7)
+        _axis_style(ax, label)
+
+    if color_map is not None:
+        handles = [Line2D([], [], marker="o", linestyle="-", markersize=5,
+                          markerfacecolor=c, markeredgecolor=c, label=str(v))
                    for v, c in color_map.items()]
         fig.legend(handles=handles, loc="upper right", fontsize=7,
                    title=color, frameon=False)

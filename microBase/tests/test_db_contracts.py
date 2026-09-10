@@ -66,10 +66,11 @@ def test_canonical_directory(tmp_path):
     root = tmp_path / "dataset"
     sub = root / "images" / "wellA"
     sub.mkdir(parents=True)
-    assert canonical_directory(sub, root) == "images/wellA"
-    assert canonical_directory(root, root) == "."
-    # Paths outside the root keep their leading .. (never silently escaped).
-    assert canonical_directory(tmp_path, root).startswith("..")
+    # The DB `directory` contract: ABSOLUTE path with forward slashes.
+    expected = str(sub.resolve()).replace("\\", "/")
+    assert canonical_directory(sub, root) == expected
+    # A relative path is anchored at the root before absolutizing.
+    assert canonical_directory("images/wellA", root) == expected
     # Forward slashes on every platform.
     assert "\\" not in canonical_directory(sub, root)
 
@@ -79,13 +80,11 @@ def test_resolve_directory_roundtrip(tmp_path):
     sub = root / "images" / "wellA"
     sub.mkdir(parents=True)
 
-    rel = canonical_directory(sub, root)
-    assert resolve_directory(rel, root) == str(sub.resolve())
-    # Root-relative "." resolves to the root itself.
+    stored = canonical_directory(sub, root)
+    assert resolve_directory(stored, root) == str(sub.resolve())
+    # Root-relative "." resolves to the root itself (legacy rows).
     assert resolve_directory(".", root) == str(root.resolve())
     # Empty resolves to the root.
     assert resolve_directory("", root) == str(root.resolve())
-    # An already-absolute stored value (legacy) wins over the root.
-    assert resolve_directory(str(sub), tmp_path) == str(sub)
     # Windows separators in stored values still resolve.
     assert resolve_directory("images\\wellA", root) == str(sub.resolve())

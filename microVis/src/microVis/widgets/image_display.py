@@ -728,31 +728,34 @@ class ImageDisplay(QScrollArea):
                 thumb.render_overlay(overlay_alpha, overlay_cmap, polygons)
 
     def _insert_row_sorted(self, group_key, row_widget):
-        """Insert row widget at the correct sorted position in the layout."""
-        # Build list of existing group_keys in layout order
-        existing = []
-        for i in range(self._layout.count()):
-            item = self._layout.itemAt(i)
-            if item is None or not item.widget():
-                continue
-            for gk, (rw, _) in self._row_widgets.items():
-                if rw is item.widget():
-                    existing.append(gk)
-                    break
+        """Insert row widget at the correct sorted position in the layout.
 
-        # Find insertion index
-        insert_idx = len(existing)
-        for i, gk in enumerate(existing):
-            if natsort_key(str(group_key)) < natsort_key(str(gk)):
-                insert_idx = i
-                break
+        The layout also holds non-row widgets (the colorbar added at the
+        top), so the insert position is resolved as the layout index of the
+        SUCCESSOR row — counting rows-only indexes would be off by the
+        colorbar and could slot a row above it.
+        """
+        new_key = natsort_key(str(group_key))
+        following_widget = None
+        best_key = None
+        for gk, (rw, _) in self._row_widgets.items():
+            if rw is row_widget:
+                continue
+            k = natsort_key(str(gk))
+            if k > new_key and (best_key is None or k < best_key):
+                best_key = k
+                following_widget = rw
 
         # Remove trailing stretch, insert row, re-add stretch
         last = self._layout.itemAt(self._layout.count() - 1)
         has_stretch = last is not None and last.spacerItem() is not None
         if has_stretch:
             self._layout.takeAt(self._layout.count() - 1)
-        self._layout.insertWidget(insert_idx, row_widget)
+        if following_widget is not None:
+            self._layout.insertWidget(self._layout.indexOf(following_widget),
+                                      row_widget)
+        else:
+            self._layout.addWidget(row_widget)
         if has_stretch:
             self._layout.addStretch()
 

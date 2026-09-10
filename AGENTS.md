@@ -126,7 +126,8 @@ Key concepts:
 
 * `db_contracts` is the single source of truth for the cross-package DB
   schema (inference/reduction/find_cluster tables, column prefixes, DR method
-  names, `directory` canonicalization) and for SQL identifier quoting.
+  names, `directory` stored as absolute forward-slash paths) and for SQL
+  identifier quoting.
 
 * Library code never calls `sys.exit`: everything raises a `MicroMaxError`
   subclass and only the CLI/GUI boundaries decide how to report it.
@@ -164,7 +165,9 @@ Package layout (overview):
 * `io/` — SQLite wrapper (`Database`) for `profiler.db`.
 
 * `gui/` — QApplication bootstrap, main window, `PipelineController`,
-  step panels (one per pipeline step), background workers, progress.
+  step panels (one per pipeline step), background workers, progress;
+  `ui_spec.py` holds the shared layout tokens (page margins, button
+  heights, compact-width caps) so GUI geometry is tuned in one place.
 
 * `cli.py` — headless run, fully equivalent to the GUI.
 
@@ -237,11 +240,14 @@ Package layout (overview):
 
 * `widgets/` — image display (thumbnail grid + full-res view), channel
   controls, image filters, well-grid canvas, label annotation panel, pixel
-  info, data view, profiler/infer DB plot tabs.
+  info, data view, profiler/infer DB plot tabs (shared skeleton in
+  `plot_tab_base.py`); `ui_spec.py` centralizes
+  the control-pane geometry tokens and small widget builders (form rows,
+  small buttons, checkbox strips) shared by the panel widgets.
 
 * `processing/` — multi-channel compositing, contrast, mask overlay; `plotting.py`
-  builds facet-aware matplotlib figures (boxplot / barplot mean±SD / scatter)
-  and exports vector PDFs with editable Type-42 text.
+  builds facet-aware matplotlib figures (scatter / line mean±SEM / boxplot /
+  barplot mean±SEM) and exports vector PDFs with editable Type-42 text.
 
 * `worker.py` — background `QRunnable` workers (thumbnail, full-res, crop,
   object export, dataset load).
@@ -276,11 +282,13 @@ Data flow:
 
 * The Data page selects a dataset directory via a line edit (type/browse/drop)
   and opens read-only plot tabs: `Select Profiler DB` (one or more `profiler.db`
-  files → an object table plotted as boxplot / barplot mean±SD / scatter with
-  X/Y/color/size/facets and palette; X/Y accept every meta + measurement
-  variable, categoricals plotted on level ticks) and `Select Infer DB` (one or
-  more microModel `infer.db` files → DR-method scatter colored/sized by one
-  variable each, filtered to the current dataset). Each selected DB gets its
+  files → an object table plotted as scatter / line mean±SEM / boxplot /
+  barplot mean±SEM with X/Y/color/size/facets and palette; X/Y accept every
+  meta + measurement variable, categoricals plotted on level ticks) and
+  `Select Infer DB` (one or more microModel `infer.db` files → DR-method
+  scatter colored/sized/faceted by chosen variables, filtered to the current
+  dataset). Every picker combo is editable — type to filter long column /
+  table / directory lists. Each selected DB gets its
   own tab (re-selecting activates it). Every tab has a free-form pandas-
   expression filter applied before plotting. Plot controls sit in a left column
   with the interactive canvas on the right (hover shows the point's values,

@@ -420,13 +420,14 @@ def run_train(config, config_path=None):
         logger.info("Loading SSL backbone from %s", ssl_bundle_path)
         ssl_bundle = torch.load(ssl_bundle_path, map_location=device, weights_only=False)
         # resume.ssl_model must point at an SSL pretrain bundle (meta has
-        # 'method') — a train bundle's meta has no 'method' and would
-        # silently take the generic backbone path below (which only works
-        # by accident). Same contract pretrain enforces via
+        # 'ssl_method'; older bundles used 'method') — a train bundle's meta
+        # has neither and would silently take the generic backbone path below
+        # (which only works by accident). Same contract pretrain enforces via
         # _load_checkpoint_state.
-        if "method" not in (ssl_bundle.get("meta") or {}):
+        ssl_meta = ssl_bundle.get("meta") or {}
+        if "ssl_method" not in ssl_meta and "method" not in ssl_meta:
             raise MicroMaxError("Error: resume.ssl_model must point at an SSL pretrain bundle "
-                f"(meta has 'method'); {ssl_bundle_path} is not an SSL bundle. "
+                f"(meta has 'ssl_method'); {ssl_bundle_path} is not an SSL bundle. "
                 "Use resume.sl_model for train-bundle resumes.")
         model, ssl_method, ssl_meta = _build_model_from_ssl(
             ssl_bundle, model_cfg, num_classes, device)

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QDoubleSpinBox, QHBoxLayout, QLabel, QPushButton
 
-from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp
+from microProfiler.gui.panels.base_step_panel import BaseStepPanel
+from microProfiler.gui.ui_spec import step_button
 
 
 class ResizeStepPanel(BaseStepPanel):
@@ -24,9 +25,7 @@ class ResizeStepPanel(BaseStepPanel):
         self._scale_factor.setToolTip("Resize factor (0.5 = half size, 2.0 = double)")
         row.addWidget(self._scale_factor)
         row.addStretch()
-        self._apply_btn = QPushButton("▶ Apply")
-        self._apply_btn.setProperty("class", "primary")
-        self._apply_btn.setFixedHeight(dp(28))
+        self._apply_btn = step_button("▶ Apply")
         row.addWidget(self._apply_btn)
         self._controls_layout.addLayout(row)
 

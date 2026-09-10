@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (
 )
 
 from microProfiler.config import default_n_workers
-from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp, make_hsep
+from microProfiler.gui.dpi import dp
+from microProfiler.gui.panels.base_step_panel import BaseStepPanel, make_hsep
 from microProfiler.gui.panels._block_container import BlockContainerPanel
 
 

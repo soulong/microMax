@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from microVis.widgets.ui_spec import FORM_LABEL_WIDTH_WIDE
+
 
 class DataView(QWidget):
     """Data tab: dataset selection + DB plot tabs.
@@ -35,6 +37,9 @@ class DataView(QWidget):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
+        # Scoped style hook: the Data page's buttons are compact (see
+        # QWidget#data-view rules in resources/style.qss).
+        self.setObjectName("data-view")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
@@ -77,7 +82,7 @@ class DataView(QWidget):
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(6)
             lbl = QLabel(label_text)
-            lbl.setFixedWidth(120)
+            lbl.setFixedWidth(FORM_LABEL_WIDTH_WIDE)
             lbl.setStyleSheet("font-weight: bold; color: #7a9aaa;")
             row.addWidget(lbl)
             edit = QLineEdit()

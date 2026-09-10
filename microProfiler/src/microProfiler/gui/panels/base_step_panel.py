@@ -19,10 +19,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from microProfiler.gui.dpi import dp
 from microProfiler.gui.state import PipelineState
+from microProfiler.gui.ui_spec import COMPACT_LINEEDIT_WIDTH, COMPACT_MAX_WIDTH
 
 logger = logging.getLogger(__name__)
+
+# Qt's QWIDGETSIZE_MAX (not exported by this PySide6 build): the default
+# maximum widget size, i.e. "no explicit cap set".
+_WIDGETSIZE_MAX = 16_777_215
 
 
 def make_hsep() -> QFrame:
@@ -50,13 +54,12 @@ class BaseStepPanel(QGroupBox):
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
 
         self._controls_widget = QWidget()
-        self._controls_widget.setStyleSheet("background-color: #252536;")
+        self._controls_widget.setProperty("class", "card-inner")
         self._controls_layout = QVBoxLayout(self._controls_widget)
         self._controls_layout.setContentsMargins(0, 0, 0, 0)
         self._controls_layout.setSpacing(2)
 
         self._preview_widget = QWidget()
-        self._preview_widget.setStyleSheet("background-color: #252536;")
         self._preview_widget.setProperty("class", "card-inner")
         self._preview_layout = QVBoxLayout(self._preview_widget)
         self._preview_layout.setContentsMargins(0, 0, 0, 0)
@@ -115,9 +118,12 @@ class BaseStepPanel(QGroupBox):
             widget.currentIndexChanged.connect(self.parameter_changed, Qt.UniqueConnection)
 
     @staticmethod
-    def _compact_block(widget: QWidget, max_width: int = 200,
+    def _compact_block(widget: QWidget, max_width: int = COMPACT_MAX_WIDTH,
                        excluded: "frozenset | set | None" = None) -> None:
         """Cap spin/combo/line-edit widths so block cards stay compact.
+
+        Caps come from gui/ui_spec.py (COMPACT_MAX_WIDTH for spins/combos,
+        COMPACT_LINEEDIT_WIDTH for line edits).
 
         excluded: object names of line edits that must keep their natural
         (stretching) width — path boxes. When not given explicitly it is
@@ -140,8 +146,8 @@ class BaseStepPanel(QGroupBox):
             name = child.objectName()
             if name in excluded:
                 continue
-            if child.maximumWidth() > max_width or child.maximumWidth() == 16777215:
-                child.setMaximumWidth(160)
+            if child.maximumWidth() > max_width or child.maximumWidth() == _WIDGETSIZE_MAX:
+                child.setMaximumWidth(COMPACT_LINEEDIT_WIDTH)
 
     def build_config_section(self) -> Optional[dict]:
         if not self._FIELD_MAP:

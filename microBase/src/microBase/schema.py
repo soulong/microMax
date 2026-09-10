@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 from natsort import natsorted
 
+from microBase.errors import DatasetError
+
 
 STRUCTURAL_COLS = {"well", "field", "stack", "timepoint", "channel", "row", "col"}
 # Captured columns that are internal bookkeeping, not user-facing extra
@@ -125,13 +127,24 @@ class MetadataSchema:
         )
 
     def apply_well_merge(self, df):
-        """If derived_well, build the well column from row+col and drop them."""
+        """If derived_well, build the well column from row+col and drop them.
+
+        A non-numeric row/col capture (e.g. an optional group that matched
+        nothing) is a dataset-layout mistake, so the ValueError is wrapped
+        in DatasetError — build_metadata must only ever raise MicroMaxError
+        subclasses.
+        """
         if not self.derived_well:
             return df
         if "row" in df.columns and "col" in df.columns:
             df = df.copy()
-            df["well"] = df.apply(
-                lambda r: derive_well(r["row"], r["col"]), axis=1
-            )
+            try:
+                df["well"] = df.apply(
+                    lambda r: derive_well(r["row"], r["col"]), axis=1
+                )
+            except (ValueError, TypeError) as e:
+                raise DatasetError(
+                    f"could not derive 'well' from row/col captures: {e}"
+                ) from e
             df = df.drop(columns=["row", "col"])
         return df

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from microProfiler.gui.dpi import dp
+from microProfiler.gui.ui_spec import SIDEBAR_BTN_HEIGHT, SIDEBAR_WIDTH
 
 
 def _make_divider() -> QFrame:
@@ -93,7 +94,7 @@ class Sidebar(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(dp(100))
+        self.setFixedWidth(dp(SIDEBAR_WIDTH))
         self.setObjectName("sidebar")
         self._items: dict[str, SidebarItem] = {}
 
@@ -163,25 +164,25 @@ class Sidebar(QWidget):
 
         self._load_config_btn = QPushButton("Load")
         self._load_config_btn.setProperty("class", "sidebar-footer-btn")
-        self._load_config_btn.setFixedHeight(dp(32))
+        self._load_config_btn.setFixedHeight(dp(SIDEBAR_BTN_HEIGHT))
         self._load_config_btn.clicked.connect(self.load_config_clicked.emit)
         layout.addWidget(self._load_config_btn)
 
         self._reset_all_btn = QPushButton("Reset")
         self._reset_all_btn.setProperty("class", "sidebar-footer-btn-danger")
-        self._reset_all_btn.setFixedHeight(dp(32))
+        self._reset_all_btn.setFixedHeight(dp(SIDEBAR_BTN_HEIGHT))
         self._reset_all_btn.clicked.connect(self.reset_all_clicked.emit)
         layout.addWidget(self._reset_all_btn)
 
         self._run_all_btn = QPushButton("Run All")
         self._run_all_btn.setProperty("class", "sidebar-footer-btn-primary")
-        self._run_all_btn.setFixedHeight(dp(28))
+        self._run_all_btn.setFixedHeight(dp(SIDEBAR_BTN_HEIGHT))
         self._run_all_btn.clicked.connect(self.run_all_clicked.emit)
         layout.addWidget(self._run_all_btn)
 
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.setProperty("class", "sidebar-footer-btn-cancel")
-        self._cancel_btn.setFixedHeight(dp(28))
+        self._cancel_btn.setFixedHeight(dp(SIDEBAR_BTN_HEIGHT))
         self._cancel_btn.setVisible(False)
         self._cancel_btn.clicked.connect(self.cancel_clicked.emit)
         layout.addWidget(self._cancel_btn)

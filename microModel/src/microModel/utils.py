@@ -285,8 +285,14 @@ def copy_config_file(config_path, target_dir):
 
 def save_reducer(obj, path):
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-    with open(path, "wb") as f:
+    # Temp file + os.replace, same contract as atomic_torch_save: an
+    # interrupted save must never leave a truncated pickle behind — for
+    # cluster.pkl / selection_state.pkl that would break the next run's
+    # baseline/incremental chain, not just lose one file.
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "wb") as f:
         pickle.dump(obj, f)
+    os.replace(tmp_path, path)
     logger.info("Saved reducer to %s", path)
 
 

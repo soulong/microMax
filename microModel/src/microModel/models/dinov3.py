@@ -828,7 +828,7 @@ def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
     criterion = (dino_criterion, ibot_criterion, koleo_criterion,
                  gram_criterion_or_None)
     step_info = {global_step, total_steps, warmup_steps, lr_peak, lr_final,
-                 momentum_start, momentum_end, koleo_weight,
+                 momentum_start, momentum_end,
                  teacher_temp_start, teacher_temp_end,
                  weight_decay_start, weight_decay_end}
     Views convention (see config):
