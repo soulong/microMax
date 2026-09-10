@@ -13,6 +13,8 @@ import pandas as pd
 from skimage.measure import label, regionprops_table
 
 from microBase import ImageDataset
+from microBase.db_contracts import IMAGE_TABLE
+from microProfiler.io import ImageReadError, quarantine_row
 from microProfiler.profiling import resolve_source_directory
 from microProfiler.profiling.batch_writer import BatchWriter
 from microProfiler.progress import StepProgress
@@ -82,8 +84,15 @@ def _process_one_image(
     channels: List[str],
     thresholds: Optional[Dict[str, float]],
 ) -> pd.DataFrame:
-    """Profile a single image — extracted for parallel execution."""
-    image_data, _ = ds.get_imageset(idx)
+    """Profile a single image — extracted for parallel execution.
+
+    Strict reads: a missing/unreadable file raises ImageReadError so the
+    caller can quarantine the row. Masks are deliberately not loaded: image
+    profiling has no mask dependency, and a corrupt mask must not quarantine
+    a row whose images are fine (masks=[] keeps get_imageset from loading
+    the full mask set).
+    """
+    image_data, _ = ds.get_imageset(idx, masks=[])
     # _process_one_image: keep the raw metadata row but override "directory"
     # with the absolute, forward-slash parent path — consistent with the
     # object tables (object_profiler._resolve_source_directory) so consumers
@@ -91,7 +100,7 @@ def _process_one_image(
     row = ds.metadata.iloc[idx]
     excluded = set(ds.intensity_colnames) | set(ds.mask_colnames)
     meta = {k: v for k, v in row.to_dict().items() if k not in excluded}
-    meta["directory"] = resolve_source_directory(row, ds.intensity_colnames)
+    meta["directory"] = resolve_source_directory(row, ds.intensity_colnames, ds.root)
     measures = measure_single_image(image_data, ds.intensity_colnames, channels, thresholds)
     return pd.DataFrame([{**meta, **measures}])
 
@@ -108,7 +117,7 @@ def profile_images(
     channels: Optional[List[str]] = None,
     thresholds: Optional[Dict[str, float]] = None,
     db_path: Union[str, Path, None] = None,
-    table_name: str = "image",
+    table_name: str = IMAGE_TABLE,
     progress: ProgressCollector = NullProgressCollector(),
     n_workers: int = 1,
 ) -> Optional[pd.DataFrame]:
@@ -143,6 +152,13 @@ def profile_images(
                             result = _process_one_image(ds, idx, channels, thresholds)
                         except InterruptedError:
                             raise
+                        except ImageReadError as e:
+                            # Missing/unreadable file: quarantine the row and
+                            # skip it (completed still advances so the bar
+                            # reaches n_total exactly).
+                            quarantine_row(ds, idx, str(e))
+                            completed += 1
+                            continue
                         except Exception:
                             # Align with object profiler's per-row skip: one
                             # bad image logs and continues (the CLI's row-count
@@ -153,6 +169,7 @@ def profile_images(
                             continue
                         writer.add(result)
                         completed += 1
+                    sp.finish("Image profiling")
                 else:
                     # One executor for the whole run (chunks only bound how
                     # many images are pre-loaded into RAM).
@@ -161,11 +178,17 @@ def profile_images(
                         chunk_end = min(chunk_start + BATCH, n_total)
                         tasks = []
                         for idx in range(chunk_start, chunk_end):
-                            image_data, _ = ds.get_imageset(idx)
+                            try:
+                                image_data, _ = ds.get_imageset(idx, masks=[])
+                            except ImageReadError as e:
+                                quarantine_row(ds, idx, str(e))
+                                completed += 1
+                                sp.tick("")
+                                continue
                             row = ds.metadata.iloc[idx]
                             excluded = set(ds.intensity_colnames) | set(ds.mask_colnames)
                             meta = {k: v for k, v in row.to_dict().items() if k not in excluded}
-                            meta["directory"] = resolve_source_directory(row, ds.intensity_colnames)
+                            meta["directory"] = resolve_source_directory(row, ds.intensity_colnames, ds.root)
                             tasks.append((idx, (image_data, ds.intensity_colnames, channels, thresholds, meta)))
 
                         futures = {

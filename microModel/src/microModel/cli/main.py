@@ -1,4 +1,4 @@
-"""CLI entry point: micromodel pretrain / train / infer / augment-vis / reduction / reduction-vis / attention-vis."""
+"""CLI entry point: micromodel pretrain / train / infer / deduplication / label / augment-vis / reduction / reduction-vis / attention-vis."""
 
 import argparse
 import sys
@@ -6,31 +6,35 @@ import time
 
 from .. import __version__
 from ..utils import setup_logging, load_yaml, logger
-from ..pretrain import pretrain_ssl
-from ..attention_vis import vis_attention
-from ..train import train
+from ..pretrain import run_pretrain
+from ..attention_vis import run_attention_vis
+from ..train import run_train
 from ..infer import run_inference
-from ..reduction import show_reduction
-from ..augment_vis import show_augmentation
+from ..deduplication import run_deduplication
+from ..label import run_label
+from ..reduction import run_reduction
+from ..augment_vis import run_augment_vis
 from ..reduction_vis import main as main_interactive
+
+from microBase import MicroMaxError
 
 
 def cmd_pretrain(args):
     logger.info("Loading pretrain config from %s", args.config)
     cfg = load_yaml(args.config)
-    pretrain_ssl(cfg, config_path=args.config)
+    run_pretrain(cfg, config_path=args.config)
 
 
 def cmd_attention_vis(args):
     logger.info("Loading pretrain config from %s for attention visualization", args.config)
     cfg = load_yaml(args.config)
-    vis_attention(cfg, config_path=args.config)
+    run_attention_vis(cfg, config_path=args.config)
 
 
 def cmd_train(args):
     logger.info("Loading train config from %s", args.config)
     cfg = load_yaml(args.config)
-    train(cfg, config_path=args.config)
+    run_train(cfg, config_path=args.config)
 
 
 def cmd_infer(args):
@@ -39,16 +43,29 @@ def cmd_infer(args):
     run_inference(cfg, config_path=args.config)
 
 
+def cmd_deduplication(args):
+    logger.info("Loading deduplication config from %s", args.config)
+    cfg = load_yaml(args.config)
+    run_deduplication(cfg, config_path=args.config)
+
+
+def cmd_label(args):
+    logger.info("Loading label config from %s", args.config)
+    cfg = load_yaml(args.config)
+    run_label(cfg, config_path=args.config, port=args.port,
+                 no_browser=args.no_browser)
+
+
 def cmd_augment_vis(args):
     logger.info("Loading config from %s for augmentation preview", args.config)
     cfg = load_yaml(args.config)
-    show_augmentation(cfg)
+    run_augment_vis(cfg)
 
 
 def cmd_reduction(args):
     logger.info("Loading inference config from %s for reduction view", args.config)
     cfg = load_yaml(args.config)
-    show_reduction(cfg)
+    run_reduction(cfg)
 
 
 def cmd_reduction_vis(args):
@@ -75,6 +92,19 @@ def main():
     p_infer = sub.add_parser("infer", help="Inference + feature extraction -> infer.db (mode from bundle: SSL = features, train = classify + features)")
     p_infer.add_argument("--config", required=True, help="Path to inference YAML config")
     p_infer.set_defaults(func=cmd_infer)
+
+    p_cur = sub.add_parser("deduplication",
+                           help="Diversity-preserving selection over cropped single-cell folders: teacher-branch features + radius-coverage greedy (prune redundancy / pick diverse new data) -> selection_state.pkl + manifest + curated/ hardlinks")
+    p_cur.add_argument("--config", required=True, help="Path to deduplication YAML config")
+    p_cur.set_defaults(func=cmd_deduplication)
+
+    p_ann = sub.add_parser("label",
+                           help="Interactive multi-label annotation web server (Flask) with feature-similarity assisted suggestions: SSL/train bundle -> kNN label recommendation, auto-annotate confirm queue, per-label ranked / uncertain queues -> label.db / label_multiple.db + label_export.csv")
+    p_ann.add_argument("--config", required=True, help="Path to label YAML config")
+    p_ann.add_argument("--port", type=int, default=5000, help="Server port (default 5000)")
+    p_ann.add_argument("--no-browser", action="store_true",
+                       help="Do not open the browser automatically")
+    p_ann.set_defaults(func=cmd_label)
 
     p_aug = sub.add_parser("augment-vis", help="Visualize multi-view augmentation preview (no model needed)")
     p_aug.add_argument("--config", required=True, help="Path to pretrain or train YAML config")
@@ -105,6 +135,10 @@ def main():
     logger.info("microModel %s: %s (config: %s)", __version__, args.command, args.config)
     try:
         args.func(args)
+    except MicroMaxError as e:
+        # Deliberate library errors: concise message + exit code, no traceback.
+        logger.error("%s", e)
+        sys.exit(1)
     except Exception as e:
         logger.exception("Fatal error: %s", e)
         sys.exit(1)

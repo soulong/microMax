@@ -2,6 +2,7 @@
 
 import pytest
 
+from microBase import ConfigError
 from microBase.config import (
     load_yaml,
     save_yaml,
@@ -19,15 +20,15 @@ def test_save_and_load_yaml(tmp_path):
     assert out == data
 
 
-def test_load_yaml_missing_exits(tmp_path):
-    with pytest.raises(SystemExit):
+def test_load_yaml_missing_raises(tmp_path):
+    with pytest.raises(ConfigError):
         load_yaml(tmp_path / "nonexistent.yml")
 
 
-def test_load_yaml_invalid_exits(tmp_path):
+def test_load_yaml_invalid_raises(tmp_path):
     path = tmp_path / "bad.yml"
     path.write_text("not: valid: yaml: [")
-    with pytest.raises(SystemExit):
+    with pytest.raises(ConfigError):
         load_yaml(path)
 
 
@@ -41,7 +42,7 @@ def test_load_yaml_non_dict_root_raises(tmp_path):
     """A YAML root that is not a mapping must raise, never silently become {}."""
     path = tmp_path / "list.yml"
     path.write_text("- a\n- b\n")
-    with pytest.raises(ValueError, match="mapping"):
+    with pytest.raises(ConfigError, match="mapping"):
         load_yaml(path)
 
 

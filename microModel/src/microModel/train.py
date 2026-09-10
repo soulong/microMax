@@ -20,6 +20,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score
 
+from microBase import MicroMaxError
+
 from . import __version__
 from .utils import (logger, set_seed, select_device, load_label_csv, copy_config_file,
                     add_file_logging, atomic_torch_save, merge_locked_normalize,
@@ -87,33 +89,29 @@ def _try_resume(config, device):
         return None, config
 
     if not os.path.exists(resume_path):
-        print(f"Error: resume train model not found: {resume_path}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: resume train model not found: {resume_path}")
 
     ckpt = torch.load(resume_path, map_location=device, weights_only=False)
     logger.info("Loaded train checkpoint from epoch %d", ckpt.get("epoch", -1))
 
     meta = ckpt.get("meta") or {}
     if "num_classes" not in meta and "class_names" not in meta:
-        print(
-            f"Error: {resume_path} is not a train bundle (meta has no "
+        raise MicroMaxError(f"Error: {resume_path} is not a train bundle (meta has no "
             f"'num_classes'/'class_names') — resume.sl_model expects a "
             f"classification checkpoint, not an SSL bundle. Use "
-            f"resume.ssl_model for SSL backbone transfer.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            f"resume.ssl_model for SSL backbone transfer.")
 
     saved_cfg = ckpt.get("config")
     if saved_cfg is None:
-        print(f"Error: train checkpoint at {resume_path} has no 'config' key", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: train checkpoint at {resume_path} has no 'config' key")
 
     # Locked model-specific settings (bundle wins). The loss is NOT here —
-    # it is auto-detected from the label form at every run.
+    # it is auto-detected from the label form at every run. freeze_backbone
+    # changes the optimizer's param groups, so resuming across a change
+    # would fail at optimizer.load_state_dict — lock it to the bundle.
     locked = [
         ("model", "backbone"), ("model", "pretrained"), ("model", "focal_gamma"),
-        ("model", "label_smoothing"),
+        ("model", "label_smoothing"), ("model", "freeze_backbone"),
     ]
     for section, key in locked:
         sv = saved_cfg.get(section, {}).get(key)
@@ -160,8 +158,7 @@ def _build_records_from_cell_dataset(cell_ds, root, label_from_dir, label_csv):
         # A configured-but-missing CSV is a typo — never silently fall back to
         # directory labels (§2 no-guessing).
         if not os.path.exists(label_csv):
-            print(f"Error: label_csv file not found: {label_csv}", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError(f"Error: label_csv file not found: {label_csv}")
         label_map = load_label_csv(label_csv)
 
     records = []
@@ -200,7 +197,7 @@ def _build_model_from_ssl(ssl_bundle, model_cfg, num_classes, device):
     Returns (model, method, meta).
     """
     meta = ssl_bundle["meta"]
-    method = meta.get("method")
+    method = meta.get("ssl_method")
     in_chans = meta["in_chans"]
 
     if method == "dinov3":
@@ -221,27 +218,22 @@ def _build_model_from_ssl(ssl_bundle, model_cfg, num_classes, device):
     return model, method, meta
 
 
-def train(config, config_path=None):
+def run_train(config, config_path=None):
     """Classification training from SSL backbone or scratch."""
     method = config.get("method", "classification")
     if method not in ("classification",):
-        print(f"Error: train method '{method}' is not supported. Available: "
-              f"classification (segmentation is planned but not yet implemented)",
-              file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: train method '{method}' is not supported. Available: "
+              f"classification (segmentation is planned but not yet implemented)")
 
     mode = config.get("mode", "single_cell")
     if mode not in ("single_cell",):
-        print(f"Error: train mode '{mode}' is not supported. Available: "
-              f"single_cell (whole_image is planned but not yet implemented)",
-              file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: train mode '{mode}' is not supported. Available: "
+              f"single_cell (whole_image is planned but not yet implemented)")
 
     resume_cfg = config.get("resume", {})
     if resume_cfg.get("sl_model") and resume_cfg.get("ssl_model"):
-        print("Error: resume.sl_model and resume.ssl_model are mutually exclusive; "
-              "set only one.", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError("Error: resume.sl_model and resume.ssl_model are mutually exclusive; "
+              "set only one.")
 
     device = select_device()
     checkpoint, config = _try_resume(config, device)
@@ -294,22 +286,17 @@ def train(config, config_path=None):
         all_records.extend(recs)
 
     if not all_records:
-        print(f"Error: no records found in {roots}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: no records found in {roots}")
 
     # All roots must resolve to the same channel set — one bundle carries a
     # single `channels` meta, so a heterogeneous resolution would silently
     # train on the wrong channels for some roots (last-root-wins bug).
     unique_resolved = {tuple(v) for v in resolved_per_root.values()}
     if len(unique_resolved) > 1:
-        print(
-            f"Error: data roots resolve to different channel sets: "
+        raise MicroMaxError(f"Error: data roots resolve to different channel sets: "
             f"{ {r: v for r, v in resolved_per_root.items()} }. "
             f"Give every root the same channel count or set data.channels "
-            f"explicitly.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            f"explicitly.")
     resolved_channels = list(next(iter(unique_resolved))) if unique_resolved else channels
 
     # Drop records without any label (mode-independent).
@@ -318,8 +305,7 @@ def train(config, config_path=None):
         logger.warning("Dropping %d records with no label", n_unlabeled)
         all_records = [r for r in all_records if r["label"] is not None]
         if not all_records:
-            print("Error: all records are unlabeled", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError("Error: all records are unlabeled")
 
     labels = [r["label"] for r in all_records]
 
@@ -339,8 +325,7 @@ def train(config, config_path=None):
                            if any(c.strip() for c in r["label"].split(";"))]
             labels = [r["label"] for r in all_records]
             if not all_records:
-                print("Error: all records are unlabeled", file=sys.stderr)
-                sys.exit(1)
+                raise MicroMaxError("Error: all records are unlabeled")
 
     # Multi-label: classes are the UNION of ';'-separated categories over all
     # records — the record keeps the joined label string and is split again
@@ -384,20 +369,15 @@ def train(config, config_path=None):
 
     val_ratio = train_cfg.get("val_ratio", 0.25)
     if not (0 <= val_ratio < 1):
-        print(f"Error: training.val_ratio must be in [0, 1), got {val_ratio!r} "
-              f"(0 disables validation)", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: training.val_ratio must be in [0, 1), got {val_ratio!r} "
+              f"(0 disables validation)")
     train_records, val_records = stratified_split(all_records, val_ratio, seed)
     logger.info("Train: %d  Val: %d", len(train_records), len(val_records))
 
     if not val_records and val_ratio > 0:
-        print(
-            "Error: validation split is empty — every class needs at least "
+        raise MicroMaxError("Error: validation split is empty — every class needs at least "
             "two samples for a non-empty val set (val_ratio "
-            f"{val_ratio}).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            f"{val_ratio}).")
 
     # ---- Build train/val datasets ----
     train_ds = SingleCellDataset(
@@ -436,8 +416,7 @@ def train(config, config_path=None):
     trained_in_chans = len(resolved_channels)
     if ssl_bundle_path:
         if not os.path.exists(ssl_bundle_path):
-            print(f"Error: SSL model not found: {ssl_bundle_path}", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError(f"Error: SSL model not found: {ssl_bundle_path}")
         logger.info("Loading SSL backbone from %s", ssl_bundle_path)
         ssl_bundle = torch.load(ssl_bundle_path, map_location=device, weights_only=False)
         # resume.ssl_model must point at an SSL pretrain bundle (meta has
@@ -446,13 +425,9 @@ def train(config, config_path=None):
         # by accident). Same contract pretrain enforces via
         # _load_checkpoint_state.
         if "method" not in (ssl_bundle.get("meta") or {}):
-            print(
-                "Error: resume.ssl_model must point at an SSL pretrain bundle "
+            raise MicroMaxError("Error: resume.ssl_model must point at an SSL pretrain bundle "
                 f"(meta has 'method'); {ssl_bundle_path} is not an SSL bundle. "
-                "Use resume.sl_model for train-bundle resumes.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+                "Use resume.sl_model for train-bundle resumes.")
         model, ssl_method, ssl_meta = _build_model_from_ssl(
             ssl_bundle, model_cfg, num_classes, device)
         trained_backbone = ssl_meta["backbone"]
@@ -460,13 +435,9 @@ def train(config, config_path=None):
         if trained_in_chans != len(resolved_channels):
             # Same gate the scratch path has: a mismatch would otherwise only
             # crash at the first forward with a cryptic conv-shape error.
-            print(
-                f"Error: data.channels resolves to {len(resolved_channels)} "
+            raise MicroMaxError(f"Error: data.channels resolves to {len(resolved_channels)} "
                 f"but the SSL bundle's backbone was built with "
-                f"in_chans={trained_in_chans}; use matching data.channels.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+                f"in_chans={trained_in_chans}; use matching data.channels.")
     else:
         # From scratch (timm pretrained). On resume the checkpoint state dict
         # fully overwrites these weights, so the ImageNet load is skipped.
@@ -474,13 +445,9 @@ def train(config, config_path=None):
             ckpt_state = checkpoint.get("model_state_dict")
             ckpt_in_chans = _infer_state_dict_in_chans(ckpt_state) if ckpt_state else None
             if ckpt_in_chans is not None and ckpt_in_chans != len(resolved_channels):
-                print(
-                    f"Error: data.channels ({len(resolved_channels)}) does not match the "
+                raise MicroMaxError(f"Error: data.channels ({len(resolved_channels)}) does not match the "
                     f"resume checkpoint's input channels ({ckpt_in_chans}); re-run with "
-                    f"matching data.channels or without resume.sl_model",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+                    f"matching data.channels or without resume.sl_model")
         backbone, feat_dim, pool_fn = build_backbone(
             model_cfg["backbone"], len(resolved_channels),
             model_cfg.get("pretrained", True) if checkpoint is None else False)
@@ -558,9 +525,7 @@ def train(config, config_path=None):
 
     epochs = train_cfg.get("epochs", 10)
     if epochs is None or int(epochs) < 1:
-        print(f"Error: training.epochs must be a positive integer, got {epochs!r}",
-              file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: training.epochs must be a positive integer, got {epochs!r}")
     epochs = int(epochs)
     patience = train_cfg.get("patience", 5)
     save_interval = train_cfg.get("save_interval")

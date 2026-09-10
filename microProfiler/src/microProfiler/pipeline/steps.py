@@ -14,13 +14,14 @@ import os
 from pathlib import Path
 
 from microBase import ImageDataset
+from microBase.db_contracts import IMAGE_TABLE, PROFILER_DB_NAME
 
 from microProfiler.config import (
     SECTION_ATTRS,
     PipelineConfig,
     resolve_inference_db,
 )
-from microProfiler.io import Database
+from microProfiler.io import Database, rebuild_dataset
 from microProfiler.pipeline.errors import MetadataValidationError
 from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
 
@@ -111,11 +112,6 @@ def _run_zproject(
         raise MetadataValidationError(
             "Z-projection is enabled but the dataset has no 'stack' column. "
             "Either disable zproject or use an image_pattern with a (?P<stack>...) group."
-        )
-    if ds.channel_layout is not None:
-        raise MetadataValidationError(
-            "Z-projection is not supported for multi-channel-per-file (CHW/HWC) "
-            "datasets — each file already holds one plane per site."
         )
     # Import after the gate.
     from microProfiler.preprocessing.z_projection import z_project_dataset
@@ -216,7 +212,7 @@ def _run_image_profile(
     ds,
     root_dir: Path,
     progress: ProgressCollector = NullProgressCollector(),
-    result_db: str = "result.db",
+    result_db: str = PROFILER_DB_NAME,
 ):
     section = cfg.image_profile
     if not section or not section.run:
@@ -231,7 +227,7 @@ def _run_image_profile(
     from microProfiler.profiling.image_profiler import profile_images
 
     db_path = root_dir / result_db
-    img_kwargs = {"db_path": db_path, "table_name": "image", "progress": progress}
+    img_kwargs = {"db_path": db_path, "table_name": IMAGE_TABLE, "progress": progress}
     if section.image_thresholds:
         img_kwargs["thresholds"] = section.image_thresholds
     progress.step_start("image_profile", "Starting...")
@@ -239,7 +235,9 @@ def _run_image_profile(
         ds, channels=section.image_channels, n_workers=section.n_workers, **img_kwargs,
     )
     progress.step_end("image_profile", "Done")
-    return ds
+    # Quarantine deletes files mid-run; rescan so this step's returned
+    # dataset (and later steps) never reference rows that are gone.
+    return rebuild_dataset(ds)
 
 
 def _run_object_profile(
@@ -247,7 +245,7 @@ def _run_object_profile(
     ds,
     root_dir: Path,
     progress: ProgressCollector = NullProgressCollector(),
-    result_db: str = "result.db",
+    result_db: str = PROFILER_DB_NAME,
 ):
     section = cfg.object_profile
     if not section or not section.run or not section.configs:
@@ -294,7 +292,9 @@ def _run_object_profile(
         progress.step_end(
             f"object_profile ({entry.mask_name})", "Done",
         )
-    return ds
+    # Quarantine deletes files mid-run; rescan so this step's returned
+    # dataset (and later steps) never reference rows that are gone.
+    return rebuild_dataset(ds)
 
 
 def _run_inference(
@@ -383,7 +383,7 @@ _STEP_FUNCTIONS = {
 }
 
 
-def _step_will_execute(cfg: PipelineConfig, step_name: str, root_dir=None) -> bool:
+def _step_will_execute(cfg: PipelineConfig, step_name: str, root_dir=None, ds=None) -> bool:
     """True when the section is enabled AND at least one unit will run.
 
     A block whose channel list is empty is skipped at runtime (empty means
@@ -395,6 +395,18 @@ def _step_will_execute(cfg: PipelineConfig, step_name: str, root_dir=None) -> bo
     section = getattr(cfg, step_name, None)
     if not section or not section.run:
         return False
+    if step_name == "resize":
+        # scale_factor == 1.0 is a no-op — recording it would gate a later
+        # real resize out of applied_steps.
+        return float(getattr(section, "scale_factor", 1.0)) != 1.0
+    if step_name == "tile":
+        # A tile size larger than the image produces zero complete tiles;
+        # sources are kept (see tile_splitter) but the step must not be
+        # recorded as applied.
+        if ds is not None and ds.img_shape:
+            h, w = ds.img_shape
+            return section.tile_width <= w and section.tile_height <= h
+        return True
     if step_name == "image_profile":
         return bool(section.image_channels)
     if step_name == "object_profile":
@@ -428,7 +440,13 @@ def _is_fit_only_basic(cfg: PipelineConfig) -> bool:
 
 
 def _build_dataset(cfg: PipelineConfig, root_dir: Path) -> ImageDataset:
-    """Construct an ImageDataset from pipeline config patterns."""
+    """Construct an ImageDataset from pipeline config patterns.
+
+    microProfiler supports ONE channel per file only (Operetta-style layouts).
+    channel_layout is intentionally not exposed: the multi-channel-per-file
+    path is unsupported end to end and would need a config key + GUI control
+    (see microBase.ImageDataset for the low-level support).
+    """
     return ImageDataset(
         root=root_dir,
         image_pattern=cfg.image_pattern,

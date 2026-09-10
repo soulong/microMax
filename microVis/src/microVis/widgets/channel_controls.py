@@ -56,7 +56,10 @@ class ChannelControls(QWidget):
                 if cname == current_color:
                     self._color.setCurrentIndex(i)
                     break
-            elif CHANNEL_COLORS[cname] == tuple(current_color):
+            elif current_color is not None and CHANNEL_COLORS[cname] == tuple(current_color):
+                # A YAML `color: null` (normalize_null_strings) reaches here as
+                # None — fall through to the default instead of crashing on
+                # tuple(None).
                 self._color.setCurrentIndex(i)
                 break
         self._color.currentTextChanged.connect(lambda: self.config_changed.emit(self._ch_name))

@@ -1,6 +1,6 @@
 """Augmentation preview (CLI: micromodel augment-vis).
 
-show_augmentation adapts to both pretrain configs (augmentation_views) and
+run_augment_vis adapts to both pretrain configs (augmentation_views) and
 train configs (augmentation_train + augmentation_infer): it renders one
 multi-page grid of raw + augmented views per sample and channel.
 """
@@ -17,20 +17,21 @@ import matplotlib.pyplot as plt
 
 from microBase import (
     CellDataset,
+    MicroMaxError,
     build_pipeline,
     apply,
     normalize,
 )
 
 from .dataset import _compute_ref_stats, _normalize_fixed, _to_float_max
-from .utils import logger, add_file_logging, resolve_max_value
+from .utils import logger, add_file_logging, resolve_max_value, set_seed
 
 
 # ----------------------------------------------------------------------------
 # Augmentation preview — supports both pretrain (multi-view) and train configs
 # ----------------------------------------------------------------------------
 
-def show_augmentation(config):
+def run_augment_vis(config):
     """Render augmentation preview.
 
     For pretrain configs (has 'augmentation_views'): renders ALL N views per
@@ -38,6 +39,9 @@ def show_augmentation(config):
     For train configs (has 'augmentation_train' + 'augmentation_infer'):
     renders raw + eval + num_views augmented views per sample.
     """
+    # Deterministic sample draw — the preview is a debugging artifact and
+    # must show the same cells on every run.
+    set_seed(int(config.get("seed", 42)))
     data_cfg = config["data"]
     norm_cfg = config.get("normalize", {})
     vis_cfg = config.get("vis_augment", {})
@@ -61,8 +65,7 @@ def show_augmentation(config):
 
     cell_ds = CellDataset(root, channel_layout=channel_layout, image_pattern=image_pattern)
     if len(cell_ds) == 0:
-        print(f"Error: no TIFF files found in {root}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: no TIFF files found in {root}")
 
     if channels is None:
         n_avail = len(cell_ds.intensity_colnames)

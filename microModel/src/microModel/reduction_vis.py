@@ -30,6 +30,7 @@ import torch
 from flask import Flask, jsonify, request
 
 from microBase import (
+    MicroMaxError,
     build_pipeline,
     apply,
     read_image,
@@ -37,6 +38,26 @@ from microBase import (
     read_mask,
     crop_cell,
     get_labels,
+)
+from microBase.db_contracts import (
+    CLUSTER_PROB_PREFIX,
+    CLUSTER_RES_PREFIX,
+    DIRECTORY_COLUMN,
+    DR_METHODS,
+    FEATURES_COLUMN,
+    FILENAME_COLUMN,
+    FIND_CLUSTER_TABLE,
+    INFERENCE_TABLE,
+    INFER_DB_NAME,
+    LABEL_COLUMN,
+    MASK_FILENAME_COLUMN,
+    PRED_CLASS_COLUMN,
+    PRED_PROB_COLUMN,
+    PROB_COLUMN_PREFIX,
+    REDUCTION_TABLE_PREFIX,
+    UID_COLUMN,
+    reduction_coord_prefix,
+    resolve_directory,
 )
 
 from .utils import (logger, resolve_output_paths, resolve_max_value,
@@ -58,7 +79,7 @@ class VisInteractiveServer:
         self.inf_cfg = config["inference"]
         self.red_cfg = config.get("reduction", {})
 
-        self.db_name = self.inf_cfg.get("db_name", "infer.db")
+        self.db_name = self.inf_cfg.get("db_name", INFER_DB_NAME)
         self.base_output_dir = self.config.get("output_dir")
         self.data_roots = self.data_cfg["root"]
 
@@ -67,21 +88,18 @@ class VisInteractiveServer:
         # needed here.
         model_path = config.get("model")
         if not isinstance(model_path, str) or not model_path:
-            print("Error: config 'model' must be a string path to a model bundle "
-                  "(train model.pt or SSL model.pt)", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError("Error: config 'model' must be a string path to a model bundle "
+                  "(train model.pt or SSL model.pt)")
         if not os.path.exists(model_path):
-            print(f"Error: model bundle not found: {model_path}", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError(f"Error: model bundle not found: {model_path}")
         logger.info("Loading model bundle from %s", model_path)
         bundle = torch.load(model_path, map_location="cpu", weights_only=False)
         self.meta = bundle["meta"]
 
         # Build augmentation_infer pipeline from bundle meta
         if "augmentation_infer" not in self.meta:
-            print("Error: bundle meta missing 'augmentation_infer' (unsupported "
-                  "pre-0.2.1 bundle format)", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError("Error: bundle meta missing 'augmentation_infer' (unsupported "
+                  "pre-0.2.1 bundle format)")
         aug_infer_spec = self.meta["augmentation_infer"]
         self.aug_infer_pipeline = build_pipeline(aug_infer_spec) if aug_infer_spec else None
 
@@ -100,6 +118,10 @@ class VisInteractiveServer:
         self._dr_methods = []
 
         self.app = Flask(__name__)
+        # Library errors become clean HTTP 400 responses instead of killing
+        # the server process (requests handle data problems all the time).
+        self.app.register_error_handler(
+            MicroMaxError, lambda e: (jsonify({"error": str(e)}), 400))
         self.app.route("/")(self._serve_html)
         self.app.route("/api/scatter")(self._api_scatter)
         self.app.route("/api/image")(self._api_image)
@@ -130,19 +152,19 @@ class VisInteractiveServer:
                 logger.warning("DB not found: %s", db_path)
                 continue
             try:
-                self._load_coords(db_path)
+                self._load_coords(db_path, data_dir)
             except Exception as e:
                 logger.warning("Failed to load %s: %s", db_path, e)
 
         logger.info("Loaded %d scatter points from %d DB(s)",
                     len(self.scatter_data), len(seen))
 
-    def _load_coords(self, db_path):
+    def _load_coords(self, db_path, data_root):
         conn = sqlite3.connect(db_path)
         # Discover every reduction_<method> table written by `micromodel reduction`.
         cur = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name LIKE 'reduction_%'")
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?",
+            (f"{REDUCTION_TABLE_PREFIX}%",))
         tables = sorted(row[0] for row in cur.fetchall())
         if not tables:
             logger.warning(
@@ -156,24 +178,25 @@ class VisInteractiveServer:
         # coordinate columns are skipped with a warning.
         coords_by_uid = {}
         for table in tables:
-            method = table[len("reduction_"):]
-            if method not in ("pca", "umap", "pacmap", "localmap"):
+            method = table[len(REDUCTION_TABLE_PREFIX):]
+            if method not in DR_METHODS:
                 continue
-            x_col = "pc_1" if method == "pca" else f"{method}_1"
-            y_col = "pc_2" if method == "pca" else f"{method}_2"
+            coord = reduction_coord_prefix(method)
+            x_col = f"{coord}_1"
+            y_col = f"{coord}_2"
             cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
             if x_col not in cols or y_col not in cols:
                 logger.warning("Table %s lacks %s/%s columns; skipping",
                                table, x_col, y_col)
                 continue
-            for uid, x, y in conn.execute(f"SELECT uid, {x_col}, {y_col} FROM {table}"):
+            for uid, x, y in conn.execute(f"SELECT {UID_COLUMN}, {x_col}, {y_col} FROM {table}"):
                 d = coords_by_uid.setdefault(int(uid), {})
                 d[f"{method}_x"] = float(x)
                 d[f"{method}_y"] = float(y)
             if method not in self._dr_methods:
                 self._dr_methods.append(method)
         # Canonical method order (alphabetical sqlite_master order otherwise).
-        canonical = ("pca", "umap", "pacmap", "localmap")
+        canonical = DR_METHODS
         self._dr_methods = ([m for m in canonical if m in self._dr_methods]
                             + [m for m in self._dr_methods if m not in canonical])
 
@@ -184,19 +207,26 @@ class VisInteractiveServer:
         cluster_by_uid = {}
         cluster_cols = []
         has_fc = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='find_cluster'"
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (FIND_CLUSTER_TABLE,)
         ).fetchone()
         if has_fc:
-            all_cols = [row[1] for row in conn.execute("PRAGMA table_info(find_cluster)")]
-            cluster_cols = [c for c in all_cols if c.startswith("cluster_")]
+            all_cols = [
+                row[1]
+                for row in conn.execute(f"PRAGMA table_info({FIND_CLUSTER_TABLE})")
+            ]
+            cluster_cols = [
+                c for c in all_cols
+                if c.startswith(CLUSTER_RES_PREFIX) or c.startswith(CLUSTER_PROB_PREFIX)
+            ]
             if cluster_cols:
-                sel = ", ".join(["uid"] + [f'"{c}"' for c in cluster_cols])
-                for row in conn.execute(f"SELECT {sel} FROM find_cluster"):
+                sel = ", ".join([UID_COLUMN] + [f'"{c}"' for c in cluster_cols])
+                for row in conn.execute(f"SELECT {sel} FROM {FIND_CLUSTER_TABLE}"):
                     d = cluster_by_uid.setdefault(int(row[0]), {})
                     for col, val in zip(cluster_cols, row[1:]):
                         # cluster_res_<tag> holds integer IDs; the
                         # cluster_prob_<tag> confidence columns are floats.
-                        if col.startswith("cluster_prob"):
+                        if col.startswith(CLUSTER_PROB_PREFIX):
                             d[col] = float(val) if val is not None else None
                         else:
                             d[col] = int(val) if val is not None else None
@@ -207,9 +237,9 @@ class VisInteractiveServer:
         # Get inference table columns dynamically. Everything except uid and
         # the features BLOB is a color_by candidate (and merged into the
         # scatter payload) — prediction/probability/path columns included.
-        cur = conn.execute("PRAGMA table_info(inference)")
+        cur = conn.execute(f"PRAGMA table_info({INFERENCE_TABLE})")
         infer_cols = [row[1] for row in cur.fetchall()]
-        _exclude_color = {"uid", "features"}
+        _exclude_color = {UID_COLUMN, FEATURES_COLUMN}
         for col in infer_cols:
             if col not in self._color_by_cols and col not in _exclude_color:
                 self._color_by_cols.append(col)
@@ -218,21 +248,23 @@ class VisInteractiveServer:
         # Column names may contain spaces (prob_<class> columns derive from
         # arbitrary class names) — quote every identifier.
         col_select = ", ".join(f'"{c}"' for c in infer_cols)
-        cur = conn.execute(f"SELECT {col_select} FROM inference")
+        cur = conn.execute(f"SELECT {col_select} FROM {INFERENCE_TABLE}")
         col_names = [desc[0] for desc in cur.description]
 
         db_points = []
         for row in cur.fetchall():
             d = dict(zip(col_names, row))
-            uid = int(d.get("uid"))
+            uid = int(d.get(UID_COLUMN))
             coords = coords_by_uid.get(uid)
             if not coords:
                 continue
 
-            directory = str(d.get("directory", ""))
-            filename = str(d.get("filename", ""))
-            label = int(d.get("label", 0)) if d.get("label") is not None else 0
-            mask_filename = str(d.get("mask_filename", "")) if d.get("mask_filename") else ""
+            directory = str(d.get(DIRECTORY_COLUMN, ""))
+            filename = str(d.get(FILENAME_COLUMN, ""))
+            label = int(d.get(LABEL_COLUMN, 0)) if d.get(LABEL_COLUMN) is not None else 0
+            mask_filename = (
+                str(d.get(MASK_FILENAME_COLUMN, "")) if d.get(MASK_FILENAME_COLUMN) else ""
+            )
             # source_image: for frontend hover display (first channel or filename)
             if self.mode == "whole_image":
                 try:
@@ -251,9 +283,10 @@ class VisInteractiveServer:
             # show no ranking).
             prob_items = []
             for col in infer_cols:
-                if col.startswith("prob_") and d.get(col) is not None:
+                if col.startswith(PROB_COLUMN_PREFIX) and d.get(col) is not None:
                     try:
-                        prob_items.append((col[len("prob_"):], float(d[col])))
+                        prob_items.append(
+                            (col[len(PROB_COLUMN_PREFIX):], float(d[col])))
                     except (TypeError, ValueError):
                         pass
             ml_pairs = sorted(prob_items, key=lambda t: -t[1])
@@ -265,8 +298,8 @@ class VisInteractiveServer:
                 str(label) if self.mode == "whole_image" else "")
 
             point = {
-                "pred_class": str(d.get("pred_class")) if d.get("pred_class") else "unknown",
-                "pred_prob": parse_pred_prob(d.get("pred_prob")),
+                "pred_class": str(d.get(PRED_CLASS_COLUMN)) if d.get(PRED_CLASS_COLUMN) else "unknown",
+                "pred_prob": parse_pred_prob(d.get(PRED_PROB_COLUMN)),
                 "source_image": src,
                 "directory": directory,
                 "filename": filename,
@@ -280,13 +313,17 @@ class VisInteractiveServer:
             # Cluster assignments + every remaining inference column land in
             # the point payload for color_by support (uid/features excluded).
             point.update(cluster_by_uid.get(uid, {}))
-            _exclude_point = {"uid", "features"}
+            _exclude_point = {UID_COLUMN, FEATURES_COLUMN}
             for col in infer_cols:
-                if col not in _exclude_point:
-                    val = d.get(col)
-                    if hasattr(val, "item"):
-                        val = val.item()
-                    point[col] = val
+                if col in _exclude_point:
+                    continue
+                val = d.get(col)
+                if hasattr(val, "item"):
+                    val = val.item()
+                point[col] = val
+            # The dataset root this row came from — directory is stored
+            # relative to it, so image loading must resolve against it.
+            point["_data_root"] = str(data_root)
             db_points.append(point)
         conn.close()
 
@@ -331,7 +368,9 @@ class VisInteractiveServer:
                 n_ch = len(ch_names)
             else:
                 # single-cell: read raw TIFF array to count channels
-                full_path = os.path.join(pt["directory"], pt["filename"])
+                full_path = resolve_directory(
+                    pt.get(DIRECTORY_COLUMN, ""), pt.get("_data_root", ""))
+                full_path = os.path.join(full_path, pt["filename"])
                 from tifffile import TiffFile
                 with TiffFile(full_path) as tif:
                     arr = tif.asarray()
@@ -358,15 +397,15 @@ class VisInteractiveServer:
     # Image resolution: load a cell crop for a scatter point
     # ------------------------------------------------------------------
 
-    def _resolve_single_cell(self, directory, filename, channels, label):
-        """Load a single-cell TIFF directly from {directory}/{filename}.
+    def _resolve_single_cell(self, root, directory, filename, channels, label):
+        """Load a single-cell TIFF directly from {root}/{directory}/{filename}.
 
         The cell TIFF contains all channels. Channel selection uses the
         `channels` list (1-based indices). channel_layout comes from the
         bundle meta (same source as inference uses).
         Returns img_HWC.
         """
-        full_path = os.path.join(directory, filename) if directory else filename
+        full_path = os.path.join(resolve_directory(directory, root), filename)
         if not os.path.exists(full_path):
             raise ValueError(f"Cell TIFF not found: {full_path}")
         channel_layout = self.meta.get("channel_layout", "CHW")
@@ -374,7 +413,7 @@ class VisInteractiveServer:
         img_hwc = read_tiff_channels(full_path, ch_indices, channel_layout=channel_layout)
         return img_hwc
 
-    def _resolve_whole_image(self, directory, filename_json, mask_filename,
+    def _resolve_whole_image(self, root, directory, filename_json, mask_filename,
                              channels, label):
         """Load all channel TIFFs + mask, then crop the cell by label.
 
@@ -386,10 +425,11 @@ class VisInteractiveServer:
         if not ch_filenames:
             raise ValueError("Empty channel filename list")
 
+        dir_path = resolve_directory(directory, root)
         # Load each channel TIFF and stack into HWC
         arrays = []
         for ch_fname in ch_filenames:
-            ch_path = os.path.join(directory, ch_fname) if directory else ch_fname
+            ch_path = os.path.join(dir_path, ch_fname)
             arrays.append(read_image(ch_path))
         img_hwc = np.stack(arrays, axis=-1)  # (H, W, C)
 
@@ -398,8 +438,8 @@ class VisInteractiveServer:
             raise ValueError("Missing mask_filename in DB for whole-image mode")
         mask = read_mask(mask_filename)
 
-        # Crop the cell using label (mask object ID). crop_cell hard-exits
-        # (sys.exit) when the label has zero pixels in the mask; validate
+        # Crop the cell using label (mask object ID). crop_cell raises
+        # DataError when the label has zero pixels in the mask; validate
         # first so a stale DB row (e.g. mask regenerated after inference)
         # yields a JSON error instead of killing the viewer server.
         if int(label) not in get_labels(mask):
@@ -451,7 +491,12 @@ class VisInteractiveServer:
         })
 
     def _api_scatter(self):
-        return jsonify(self.scatter_data)
+        # Internal per-point plumbing (_data_root) stays out of the payload.
+        out = [
+            {k: v for k, v in d.items() if k != "_data_root"}
+            for d in self.scatter_data
+        ]
+        return jsonify(out)
 
     def _api_image(self):
         src = request.args.get("src", "")
@@ -479,16 +524,17 @@ class VisInteractiveServer:
             if point is None:
                 return jsonify({"error": f"Point not found: src={src}, cid={label}"}), 400
 
-            directory = point["directory"]
-            filename = point["filename"]
-            mask_filename = point.get("mask_filename", "")
+            directory = point[DIRECTORY_COLUMN]
+            filename = point[FILENAME_COLUMN]
+            mask_filename = point.get(MASK_FILENAME_COLUMN, "")
+            root = point.get("_data_root", "")
 
             if self.mode == "single_cell":
                 img_hwc = self._resolve_single_cell(
-                    directory, filename, requested_channels, label)
+                    root, directory, filename, requested_channels, label)
             elif self.mode == "whole_image":
                 img_hwc = self._resolve_whole_image(
-                    directory, filename, mask_filename,
+                    root, directory, filename, mask_filename,
                     requested_channels, label)
             else:
                 return jsonify({"error": f"Unknown mode: {self.mode}"}), 400
@@ -566,7 +612,7 @@ class VisInteractiveServer:
             return jsonify(result)
 
         except SystemExit as e:
-            # microBase hard-exits (sys.exit) on missing files / out-of-range
+            # microBase raises MicroMaxError on missing files / out-of-range
             # channels; convert to a JSON error so the server never dies.
             logger.exception("Image fetch error: %s", e)
             return jsonify({"error": "Data error (missing or mismatched "

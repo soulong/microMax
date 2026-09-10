@@ -58,6 +58,8 @@ from lightly.models.modules import MaskedVisionTransformerTIMM
 from lightly.utils.scheduler import cosine_schedule, linear_warmup_schedule
 from timm.models.vision_transformer import VisionTransformer
 
+from microBase import MicroMaxError
+
 from ..backbone import build_dino_vit
 from ..utils import logger
 
@@ -263,9 +265,13 @@ def _make_masks(model, n_global_views, grid_h, grid_w, device):
 # ---------------------------------------------------------------------------
 
 class DINOLoss(nn.Module):
-    """DINO loss with Sinkhorn-Knopp teacher centering (DINOv3)."""
+    """DINO loss with Sinkhorn-Knopp teacher centering (DINOv3).
 
-    def __init__(self, out_dim, student_temp=0.1):
+    Prototype count is never configured here — every shape comes from the
+    tensors at forward time; only the student temperature is a parameter.
+    """
+
+    def __init__(self, student_temp=0.1):
         super().__init__()
         self.student_temp = student_temp
 
@@ -309,7 +315,7 @@ class DINOLoss(nn.Module):
 class iBOTPatchLoss(nn.Module):
     """iBOT patch-level loss with Sinkhorn-Knopp teacher centering (DINOv3)."""
 
-    def __init__(self, patch_out_dim, student_temp=0.1):
+    def __init__(self, student_temp=0.1):
         super().__init__()
         self.student_temp = student_temp
 
@@ -619,19 +625,16 @@ class DINOv3(nn.Module):
         if not self.gram_use_loss or self.gram_backbone is None:
             return
         if not path or not os.path.exists(path):
-            print(f"Error: dinov3.gram.ckpt not found: {path}", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError(f"Error: dinov3.gram.ckpt not found: {path}")
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         sd = ckpt.get("state_dict")
         if not sd:
-            print(f"Error: {path} is not an SSL bundle (no 'state_dict')", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError(f"Error: {path} is not an SSL bundle (no 'state_dict')")
         prefix = "teacher_backbone.vit."
         vt = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
         if not vt:
-            print(f"Error: bundle {path} has no '{prefix}' weights "
-                  f"(not a DINOv3 SSL bundle)", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError(f"Error: bundle {path} has no '{prefix}' weights "
+                  f"(not a DINOv3 SSL bundle)")
         self.gram_backbone.vit.load_state_dict(vt)
         self._gram_teacher_initialized = True
         _freeze_eval_module(self.gram_backbone)
@@ -683,12 +686,23 @@ class DINOv3(nn.Module):
             self._num_gram_updates += 1
 
     def set_gram_resume_updates(self, start_iter):
-        """Restore the number of gram updates already done when resuming."""
+        """Restore the number of gram updates already done when resuming.
+
+        maybe_update_gram fires when (global_step + 1) is a positive multiple
+        of the update frequency and >= the first-update step. After completing
+        steps 0..start_iter-1 that is exactly the multiples m of frequency
+        with m >= first and m <= start_iter (floor accounting, not ceil).
+        """
         if not self.gram_use_loss or self.gram_backbone is None:
             return
         if start_iter > 0 and start_iter >= self._gram_it_first_update:
-            self._num_gram_updates = math.ceil(
-                (start_iter + 1 - self._gram_it_first_update) / self._gram_update_frequency)
+            freq = self._gram_update_frequency
+            # First trigger point: the smallest POSITIVE multiple of freq that
+            # is >= first (step counting starts at global_step=0, so m=0 is
+            # never a trigger).
+            m0 = max(freq, -(-self._gram_it_first_update // freq) * freq)
+            if start_iter >= m0:
+                self._num_gram_updates = (start_iter - m0) // freq + 1
 
     def forward_teacher(self, x):
         """Teacher forward (unmasked). Returns (cls_tokens, features)."""
@@ -808,7 +822,7 @@ def build_dinov3(backbone_cfg, method_cfg, device):
 def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
                step_info, scaler=None, grad_clip=None, step=True):
     """One DINOv3 training step. Returns (loss_value, components_dict) — the
-    uniform protocol consumed by pretrain_ssl (components: dino/ibot/koleo,
+    uniform protocol consumed by run_pretrain (components: dino/ibot/koleo,
     plus gram when the Gram anchoring loss is enabled).
 
     criterion = (dino_criterion, ibot_criterion, koleo_criterion,
@@ -828,13 +842,9 @@ def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
     n_gram = getattr(model, "_n_gram_views", 0)
     n_local = len(views) - 2 - n_gram
     if n_local < 1 or 2 + n_local + n_gram != len(views):
-        print(
-            f"Error: DINOv3 requires 2 global + >=1 local views"
+        raise MicroMaxError(f"Error: DINOv3 requires 2 global + >=1 local views"
             f"{' + 2 gram-teacher crops' if n_gram else ''} "
-            f"(total {2 + n_gram} + n_local), got {len(views)}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            f"(total {2 + n_gram} + n_local), got {len(views)}")
 
     global_views = torch.cat(views[:2]).to(device)
     local_views = torch.cat(views[2:2 + n_local]).to(device)
@@ -938,11 +948,9 @@ def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
                 N = (g_h // patch_h) * (g_w // patch_w)
                 N_student = grid_h * grid_w
                 if teacher_patches.shape[1] != N or student_patches.shape[1] != N_student:
-                    print(
-                        f"Error: gram-teacher patch count {teacher_patches.shape[1]} "
+                    raise MicroMaxError(f"Error: gram-teacher patch count {teacher_patches.shape[1]} "
                         f"!= ({g_h}//{patch_h})^2 and student {student_patches.shape[1]} "
-                        f"!= ({in_h}//{patch_h})^2", file=sys.stderr)
-                    sys.exit(1)
+                        f"!= ({in_h}//{patch_h})^2")
                 S = int(round(math.sqrt(N)))
                 S_student = int(round(math.sqrt(N_student)))
                 patches_hw = teacher_patches.transpose(-2, -1).unflatten(-1, (S, S))
@@ -981,9 +989,8 @@ def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
     if gram_loss is not None:
         loss = loss + gram_weight * gram_loss
     if not torch.isfinite(loss).item():
-        print(f"Error: non-finite DINOv3 loss ({loss.item()}) at global step "
-              f"{global_step}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: non-finite DINOv3 loss ({loss.item()}) at global step "
+              f"{global_step}")
 
     # Monitoring hook: detached diagnostic tensors for monitor.py (no extra
     # forward passes; all tensors are already in scope).

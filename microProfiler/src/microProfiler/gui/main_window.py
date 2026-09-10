@@ -92,9 +92,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self._state = PipelineState()
-        self._output_manually_set = False
+        # The input dir is the dataset dir: results (profiler.db, masks,
+        # session.yml, infer.db) are always written next to the sources.
         self._loaded_dataset_dir = None
-        self._loaded_input_dir = None
         self._pending_filters = None
 
         self.setWindowTitle("microProfiler")
@@ -122,12 +122,6 @@ class MainWindow(QMainWindow):
 
     def get_input_dir(self) -> str:
         return self._input_dir.text()
-
-    def get_output_dir(self) -> str:
-        return self._output_dir.text()
-
-    def output_path(self) -> Path:
-        return self._output_path()
 
     def get_image_pattern(self) -> Optional[str]:
         return self._custom_image_pattern.text().strip() or None
@@ -315,15 +309,6 @@ class MainWindow(QMainWindow):
         input_row.addWidget(self._input_browse)
         input_form.addRow("Input dir:", input_row)
 
-        self._output_dir = QLineEdit()
-        enable_path_drop(self._output_dir)
-        self._output_browse = QPushButton("Browse...")
-        self._output_browse.setProperty("class", "secondary")
-        output_row = QHBoxLayout()
-        output_row.addWidget(self._output_dir, 1)
-        output_row.addWidget(self._output_browse)
-        input_form.addRow("Output dir:", output_row)
-
         self._load_dataset_btn = QPushButton("Load Dataset")
         self._load_dataset_btn.setProperty("class", "primary")
         self._load_dataset_btn.setFixedHeight(dp(32))
@@ -349,7 +334,7 @@ class MainWindow(QMainWindow):
         self._custom_image_subdir_pattern = QLineEdit()
         self._custom_image_subdir_pattern.setPlaceholderText("Leave empty to search directly")
         search_row.addWidget(self._custom_image_subdir_pattern, 1)
-        input_form.addRow("Image subdir pattern:", search_row)
+        input_form.addRow("Image subdir:", search_row)
 
         self._dataset_info_label = QLabel("")
         self._dataset_info_label.setWordWrap(True)
@@ -479,9 +464,7 @@ class MainWindow(QMainWindow):
         self._sidebar.thread_count_changed.connect(self._on_thread_count_changed)
         self._sidebar.display_range_changed.connect(self._on_vmin_vmax_changed)
         self._input_browse.clicked.connect(self._browse_input)
-        self._output_browse.clicked.connect(self._browse_output)
         self._input_dir.textChanged.connect(self._on_input_dir_edited)
-        self._output_dir.textChanged.connect(self._on_output_changed)
         self._load_dataset_btn.clicked.connect(self._load_dataset)
         self._sidebar.run_all_clicked.connect(self._ctrl.run_all)
         self._run_pre_btn.clicked.connect(self._ctrl.run_preprocessing)
@@ -538,20 +521,15 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._input_dir.setText(path)
-        if not self._output_manually_set:
-            self._output_dir.blockSignals(True)
-            self._output_dir.setText(path)
-            self._output_dir.blockSignals(False)
-        output_path = self._output_path()
         # session.yml is read only on the FIRST browse of a given directory
         # (pre-fills GUI fields); re-browsing the SAME directory preserves the
         # user's GUI edits and the loaded dataset — session.yml is never
         # re-read into the GUI (§3.16).
-        if output_path == self._loaded_dataset_dir:
+        if path == self._loaded_dataset_dir:
             return
         self._on_input_changed()
 
-        sf = SessionFile(output_path)
+        sf = SessionFile(path)
         session_data = sf.load()
         if not session_data:
             return
@@ -578,48 +556,12 @@ class MainWindow(QMainWindow):
         if "filter" in session_data:
             self._pending_filters = session_data["filter"]
 
-    def _browse_output(self):
-        path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
-        if path:
-            self._output_dir.setText(path)
-            self._output_manually_set = True
-
-    def _on_output_changed(self) -> None:
-        self._output_manually_set = True
-        # Manual edit (not Browse): if the output dir no longer matches the
-        # loaded dataset's dir, invalidate the dataset so a Run can't process
-        # stale data into the new directory.
-        if self._loaded_dataset_dir is not None and self._output_path() != self._loaded_dataset_dir:
-            self._on_input_changed()
-
     def _on_input_dir_edited(self, text: str) -> None:
         # Manual edit (not Browse): if the input dir no longer matches the
         # loaded dataset's input, invalidate the dataset (Run would otherwise
-        # process the old dataset's files while writing to the new layout).
-        if self._loaded_input_dir is not None and text != self._loaded_input_dir:
+        # process the old dataset's files while writing to the new directory).
+        if self._loaded_dataset_dir is not None and text != self._loaded_dataset_dir:
             self._on_input_changed()
-
-    def _is_converted(self, output_path: Path) -> bool:
-        """True when the output dir holds a converted layout (subdir with images).
-
-        Uses the configured image_subdir_pattern (default 'images' — the old
-        hardcoded 'image' never matched the default layout on case-sensitive
-        filesystems); falls back to a case-insensitive subdir match.
-        """
-        subdir = (self.get_image_subdir_pattern() or "images").strip("/\\")
-        candidates = [output_path / subdir]
-        if output_path.is_dir():
-            candidates += [
-                p for p in output_path.iterdir()
-                if p.is_dir() and p.name.lower() == subdir.lower()
-            ]
-        for image_subdir in candidates:
-            if image_subdir.is_dir() and bool(
-                list(image_subdir.glob("*.tiff")) or list(image_subdir.glob("*.tif"))
-                or list(image_subdir.glob("*.png")) or list(image_subdir.glob("*.jpg"))
-            ):
-                return True
-        return False
 
     def _load_dataset(self) -> None:
         if self._running:
@@ -628,9 +570,6 @@ class MainWindow(QMainWindow):
         if not path.exists():
             QMessageBox.warning(self, "Invalid Directory", "Input directory does not exist.")
             return
-
-        output_path = self._output_path()
-        is_converted = self._is_converted(output_path)
 
         # Use current GUI values. session.yml is read once at Browse time;
         # the user's manual edits take precedence over any saved values.
@@ -649,7 +588,8 @@ class MainWindow(QMainWindow):
         # the UI thread. ImageDataset.__init__ scans files + builds metadata
         # — synchronous and slow for large datasets. Moving it off the UI
         # thread keeps the dialog responsive (no "not responding" ghost).
-        root = output_path if is_converted else path
+        # The input dir IS the dataset dir: all artifacts land there.
+        root = path
 
         self._loader_dialog = QProgressDialog("Loading dataset...", None, 0, 0, self)
         self._loader_dialog.setWindowModality(Qt.WindowModal)
@@ -659,8 +599,7 @@ class MainWindow(QMainWindow):
         self._loader_dialog.show()
 
         # Stash pending params for phase 2 (UI population)
-        self._loader_pending = (output_path, is_converted, image_pattern,
-                                mask_pattern, raw_pattern, str(path))
+        self._loader_pending = (image_pattern, mask_pattern, raw_pattern, str(path))
 
         self._loader_worker = DatasetLoadWorker(
             root, img_pat, msk_pat, raw_pattern,
@@ -671,7 +610,7 @@ class MainWindow(QMainWindow):
 
     def _on_dataset_loaded(self, ds, clone) -> None:
         """Phase 2: populate UI after background ImageDataset construction."""
-        output_path, is_converted, image_pattern, mask_pattern, raw_pattern, input_path = self._loader_pending
+        image_pattern, mask_pattern, raw_pattern, input_path = self._loader_pending
         dialog = getattr(self, "_loader_dialog", None)
         worker = getattr(self, "_loader_worker", None)
         self._loader_pending = None
@@ -687,7 +626,6 @@ class MainWindow(QMainWindow):
         try:
             self._state.dataset = ds
             self._state.original_dataset = clone
-            self._loaded_input_dir = input_path
 
             # Re-apply filters restored from session.yml (Browse defers them
             # because the filter panel needs the dataset's metadata columns);
@@ -729,7 +667,7 @@ class MainWindow(QMainWindow):
             self._update_dataset_info(ds)
 
             logging.getLogger("microProfiler").info(
-                f"{'Converted' if is_converted else 'Raw'} dataset loaded: {len(ds)} rows, channels={ds.intensity_colnames}"
+                f"Dataset loaded: {len(ds)} rows, channels={ds.intensity_colnames}"
             )
 
             # Load Dataset writes the user's current patterns to session.yml
@@ -737,7 +675,7 @@ class MainWindow(QMainWindow):
             # here — step params / applied_steps / filter are written by the
             # Run/Apply action buttons via PipelineController._save_session_yml.
             try:
-                sf = SessionFile(output_path)
+                sf = SessionFile(input_path)
                 sf.set_patterns(
                     image_pattern=image_pattern or "",
                     mask_pattern=mask_pattern or "",
@@ -747,7 +685,7 @@ class MainWindow(QMainWindow):
                 logging.getLogger("microProfiler").warning(
                     "Failed to persist patterns to session.yml", exc_info=True)
 
-            self._loaded_dataset_dir = output_path
+            self._loaded_dataset_dir = input_path
             self._update_window_title()
             self._update_tab_status()
         except Exception as e:
@@ -760,7 +698,6 @@ class MainWindow(QMainWindow):
 
     def _on_dataset_load_error(self, msg: str) -> None:
         """Phase 2 error: clean up loader state and notify the user."""
-        output_path = self._loader_pending[0] if self._loader_pending else None
         dialog = getattr(self, "_loader_dialog", None)
         worker = getattr(self, "_loader_worker", None)
         self._loader_pending = None
@@ -786,12 +723,11 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Load Failed", f"Could not load dataset:\n{msg}")
 
     def _on_input_changed(self):
-        # Reset dataset state when the input/output directory changes.
+        # Reset dataset state when the input directory changes.
         # session.yml is read at Browse time, not here.
         self._state.dataset = None
         self._state.original_dataset = None
         self._loaded_dataset_dir = None
-        self._loaded_input_dir = None
         self._pending_filters = None
         self._update_window_title()
         # Structured configs restored from a previous directory must not
@@ -819,10 +755,6 @@ class MainWindow(QMainWindow):
             BaseStepPanel._compact_block(panel)
 
     # ── Helpers ─────────────────────────────────────────────────────────
-
-    def _output_path(self) -> Path:
-        txt = self._output_dir.text() or self._input_dir.text()
-        return Path(txt)
 
     def _update_window_title(self) -> None:
         if self._loaded_dataset_dir:
@@ -950,7 +882,6 @@ class MainWindow(QMainWindow):
         self._last_filter_channels = None
         self._last_filter_masks = None
         self._loaded_dataset_dir = None
-        self._loaded_input_dir = None
         self._pending_filters = None
         obj_panel = getattr(self, "_object_profile_panel", None)
         if obj_panel is not None:
@@ -964,8 +895,6 @@ class MainWindow(QMainWindow):
         self._segment_panel.clear_preview()
         self.refresh_step_panels([], [])
         self._input_dir.clear()
-        self._output_dir.clear()
-        self._output_manually_set = False
         self._clear_dataset_info()
         self._update_window_title()
         self._update_tab_status()
@@ -974,7 +903,6 @@ class MainWindow(QMainWindow):
     def _set_running(self, running: bool) -> None:
         self._running = running
         self._input_browse.setEnabled(not running)
-        self._output_browse.setEnabled(not running)
         self._load_dataset_btn.setEnabled(not running)
         for step in self._all_step_panels:
             step.setEnabled(not running)

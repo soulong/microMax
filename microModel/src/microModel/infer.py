@@ -12,8 +12,9 @@ Model mode is detected from the bundle: train bundles carry "state_dict" +
 "num_classes".
 
 DB schema — single `inference` table + lazily-created reduction/cluster
-tables (reduction_<method>, find_cluster), written by vis.show_reduction.
-No _meta, no migrations.
+tables (reduction_<method>, find_cluster), written by run_reduction.
+The table/column names come from microBase.db_contracts (shared with
+microVis and the microProfiler bridge). No _meta, no migrations.
 """
 
 import os
@@ -25,7 +26,25 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from microBase import CellDataset, ImageDataset
+from microBase import CellDataset, ImageDataset, MicroMaxError
+from microBase.db_contracts import (
+    DIRECTORY_COLUMN,
+    FEATURES_COLUMN,
+    FILENAME_COLUMN,
+    GROUND_TRUTH_COLUMN,
+    INFERENCE_TABLE,
+    INFER_DB_NAME,
+    LABEL_COLUMN,
+    MASK_FILENAME_COLUMN,
+    PRED_CLASS_COLUMN,
+    PRED_PROB_COLUMN,
+    PROB_COLUMN_PREFIX,
+    UID_COLUMN,
+    bare_mask_name,
+    canonical_directory,
+    mask_column,
+    reserved_inference_columns,
+)
 
 from .utils import (logger, set_seed, select_device, load_label_csv,
                     resolve_output_paths, copy_config_file,
@@ -35,7 +54,7 @@ from .backbone import load_model_from_bundle, load_ssl_backbone_from_bundle
 
 
 # ----------------------------------------------------------------------------
-# DB schema — single `inference` table + 3 lazily-created reduction tables.
+# DB schema — single `inference` table + lazily-created reduction tables.
 # ----------------------------------------------------------------------------
 
 def _resolve_gt(label_map, label_from_dir, abs_path, file_dir):
@@ -59,36 +78,80 @@ def _to_native(val):
     return val
 
 
+def _reject_reserved_extra_cols(extra_cols, class_names):
+    """Fail loudly when a metadata capture collides with an inference column.
+
+    A regex group named label/pred_class/features/prob_<class>/... would
+    duplicate a base/tail column and make CREATE TABLE or INSERT invalid.
+    """
+    reserved = reserved_inference_columns(class_names)
+    conflicts = [c for c in extra_cols if c in reserved]
+    if conflicts:
+        raise ValueError(
+            f"Metadata column(s) {conflicts} collide with columns the "
+            f"inference table owns — rename the offending regex capture."
+        )
+
+
 def _init_db(conn, mode, extra_cols=None, prob_cols=None):
     """Create the single `inference` table.
+
+    Existing tables whose column set differs are dropped and recreated
+    (no migrations / no backward compatibility): a re-run with changed
+    metadata, classes or mode must never hit an INSERT referencing columns
+    the old table does not have.
 
     prob_cols: per-class probability columns, one REAL column per class in
     class_names order (both single- and multi-label bundles).
     """
     extra_cols = extra_cols or []
     prob_cols = prob_cols or []
-    cols = [
-        "uid INTEGER PRIMARY KEY AUTOINCREMENT",
-        "directory TEXT NOT NULL",
-        "filename TEXT NOT NULL",
+    col_names = [
+        UID_COLUMN, DIRECTORY_COLUMN, FILENAME_COLUMN,
     ]
     if mode == "whole_image":
-        cols.append("mask_filename TEXT")
-        cols.append("label INTEGER NOT NULL DEFAULT 0")
-    cols.append("ground_truth TEXT")
+        col_names.extend([MASK_FILENAME_COLUMN, LABEL_COLUMN])
+    col_names.append(GROUND_TRUTH_COLUMN)
+    col_names.extend(extra_cols)
+    col_names.extend([PRED_CLASS_COLUMN, PRED_PROB_COLUMN])
+    col_names.extend(prob_cols)
+    col_names.append(FEATURES_COLUMN)
+
+    cols = [
+        f"{UID_COLUMN} INTEGER PRIMARY KEY AUTOINCREMENT",
+        f"{DIRECTORY_COLUMN} TEXT NOT NULL",
+        f"{FILENAME_COLUMN} TEXT NOT NULL",
+    ]
+    if mode == "whole_image":
+        cols.append(f"{MASK_FILENAME_COLUMN} TEXT")
+        cols.append(f"{LABEL_COLUMN} INTEGER NOT NULL DEFAULT 0")
+    cols.append(f"{GROUND_TRUTH_COLUMN} TEXT")
     # Metadata/probability column names come from regex captures / class
     # names (arbitrary text, may contain spaces or dots) — quote them all.
     for c in extra_cols:
         cols.append(f"{sql_ident(c)} TEXT")
-    cols.append("pred_class TEXT")
+    cols.append(f"{PRED_CLASS_COLUMN} TEXT")
     # Probability of the pred_class winner only — the full per-class vector
     # lives in the prob_<name> columns.
-    cols.append("pred_prob REAL")
+    cols.append(f"{PRED_PROB_COLUMN} REAL")
     for c in prob_cols:
         cols.append(f"{sql_ident(c)} REAL")
-    cols.append("features BLOB")
+    cols.append(f"{FEATURES_COLUMN} BLOB")
+
+    # Schema evolution: compare the desired column names with the existing
+    # table and rebuild on any mismatch (added metadata, changed class set,
+    # single_cell <-> whole_image, features-only <-> classify).
+    existing = [
+        row[1] for row in conn.execute(f"PRAGMA table_info({INFERENCE_TABLE})")
+    ]
+    if existing and existing != col_names:
+        logger.warning(
+            "inference table schema changed (%s -> %s) — dropping and "
+            "recreating it (no migration)", existing, col_names)
+        conn.execute(f"DROP TABLE {INFERENCE_TABLE}")
+
     col_defs = ", ".join(cols)
-    conn.execute(f"CREATE TABLE IF NOT EXISTS inference ({col_defs})")
+    conn.execute(f"CREATE TABLE IF NOT EXISTS {INFERENCE_TABLE} ({col_defs})")
     conn.commit()
 
 
@@ -128,22 +191,17 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
 
     conn = sqlite3.connect(db_path)
     # One REAL column per class (class_names order) — both label modes.
-    prob_cols = [f"prob_{c}" for c in class_names] if write_pred_class else []
+    prob_cols = (
+        [f"{PROB_COLUMN_PREFIX}{c}" for c in class_names]
+        if write_pred_class else []
+    )
     _init_db(conn, mode, extra_cols, prob_cols)
 
     n = len(meta_rows)
     if write_pred_class and probs_all is not None and n != len(probs_all):
-        print(
-            f"Error: meta_rows length {n} != predictions length {len(probs_all)}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise MicroMaxError(f"Error: meta_rows length {n} != predictions length {len(probs_all)}")
     if write_features and feats_all is not None and n != len(feats_all):
-        print(
-            f"Error: meta_rows length {n} != features length {len(feats_all)}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise MicroMaxError(f"Error: meta_rows length {n} != features length {len(feats_all)}")
 
     # Re-run protection: replace THIS dataset's rows instead of appending.
     # Scoped to the written directories so multiple datasets sharing one
@@ -160,25 +218,27 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
             dirs.add(str(d))
     if has_null_dir:
         conn.execute(
-            "DELETE FROM inference WHERE directory IS NULL OR directory = ''")
+            f"DELETE FROM {INFERENCE_TABLE} WHERE "
+            f"{DIRECTORY_COLUMN} IS NULL OR {DIRECTORY_COLUMN} = ''")
     if dirs:
         ph = ", ".join("?" * len(dirs))
         existing = conn.execute(
-            f"SELECT COUNT(*) FROM inference WHERE directory IN ({ph})",
+            f"SELECT COUNT(*) FROM {INFERENCE_TABLE} WHERE {DIRECTORY_COLUMN} IN ({ph})",
             tuple(dirs)).fetchone()[0]
         if existing:
             logger.warning("inference table already has %d rows for this "
                            "dataset's directories; deleting them "
                            "(rows replaced on re-run)", existing)
-            conn.execute(f"DELETE FROM inference WHERE directory IN ({ph})",
-                         tuple(dirs))
+            conn.execute(
+                f"DELETE FROM {INFERENCE_TABLE} WHERE {DIRECTORY_COLUMN} IN ({ph})",
+                tuple(dirs))
 
-    base_cols = ["directory", "filename"]
+    base_cols = [DIRECTORY_COLUMN, FILENAME_COLUMN]
     if mode == "whole_image":
-        base_cols.append("mask_filename")
-        base_cols.append("label")
-    base_cols.append("ground_truth")
-    tail_cols = ["pred_class", "pred_prob"] + prob_cols + ["features"]
+        base_cols.append(MASK_FILENAME_COLUMN)
+        base_cols.append(LABEL_COLUMN)
+    base_cols.append(GROUND_TRUTH_COLUMN)
+    tail_cols = [PRED_CLASS_COLUMN, PRED_PROB_COLUMN] + prob_cols + [FEATURES_COLUMN]
     all_cols = base_cols + extra_cols + tail_cols
     col_names = ", ".join(sql_ident(c) for c in all_cols)
     placeholders = ", ".join("?" * len(all_cols))
@@ -253,7 +313,7 @@ def _forward_pass(loader, model, device, write_features, classify_mode,
 # ----------------------------------------------------------------------------
 
 def _validate_channel_count(n_avail, channels, meta, data_dir):
-    """Hard-exit if the resolved data channel count mismatches the model's in_chans.
+    """Raise if the resolved data channel count mismatches the model's in_chans.
 
     Mirrors pretrain's in_chans-vs-data.channels check: the model architecture
     is fixed by the channel count it was built with, so a mismatch would
@@ -262,13 +322,9 @@ def _validate_channel_count(n_avail, channels, meta, data_dir):
     resolved = len(channels) if channels is not None else n_avail
     in_chans = meta.get("in_chans")
     if in_chans is not None and resolved != in_chans:
-        print(
-            f"Error: {data_dir}: data channels resolve to {resolved} "
+        raise MicroMaxError(f"Error: {data_dir}: data channels resolve to {resolved} "
             f"(channels={channels}, {n_avail} available) but the model bundle "
-            f"was built with in_chans={in_chans}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            f"was built with in_chans={in_chans}")
 
 
 def _run_single_cell(data_dir, meta, model, device,
@@ -285,16 +341,14 @@ def _run_single_cell(data_dir, meta, model, device,
     cell_ds = CellDataset(data_dir, channel_layout=channel_layout,
                           image_pattern=image_pattern)
     if len(cell_ds) == 0:
-        print(f"Error: no TIFF files found in {data_dir}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: no TIFF files found in {data_dir}")
     _validate_channel_count(len(cell_ds.intensity_colnames), channels, meta, data_dir)
 
     _required_meta = ("augmentation_infer", "normalize_method", "normalize_with_masking",
                       "clip_low", "clip_high", "normalize_fixed_reference")
     _missing = [k for k in _required_meta if k not in meta]
     if _missing:
-        print(f"Error: bundle meta missing required keys: {_missing}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: bundle meta missing required keys: {_missing}")
     augmentation_spec = meta["augmentation_infer"]
     normalize_method = meta["normalize_method"]
     with_masking = meta["normalize_with_masking"]
@@ -302,17 +356,21 @@ def _run_single_cell(data_dir, meta, model, device,
     clip_high = meta["clip_high"]
     fixed_reference = bool(meta["normalize_fixed_reference"])
 
+    class_names = meta.get("class_names", []) if classify_mode else []
     md = cell_ds.metadata
-    _exclude = {"stem", "path", "directory", "channel", "ext", "mask_name"}
+    _exclude = {"stem", "path", "directory", "channel", "ext", "mask_name", "tile"}
     _exclude.update(cell_ds.intensity_colnames)
     extra_cols = [c for c in md.columns if c not in _exclude]
+    _reject_reserved_extra_cols(extra_cols, class_names)
 
     entries = []
     for i in range(len(md)):
         row = md.iloc[i]
         path = row["path"]
         abs_path = os.path.normcase(os.path.abspath(path))
-        file_dir = os.path.dirname(path).replace("\\", "/")
+        # Canonical directory form shared with microProfiler/microVis:
+        # relative to the dataset root, forward slashes.
+        file_dir = canonical_directory(os.path.dirname(path), data_dir)
         gt = _resolve_gt(label_map, label_from_dir, abs_path, file_dir)
         entry = {
             "idx": i,
@@ -358,7 +416,6 @@ def _run_single_cell(data_dir, meta, model, device,
         {k: e.get(k) for k in base_keys + tuple(extra_cols)}
         for e in entries
     ]
-    class_names = meta.get("class_names", []) if classify_mode else []
     return _write_db(db_path, meta_rows, all_logits, all_features,
                      class_names, write_features, extra_cols=extra_cols,
                      mode="single_cell", write_pred_class=write_pred_class,
@@ -385,8 +442,7 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
                       "clip_low", "clip_high", "normalize_fixed_reference")
     _missing = [k for k in _required_meta if k not in meta]
     if _missing:
-        print(f"Error: bundle meta missing required keys: {_missing}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: bundle meta missing required keys: {_missing}")
     augmentation_spec = meta["augmentation_infer"]
     normalize_method = meta["normalize_method"]
     with_masking = meta["normalize_with_masking"]
@@ -400,23 +456,24 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
         image_subdir_pattern=image_subdir_pattern or None,
     )
     if len(image_ds) == 0:
-        print(f"Error: no whole-image + mask pairs found in {data_dir}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: no whole-image + mask pairs found in {data_dir}")
     _validate_channel_count(len(image_ds.intensity_colnames), channels, meta, data_dir)
 
     mask_cols = image_ds.mask_colnames
     if not mask_cols:
-        print(f"Error: no mask columns found in {data_dir}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: no mask columns found in {data_dir}")
     if mask_name_cfg is not None:
-        mask_name = f"mask_{mask_name_cfg}"
+        # Config mask names are BARE ('cell'); tolerate (and normalize) a
+        # caller that passed the internal 'mask_cell' column form.
+        bare = bare_mask_name(mask_name_cfg)
+        if bare != mask_name_cfg:
+            logger.warning("mask_name %r carries the 'mask_' prefix — using %r",
+                           mask_name_cfg, bare)
+        mask_name_cfg = bare
+        mask_name = mask_column(mask_name_cfg)
         if mask_name not in mask_cols:
-            print(
-                f"Error: mask_name '{mask_name_cfg}' -> column '{mask_name}' "
-                f"not found. Available mask columns: {mask_cols}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise MicroMaxError(f"Error: mask_name '{mask_name_cfg}' -> column '{mask_name}' "
+                f"not found. Available mask columns: {mask_cols}")
     else:
         mask_name = mask_cols[0]
     logger.info("Using mask column: %s", mask_name)
@@ -437,7 +494,9 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
             source_path = ds.row_source_path(row_idx)
             abs_path = (os.path.normcase(os.path.abspath(source_path))
                         if source_path else None)
-            file_dir = os.path.dirname(source_path).replace("\\", "/") if source_path else ""
+            file_dir = (
+                canonical_directory(os.path.dirname(source_path), data_dir)
+                if source_path else "")
             gt = _resolve_gt(label_map, label_from_dir, abs_path, file_dir)
             entries.append({"idx": idx, "ground_truth": gt})
         entries = subsample(entries, sample_max, sample_by, seed,
@@ -457,10 +516,12 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
         write_pred_class=write_pred_class, pool_fn=pool_fn)
 
     md = image_ds.metadata
-    _exclude = {"path", "stem", "__file__", "directory", "channel", "ext", "mask_name"}
+    _exclude = {"path", "stem", "__file__", "directory", "channel", "ext", "mask_name", "tile"}
     _exclude.update(image_ds.intensity_colnames)
     _exclude.update(image_ds.mask_colnames)
     extra_cols = [c for c in md.columns if c not in _exclude]
+    class_names = meta.get("class_names", []) if classify_mode else []
+    _reject_reserved_extra_cols(extra_cols, class_names)
 
     meta_rows = []
     for idx in range(len(ds)):
@@ -469,9 +530,19 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
         ch_filenames = ds.row_channel_filenames(row_idx)
         filename_json = json.dumps(ch_filenames)
         mask_fname = ds.row_mask_filename(row_idx)
+        if mask_fname:
+            # Mask path is consumed directly (reduction_vis/reduction contact
+            # sheets) — anchor it now so a relative data.root cannot make it
+            # CWD-dependent later.
+            mask_fname = os.path.abspath(mask_fname).replace("\\", "/")
         source_path = ds.row_source_path(row_idx)
-        abs_path = os.path.abspath(source_path) if source_path else None
-        file_dir = os.path.dirname(source_path).replace("\\", "/") if source_path else ""
+        # normcase matches load_label_csv's key form — without it a drive /
+        # directory case mismatch on Windows silently misses every label.
+        abs_path = (os.path.normcase(os.path.abspath(source_path))
+                    if source_path else None)
+        file_dir = (
+            canonical_directory(os.path.dirname(source_path), data_dir)
+            if source_path else "")
         gt = _resolve_gt(label_map, label_from_dir, abs_path, file_dir)
         meta_entry = {
             "directory": file_dir,
@@ -484,7 +555,6 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
             meta_entry[col] = row.get(col)
         meta_rows.append(meta_entry)
 
-    class_names = meta.get("class_names", []) if classify_mode else []
     return _write_db(db_path, meta_rows, all_logits, all_features,
                      class_names, write_features, extra_cols=extra_cols,
                      mode="whole_image", write_pred_class=write_pred_class,
@@ -509,12 +579,10 @@ def run_inference(config, config_path=None):
 
     model_path = config["model"]
     if not isinstance(model_path, str) or not model_path:
-        print("Error: config 'model' must be a string path to a model bundle "
-              "(train model.pt or SSL model.pt)", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError("Error: config 'model' must be a string path to a model bundle "
+              "(train model.pt or SSL model.pt)")
     if not os.path.exists(model_path):
-        print(f"Error: model not found: {model_path}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: model not found: {model_path}")
 
     logger.info("Loading model from %s", model_path)
     device = select_device()
@@ -535,9 +603,8 @@ def run_inference(config, config_path=None):
         model, feat_dim, pool_fn, meta = load_ssl_backbone_from_bundle(bundle, device)
         logger.info("Features-only mode: feat_dim=%d", feat_dim)
     else:
-        print("Error: bundle has no 'state_dict' key (unsupported pre-0.2.1 "
-              "bundle format)", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError("Error: bundle has no 'state_dict' key (unsupported pre-0.2.1 "
+              "bundle format)")
 
     # What to write (defaults: pred_class = bundle capability, feature = true).
     write_pred_class = bool(inf_cfg.get("pred_class", classify_mode))
@@ -565,13 +632,9 @@ def run_inference(config, config_path=None):
 
     missing = [k for k in required_data_keys if k not in data_cfg]
     if missing:
-        print(
-            f"Error: missing data.* keys in inference config: {missing}. "
+        raise MicroMaxError(f"Error: missing data.* keys in inference config: {missing}. "
             f"All data.* settings must be explicit (null is allowed; "
-            f"missing is not). Required for mode='{mode}': {required_data_keys}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            f"missing is not). Required for mode='{mode}': {required_data_keys}")
 
     data_roots = data_cfg["root"]
     channels_cfg = data_cfg["channels"]
@@ -584,7 +647,7 @@ def run_inference(config, config_path=None):
     sample_by = data_cfg["sample_by"]
 
     output_dir = config.get("output_dir")
-    db_name = inf_cfg.get("db_name", "infer.db")
+    db_name = inf_cfg.get("db_name", INFER_DB_NAME)
     batch_size = inf_cfg.get("batch_size", 128)
     seed = 42
 
@@ -598,8 +661,7 @@ def run_inference(config, config_path=None):
         # A configured-but-missing CSV is a typo — never silently fall back
         # to label_from_dir/NULL ground truth (same policy as train).
         if not os.path.exists(label_csv):
-            print(f"Error: label_csv file not found: {label_csv}", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError(f"Error: label_csv file not found: {label_csv}")
         label_map = load_label_csv(label_csv)
 
     out_pairs = resolve_output_paths(data_roots, output_dir)
@@ -649,11 +711,9 @@ def run_inference(config, config_path=None):
                     sample_max=sample_max, sample_by=sample_by, seed=seed,
                     multi_label=multi_label)
             else:
-                print(f"Error: unknown inference mode: {mode}", file=sys.stderr)
-                sys.exit(1)
+                raise MicroMaxError(f"Error: unknown inference mode: {mode}")
             results.append(path)
         except Exception as e:
-            print(f"Error: inference failed for {data_dir}: {e}", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError(f"Error: inference failed for {data_dir}: {e}")
 
     return results

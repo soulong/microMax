@@ -53,13 +53,13 @@ Console scripts after install:
   inference without it is a hard error.
 
 * The tools talk to each other through **on-disk artifacts**: TIFF images,
-  segmentation masks, `result.db` (profiling, owned by microProfiler, read
+  segmentation masks, `profiler.db` (profiling, owned by microProfiler, read
   by microVis), `infer.db` (predictions/features, owned by microModel), and
   per-dataset `session.yml` (deep-merged by microProfiler and microVis so
   each tool owns its own keys; microModel does NOT use session.yml — it
   reads patterns from its own config files).
 
-* `microProfiler` produces the dataset (TIFFs, masks, `result.db`,
+* `microProfiler` produces the dataset (TIFFs, masks, `profiler.db`,
   `session.yml`) that `microVis` and `microModel` consume. The tools may
   also be used independently: microModel accepts pre-cropped single-cell
   folders (e.g. exported by microVis) or whole-image datasets with masks.
@@ -84,7 +84,7 @@ Console scripts after install:
 
 ## 4. microBase — shared foundation
 
-**Path:** `microMax/microBase/` · **Layout:** flat, 10 modules under
+**Path:** `microMax/microBase/` · **Layout:** flat modules under
 `src/microBase/` (no subpackages).
 
 Module map (overview):
@@ -93,14 +93,16 @@ Module map (overview):
 | ------------------ | ---------------------------------------------------------------------------------------- |
 | `__init__.py`      | Re-exports public names; sets env vars disabling albumentations update/telemetry         |
 | `schema.py`        | Classifies regex-captured columns (structural vs extra); derives `well` from `row`+`col` |
-| `io.py`            | TIFF/mask readers, normalized to `(H, W, C)`; no writers                                 |
+| `io.py`            | TIFF/mask readers, normalized to `(H, W, C)`; raises `ImageReadError`/`DatasetError`; no writers |
 | `cells.py`         | Pure functions for labeled masks: single-cell cropping, per-object edge-pixel ratio        |
-| `config.py`        | YAML load/save + per-dataset `SessionFile` (deep-merge into `session.yml`)               |
-| `augment.py`       | Registry-driven augmentation pipeline over AlbumentationsX                               |
+| `config.py`        | YAML load/save (atomic) + per-dataset `SessionFile` (deep-merge into `session.yml`)       |
+| `augment.py`       | AlbumentationsX pipeline builder (class name -> kwargs, unknown names/kwargs raise)       |
 | `normalize.py`     | Per-channel percentile clip + min-max rescale + optional z-score                         |
 | `image_dataset.py` | Whole-image loader: regex metadata, masks, LRU cache, cell cropping                      |
 | `cell_dataset.py`  | Pre-cropped single-cell TIFF loader (one TIFF per cell)                                  |
 | `patterns.py`      | Default regex patterns for common microscope file layouts                                |
+| `db_contracts.py`  | Shared profiler.db / infer.db table+column names and SQL helpers                          |
+| `errors.py`        | Exception hierarchy (`MicroMaxError`, `ImageReadError`, `ConfigError`, ...)                |
 
 Key concepts:
 
@@ -108,17 +110,26 @@ Key concepts:
   site), supports one-channel-per-file and multi-channel-per-file (CHW/HWC)
   layouts, and offers per-site image loading and per-mask cell cropping. Its
   LRU cache is thread-safe and picklable (so torch DataLoader workers can
-  spawn it on Windows). Missing image files hard-exit; missing mask paths are
-  skipped.
+  spawn it on Windows). Missing/unreadable files raise `ImageReadError`
+  (pipeline quarantine), layout/config mistakes raise `DatasetError` /
+  `ConfigError`, and auto-detection skips unreadable candidates. Missing mask
+  paths are skipped.
 
 * `CellDataset` loads pre-cropped single cells with channels multiplexed
   inside each file.
 
-* `SessionFile` lives at `<dataset>/session.yml` and deep-merges updates so
-  each tool only owns its own keys.
+* `SessionFile` lives at `<dataset>/session.yml`, deep-merges updates so each
+  tool only owns its own keys, and writes atomically (temp + replace).
 
 * All metadata is TEXT end-to-end (regex captures used verbatim); structural
   columns absent from the pattern are simply missing, never defaulted.
+
+* `db_contracts` is the single source of truth for the cross-package DB
+  schema (inference/reduction/find_cluster tables, column prefixes, DR method
+  names, `directory` canonicalization) and for SQL identifier quoting.
+
+* Library code never calls `sys.exit`: everything raises a `MicroMaxError`
+  subclass and only the CLI/GUI boundaries decide how to report it.
 
 **Adding a new shared capability:** add a flat module under `src/microBase/`,
 re-export its public names in `__init__.py`/`__all__`, add a test under
@@ -150,7 +161,7 @@ Package layout (overview):
 * `profiling/` — image-level and object-level feature extraction
   (shape/intensity/radial/granularity/GLCM/correlation) + batch writer.
 
-* `io/` — SQLite wrapper (`Database`) for `result.db`.
+* `io/` — SQLite wrapper (`Database`) for `profiler.db`.
 
 * `gui/` — QApplication bootstrap, main window, `PipelineController`,
   step panels (one per pipeline step), background workers, progress.
@@ -167,10 +178,18 @@ The pipeline:
   by `applied_steps` in `session.yml` (already-applied steps are skipped).
   segment/profile/inference are non-destructive and always re-runnable.
 
+* A missing or unreadable image file **quarantines its metadata row**: every
+  file the row references (all channel files + masks) is deleted and the row
+  is skipped, so the step and the whole run continue instead of hard-exiting.
+  Layout/config mistakes still abort — only genuine I/O/decode failures are
+  treated as broken rows. Inference (microModel) is out of scope: earlier
+  steps normally remove the row from disk before it runs.
+
 * GUI and CLI build the same `PipelineConfig` and drive the same
   `run_pipeline` loop, so behaviour is identical. Every section has a `run`
   flag defaulting to `false` — a minimal YAML never silently runs a
-  destructive step.
+  destructive step. The GUI has a single Input dir (no separate output dir):
+  every artifact is written next to the sources.
 
 * Config is YAML + strict validation (unknown keys raise an error listing the
   valid keys). Metadata-gated steps require their metadata column (zproject
@@ -180,12 +199,13 @@ The pipeline:
   bars/signals for GUI). Workers are cancellable at checkpoints.
 
 * The optional inference step lazily imports microModel to run per-object
-  inference and optional DR reduction / cluster prediction (one reducer
-  pickle of any DR method, or a baseline cluster.pkl that kNN-predicts the
-  find_cluster table), writing a per-block DB under the dataset dir.
+  inference and optional DR reduction / cluster prediction (one or more
+  pre-fitted reducer pickles of any DR mix, and/or a baseline cluster.pkl
+  that kNN-predicts the find_cluster table), writing a per-block DB under
+  the dataset dir.
 
 * Outputs: in-place processed TIFFs, `<stem>_cp_masks_<obj>.png` masks,
-  `result.db` (image + per-object tables), `<dataset>/<output_db>`
+  `profiler.db` (image + per-object tables), `<dataset>/<output_db>`
   (inference), and `session.yml` (applied steps + patterns).
 
 **Adding a new pipeline step:** add a step module exposing
@@ -207,13 +227,21 @@ buttons all drive `run_pipeline` with a section-restricted config.
 Package layout (overview):
 
 * `io/data_module.py` — `DataModule`, the single facade over
-  `microBase.ImageDataset` + `result.db`.
+  `microBase.ImageDataset` + `profiler.db`.
+
+* `io/infer_db.py` — `InferDB`, read-only reader for a microModel `infer.db`
+  (`inference` + `reduction_<method>` + `find_cluster`).
+
+* `io/profiler_db.py` — `ProfilerDB`, read-only reader for a microProfiler
+  `profiler.db` (one reader per open DB tab).
 
 * `widgets/` — image display (thumbnail grid + full-res view), channel
   controls, image filters, well-grid canvas, label annotation panel, pixel
-  info, data view.
+  info, data view, profiler/infer DB plot tabs.
 
-* `processing/` — multi-channel compositing, contrast, mask overlay.
+* `processing/` — multi-channel compositing, contrast, mask overlay; `plotting.py`
+  builds facet-aware matplotlib figures (boxplot / barplot mean±SD / scatter)
+  and exports vector PDFs with editable Type-42 text.
 
 * `worker.py` — background `QRunnable` workers (thumbnail, full-res, crop,
   object export, dataset load).
@@ -239,6 +267,33 @@ Data flow:
   index (`row_idx`), which works for any metadata combination (including
   non-standard datasets without well/field/stack/timepoint).
 
+* The Image panel's filters are labeled with their metadata column names
+  (`field`/`stack`/`timepoint` + extra columns). Both "Color by" dropdowns
+  (well grid and Object Overlay) accept profiler tables, merged Excel metadata
+  and every loaded infer DB column (`<db-stem>/<column>`, directory-scoped
+  with fallback); infer columns also provide object counts when no profiler
+  table does.
+
+* The Data page selects a dataset directory via a line edit (type/browse/drop)
+  and opens read-only plot tabs: `Select Profiler DB` (one or more `profiler.db`
+  files → an object table plotted as boxplot / barplot mean±SD / scatter with
+  X/Y/color/size/facets and palette; X/Y accept every meta + measurement
+  variable, categoricals plotted on level ticks) and `Select Infer DB` (one or
+  more microModel `infer.db` files → DR-method scatter colored/sized by one
+  variable each, filtered to the current dataset). Each selected DB gets its
+  own tab (re-selecting activates it). Every tab has a free-form pandas-
+  expression filter applied before plotting. Plot controls sit in a left column
+  with the interactive canvas on the right (hover shows the point's values,
+  minus the reduction coordinates on infer tabs); all plots export vector PDFs
+  with editable text. PyGwalker is not used.
+
+* Excel plate metadata (`Select Metadata`) is merged by `well` into every open
+  plot tab on **Merge** (no DB write) and un-merged on **Clear**. **Write to
+  DB** persists it additively — missing columns are added with `ALTER TABLE`
+  and rows updated by `well` — in every loaded profiler DB (all tables with a
+  `well` column) and every loaded infer DB (`inference` table), preserving
+  primary keys and BLOB features.
+
 **Adding a new widget:** add the class under `widgets/`, instantiate it in
 `MainWindow.__init__` and wire its signals to private `_on_*` handlers; access
 data through `self._dm`; wrap heavy work in a `QRunnable` under `worker.py`.
@@ -248,8 +303,8 @@ data through `self._dm`; wrap heavy work in a `QRunnable` under `worker.py`.
 ## 7. microModel — SSL pretrain + train + infer
 
 **Path:** `microMax/microModel/` · **Entry:** `micromodel` (CLI subcommands:
-`pretrain`, `train`, `infer`, `augment-vis`, `reduction`,
-`reduction-vis`, `attention-vis`).
+`pretrain`, `train`, `infer`, `deduplication`, `label`, `augment-vis`,
+`reduction`, `reduction-vis`, `attention-vis`).
 
 Additional deps: `lightly` (SSL projection heads/losses), `timm` (backbones +
 ViT rebuild), `pacmap` (PaCMAP/LocalMAP DR).
@@ -258,7 +313,8 @@ Package layout (overview):
 
 * `cli/main.py` — argparse dispatch to the subcommands.
 
-* `pretrain.py` / `train.py` / `infer.py` — the three stage entries.
+* `pretrain.py` / `train.py` / `infer.py` / `deduplication.py` / `label.py` —
+  the five stage entries.
 
 * `backbone.py` — backbone builders (incl. DINOv3 ViT), loss, head,
   model + bundle loaders.
@@ -275,6 +331,9 @@ Package layout (overview):
 * `reduction_vis.py` — Flask server for interactive point inspection (the
   `reduction-vis` command).
 
+* `label.py` — Flask server for interactive multi-label annotation (the
+  `label` command).
+
 * `augment_vis.py` — augmentation preview (the `augment-vis` command).
 
 * `attention_vis.py` — offline attention/patch-similarity PDF from a
@@ -282,6 +341,11 @@ Package layout (overview):
 
 * `plots.py` — training/pretrain monitoring plots shared by the loops and
   the commands above.
+
+* `monitor.py` — MetricsTracker (metrics.csv + TensorBoard sinks) and the
+  DINOv3 training-quality diagnostics (head-collapse / gram-split metrics,
+  patch-similarity + CLS-attention maps) used by the pretrain loop and
+  attention-vis.
 
 * `utils.py` — logging, seed/device, label resolution, reducer pickling.
 
@@ -327,22 +391,55 @@ Design:
   vector is stored in fixed-order `prob_<class>` columns (single-label probs
   are a softmax distribution, multi-label independent per-class sigmoids).
   Probability-descending ordering is a display concern of
-  vis-reduction-interactive, never baked into the DB.
+  reduction-vis, never baked into the DB.
 
 * Bundles carry their meta (channels, normalization, augmentation);
   inference always uses the settings baked into the bundle at training time.
 
-* The only interactive surface is the Flask viewer
-  (`http://127.0.0.1:5000`) for clicking through individual cells in the
-  reduction scatter.
+* Deduplication (`deduplication.py`) prunes redundancy / picks diverse new data over
+  pre-cropped single-cell folders. Teacher-branch features (cached per folder,
+  keyed by bundle + file list) are projected into a whitened-PCA +
+  L2-normalized space (same convention as vis clustering) and selected by
+  radius-coverage greedy: keep a cell only if it lies beyond a radius of the
+  already-kept set — sparse regions keep a floor, dense regions thin out.
+  A previous `selection_state.pkl` seeds an incremental run, so new datasets
+  contribute only latent diversity. Outputs (manifest, curated/ hardlinks,
+  keep_label.csv, plot) never touch the source folders.
+
+* Label (`label.py`) is an interactive multi-label labeling web app
+  over pre-cropped single-cell folders (a project-level single-label
+  mode makes positives mutually exclusive). An SSL or train bundle embeds all
+  cells (deduplication extraction + cache) into a whitened-PCA space where a
+  kNN suggest engine scores every label from the user's positive /
+  explicit-negative exemplars ("never labeled" is never a negative); a
+  classify bundle's per-class probabilities are a second suggestion source.
+  Queues: diverse cold-start (farthest-point), auto-label confirm,
+  per-label ranked, uncertain band, and a review queue whose leave-one-out
+  kNN consistency check ranks already-decided cells whose embedding
+  contradicts their label (suspected mislabels) for re-labeling. Cells are
+  displayed through the bundle's inference preprocessing (uniform square
+  model input, percentile normalization ignoring the zero background).
+  Labels support drag reordering and confirmed deletion; every write hits
+  SQLite immediately, and re-running a save_dir resumes the project (a
+  changed model bundle logs a warning but keeps the human decisions).   `label_export.csv` (`;`-joined multi-labels) feeds train directly —
+  exportable at any time with only a subset annotated. State lives in an
+  append-friendly SQLite DB (`label.db` single-label mode, `label_multiple.db`
+  multi-label mode; label registry, current decisions, full decision log) so
+  re-annotating, adding labels or datasets never destroys prior work;
+  `label_export.csv` (`;`-joined multi-labels) feeds train directly.
+
+* Interactive surfaces are the two Flask viewers: reduction-vis
+  (`http://127.0.0.1:5000`) for clicking through cells in the reduction
+  scatter, and label (same port convention) for labeling them.
 
 **Adding a new SSL method:** create `models/<method>.py` with a model class,
-`build_<method>`, and `train_step`; register it in `models/__init__.py`
-(`_SSL_REGISTRY`, `get_train_step`, `get_criterion`); add a
-`configs/pretrain_<method>.yml` and a `<method>:` config block.
+`build_<method>`, `train_step`, and a criterion factory; register the module in
+`models/__init__.py` (`_SSL_REGISTRY`) and add its criterion branch in
+`get_criterion`; add a `configs/pretrain_<method>.yml` and a `<method>:`
+config block.
 
-**Adding a new augmentation:** register it in `microBase.augment` and
-reference it by name in the config lists — no microModel change needed.
+**Adding a new augmentation:** reference its AlbumentationsX class name in the
+config lists — no microBase/microModel change needed.
 
 ***
 

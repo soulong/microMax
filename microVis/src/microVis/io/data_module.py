@@ -9,6 +9,12 @@ import numpy as np
 import pandas as pd
 from natsort import natsorted
 
+from microBase.db_contracts import (
+    DIRECTORY_COLUMN,
+    WELL_COLUMN,
+    is_numeric_sql_type,
+    sql_ident,
+)
 from microVis.log_utils import get_logger
 
 logger = get_logger("microVis.data_module")
@@ -57,7 +63,7 @@ def _infer_plate_dims(wells: list[str]) -> tuple[int, int]:
 
 
 class DataModule:
-    """Data access layer wrapping microBase ImageDataset + result.db."""
+    """Data access layer wrapping microBase ImageDataset + profiler.db."""
 
     def __init__(
         self,
@@ -143,7 +149,9 @@ class DataModule:
             "SELECT name FROM sqlite_master WHERE type='table'"
         )
         for (tname,) in cursor.fetchall():
-            if tname.startswith("sqlite_"):
+            # sqlite_* are internals; _* are reserved bookkeeping tables
+            # (e.g. microProfiler's _schema_version) — never plot variables.
+            if tname.startswith("sqlite_") or tname.startswith("_"):
                 continue
             cur = self._db_conn.execute(f'PRAGMA table_info("{tname}")')
             self._db_tables[tname] = {row[1]: row[2] for row in cur.fetchall()}
@@ -154,7 +162,7 @@ class DataModule:
         p = Path(db_path)
         if not p.exists():
             raise FileNotFoundError(f"DB file not found: {p}")
-        self.close_db_only()
+        self.close_db()
         self._df_cache.clear()
         self._init_db(p)
 
@@ -233,11 +241,26 @@ class DataModule:
     def get_plate_dims(self) -> tuple[int, int]:
         return _infer_plate_dims(self.get_wells())
 
+    def directory_scopes(self) -> list[str]:
+        """Directory values identifying this dataset in DB `directory` columns.
+
+        DB writers store directories relative to the dataset root with
+        forward slashes, so the dataset's metadata `directory` values are the
+        exact match keys; the absolute dataset dir and "." are included for
+        legacy absolute DBs and root-level files.
+        """
+        scopes = [str(self._root_dir), "."]
+        if self._metadata is not None and DIRECTORY_COLUMN in self._metadata.columns:
+            scopes.extend(
+                str(v) for v in self._metadata[DIRECTORY_COLUMN].dropna().unique()
+            )
+        return scopes
+
     # ── DB access ──────────────────────────────────────────────────
 
     def get_profiling_tables(self) -> dict[str, list[str]]:
         result: dict[str, list[str]] = {}
-        exclude = {"directory", "index"}
+        exclude = {DIRECTORY_COLUMN}
         for tname, cols in self._db_tables.items():
             profiling = [c for c, t in cols.items()
                          if c not in exclude and t.upper() != "BLOB"]
@@ -247,13 +270,12 @@ class DataModule:
 
     def get_profiling_columns(self, table: str) -> list[tuple[str, str, bool]]:
         cols = self._db_tables.get(table, {})
-        exclude = {"directory", "index"}
+        exclude = {DIRECTORY_COLUMN}
         result = []
         for cname, ctype in cols.items():
             if cname in exclude or ctype.upper() == "BLOB":
                 continue
-            is_num = any(k in ctype.upper() for k in ("INT", "REAL", "FLOAT", "NUM"))
-            result.append((cname, ctype, is_num))
+            result.append((cname, ctype, is_numeric_sql_type(ctype)))
         return result
 
     def get_table_df(self, table: str) -> pd.DataFrame | None:
@@ -269,8 +291,9 @@ class DataModule:
             conn = sqlite3.connect(str(self._db_path))
         try:
             cols = self._select_columns(table)
-            col_sql = ", ".join(f'"{c}"' for c in cols) if cols != ["*"] else "*"
-            df = pd.read_sql(f'SELECT {col_sql} FROM "{table}"', conn)
+            col_sql = ", ".join(sql_ident(c) for c in cols) if cols != ["*"] else "*"
+            df = pd.read_sql(
+                f'SELECT {col_sql} FROM {sql_ident(table)}', conn)
             self._df_cache[table] = df
             return df
         except Exception as e:
@@ -290,10 +313,12 @@ class DataModule:
         if temp:
             conn = sqlite3.connect(str(self._db_path))
         try:
-            total = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            total = conn.execute(
+                f'SELECT COUNT(*) FROM {sql_ident(table)}').fetchone()[0]
             cols = self._select_columns(table)
-            col_sql = ", ".join(f'"{c}"' for c in cols) if cols != ["*"] else "*"
-            df = pd.read_sql(f'SELECT {col_sql} FROM "{table}" LIMIT {limit}', conn)
+            col_sql = ", ".join(sql_ident(c) for c in cols) if cols != ["*"] else "*"
+            df = pd.read_sql(
+                f'SELECT {col_sql} FROM {sql_ident(table)} LIMIT {limit}', conn)
             return df, total
         except Exception as e:
             logger.warning("get_table_preview(%s) failed: %s", table, e)
@@ -301,20 +326,6 @@ class DataModule:
         finally:
             if temp:
                 conn.close()
-
-    def write_merged_table(self, table_name: str, df: pd.DataFrame) -> None:
-        """Write a DataFrame to the DB. Opens connection, writes, closes."""
-        _validate_table_name(table_name)
-        if self._db_path is None:
-            raise RuntimeError("No database available")
-        conn = sqlite3.connect(str(self._db_path))
-        try:
-            df.to_sql(table_name, conn, if_exists="replace", index=False)
-            cur = conn.execute(f'PRAGMA table_info("{table_name}")')
-            self._db_tables[table_name] = {row[1]: row[2] for row in cur.fetchall()}
-        finally:
-            conn.close()
-        self.invalidate_table_cache(table_name)
 
     def invalidate_table_cache(self, table: str | None = None) -> None:
         """Clear cached DataFrames. If table is given, clear only that table."""
@@ -333,32 +344,37 @@ class DataModule:
             logger.warning("aggregate: column %s not in table %s, cols=%s",
                            column, table, list(df.columns[:10]))
             return {}
-        if "well" not in df.columns:
+        if WELL_COLUMN not in df.columns:
             logger.warning("aggregate: no 'well' column in table %s, cols=%s",
                            table, list(df.columns))
             return {}
 
         col_type = self._db_tables.get(table, {}).get(column, "")
-        is_num = any(k in col_type.upper() for k in ("INT", "REAL", "FLOAT", "NUM"))
+        is_num = is_numeric_sql_type(col_type)
 
         logger.debug("aggregate: table=%s col=%s is_num=%s method=%s rows=%d",
                      table, column, is_num, method, len(df))
 
         if not is_num:
-            grouped = df.groupby("well")[column].first()
+            grouped = df.groupby(WELL_COLUMN)[column].first()
         elif method == "std":
-            grouped = df.groupby("well")[column].std()
+            grouped = df.groupby(WELL_COLUMN)[column].std()
         elif method == "sum":
-            grouped = df.groupby("well")[column].sum()
+            grouped = df.groupby(WELL_COLUMN)[column].sum()
         else:
-            grouped = df.groupby("well")[column].mean()
+            grouped = df.groupby(WELL_COLUMN)[column].mean()
 
-        result = grouped.dropna().to_dict()
+        # Native Python scalars: the well grid's numeric check handles
+        # numpy too, but native values keep downstream code simple.
+        result = {
+            k: (v.item() if hasattr(v, "item") else v)
+            for k, v in grouped.dropna().to_dict().items()
+        }
         logger.debug("aggregate: result has %d wells", len(result))
         return result
 
     def write_label_table(self, table_name: str, df: pd.DataFrame) -> None:
-        """Write label annotations to a table in result.db.
+        """Write label annotations to a table in profiler.db.
 
         Opens a temporary connection, writes, and closes immediately.
 
@@ -372,6 +388,24 @@ class DataModule:
 
         conn = sqlite3.connect(str(self._db_path))
         try:
+            # Refuse to silently REPLACE a non-label table: the table name is
+            # free-form user input, and a profiler/infer table (e.g. "cell")
+            # must never be dropped because the name collided. A label table
+            # is identified by its well/label/class columns.
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            ).fetchone()
+            if exists:
+                existing_cols = {
+                    row[1] for row in conn.execute(f'PRAGMA table_info("{table_name}")')
+                }
+                if not {"well", "label", "class"} <= existing_cols:
+                    raise RuntimeError(
+                        f"Refusing to replace table '{table_name}': it is not a "
+                        f"label table (expected at least well/label/class, found "
+                        f"{sorted(existing_cols)}). Choose another table name."
+                    )
             df.to_sql(table_name, conn, if_exists="replace", index=False)
             # Update the table schema cache
             cur = conn.execute(f'PRAGMA table_info("{table_name}")')
@@ -515,3 +549,47 @@ def parse_plate_metadata(path: str) -> pd.DataFrame:
             result[col] = converted
 
     return result
+
+
+def merge_metadata(
+    df: pd.DataFrame,
+    metadata: pd.DataFrame | None,
+    key: str = "well",
+) -> pd.DataFrame:
+    """Left-join only the metadata columns missing from *df*.
+
+    Re-merging after a Write-to-DB never duplicates columns (the DB table
+    already carries them), and tables without the join key are returned
+    unchanged.
+    """
+    if df is None or metadata is None:
+        return df
+    if key not in df.columns or key not in metadata.columns:
+        return df
+    missing = [c for c in metadata.columns if c != key and c not in df.columns]
+    if not missing:
+        return df
+    return df.merge(metadata[[key] + missing], on=key, how="left")
+
+
+def aggregate_by_well(
+    df: pd.DataFrame,
+    column: str,
+    method: str = "mean",
+) -> dict:
+    """Reduce a per-object DataFrame to one value per well.
+
+    Numeric columns use the requested method (mean/sum/std); text columns take
+    the first value. Returns {well: value}; missing values are dropped.
+    """
+    if df is None or column not in df.columns or "well" not in df.columns:
+        return {}
+    if not pd.api.types.is_numeric_dtype(df[column]):
+        grouped = df.groupby("well")[column].first()
+    elif method == "std":
+        grouped = df.groupby("well")[column].std()
+    elif method == "sum":
+        grouped = df.groupby("well")[column].sum()
+    else:
+        grouped = df.groupby("well")[column].mean()
+    return grouped.dropna().to_dict()

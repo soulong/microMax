@@ -1,84 +1,36 @@
 from __future__ import annotations
 
-import pandas as pd
-from natsort import natsort_key
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QButtonGroup,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QRadioButton,
-    QTableView,
+    QSizePolicy,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 
-class _PandasTableModel(QAbstractTableModel):
-    """QAbstractTableModel wrapping a pandas DataFrame."""
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self._df = pd.DataFrame()
-
-    def setDataFrame(self, df: pd.DataFrame) -> None:
-        self.beginResetModel()
-        self._df = df
-        self.endResetModel()
-
-    def rowCount(self, parent: QModelIndex | None = None) -> int:
-        return len(self._df)
-
-    def columnCount(self, parent: QModelIndex | None = None) -> int:
-        return len(self._df.columns)
-
-    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
-        if not index.isValid():
-            return None
-        if role == Qt.DisplayRole:
-            val = self._df.iloc[index.row(), index.column()]
-            if isinstance(val, float):
-                return f"{val:.4g}"
-            return str(val)
-        return None
-
-    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):
-        if role != Qt.DisplayRole:
-            return None
-        if orientation == Qt.Horizontal:
-            return str(self._df.columns[section])
-        else:
-            return str(self._df.index[section])
-
-
-class _NatSortProxyModel(QSortFilterProxyModel):
-    """Proxy model with natural sorting (numbers sort correctly)."""
-
-    def lessThan(self, left, right):
-        left_val = self.sourceModel().data(left, Qt.DisplayRole)
-        right_val = self.sourceModel().data(right, Qt.DisplayRole)
-        try:
-            return float(left_val) < float(right_val)
-        except (ValueError, TypeError):
-            return natsort_key(str(left_val)) < natsort_key(str(right_val))
-
-
 class DataView(QWidget):
-    """Data tab: dataset + metadata browsing, table view, PyGwalker integration."""
+    """Data tab: dataset selection + DB plot tabs.
+
+    The dataset directory is a type/browse/drop line edit (same style as
+    microProfiler's Input dir). Two DB selectors open plot tabs in the area
+    below: the profiler DB (profiler.db object tables) and the infer DB
+    (microModel inference/reduction scatter).
+    """
 
     dataset_browse_clicked = Signal()
-    db_browse_clicked = Signal()
     load_dataset_clicked = Signal()
-    pygwalker_open_clicked = Signal()
+    profiler_db_browse_clicked = Signal()
+    infer_db_browse_clicked = Signal()
     metadata_browse_clicked = Signal()
     metadata_merge_clicked = Signal()
     metadata_clear_clicked = Signal()
     write_to_db_clicked = Signal()
-    table_radio_selected = Signal(str)
     reset_clicked = Signal()
 
     def __init__(self, parent: QWidget | None = None):
@@ -86,33 +38,38 @@ class DataView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
-        self.setStyleSheet("QPushButton { font-size: 9pt; padding: 0px 4px; }")
 
-        # ── Row 1: Dataset browse + dataset label + Reset ──
+        # All fixed controls live in one top container whose height is capped
+        # at its size hint: the plot area below absorbs the extra space, so
+        # the controls never drift to the bottom when the page is empty.
+        top = QWidget()
+        top.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(8)
+
+        # ── Row 1: dataset path line edit + browse + Reset ──
         row1 = QHBoxLayout()
         row1.setAlignment(Qt.AlignBottom)
-        self._btn_dataset_browse = QPushButton("Select Dataset Directory")
+        self._dataset_edit = QLineEdit()
+        self._dataset_edit.setPlaceholderText(
+            "Dataset directory — type, browse, or drop a folder here")
+        row1.addWidget(self._dataset_edit, 1)
+
+        self._btn_dataset_browse = QPushButton("Browse...")
         self._btn_dataset_browse.setProperty("class", "primary")
-        self._btn_dataset_browse.setFixedHeight(12)
+        self._btn_dataset_browse.setToolTip("Browse for a dataset directory")
         self._btn_dataset_browse.clicked.connect(self.dataset_browse_clicked)
         row1.addWidget(self._btn_dataset_browse)
 
-        self._dataset_label = QLabel("")
-        self._dataset_label.setStyleSheet("color: #aaaaaa;")
-        self._dataset_label.setAlignment(Qt.AlignBottom)
-        row1.addWidget(self._dataset_label)
-        row1.addStretch()
-
         self._btn_reset = QPushButton("Reset")
         self._btn_reset.setProperty("class", "primary")
-        self._btn_reset.setFixedHeight(12)
         self._btn_reset.setEnabled(False)
         self._btn_reset.clicked.connect(self.reset_clicked)
         row1.addWidget(self._btn_reset)
-        layout.addLayout(row1)
+        top_layout.addLayout(row1)
 
-        # ── Pattern inputs (visible after dataset selected) ──
-        self._pattern_widgets: list[QWidget] = []
+        # ── Pattern inputs (always visible so the button row never moves) ──
 
         # Helper to build a label+input row
         def _pattern_row(label_text: str, placeholder: str) -> tuple[QWidget, QLineEdit]:
@@ -135,141 +92,93 @@ class DataView(QWidget):
             "Image Pattern",
             r"e.g. (?P<field>\d+)...ch(?P<channel>\d+)\.tiff",
         )
-        layout.addWidget(pat1)
-        self._pattern_widgets.append(pat1)
+        top_layout.addWidget(pat1)
 
         pat2, self._pattern_mask_edit = _pattern_row(
             "Mask Pattern",
             r"e.g. ...cp_masks_(?P<mask_name>.+)\.png",
         )
-        layout.addWidget(pat2)
-        self._pattern_widgets.append(pat2)
+        top_layout.addWidget(pat2)
 
         pat3, self._pattern_subdir_edit = _pattern_row(
             "Image Subdir",
             "e.g. Images/  (leave empty to scan root)",
         )
-        layout.addWidget(pat3)
-        self._pattern_widgets.append(pat3)
+        top_layout.addWidget(pat3)
 
-        # ── Button row: Load Dataset + DB select + PyGwalker + db label
-        #    left, metadata buttons right ──
+        # ── Button row: Load Dataset + two DB selectors + metadata actions ──
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 4, 0, 0)
 
         self._btn_load_dataset = QPushButton("Load Dataset")
         self._btn_load_dataset.setProperty("class", "primary")
-        self._btn_load_dataset.setFixedHeight(12)
         self._btn_load_dataset.setEnabled(False)
         self._btn_load_dataset.clicked.connect(self.load_dataset_clicked)
         btn_row.addWidget(self._btn_load_dataset)
 
-        self._btn_db_browse = QPushButton("Select DB")
-        self._btn_db_browse.setProperty("class", "primary")
-        self._btn_db_browse.setFixedHeight(12)
-        self._btn_db_browse.setEnabled(False)
-        self._btn_db_browse.clicked.connect(self.db_browse_clicked)
-        btn_row.addWidget(self._btn_db_browse)
+        self._btn_profiler_db = QPushButton("Select Profiler DB")
+        self._btn_profiler_db.setProperty("class", "primary")
+        self._btn_profiler_db.setEnabled(False)
+        self._btn_profiler_db.setToolTip(
+            "Pick one or more microProfiler profiler.db files (object profiling). "
+            "Each DB opens its own plot tab; you can also drop files on this button.")
+        self._btn_profiler_db.clicked.connect(self.profiler_db_browse_clicked)
+        btn_row.addWidget(self._btn_profiler_db)
 
-        self._btn_pgw_open = QPushButton("Open in PyGwalker")
-        self._btn_pgw_open.setProperty("class", "primary")
-        self._btn_pgw_open.setFixedHeight(12)
-        self._btn_pgw_open.setEnabled(False)
-        self._btn_pgw_open.clicked.connect(self.pygwalker_open_clicked)
-        btn_row.addWidget(self._btn_pgw_open)
-
-        self._db_label = QLabel("")
-        self._db_label.setStyleSheet("color: #aaaaaa;")
-        self._db_label.setAlignment(Qt.AlignBottom)
-        btn_row.addWidget(self._db_label)
+        self._btn_infer_db = QPushButton("Select Infer DB")
+        self._btn_infer_db.setProperty("class", "primary")
+        self._btn_infer_db.setEnabled(False)
+        self._btn_infer_db.setToolTip(
+            "Pick one or more microModel infer.db files (inference + reduction "
+            "tables). Each DB opens its own scatter tab; you can also drop "
+            "files on this button.")
+        self._btn_infer_db.clicked.connect(self.infer_db_browse_clicked)
+        btn_row.addWidget(self._btn_infer_db)
 
         btn_row.addStretch()
 
         self._btn_meta_browse = QPushButton("Select Metadata")
         self._btn_meta_browse.setProperty("class", "primary")
-        self._btn_meta_browse.setFixedHeight(12)
         self._btn_meta_browse.setEnabled(False)
         self._btn_meta_browse.clicked.connect(self.metadata_browse_clicked)
         btn_row.addWidget(self._btn_meta_browse)
 
         self._btn_merge = QPushButton("Merge")
         self._btn_merge.setProperty("class", "primary")
-        self._btn_merge.setFixedHeight(12)
         self._btn_merge.setEnabled(False)
         self._btn_merge.clicked.connect(self.metadata_merge_clicked)
         btn_row.addWidget(self._btn_merge)
 
         self._btn_meta_clear = QPushButton("Clear")
         self._btn_meta_clear.setProperty("class", "primary")
-        self._btn_meta_clear.setFixedHeight(12)
         self._btn_meta_clear.setEnabled(False)
         self._btn_meta_clear.clicked.connect(self.metadata_clear_clicked)
         btn_row.addWidget(self._btn_meta_clear)
 
         self._btn_write_db = QPushButton("Write to DB")
         self._btn_write_db.setProperty("class", "primary")
-        self._btn_write_db.setFixedHeight(12)
         self._btn_write_db.setEnabled(False)
         self._btn_write_db.clicked.connect(self._on_write_to_db)
         btn_row.addWidget(self._btn_write_db)
 
-        layout.addLayout(btn_row)
-        self._pattern_widgets.append(self._btn_load_dataset)
-        self._pattern_widgets.append(self._btn_reset)
+        top_layout.addLayout(btn_row)
 
-        self._set_pattern_visible(False)
+        layout.addWidget(top)
+        # Pin the controls to the top even while the plot tabs are hidden
+        # (an empty hidden tab item must not shift them down/center them).
+        layout.setAlignment(top, Qt.AlignTop)
 
-        # ── Row 3: Table radio buttons ──
-        self._radio_row = QHBoxLayout()
-        self._radio_row.setSpacing(12)
-        self._tables_label = QLabel("Tables")
-        self._tables_label.setStyleSheet("font-weight: bold; color: #7a9aaa;")
-        self._radio_row.addWidget(self._tables_label)
-        self._radio_group = QButtonGroup(self)
-        self._radio_group.setExclusive(True)
-        self._radio_group.idClicked.connect(self._on_radio_clicked)
-        self._radio_container = QWidget()
-        self._radio_container.setLayout(self._radio_row)
-        layout.addWidget(self._radio_container)
-
-        # ── Row 4: Table view ──
-        self._model = _PandasTableModel(self)
-        self._proxy = _NatSortProxyModel(self)
-        self._proxy.setSourceModel(self._model)
-
-        self._table_view = QTableView()
-        self._table_view.setModel(self._proxy)
-        self._table_view.setSortingEnabled(True)
-        self._table_view.setAlternatingRowColors(True)
-        self._table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self._table_view.horizontalHeader().setStretchLastSection(True)
-        self._table_view.setStyleSheet(
-            "QTableView { background-color: #1e1e2e; gridline-color: #333333; }"
-            "QTableView::item { padding: 2px 8px; }"
-            "QHeaderView::section {"
-            "  background-color: #2d2d44; color: #e0e0e0;"
-            "  padding: 4px 8px; border: 1px solid #333333;"
-            "}"
-        )
-        layout.addWidget(self._table_view, 1)
-
-        # ── Row 5: Preview hint ──
-        self._preview_hint = QLabel("")
-        self._preview_hint.setStyleSheet("color: #777777; font-size: 8pt;")
-        self._preview_hint.setVisible(False)
-        layout.addWidget(self._preview_hint)
+        # ── Plot tabs (filled by MainWindow when a DB is selected) ──
+        self._plot_tabs = QTabWidget()
+        self._plot_tabs.setVisible(False)
+        layout.addWidget(self._plot_tabs, 1)
 
     # ── Public methods ─────────────────────────────────────────────────────
-
-    def _set_pattern_visible(self, visible: bool) -> None:
-        for w in self._pattern_widgets:
-            w.setVisible(visible)
 
     def set_patterns(self, image: str, mask: str, subdir: str) -> None:
         self._pattern_image_edit.setText(image)
         self._pattern_mask_edit.setText(mask)
         self._pattern_subdir_edit.setText(subdir)
-        self._set_pattern_visible(True)
         self._btn_load_dataset.setEnabled(True)
         self._btn_reset.setEnabled(True)
 
@@ -280,31 +189,36 @@ class DataView(QWidget):
             self._pattern_subdir_edit.text().strip(),
         )
 
-    # Selector buttons double as drag-and-drop drop targets (wired by
-    # main_window with enable_path_drop); exposed read-only on purpose.
+    # The dataset directory is a type/browse/drop line edit; the browse
+    # button is exposed so MainWindow can wire drag-and-drop onto it too.
+    @property
+    def dataset_path_edit(self) -> QLineEdit:
+        return self._dataset_edit
+
     @property
     def dataset_browse_button(self) -> QPushButton:
         return self._btn_dataset_browse
 
     @property
-    def db_browse_button(self) -> QPushButton:
-        return self._btn_db_browse
+    def profiler_db_browse_button(self) -> QPushButton:
+        return self._btn_profiler_db
+
+    @property
+    def infer_db_browse_button(self) -> QPushButton:
+        return self._btn_infer_db
 
     @property
     def metadata_browse_button(self) -> QPushButton:
         return self._btn_meta_browse
 
-    def set_dataset_label(self, text: str) -> None:
-        self._dataset_label.setText(text)
+    def get_dataset_path(self) -> str:
+        return self._dataset_edit.text().strip()
 
-    def set_db_browse_enabled(self, enabled: bool) -> None:
-        self._btn_db_browse.setEnabled(enabled)
+    def set_dataset_path(self, text: str) -> None:
+        self._dataset_edit.setText(text)
 
     def set_meta_browse_enabled(self, enabled: bool) -> None:
         self._btn_meta_browse.setEnabled(enabled)
-
-    def set_db_label(self, text: str) -> None:
-        self._db_label.setText(text)
 
     def set_metadata_label(self, text: str | None) -> None:
         has_meta = text is not None
@@ -312,100 +226,59 @@ class DataView(QWidget):
         self._btn_meta_clear.setEnabled(has_meta)
         self._btn_write_db.setEnabled(has_meta)
 
-    def set_table_names(self, names: list[str]) -> None:
-        # Clear existing radios (keep the "Tables" label)
-        for btn in self._radio_group.buttons():
-            self._radio_group.removeButton(btn)
-            btn.deleteLater()
-        # Remove everything after the "Tables" label
-        while self._radio_row.count() > 1:
-            item = self._radio_row.takeAt(1)
-            if item.widget():
-                item.widget().deleteLater()
+    def set_db_buttons_enabled(self, enabled: bool) -> None:
+        self._btn_profiler_db.setEnabled(enabled)
+        self._btn_infer_db.setEnabled(enabled)
 
-        self._radio_container.setVisible(bool(names))
-        _rb_style = (
-            "QRadioButton { color: #7a9aaa; border: none; padding: 2px 8px; }"
-            "QRadioButton:checked { background-color: #4a6a7a; color: #e0e0e0;"
-            " border-radius: 3px; }"
-        )
-        for i, name in enumerate(names):
-            rb = QRadioButton(name)
-            rb.setStyleSheet(_rb_style)
-            self._radio_group.addButton(rb, i)
-            self._radio_row.addWidget(rb)
-            if i == 0:
-                rb.setChecked(True)
-        self._radio_row.addStretch()
-        if names:
-            self.table_radio_selected.emit(names[0])
+    # ── Plot tabs ──────────────────────────────────────────────────────────
 
-    def _on_radio_clicked(self, idx: int) -> None:
-        btn = self._radio_group.button(idx)
-        if btn:
-            self.table_radio_selected.emit(btn.text())
-
-    def set_dataframe(self, df: pd.DataFrame) -> None:
-        self._model.setDataFrame(df)
-        self._table_view.resizeColumnsToContents()
-        for col in range(self._model.columnCount()):
-            if self._table_view.columnWidth(col) > 120:
-                self._table_view.setColumnWidth(col, 120)
-
-    def clear_table(self) -> None:
-        self._model.setDataFrame(pd.DataFrame())
-        self._preview_hint.setVisible(False)
-
-    def set_preview_hint(self, total_rows: int | None) -> None:
-        """Show/hide the preview hint label."""
-        if total_rows is not None and total_rows > 20:
-            self._preview_hint.setText(f"Showing top 20 rows (of {total_rows} total)")
-            self._preview_hint.setVisible(True)
+    def show_plot_tab(self, title: str, widget: QWidget) -> None:
+        """Add (or activate) a plot tab. Re-showing the same widget activates
+        its existing tab instead of adding a duplicate."""
+        index = self._plot_tabs.indexOf(widget)
+        if index < 0:
+            index = self._plot_tabs.addTab(widget, title)
         else:
-            self._preview_hint.setVisible(False)
+            self._plot_tabs.setTabText(index, title)
+        self._plot_tabs.setCurrentIndex(index)
+        self._plot_tabs.setVisible(True)
 
-    def set_pygwalker_hint(self, row_count: int, sampled: bool = False) -> None:
-        """Show a hint after sending data to PyGwalker."""
-        if row_count == 0:
-            self._preview_hint.setText("Loading data for PyGwalker...")
-        elif sampled:
-            self._preview_hint.setText(
-                f"PyGwalker: sent {row_count} sampled rows (max 200 per group)"
-            )
-        else:
-            self._preview_hint.setText(
-                f"PyGwalker: sent all {row_count} rows"
-            )
-        self._preview_hint.setVisible(True)
+    def clear_plot_tabs(self) -> None:
+        """Remove and delete every plot tab (dataset change / reset).
 
-    def set_pygwalker_buttons(self, has_tables: bool) -> None:
-        self._btn_pgw_open.setEnabled(has_tables)
+        Each tab is a per-DB widget owned by MainWindow, which drops its
+        references before calling this.
+        """
+        while self._plot_tabs.count():
+            w = self._plot_tabs.widget(0)
+            self._plot_tabs.removeTab(0)
+            if w is not None:
+                w.deleteLater()
+        self._plot_tabs.setVisible(False)
 
     def reset(self) -> None:
         """Reset to initial startup state."""
-        self._dataset_label.setText("")
-        self._db_label.setText("")
-        self._btn_db_browse.setEnabled(False)
+        self._dataset_edit.clear()
         self._pattern_image_edit.clear()
         self._pattern_mask_edit.clear()
         self._pattern_subdir_edit.clear()
-        self._set_pattern_visible(False)
         self._btn_load_dataset.setEnabled(False)
         self._btn_reset.setEnabled(False)
-        self._btn_pgw_open.setEnabled(False)
+        self._btn_profiler_db.setEnabled(False)
+        self._btn_infer_db.setEnabled(False)
         self._btn_meta_browse.setEnabled(False)
         self._btn_merge.setEnabled(False)
         self._btn_meta_clear.setEnabled(False)
         self._btn_write_db.setEnabled(False)
-        self.set_table_names([])
-        self.clear_table()
-        self._preview_hint.setVisible(False)
+        self.clear_plot_tabs()
 
     def _on_write_to_db(self) -> None:
         reply = QMessageBox.question(
             self,
-            "Write to Database",
-            "This will overwrite the existing profiling database with the merged tables.\n\n"
+            "Write Metadata to Databases",
+            "This will add/update the merged metadata columns (matched by well) "
+            "in every loaded profiler DB and infer DB.\n\n"
+            "Existing columns and rows are preserved.\n\n"
             "Are you sure you want to continue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,

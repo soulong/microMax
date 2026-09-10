@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from microBase import augment
+from microBase import augment, ConfigError
 
 
 def test_build_pipeline_empty_returns_none():
@@ -20,30 +20,30 @@ def test_build_pipeline_basic():
     assert len(pipeline.transforms) == 2
 
 
-def test_build_pipeline_unknown_class_exits():
-    with pytest.raises(SystemExit):
+def test_build_pipeline_unknown_class_raises():
+    with pytest.raises(ConfigError):
         augment.build_pipeline([{"NotARealTransform": {}}])
 
 
-def test_build_pipeline_non_transform_class_exits():
+def test_build_pipeline_non_transform_class_raises():
     # Compose exists in albumentations but is not a BasicTransform
-    with pytest.raises(SystemExit):
+    with pytest.raises(ConfigError):
         augment.build_pipeline([{"Compose": {}}])
 
 
-def test_build_pipeline_bad_spec_exits():
-    with pytest.raises(SystemExit):
+def test_build_pipeline_bad_spec_raises():
+    with pytest.raises(ConfigError):
         augment.build_pipeline([{"a": {}, "b": {}}])  # two keys
-    with pytest.raises(SystemExit):
+    with pytest.raises(ConfigError):
         augment.build_pipeline(["not_a_dict"])
 
 
-def test_build_pipeline_unknown_kwargs_exits():
+def test_build_pipeline_unknown_kwargs_raises():
     # AlbumentationsX renamed classic kwargs (Rotate.limit -> angle_range) and
     # silently drops unknown ones, so build_pipeline hard-exits on the warning.
-    with pytest.raises(SystemExit):
+    with pytest.raises(ConfigError):
         augment.build_pipeline([{"Rotate": {"limit": 30, "p": 1.0}}])
-    with pytest.raises(SystemExit):
+    with pytest.raises(ConfigError):
         augment.build_pipeline([{"GaussianBlur": {"blur_limit": [3, 5], "p": 1.0}}])
 
 

@@ -12,7 +12,7 @@ class DatasetService:
         try:
             p = ds.image_path(row_idx, channel)
         except SystemExit as e:
-            # microBase hard-exits (print + sys.exit) when a row is missing
+            # microBase raises MicroMaxError when a row is missing
             # the channel file. Convert to a catchable exception so the GUI
             # pick/preview paths degrade gracefully instead of dying.
             raise FileNotFoundError(

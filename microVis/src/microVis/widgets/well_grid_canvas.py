@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numbers
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -93,10 +95,14 @@ class WellGridCanvas(QWidget):
         palette: str,
         fmt_name: str,
         selected_wells: set[str],
-        metadata_map: dict[str, float | str] | None = None,
+        value_map: dict[str, float | str] | None = None,
         force_redraw: bool = False,
     ) -> None:
-        """Redraw the well grid. Uses incremental update when dimensions are unchanged."""
+        """Redraw the well grid. Uses incremental update when dimensions are unchanged.
+
+        ``value_map`` is a precomputed well→value map (merged Excel metadata or
+        a loaded infer DB); when given, it bypasses ``dm.aggregate``.
+        """
         rows, cols = dm.get_plate_dims()
         fmt_rows, fmt_cols = _get_format_dims(fmt_name)
         rows = max(rows, fmt_rows)
@@ -124,8 +130,8 @@ class WellGridCanvas(QWidget):
         if col_val and col_val[0] is not None and table_name:
             col_name, is_numeric = col_val
             self._col_name = col_name
-            if metadata_map is not None:
-                data_map = metadata_map
+            if value_map is not None:
+                data_map = value_map
             else:
                 try:
                     data_map = dm.aggregate(table_name, col_name, agg)
@@ -141,7 +147,9 @@ class WellGridCanvas(QWidget):
         cat_to_color = {}
 
         if has_data and is_numeric:
-            numeric_vals = [v for v in data_map.values() if isinstance(v, (int, float))]
+            # numbers.Real includes numpy integer/float scalars (np.int64 is
+            # NOT an int; Excel metadata and sum aggregations produce them).
+            numeric_vals = [v for v in data_map.values() if isinstance(v, numbers.Real)]
             if numeric_vals:
                 vmin = min(numeric_vals)
                 vmax = max(numeric_vals)
@@ -168,7 +176,7 @@ class WellGridCanvas(QWidget):
                 y_vals.append(r + 1)
                 if has_data and well in data_map:
                     val = data_map[well]
-                    if is_numeric and isinstance(val, (int, float)):
+                    if is_numeric and isinstance(val, numbers.Real):
                         color_list.append(cmap_obj(norm(val)))
                     elif not is_numeric:
                         color_list.append(cat_to_color.get(str(val), "#3a3a5a"))

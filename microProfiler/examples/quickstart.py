@@ -16,7 +16,7 @@ from microProfiler.profiling.image_profiler import profile_images
 from microProfiler.profiling.object_profiler import profile_objects
 
 DATA_DIR = Path(r"/path/to/unified/images")
-OUTPUT_DB = DATA_DIR / "result.db"
+OUTPUT_DB = DATA_DIR / "profiler.db"
 MODEL_PATH = Path(r"/path/to/model.pt")
 INFER_DB = DATA_DIR / "infer.db"
 
@@ -47,7 +47,7 @@ profile_objects(
         intensity_channels=ds.intensity_colnames,
         radial_channels=ds.intensity_colnames,
         radial_bins=4,
-        gran_channels=ds.intensity_colnames,
+        granularity_channels=ds.intensity_colnames,
         glcm_channels=ds.intensity_colnames,
         glcm_distances=[2],
         correlation_pairs=[[ds.intensity_colnames[0], ds.intensity_colnames[1]]]

@@ -23,7 +23,12 @@ from skimage.transform import rescale, resize
 from tqdm import tqdm
 
 from microBase import ImageDataset
-from microProfiler.io import read_image, read_image_shape
+from microProfiler.io import (
+    ImageReadError,
+    quarantine_row,
+    read_image,
+    read_image_shape,
+)
 from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
 
 logger = logging.getLogger(__name__)
@@ -34,12 +39,13 @@ def merge_channels(
     method: str = "mean",
     resize_factor: float = 1.0,
 ) -> np.ndarray:
-    """Read and merge a list of images into a single 2D array."""
+    """Read and merge a list of images into a single 2D array.
+
+    Strict reads: a missing/unreadable file raises ImageReadError so the
+    per-row caller can quarantine the row.
+    """
     imgs = [read_image(p) for p in paths]
     stacked = np.stack(imgs, axis=0)
-
-    if stacked.ndim == 4:
-        stacked = np.mean(stacked, axis=3, keepdims=False)
 
     if method == "mean":
         merged = np.mean(stacked, axis=0)
@@ -258,6 +264,9 @@ def segment_dataset(
             continue
         src_path = Path(stem_val)
         if not src_path.exists():
+            # The source file is gone — the whole row is unusable, so delete
+            # its remaining files (channels + masks) and skip it.
+            quarantine_row(ds, idx, f"missing {src_path.name}")
             summary["skipped"] += 1
             summary["errors"].append(f"Source not found: {src_path.name}")
             continue
@@ -320,6 +329,12 @@ def segment_dataset(
             summary["processed"] += 1
             summary["masks_saved"] += 1
 
+        except ImageReadError as e:
+            # Broken/missing channel file: quarantine the whole row and skip —
+            # not a segmentation failure (nothing ran).
+            quarantine_row(ds, idx, str(e))
+            summary["skipped"] += 1
+            summary["errors"].append(f"Broken image on {src_path.name}: {e}")
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             summary["failed"] += 1

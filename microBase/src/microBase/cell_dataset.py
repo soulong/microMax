@@ -10,7 +10,6 @@ Optional `image_pattern` parses each filename to extract metadata columns
 infer single_cell mode where per-cell metadata is written to the DB.
 """
 
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +17,7 @@ import pandas as pd
 from natsort import natsorted
 
 from . import io as _io
+from .errors import ConfigError, DataError, DatasetError
 from .schema import MetadataSchema
 
 
@@ -43,14 +43,11 @@ class CellDataset:
     ):
         self.root = Path(root)
         if not self.root.exists():
-            print(f"Error: CellDataset root not found: {self.root}", file=sys.stderr)
-            sys.exit(1)
+            raise DatasetError(f"CellDataset root not found: {self.root}")
         if channel_layout not in (None, "CHW", "HWC"):
-            print(
-                f"Error: channel_layout must be None, 'CHW' or 'HWC', got '{channel_layout}'",
-                file=sys.stderr,
+            raise ConfigError(
+                f"channel_layout must be None, 'CHW' or 'HWC', got '{channel_layout}'"
             )
-            sys.exit(1)
         self.channel_layout = channel_layout
         self._image_pattern = (
             _io.compile_pattern(image_pattern, "image_pattern") if image_pattern else None
@@ -175,11 +172,7 @@ class CellDataset:
             (H, W, C) array.
         """
         if idx < 0 or idx >= len(self._metadata):
-            print(
-                f"Error: cell index {idx} out of range (0..{len(self)-1})",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise DataError(f"cell index {idx} out of range (0..{len(self)-1})")
         path = self._metadata.iloc[idx]["path"]
         n_channels = len(self._intensity_colnames)
         channels_list = list(range(1, n_channels + 1))

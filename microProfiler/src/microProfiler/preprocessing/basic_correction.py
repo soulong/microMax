@@ -18,7 +18,14 @@ import pandas as pd
 from tqdm import tqdm
 
 from microBase import ImageDataset
-from microProfiler.io import read_image, write_image, rebuild_dataset
+from microProfiler.io import (
+    ImageReadError,
+    quarantine_row,
+    read_image,
+    read_image_shape,
+    rebuild_dataset,
+    write_image,
+)
 
 # Force JAX onto CPU for BaSiC fit/transform. Must run before importing the
 # vendored basic package (which imports jax) so the GPU backend never
@@ -34,32 +41,22 @@ logger = logging.getLogger(__name__)
 
 
 def basic_fit(
-    image_paths: List[Path],
-    n_image: int = 100,
+    images: List[np.ndarray],
     enable_darkfield: bool = False,
     working_size: int = 64,
-    seed: int = 42,
 ) -> BaSiC:
-    """Fit BaSiC model on a set of images.
+    """Fit BaSiC model on pre-read images.
 
-    Defaults match BasicConfig.n_image (100) and the GUI's default, so a
-    direct call and a config-driven run fit on the same sample size.
-
-    When subsampling (len(image_paths) > n_image), a fixed seed keeps the
-    fit reproducible across runs (the fitted flatfield/darkfield — and every
-    downstream profile value — would otherwise vary run to run).
+    Reading and sampling happen in ``fit_models`` so a broken file can
+    quarantine its metadata row before the fit — this function only ever sees
+    arrays.
     """
-    if len(image_paths) > n_image:
-        rng = random.Random(seed)
-        image_paths = rng.sample(image_paths, k=n_image)
-
-    imgs = [read_image(p) for p in image_paths]
-    shapes = {img.shape for img in imgs}
+    shapes = {img.shape for img in images}
     if len(shapes) > 1:
         raise ValueError(
             f"BaSiC fit requires uniform image shapes, got {len(shapes)} different shapes: {shapes}"
         )
-    imgs = np.stack(imgs)
+    imgs = np.stack(images)
     basic = BaSiC(
         get_darkfield=enable_darkfield,
         smoothness_flatfield=1,
@@ -82,7 +79,9 @@ def fit_models(
 ) -> Path:
     """Fit BaSiC models for specified channels.
 
-    Defaults match BasicConfig.n_image (100) and the GUI's default.
+    Defaults match BasicConfig.n_image (100) and the GUI's default. Missing
+    or unreadable images quarantine their metadata row (all row files are
+    deleted) instead of aborting the run.
     """
     channels = channels or ds.intensity_colnames
     metadata = ds.metadata
@@ -95,18 +94,41 @@ def fit_models(
     fitted_any = False
     for ci, chan in enumerate(channels):
         progress.report("basic", ci, len(channels), f"Fit: channel {chan}")
-        paths = [
-            Path(metadata.iloc[i][chan])
-            for i in range(len(metadata))
-            if pd.notna(metadata.iloc[i][chan])
-        ]
-        paths = [p for p in paths if p.exists()]
-        if not paths:
+        # (row_idx, path) pairs keep the row context needed to quarantine a
+        # broken file; missing files quarantine their row immediately.
+        entries = []
+        for i in range(len(metadata)):
+            value = metadata.iloc[i][chan]
+            if pd.isna(value):
+                continue
+            path = Path(value)
+            if not path.exists():
+                quarantine_row(ds, i, f"missing {path.name}")
+                continue
+            entries.append((i, path))
+        if not entries:
             logger.warning("No existing files for channel %s, skipping", chan)
             continue
 
+        # When subsampling, a fixed seed keeps the fit reproducible across
+        # runs (the fitted flatfield/darkfield — and every downstream profile
+        # value — would otherwise vary run to run).
+        if len(entries) > n_image:
+            rng = random.Random(42)
+            entries = rng.sample(entries, k=n_image)
+
+        images = []
+        for row_idx, path in entries:
+            try:
+                images.append(read_image(path))
+            except ImageReadError as e:
+                quarantine_row(ds, row_idx, str(e))
+        if not images:
+            logger.warning("No readable files for channel %s, skipping", chan)
+            continue
+
         fitted_any = True
-        model = basic_fit(paths, n_image, enable_darkfield, working_size)
+        model = basic_fit(images, enable_darkfield, working_size)
 
         with open(model_dir / f"{chan}.pkl", "wb") as f:
             pickle.dump(model, f)
@@ -157,18 +179,23 @@ def transform_images(
         with open(model_path, "rb") as f:
             model = pickle.load(f)
 
-        paths = [
-            Path(metadata.iloc[i][chan])
+        # (row_idx, path) pairs keep the row context needed to quarantine a
+        # broken/missing file — every row file is deleted and the row skipped.
+        entries = [
+            (i, Path(metadata.iloc[i][chan]))
             for i in range(len(metadata))
             if pd.notna(metadata.iloc[i][chan])
         ]
-        missing = [p for p in paths if not p.exists()]
-        if missing:
-            logger.warning("Skipping %d missing file(s) for channel %s", len(missing), chan)
-        paths = [p for p in paths if p.exists()]
 
-        for src in tqdm(paths, desc=f"BaSiC transform {chan}", unit="img"):
-            img = read_image(src)
+        for row_idx, src in tqdm(entries, desc=f"BaSiC transform {chan}", unit="img"):
+            if not src.exists():
+                quarantine_row(ds, row_idx, f"missing {src.name}")
+                continue
+            try:
+                img = read_image(src)
+            except ImageReadError as e:
+                quarantine_row(ds, row_idx, str(e))
+                continue
             corrected = model.transform(img[None, ...])[0]
             dtype_in = img.dtype
             if dtype_in == np.uint16:
@@ -184,32 +211,40 @@ def transform_images(
 
 
 def _validate_shapes(ds: ImageDataset, n_image: int = 100) -> None:
-    """Validate that all channel images have consistent shapes."""
+    """Validate that all readable channel images have consistent shapes.
+
+    A missing/unreadable file quarantines its row (all row files deleted)
+    instead of aborting; only genuinely inconsistent shapes raise.
+    """
     channels = ds.intensity_colnames
     metadata = ds.metadata
-    sample_paths: List[Path] = []
+    sample: List[tuple] = []
     for chan in channels:
         # Channel columns hold absolute file paths (microBase convention) —
         # never join them with the (root-relative) directory column.
-        paths = [
-            Path(metadata.iloc[i][chan])
+        entries = [
+            (i, Path(metadata.iloc[i][chan]))
             for i in range(len(metadata))
             if pd.notna(metadata.iloc[i].get(chan))
         ]
-        paths = [p for p in paths if p.exists()]
-        if paths:
-            sample_paths.extend(paths[:n_image])
-    from microProfiler.io import read_image_shape
-    if sample_paths:
-        first_shape = read_image_shape(sample_paths[0])
-        for p in sample_paths[1:]:
-            shape = read_image_shape(p)
-            if shape != first_shape:
-                raise ValueError(
-                    f"BaSiC requires uniform image shapes across all channels. "
-                    f"Got {first_shape} and {shape} for {p.name}. "
-                    "This is checked before any processing begins."
-                )
+        sample.extend(entries[:n_image])
+    first_shape = None
+    first_name = None
+    for row_idx, path in sample:
+        try:
+            shape = read_image_shape(path)
+        except ImageReadError as e:
+            quarantine_row(ds, row_idx, str(e))
+            continue
+        if first_shape is None:
+            first_shape = shape
+            first_name = path.name
+        elif shape != first_shape:
+            raise ValueError(
+                f"BaSiC requires uniform image shapes across all channels. "
+                f"Got {first_shape} ({first_name}) and {shape} ({path.name}). "
+                "This is checked before any processing begins."
+            )
 
 
 def apply_basic(

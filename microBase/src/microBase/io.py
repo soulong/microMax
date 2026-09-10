@@ -7,43 +7,57 @@ Three channel layouts supported:
 
 All readers return arrays in (H, W, C) layout to callers.
 
+Missing/unreadable files raise :class:`ImageReadError` (the pipeline
+quarantines the broken row and continues); layout/shape/config mistakes raise
+:class:`DatasetError` / :class:`ConfigError` so they are never mistaken for a
+corrupt file. No reader calls ``sys.exit``.
+
 Writing is intentionally NOT provided here: microProfiler writes with its
 own zlib-compressed writer, and there is no other writer consumer.
 """
 
 import re
-import sys
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 from tifffile import TiffFile
 
+from microBase.errors import ConfigError, DatasetError, ImageReadError
+
+__all__ = [
+    "ImageReadError",
+    "compile_pattern",
+    "detect_tiff_properties",
+    "normalize_tiff_array",
+    "read_image",
+    "read_tiff_channels",
+    "read_mask",
+]
+
 
 def _coerce_path(path):
     return Path(path) if not isinstance(path, Path) else path
 
 
-def _read_or_exit(path, what="image"):
-    """Read a file with PIL, hard-exiting on missing file or read failure.
+def _read_or_raise(path, what="image"):
+    """Read a file with PIL; missing/unreadable files raise ImageReadError.
 
     Error messages keep the caller's terminology via ``what`` (e.g. "image",
     "mask").
     """
     path = _coerce_path(path)
     if not path.exists():
-        print(f"Error: {what} file not found: {path}", file=sys.stderr)
-        sys.exit(1)
+        raise ImageReadError(path, f"{what} file not found: {path}")
     try:
         with Image.open(path) as im:
             return np.array(im)
     except Exception as e:
-        print(f"Error: failed to read {what} {path}: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise ImageReadError(path, f"failed to read {what} {path}: {e}") from e
 
 
 def compile_pattern(pattern, name="image_pattern"):
-    """Compile a regex pattern, hard-exiting on invalid regex.
+    """Compile a regex pattern; invalid regex raises ConfigError.
 
     None passes through; compiled `re.Pattern` instances are returned as-is.
     """
@@ -54,8 +68,7 @@ def compile_pattern(pattern, name="image_pattern"):
     try:
         return re.compile(pattern)
     except re.error as e:
-        print(f"Error: invalid regex for {name}: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise ConfigError(f"invalid regex for {name}: {e}") from e
 
 
 def detect_tiff_properties(path, channel_layout):
@@ -69,11 +82,7 @@ def detect_tiff_properties(path, channel_layout):
         with TiffFile(path) as tif:
             arr = tif.asarray()
     except Exception as e:
-        print(
-            f"Error: failed to read first TIFF for shape detection {path}: {e}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise ImageReadError(path, f"failed to read TIFF {path}: {e}") from e
     img_shape, n_channels, arr = normalize_tiff_array(arr, channel_layout, path)
     return img_shape, n_channels, arr.dtype
 
@@ -83,7 +92,7 @@ def normalize_tiff_array(arr, channel_layout, path=None):
 
     Returns (img_shape_2d, n_channels, squeezed_arr) — the canonical
     (shape, n_channels, extra) contract shared with detect_tiff_properties.
-    Exits with error if the array shape doesn't match the expected layout.
+    A shape that does not match the layout raises DatasetError.
     """
     where = f" at {path}" if path else ""
 
@@ -93,28 +102,32 @@ def normalize_tiff_array(arr, channel_layout, path=None):
         elif arr.ndim == 3 and arr.shape[-1] == 1:
             arr = arr[:, :, 0]
         if arr.ndim != 2:
-            print(
-                f"Error: channel_layout=None expects 2D TIFF, got shape "
-                f"{arr.shape}{where}",
-                file=sys.stderr,
+            raise DatasetError(
+                f"channel_layout=None expects 2D TIFF, got shape {arr.shape}{where}"
             )
-            sys.exit(1)
         return arr.shape, 1, arr
 
-    if arr.ndim == 4 and arr.shape[-1] == 1:
-        arr = arr.squeeze(-1)
-    if arr.ndim != 3:
-        print(
-            f"Error: {channel_layout} TIFF expected 3D array, got shape "
-            f"{arr.shape}{where}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     if channel_layout == "CHW":
+        if arr.ndim == 4 and arr.shape[-1] == 1:
+            arr = arr.squeeze(-1)
+        if arr.ndim != 3:
+            raise DatasetError(
+                f"{channel_layout} TIFF expected 3D array, got shape {arr.shape}{where}"
+            )
         return arr.shape[1:], arr.shape[0], arr
-    else:  # HWC
+
+    if channel_layout == "HWC":
+        if arr.ndim == 4 and arr.shape[0] == 1:
+            arr = arr[0]
+        if arr.ndim != 3:
+            raise DatasetError(
+                f"{channel_layout} TIFF expected 3D array, got shape {arr.shape}{where}"
+            )
         return arr.shape[:2], arr.shape[-1], arr
+
+    raise ConfigError(
+        f"channel_layout must be None, 'CHW' or 'HWC', got '{channel_layout}'"
+    )
 
 
 def read_image(path):
@@ -123,11 +136,11 @@ def read_image(path):
     Uses PIL for format-agnostic reading. Multi-channel PACKED files
     (RGB/RGBA, last axis 3-4) are reduced to their first channel. Any other
     3D shape (e.g. a (C, H, W) multi-page TIFF fed to the one-channel-per-file
-    path) is a layout mistake and hard-exits instead of being silently
-    mis-sliced. Callers wanting multi-channel data should use
+    path) is a layout mistake and raises DatasetError instead of being
+    silently mis-sliced. Callers wanting multi-channel data should use
     `read_tiff_channels` (TIFF-only).
     """
-    arr = _read_or_exit(path, "image")
+    arr = _read_or_raise(path, "image")
     if arr.ndim == 3:
         # single-channel file but stored as (1, H, W) or (H, W, 1) — squeeze
         if arr.shape[0] == 1:
@@ -138,19 +151,15 @@ def read_image(path):
             # RGB/RGBA — take first channel
             arr = arr[:, :, 0]
         else:
-            print(
-                f"Error: single-channel image reader got a {arr.shape} array "
-                f"at {path} — this looks like a multi-channel (CHW?) file; "
-                f"use read_tiff_channels / set channel_layout instead.",
-                file=sys.stderr,
+            raise DatasetError(
+                f"single-channel image reader got a {arr.shape} array at {path} "
+                f"— this looks like a multi-channel (CHW?) file; use "
+                f"read_tiff_channels / set channel_layout instead."
             )
-            sys.exit(1)
     if arr.ndim != 2:
-        print(
-            f"Error: expected single-channel image, got shape {arr.shape} at {path}",
-            file=sys.stderr,
+        raise DatasetError(
+            f"expected single-channel image, got shape {arr.shape} at {path}"
         )
-        sys.exit(1)
     return arr
 
 
@@ -162,49 +171,43 @@ def read_tiff_channels(path, channels, channel_layout="CHW"):
         None  : file is 2D single-channel; `channels` must be exactly [1].
         "CHW" : pages/axes interpreted as (C, H, W).
         "HWC" : last axis is C, axes interpreted as (H, W, C).
+    Missing/unreadable files raise ImageReadError; argument/layout mistakes
+    raise ConfigError / DatasetError.
     """
     path = _coerce_path(path)
     if not path.exists():
-        print(f"Error: TIFF file not found: {path}", file=sys.stderr)
-        sys.exit(1)
+        raise ImageReadError(path, f"TIFF file not found: {path}")
     if channel_layout not in (None, "CHW", "HWC"):
-        print(
-            f"Error: channel_layout must be None, 'CHW' or 'HWC', got '{channel_layout}'",
-            file=sys.stderr,
+        raise ConfigError(
+            f"channel_layout must be None, 'CHW' or 'HWC', got '{channel_layout}'"
         )
-        sys.exit(1)
     if not channels:
-        # §3.19: at the library level an empty channel list is an error (the
+        # At the library level an empty channel list is an error (the
         # pipeline is the only place where empty channels mean "skip").
-        raise ValueError(f"channels list must not be empty at {path}")
+        raise ConfigError(f"channels list must not be empty at {path}")
     try:
         with TiffFile(path) as tif:
             arr = tif.asarray()
     except Exception as e:
-        print(f"Error: failed to read TIFF {path}: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise ImageReadError(path, f"failed to read TIFF {path}: {e}") from e
 
     _, n_channels, arr = normalize_tiff_array(arr, channel_layout, path)
 
     if channel_layout is None:
         if list(channels) != [1]:
-            print(
-                f"Error: channel_layout=None only supports channels=[1], got {channels} "
-                f"at {path}",
-                file=sys.stderr,
+            raise ConfigError(
+                f"channel_layout=None only supports channels=[1], got {channels} "
+                f"at {path}"
             )
-            sys.exit(1)
         return arr[:, :, None]
 
     idx = [c - 1 for c in channels]
     for i in idx:
         if i < 0 or i >= n_channels:
-            print(
-                f"Error: channel index out of range (got {channels}, "
-                f"file has {n_channels} channels) at {path}",
-                file=sys.stderr,
+            raise DatasetError(
+                f"channel index out of range (got {channels}, "
+                f"file has {n_channels} channels) at {path}"
             )
-            sys.exit(1)
     if channel_layout == "CHW":
         return np.transpose(arr[idx], (1, 2, 0))
     else:  # HWC
@@ -212,9 +215,12 @@ def read_tiff_channels(path, channels, channel_layout="CHW"):
 
 
 def read_mask(path):
-    """Read a mask file (PNG or TIFF). Returns 2D integer array (H, W)."""
-    arr = _read_or_exit(path, "mask")
+    """Read a mask file (PNG or TIFF). Returns 2D integer array (H, W).
+
+    Missing/unreadable files raise ImageReadError.
+    """
+    arr = _read_or_raise(path, "mask")
     if arr.ndim == 3:
-        # RGB mask — reduce to labels by taking first channel or luminance
+        # RGB mask — reduce to labels by taking first channel
         arr = arr[:, :, 0]
     return arr

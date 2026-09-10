@@ -15,16 +15,16 @@ microMax/
 
 | Package | Version | Console script |
 |---|---|---|
-| microBase | 0.9.1 | — (library) |
-| microProfiler | 1.6.3 | `microprofiler` |
-| microVis | 1.2.1 | `microvis` |
-| microModel | 0.9.0 | `micromodel` |
+| microBase | 0.11.0 | — (library) |
+| microProfiler | 1.10.1 | `microprofiler` |
+| microVis | 1.3.1 | `microvis` |
+| microModel | 0.10.1 | `micromodel` |
 
 - `microBase` is the only shared dependency — the three consumers never
   import each other (the one documented exception: microProfiler lazily
   imports microModel for its optional per-object inference step).
 - The three tools talk to each other through on-disk artifacts: TIFFs,
-  masks, `result.db`, `infer.db`, and per-dataset `session.yml`.
+  masks, `profiler.db`, `infer.db`, and per-dataset `session.yml`.
 
 ---
 
@@ -68,9 +68,9 @@ git clone https://github.com/soulong/microMax.git
 cd microMax
 
 python -m pip install -e microBase
-python -m pip install -e microModel
 python -m pip install -e microProfiler
 python -m pip install -e microVis
+python -m pip install -e microModel
 ```
 
 
@@ -107,7 +107,7 @@ Five-page flow: **Input → Pre-process → Segment → Profile → Inference**.
 4. **Profile** — choose image-level intensity features and per-object
    features (shape, intensity, radial profiles, granularity, GLCM,
    correlations), then **Run Profiling**. Results go into
-   `<dataset>/result.db` (tables `image`, plus one table per object type).
+   `<dataset>/profiler.db` (tables `image`, plus one table per object type).
    The image-profiling step requires at least one selected channel — an
    empty selection skips the step.
 5. **Inference** (optional, needs `microModel` installed) — add one block
@@ -134,37 +134,80 @@ microvis D:\data\plate1
 
 Typical flow:
 
-1. **Select Dataset Directory** (Browse), then **Load Dataset** to scan the
-   images and load their profiling results from `result.db`.
-2. Inspect images: thumbnail grid, well-plate grid, filters on well/field/
+1. Type, browse, or drop the dataset directory, then **Load Dataset** to scan
+   the images.
+2. **Select Profiler DB** (one or more `profiler.db` files) and/or **Select
+   Infer DB** (one or more `infer.db` files): each opens its own plot tab
+   (boxplot / barplot mean±SD / scatter over any profiler table; DR-method
+   scatter for infer) with a free-form pandas-expression filter. Plots export
+   vector PDFs with editable text.
+3. **Select Metadata** (Excel) then **Merge** to use the plate metadata columns
+   in every open plot tab (**Clear** removes it); **Write to DB** adds the
+   metadata columns to every loaded profiler and infer DB.
+4. Inspect images: thumbnail grid, well-plate grid, filters on well/field/
    stack/timepoint and any extra metadata columns, per-channel color and
-   contrast controls, full-resolution zoom, pixel readout.
-3. Pick a mask from the **Select object** dropdown (Object Overlay panel) to
+   contrast controls, full-resolution zoom, pixel readout. Both **Color by**
+   dropdowns (well grid and Object Overlay) accept profiler tables, merged
+   Excel metadata and loaded infer-DB columns (e.g. `pred_class`).
+5. Pick a mask from the **Select object** dropdown (Object Overlay panel) to
    see cell outlines and hover over individual objects.
-4. **Annotate**: drag objects onto class boxes to label them. Labels can be
-   written back to `result.db`.
-5. **Export**: exports the selected class's objects as multi-channel cell
+6. **Annotate**: drag objects onto class boxes to label them. Labels can be
+   written back to `profiler.db`.
+7. **Export**: exports the selected class's objects as multi-channel cell
    TIFFs (ImageJ-compatible, one file per cell) plus a `{mask_name}.csv`
    manifest — ready to feed `microModel` training.
 
 ### microModel — SSL pretrain / train / infer
 
-All commands are config-driven (`micromodel <subcommand> --config <file>`):
+All commands are config-driven: `micromodel <subcommand> --config <file>`.
+Example profiles for every mode live in `microModel/configs/`; paths inside
+a config resolve relative to the directory you launch from.
 
 ```
-micromodel pretrain --config configs/pretrain_dinov3_phase1.yml  # SSL backbone (DINOv3)
-micromodel augment-vis --config configs/pretrain_dinov3_phase1.yml # preview the augmentation views
-micromodel train --config configs/train_from_pretrain.yml   # classifier (from SSL backbone or scratch)
-micromodel infer --config configs/infer_whole_image.yml     # predictions + features -> infer.db
-micromodel reduction --config configs/infer_whole_image.yml
-micromodel reduction-vis --config configs/infer_whole_image.yml --port 5000
+# 1) SSL pretrain (DINOv3) — phase 1 trains the backbone, phase 2 adds Gram
+#    anchoring on top of it; augment-vis previews the augmentation views
+#    (no model needed); attention-vis dumps an attention/patch-similarity
+#    PDF from a trained SSL bundle
+micromodel pretrain --config configs/pretrain_dinov3_phase1.yml
+micromodel pretrain --config configs/pretrain_dinov3_phase2.yml
+micromodel augment-vis --config configs/pretrain_dinov3_phase1.yml
+micromodel attention-vis --config configs/pretrain_dinov3_phase1.yml
+
+# 2) Train a classifier — linear probe (freeze_backbone: true) or fine-tune
+#    on the SSL backbone; train_from_scratch.yml skips the SSL bundle.
+#    Labels come from a [filepath, label] CSV; single labels train
+#    FocalLoss, ';'-joined labels train multi-label BCELoss.
+micromodel train --config configs/train_from_pretrain.yml
+micromodel train --config configs/train_from_scratch.yml
+
+# 3) Infer — write predictions + features to infer.db. single_cell mode
+#    reads pre-cropped cell TIFF folders; whole_image mode reads images +
+#    segmentation masks (e.g. straight from microProfiler output)
+micromodel infer --config configs/infer_single_cell.yml
+micromodel infer --config configs/infer_whole_image.yml
+
+# 4) Reduction — PCA/UMAP/PaCMAP/LocalMAP + Leiden clustering over the
+#    infer.db features: one multi-page PDF + table per method, per-resolution
+#    cluster pages, representative-cell sheets (cluster_res<res>.pdf), and a
+#    reusable baseline cluster.pkl. reduction-vis serves the interactive
+#    scatter for clicking through individual cells
+micromodel reduction --config configs/infer_single_cell.yml
+micromodel reduction-vis --config configs/infer_single_cell.yml --port 5000
+
+# 5) deduplication — latent-diversity deduplication over pre-cropped cell folders.
+#    reference: null prunes the pool to a diverse subset (radius or
+#    target_keep); reference: <selection_state.pkl> adds only new territory
+#    from new folders (max_add). Outputs curated/ hardlinks (a ready-to-use
+#    pretrain root), keep_label.csv (for train), manifest and plot
+micromodel deduplication --config configs/deduplication.yml
 ```
 
-The end-to-end flow: **pretrain → train → infer**, with the interactive
-PCA/UMAP viewer (`reduction-vis`, served at
-`http://127.0.0.1:5000`) for clicking through individual cells. Training
-inputs can be the exported cells from microVis, or whole images with their
-segmentation masks.
+The end-to-end flow: **pretrain → (deduplication) → train → infer →
+reduction (+ reduction-vis)**. Training inputs can be the exported cells
+from microVis, curated folders from deduplication, or whole images with their
+segmentation masks. Re-running `reduction` with `cluster:` pointing at a
+previous `cluster.pkl` kNN-predicts the baseline's cluster IDs for new
+datasets, keeping cluster labels comparable across runs.
 
 ---
 
@@ -208,10 +251,10 @@ the GUI to its initial state.
 
 ### No database migrations — delete to redo
 
-`result.db` (profiling) and `infer.db` (predictions/features) have no schema
+`profiler.db` (profiling) and `infer.db` (predictions/features) have no schema
 versioning. To re-process or to change a table's structure, delete the DB
 file (or the affected table) and re-run. The microProfiler CLI also skips
-datasets it considers complete — delete `result.db` to force reprocessing.
+datasets it considers complete — delete `profiler.db` to force reprocessing.
 
 ### Segmentation & profiling are safe to re-run
 
@@ -245,8 +288,10 @@ verbatim from extraction to the profiling DB, CSV exports, and `infer.db`.
 
 | Artifact | Location | Produced by |
 |---|---|---|
-| Profiling DB | `<dataset>/result.db` | microProfiler (image + object tables) |
+| Profiling DB | `<dataset>/profiler.db` | microProfiler (image + object tables) |
 | Inference DB | `<dataset>/infer.db` or `{output_dir}/infer.db` | microModel (CLI); microProfiler inference step (always `<dataset>/<output_db>`) |
+| Reduction outputs | `{output_dir}/reduction_<method>.pdf/.pkl`, `cluster.pkl`, `cluster_res<res>.pdf` | microModel reduction |
+| Curated dataset | `{output_dir}/curated/<root>/`, `keep_label.csv`, `selection_state.pkl` | microModel deduplication |
 | Per-dataset state | `<dataset>/session.yml` | microProfiler / microVis |
 | Cellpose masks | `<stem>_cp_masks_<name>.png` next to images | microProfiler |
 | BaSiC shading models | `<dataset>/.microprofiler/BaSiC_model/` | microProfiler |

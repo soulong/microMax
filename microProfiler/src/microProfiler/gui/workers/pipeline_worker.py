@@ -82,8 +82,9 @@ class PipelineWorker(QObject):
         collector.cancel_check = lambda: self._cancel_event.is_set()
         try:
             if self._step_name:
-                self._result_ds = run_step(
-                    self._cfg, self._step_name, self._dataset_dir, progress=collector, ds=self._ds,
+                self._result_ds, self._applied_steps = run_step(
+                    self._cfg, self._step_name, self._dataset_dir,
+                    progress=collector, ds=self._ds,
                 )
             else:
                 result_ds, applied = run_pipeline(
@@ -95,12 +96,12 @@ class PipelineWorker(QObject):
         except InterruptedError:
             self.finished.emit()
         except SystemExit as e:
-            # microBase hard-exits (print + sys.exit) on bad dataset state
+            # microBase raises MicroMaxError on bad dataset state (SystemExit is caught defensively)
             # (missing image files, invalid filter column). Without this the
             # error signal never fires and the UI stays stuck with
             # set_running(True) — the modal dialog / wait cursor never clears.
-            logger.error("Pipeline failed (microBase hard-exit): %s", e)
-            self.error.emit(str(e) or "Pipeline failed (microBase hard-exit)")
+            logger.error("Pipeline failed: %s", e)
+            self.error.emit(str(e) or "Pipeline failed")
         except Exception as e:
             logger.error("Pipeline error: %s\n%s", e, traceback.format_exc())
             self.error.emit(str(e))

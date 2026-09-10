@@ -1,17 +1,26 @@
 """I/O: database and image helpers.
 
 Image reading/writing delegates to microBase. Database wraps sqlite3.
+
+The pipeline uses microBase's readers (``read_image(...)``, which raise ``ImageReadError``)
+and ``quarantine_row`` to skip broken rows: when a file is missing or cannot
+be decoded, every file of its metadata row is deleted and the row is skipped.
 """
 
-from microBase import read_image, read_mask
-from microBase import ImageDataset
+import logging
+from pathlib import Path
+
+import pandas as pd
+
+from microBase import ImageDataset, ImageReadError, read_image, read_mask
 
 from microProfiler.io.database import Database
+
+logger = logging.getLogger(__name__)
 
 
 def write_image(path, data, **kwargs):
     """Write a TIFF image with zlib compression."""
-    from pathlib import Path
     import tifffile
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -21,14 +30,56 @@ def write_image(path, data, **kwargs):
 def read_image_shape(path):
     """Read spatial dimensions (H, W) without loading pixel data.
 
-    Uses PIL for format-agnostic shape probing (TIFF/PNG/JPEG).
+    Uses PIL for format-agnostic shape probing (TIFF/PNG/JPEG). A missing or
+    unreadable file raises ImageReadError (never a raw PIL error) so pipeline
+    callers can quarantine the row instead of aborting.
     """
-    from pathlib import Path
     from PIL import Image
     path = Path(path)
-    with Image.open(path) as im:
-        w, h = im.size  # PIL returns (W, H)
+    try:
+        with Image.open(path) as im:
+            w, h = im.size  # PIL returns (W, H)
+    except Exception as e:
+        raise ImageReadError(path, f"failed to read image {path}: {e}") from e
     return (h, w)
+
+
+def quarantine_row(ds, row_idx, reason=""):
+    """Delete every file referenced by a broken metadata row.
+
+    A row is broken when one of its image files is missing or cannot be
+    decoded. All channel files, all mask files and the multi-channel
+    ``__file__`` path are removed so the row disappears on the next metadata
+    rebuild (no partial/mask-only rows). Deletion errors are logged, never
+    raised — the pipeline must keep running.
+
+    Returns the number of deleted files.
+    """
+    row = ds.metadata.iloc[row_idx]
+    cols = list(ds.intensity_colnames) + list(ds.mask_colnames) + ["__file__"]
+    deleted = 0
+    seen = set()
+    for col in cols:
+        if col not in row.index:
+            continue
+        value = row[col]
+        if pd.isna(value):
+            continue
+        path = Path(value)
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            if path.exists():
+                path.unlink()
+                deleted += 1
+        except OSError:
+            logger.exception("Quarantine: failed to delete %s", path)
+    logger.warning(
+        "Broken image row %d quarantined — deleted %d file(s) (%s); row skipped",
+        row_idx, deleted, reason,
+    )
+    return deleted
 
 
 def clone_dataset(ds: ImageDataset) -> ImageDataset:
@@ -58,7 +109,9 @@ def rebuild_dataset(ds: ImageDataset) -> ImageDataset:
 
 __all__ = [
     "Database",
+    "ImageReadError",
     "read_image", "write_image", "read_image_shape",
     "read_mask",
+    "quarantine_row",
     "clone_dataset", "rebuild_dataset",
 ]

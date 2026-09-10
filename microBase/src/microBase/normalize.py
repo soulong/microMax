@@ -12,9 +12,9 @@ as-is.
 If a mask is provided, statistics are computed only over foreground pixels.
 """
 
-import sys
-
 import numpy as np
+
+from .errors import ConfigError, DataError
 
 
 def _clip_channel(channel, clip_low, clip_high, mask=None):
@@ -62,11 +62,9 @@ def normalize(image, mask=None, method="per_channel",
         (H, W, C) float32 array. Background (mask falsy) is set to 0.
     """
     if image.ndim != 3:
-        print(
-            f"Error: normalize expects (H, W, C) array, got shape {image.shape}",
-            file=sys.stderr,
+        raise DataError(
+            f"normalize expects (H, W, C) array, got shape {image.shape}"
         )
-        sys.exit(1)
 
     img = image.astype(np.float32, copy=True)
     h, w, c = img.shape
@@ -113,9 +111,7 @@ def normalize(image, mask=None, method="per_channel",
         out = (clipped - mean) / std
         return _apply_mask(out)
 
-    print(
-        f"Error: unknown normalize method '{method}'. "
-        f"Use 'per_channel', 'global', or 'null'.",
-        file=sys.stderr,
+    raise ConfigError(
+        f"unknown normalize method '{method}'. "
+        f"Use 'per_channel', 'global', or 'null'."
     )
-    sys.exit(1)

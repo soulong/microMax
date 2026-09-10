@@ -220,7 +220,7 @@ vis_augment:
 
 # =============================================================================
 # monitoring —— 训练质量追踪（metrics.csv / tensorboard / 诊断 PDF）
-# 详见 monitor 输出：head_track.pdf、patch_similarity_epoch_N.pdf、
+# 详见 monitor 输出：head_track.pdf、attention_epoch_N.pdf、
 # metrics.csv、tensorboard/ 目录。enabled: false 即回到纯日志行为。
 # =============================================================================
 monitoring:

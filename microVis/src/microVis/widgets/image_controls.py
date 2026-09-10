@@ -543,15 +543,16 @@ class ImageControls(QScrollArea):
 
         # Only create widgets for non-empty option lists — missing structural
         # columns (e.g. HPA dataset with no stack/timepoint) yield empty lists,
-        # and the corresponding filter selector is simply omitted.
+        # and the corresponding filter selector is simply omitted. Labels are
+        # the original metadata column names (same convention as extra cols).
         self._fields_widget = (
-            _MultiSelectCombo("Fields", fields, checked_first=True) if fields else None
+            _MultiSelectCombo("field", fields, checked_first=True) if fields else None
         )
         self._stacks_widget = (
-            _MultiSelectCombo("Stacks", stacks, checked_first=True) if stacks else None
+            _MultiSelectCombo("stack", stacks, checked_first=True) if stacks else None
         )
         self._timepoints_widget = (
-            _MultiSelectCombo("Timepoints", timepoints, checked_first=True) if timepoints else None
+            _MultiSelectCombo("timepoint", timepoints, checked_first=True) if timepoints else None
         )
 
         if self._fields_widget:

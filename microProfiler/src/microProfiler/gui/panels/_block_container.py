@@ -45,6 +45,10 @@ class BlockContainerPanel(BaseStepPanel):
         self._pending_block_configs: List[dict] = []
         self._last_channels: List[str] = []
         self._last_masks: List[str] = []
+        # True once populate_masks ran for the current dataset — an EMPTY
+        # mask list still means "population finished" (mask-less datasets
+        # must not keep the restore state alive forever).
+        self._masks_populated: bool = False
         # While True, _pending_block_configs are re-applied on every dataset-
         # driven repopulation. It stays active until BOTH channels and masks
         # have real data (dataset loaded), then turns off so later
@@ -140,8 +144,13 @@ class BlockContainerPanel(BaseStepPanel):
                 self._apply_block_config(block, self._pending_block_configs[i])
 
     def _maybe_finish_restore(self) -> None:
-        """Turn restore off once both channels and masks carry real data."""
-        if self._restore_active and self._channels and self._last_masks:
+        """Turn restore off once channels (and masks) carry real data.
+
+        ``_masks_populated`` covers mask-less datasets: populate_masks([])
+        means there is nothing to wait for, not "still loading".
+        """
+        if (self._restore_active and self._channels
+                and (self._last_masks or self._masks_populated)):
             self._restore_active = False
 
     # ── Serialization: structured list-of-dicts format (load_config_section) ──
@@ -158,6 +167,7 @@ class BlockContainerPanel(BaseStepPanel):
         # restore time those widgets don't exist yet).
         self._pending_block_configs = [cfg for cfg in sections if isinstance(cfg, dict)]
         self._restore_active = True
+        self._masks_populated = False
         self._remove_all_blocks()
         self._blocks_layout.removeItem(self._add_btn_layout)
 
@@ -223,6 +233,7 @@ class BlockContainerPanel(BaseStepPanel):
     def populate_masks(self, mask_names: List[str]) -> None:
         """Rebuild mask-driven widgets, then re-apply pending configs."""
         self._last_masks = list(mask_names)
+        self._masks_populated = True
         for block in self._blocks:
             fn = getattr(block, "populate_masks", None)
             if fn is not None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numbers
+
 import matplotlib
 import numpy as np
 from natsort import natsort_key
@@ -941,7 +943,10 @@ def _draw_polygon_overlays(
         if not outline_only:
             if use_values and label_val in obj_values:
                 val = obj_values[label_val]
-                if isinstance(val, (int, float)) and vmin is not None and vmax is not None and vmin != vmax:
+                # numbers.Real includes numpy scalars (np.int64 is not int),
+                # so integer metric values are scaled instead of falling
+                # through to the neutral 0.5 color.
+                if isinstance(val, numbers.Real) and vmin is not None and vmax is not None and vmin != vmax:
                     idx = (val - vmin) / (vmax - vmin)
                 elif _cat_map and isinstance(val, str) and val in _cat_map:
                     idx = _cat_map[val]

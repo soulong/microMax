@@ -78,14 +78,6 @@ class MetricsTracker:
         """Per-epoch metrics row + TB scalars (x-axis = epoch)."""
         self._write_row("epoch", epoch, epoch, metrics)
 
-    def add_histogram(self, name, tensor, step):
-        if self.writer is None:
-            return
-        try:
-            self.writer.add_histogram(name, tensor.detach().cpu().float().flatten(), step)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("TensorBoard histogram failed: %s", e)
-
     def add_image(self, name, image_hw_c, step):
         if self.writer is None:
             return
@@ -180,11 +172,12 @@ def gram_split_metrics(gram_criterion, student_patches, teacher_patches, mask_pa
 
 @torch.no_grad()
 def compute_patch_similarity_maps(model, x, n_anchors=4):
-    """-> (maps, grid) for one input image.
+    """-> (maps, grid, anchors) for one input image.
 
     model: DINOv3 (uses teacher_backbone, the EMA branch official evaluation
     uses). x: (1, C, H, W) normalized tensor on the right device. maps: list
-    of n_anchors (grid, grid) cosine-sim maps.
+    of n_anchors (grid, grid) cosine-sim maps; anchors: the chosen flat
+    patch indices (attention_vis annotates the sheets with them).
     """
     n_prefix = model.teacher_backbone.vit.num_prefix_tokens
     features = model.teacher_backbone.encode(x)  # (1, N, D)

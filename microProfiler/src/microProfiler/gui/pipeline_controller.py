@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, Qt
 from PySide6.QtWidgets import QMessageBox
 
 from microBase import SessionFile
+from microBase.db_contracts import IMAGE_TABLE, PROFILER_DB_NAME
 from microProfiler.config import PipelineConfig, section_to_dataclass
 from microProfiler.gui.dataset_service import DatasetService
 from microProfiler.gui.interfaces import IControllerView
@@ -60,7 +61,8 @@ class PipelineController(QObject):
         self._pending_finished: Optional[tuple] = None
 
     def _output_path(self) -> Path:
-        return self._view.output_path()
+        """The dataset dir — always the Input dir (no separate output dir)."""
+        return Path(self._view.get_input_dir())
 
     def _build_base_config(self) -> PipelineConfig:
         return PipelineConfig()
@@ -82,7 +84,7 @@ class PipelineController(QObject):
         """
         names = set()
         if cfg.image_profile and cfg.image_profile.image_channels:
-            names.add("image")
+            names.add(IMAGE_TABLE)
         if cfg.object_profile and getattr(cfg.object_profile, "configs", None):
             for entry in cfg.object_profile.configs:
                 if not entry.intensity_channels:
@@ -96,15 +98,12 @@ class PipelineController(QObject):
         """Drop only the specified tables from the database, preserving others."""
         if not table_names or not db_path.exists():
             return
-        import sqlite3
+        from microProfiler.io import Database
         try:
-            conn = sqlite3.connect(str(db_path))
+            db = Database(db_path)
             for name in table_names:
-                conn.execute(f"DROP TABLE IF EXISTS [{name}]")
-            conn.commit()
-            conn.close()
-            logger.info(
-                "Dropped profiling tables: %s", ", ".join(sorted(table_names)))
+                db.drop_table(name)
+            db.close()
         except Exception:
             logger.warning(
                 "Failed to drop profiling tables", exc_info=True)
@@ -136,7 +135,7 @@ class PipelineController(QObject):
             if not prev_thread.wait(5000):
                 logger.warning(
                     "Replaced pipeline worker still running after cancel — "
-                    "it may still write result.db concurrently")
+                    "it may still write profiler.db concurrently")
                 # Thread still executing (e.g. blocked inside inference):
                 # deleting a live QThread leaves a dangling C++ wrapper.
                 # Schedule cleanup via the thread's own finished signal
@@ -369,7 +368,7 @@ class PipelineController(QObject):
                 cfg.object_profile = section_to_dataclass("object_profile", section)
 
         # Drop only profiling tables, preserving other tables (e.g. microVis's label tables)
-        db_path = self._output_path() / "result.db"
+        db_path = self._output_path() / PROFILER_DB_NAME
         table_names = self._collect_profiling_table_names(cfg)
         if db_path.exists() and table_names:
             reply = QMessageBox.question(
@@ -493,7 +492,7 @@ class PipelineController(QObject):
             return
 
         # Drop only profiling tables, preserving other tables (e.g. microVis's label tables)
-        db_path = self._output_path() / "result.db"
+        db_path = self._output_path() / PROFILER_DB_NAME
         table_names = self._collect_profiling_table_names(cfg)
         if db_path.exists() and table_names:
             reply = QMessageBox.question(
@@ -585,7 +584,11 @@ class PipelineController(QObject):
         self._view.set_running(False)
         step_name = step.step_name
         logger.info(f"{step_name} complete.")
-        self._save_session_yml(executed_steps=[step_name])
+        # Persist exactly what run_step recorded: it owns the applied-steps
+        # gate (fit-only BaSiC and no-op steps are never recorded). Saving
+        # [step_name] unconditionally would mark a fit-only BaSiC as applied
+        # and permanently skip a later fit-transform.
+        self._save_session_yml(executed_steps=self._worker._applied_steps or [])
         self._update_dataset_after_step(step_name)
 
     # ── BaSiC fit ────────────────────────────────────────────────────────

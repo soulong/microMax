@@ -30,10 +30,11 @@ build_pipeline(spec) returns an albumentations Compose (or None if spec empty).
 apply(pipeline, image, mask) returns (image, mask) after augmentation.
 """
 
-import sys
 import warnings
 
 import albumentations as A
+
+from .errors import ConfigError
 
 
 def build_pipeline(spec):
@@ -42,52 +43,43 @@ def build_pipeline(spec):
     spec: list of single-key dicts, e.g. [{"Rotate": {"angle_range": 180, "p": 0.5}}].
           Key is an albumentations class name; value is its kwargs dict.
           None / empty list -> returns None (no augmentation).
+    Invalid entries raise ConfigError (never a silently-dropped transform).
     """
     if not spec:
         return None
     transforms = []
     for entry in spec:
         if not isinstance(entry, dict) or len(entry) != 1:
-            print(
-                f"Error: augmentation spec entries must be single-key dicts, "
-                f"got {entry}",
-                file=sys.stderr,
+            raise ConfigError(
+                f"augmentation spec entries must be single-key dicts, got {entry}"
             )
-            sys.exit(1)
         name = next(iter(entry))
         kwargs = entry[name] or {}
         cls = getattr(A, name, None)
         if cls is None:
-            print(
-                f"Error: albumentations has no transform '{name}'. "
-                f"Check the class name against the albumentations docs.",
-                file=sys.stderr,
+            raise ConfigError(
+                f"albumentations has no transform '{name}'. "
+                f"Check the class name against the albumentations docs."
             )
-            sys.exit(1)
         if not (isinstance(cls, type) and issubclass(cls, A.BasicTransform)):
-            print(
-                f"Error: '{name}' is not an albumentations transform class.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise ConfigError(
+                f"'{name}' is not an albumentations transform class.")
         try:
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 t = cls(**kwargs)
             for w in caught:
                 if "not valid for transform" in str(w.message):
-                    print(
-                        f"Error: augmentation '{name}' got unknown kwargs "
-                        f"{kwargs}: {w.message}",
-                        file=sys.stderr,
+                    raise ConfigError(
+                        f"augmentation '{name}' got unknown kwargs "
+                        f"{kwargs}: {w.message}"
                     )
-                    sys.exit(1)
+        except ConfigError:
+            raise
         except Exception as e:
-            print(
-                f"Error: failed to build augmentation '{name}' with kwargs {kwargs}: {e}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise ConfigError(
+                f"failed to build augmentation '{name}' with kwargs {kwargs}: {e}"
+            ) from e
         transforms.append(t)
     if not transforms:
         return None

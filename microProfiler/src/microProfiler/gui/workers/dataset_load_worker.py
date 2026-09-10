@@ -50,10 +50,10 @@ class DatasetLoadWorker(QObject):
             clone = clone_dataset(ds)
             self.finished.emit(ds, clone)
         except SystemExit as e:
-            # microBase hard-exits (print + sys.exit) on bad dataset state.
+            # microBase raises MicroMaxError on bad dataset state (SystemExit is caught defensively).
             # SystemExit is not an Exception — without this the modal
             # progress dialog would never close.
-            logger.exception("Dataset load failed (microBase hard-exit)")
+            logger.exception("Dataset load failed")
             self.error.emit(str(e) or "Dataset load failed")
         except Exception as e:
             logger.exception("Dataset load failed")

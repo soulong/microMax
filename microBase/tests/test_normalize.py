@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from microBase import ConfigError, DataError
 from microBase.normalize import normalize
 
 
@@ -63,15 +64,15 @@ def test_normalize_global_constant_returns_zeros():
     assert np.all(out == 0)
 
 
-def test_normalize_bad_shape_exits():
+def test_normalize_bad_shape_raises():
     img = np.zeros((10, 10), dtype=np.float32)
-    with pytest.raises(SystemExit):
+    with pytest.raises(DataError):
         normalize(img, method="per_channel")
 
 
-def test_normalize_bad_method_exits():
+def test_normalize_bad_method_raises():
     img = np.zeros((10, 10, 1), dtype=np.float32)
-    with pytest.raises(SystemExit):
+    with pytest.raises(ConfigError):
         normalize(img, method="bad_method")
 
 

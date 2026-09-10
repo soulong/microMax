@@ -6,16 +6,14 @@ import re
 import sys
 from pathlib import Path
 
-from microBase import ImageDataset, SessionFile
+from microBase import ImageDataset, MicroMaxError, SessionFile
+from microBase.db_contracts import IMAGE_TABLE, INFERENCE_TABLE, PROFILER_DB_NAME
 
 from microProfiler.config import config_to_dict, load_config, PipelineConfig, resolve_inference_db
 from microProfiler.io import Database
 from microProfiler.log_utils import set_default_logging_level, setup_logging
 from microProfiler.pipeline import apply_filters, run_pipeline
-from microProfiler.pipeline._micromodel_bridge import (
-    INFERENCE_TABLE,
-    expected_reduction_tables,
-)
+from microProfiler.pipeline._micromodel_bridge import expected_reduction_tables
 
 logger = logging.getLogger(__name__)
 
@@ -43,25 +41,24 @@ def resolve_datasets(dataset_dir: Path, pattern: str) -> list[Path]:
 
 
 def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
-    """Check if result.db exists and has all expected profiling tables.
+    """Check whether every output this config enables already exists.
 
-    Table existence is required, and the `image` table must additionally
+    Profiling tables are required only when the config enables the matching
+    section; the inference DB check is independent, so an inference-only
+    config can be skipped too (previously an empty `expected` set returned
+    False before the inference check ever ran). The `image` table must
     contain one row per dataset image — a partial table (e.g. from an
     interrupted or failed run) must not be treated as complete.
-    When inference is enabled, each block's output DB must also exist with
-    its `inference` table (plus the reduction tables when reduction is on) —
+    When inference is enabled, each block's output DB must exist with its
+    `inference` table (plus the reduction tables when reduction is on) —
     table existence only, no row-count guard (masks can change between runs).
     """
-    db_path = dataset_dir / "result.db"
-    if not db_path.exists():
-        return False
-
     expected: set[str] = set()
 
     if cfg.image_profile and cfg.image_profile.run and cfg.image_profile.image_channels:
         # A section with empty image_channels is skipped entirely at runtime —
         # its table is not expected.
-        expected.add("image")
+        expected.add(IMAGE_TABLE)
 
     if cfg.object_profile and cfg.object_profile.run:
         for entry in cfg.object_profile.configs:
@@ -73,49 +70,51 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
             if name:
                 expected.add(name)
 
-    if not expected:
-        return False
-
-    count: int | None = None
-    db = Database(db_path)
-    try:
-        existing = db.list_tables()
-        missing = expected - existing
-        if missing:
+    if expected:
+        db_path = dataset_dir / PROFILER_DB_NAME
+        if not db_path.exists():
             return False
-        if "image" in expected:
-            count = db.row_count("image")
-    except Exception:
-        return False
-    finally:
-        db.close()
-
-    if "image" in expected:
+        count: int | None = None
+        db = Database(db_path)
         try:
-            ds = ImageDataset(
-                root=dataset_dir,
-                image_pattern=cfg.image_pattern,
-                mask_pattern=cfg.mask_pattern,
-                image_subdir_pattern=cfg.image_subdir_pattern,
-            )
-            # The pipeline applies cfg.filter before profiling, so the
-            # image table only holds rows matching the filters — count
-            # the same way or filtered datasets would never be skipped.
-            apply_filters(ds, cfg.filter or [])
-            n_rows = len(ds)
-        except (Exception, SystemExit) as e:
-            # microBase hard-exits (sys.exit) on bad config/dataset
-            # (missing root, absent filter column, bad regex) — convert
-            # to "not complete" so the batch logs and continues instead
-            # of aborting the whole plate scan.
-            logger.warning("Could not count images for %s: %s", dataset_dir, e)
+            existing = db.list_tables()
+            missing = expected - existing
+            if missing:
+                return False
+            if IMAGE_TABLE in expected:
+                count = db.row_count(IMAGE_TABLE)
+        except Exception:
             return False
-        if count != n_rows:
-            logger.warning(
-                "Incomplete image table in %s: %d rows for %d images",
-                dataset_dir, count, n_rows,
-            )
-            return False
+        finally:
+            db.close()
+
+        if IMAGE_TABLE in expected:
+            try:
+                ds = ImageDataset(
+                    root=dataset_dir,
+                    image_pattern=cfg.image_pattern,
+                    mask_pattern=cfg.mask_pattern,
+                    image_subdir_pattern=cfg.image_subdir_pattern,
+                )
+                # The pipeline applies cfg.filter before profiling, so the
+                # image table only holds rows matching the filters — count
+                # the same way or filtered datasets would never be skipped.
+                apply_filters(ds, cfg.filter or [])
+                n_rows = len(ds)
+            except (Exception, SystemExit) as e:
+                # microBase raises MicroMaxError on bad config/dataset
+                # (missing root, absent filter column, bad regex) — convert
+                # to "not complete" so the batch logs and continues instead
+                # of aborting the whole plate scan.
+                logger.warning("Could not count images for %s: %s", dataset_dir, e)
+                return False
+            if count != n_rows:
+                logger.warning(
+                    "Incomplete image table in %s: %d rows for %d images",
+                    dataset_dir, count, n_rows,
+                )
+                return False
+
     if cfg.inference and cfg.inference.run and cfg.inference.configs:
         for entry in cfg.inference.configs:
             if not entry.channels:
@@ -124,8 +123,18 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
                 continue
             infer_db = dataset_dir / resolve_inference_db(entry)
             tables = {INFERENCE_TABLE}
-            if entry.reduction and entry.reduction.enabled:
-                tables |= expected_reduction_tables(entry)
+            if entry.reduction:
+                try:
+                    tables |= expected_reduction_tables(entry)
+                except Exception as e:
+                    # A corrupt/unknown reducer pickle must not silently mark
+                    # the dataset complete (it would never be reprocessed and
+                    # the error would stay hidden) — reprocess instead.
+                    logger.warning(
+                        "Cannot determine expected reduction tables for %s: %s "
+                        "— reprocessing", infer_db, e,
+                    )
+                    return False
             missing = tables - _existing_tables(infer_db)
             if missing:
                 logger.info(
@@ -198,9 +207,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         try:
             cfg = load_config(args.config)
-        except ValueError as e:
-            # Unknown config keys / invalid values — clean hard-exit, not a
-            # raw traceback.
+        except (ValueError, MicroMaxError) as e:
+            # Unknown config keys / invalid values / unreadable YAML — clean
+            # hard-exit, not a raw traceback.
             print(f"Error: invalid config {args.config}: {e}", file=sys.stderr)
             sys.exit(1)
         dataset_dir = Path(args.dataset_dir)
@@ -257,7 +266,7 @@ def main(argv: list[str] | None = None) -> int:
 
         for ds_dir in datasets:
             if _is_dataset_complete(cfg, ds_dir):
-                logger.info("Skipping %s — already processed (delete result.db to re-run)", ds_dir)
+                logger.info("Skipping %s — already processed (delete profiler.db to re-run)", ds_dir)
                 skipped += 1
                 continue
 
@@ -277,14 +286,14 @@ def main(argv: list[str] | None = None) -> int:
             except (ValueError, TypeError) as e:
                 # Per-dataset failures (e.g. zproject needs a 'stack' column
                 # this dataset's pattern doesn't capture, BaSiC shape
-                # mismatch). Config-level ValueErrors already hard-exited at
+                # mismatch). Config-level errors already raised at
                 # load_config above — treat everything in-loop as dataset-
                 # specific so one bad dataset never aborts a plate scan.
                 logger.error("Dataset failed: %s — %s", ds_dir, e)
                 logger.info("Continuing to next dataset...")
                 print()
             except SystemExit as e:
-                # microBase hard-exits (sys.exit) on bad dataset state (missing
+                # microBase raises MicroMaxError on bad dataset state (missing
                 # files, invalid filter column, corrupt TIFF). Treat it as a
                 # per-dataset failure so one bad dataset never aborts a plate
                 # scan — the same policy _is_dataset_complete applies above.

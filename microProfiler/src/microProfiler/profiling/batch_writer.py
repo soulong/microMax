@@ -24,7 +24,9 @@ class BatchWriter:
         self._db_path = db_path
         self._table_name = table_name
         self._batch_size = batch_size
-        self._db: Optional[Database] = Database(db_path) if db_path else None
+        # Lazy: the DB (and its file) only appears on the first flush, so a
+        # skipped/empty step does not leave an empty profiler.db behind.
+        self._db: Optional[Database] = None
         self._first_write = True
         self._results: List[pd.DataFrame] = []
         self._batch: List[pd.DataFrame] = []
@@ -49,7 +51,9 @@ class BatchWriter:
             self._columns = combined.columns
         else:
             combined = combined.reindex(columns=self._columns)
-        if self._db is not None:
+        if self._db_path is not None:
+            if self._db is None:
+                self._db = Database(self._db_path)
             self._db.save_table(
                 combined, self._table_name,
                 if_exists="replace" if self._first_write else "append",

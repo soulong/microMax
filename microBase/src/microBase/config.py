@@ -10,10 +10,12 @@ It records dataset-level state shared across tools:
 Tools deep-merge their own updates; none overwrites the whole file.
 """
 
-import sys
+import os
 from pathlib import Path
 
 import yaml
+
+from .errors import ConfigError, DataError
 
 
 def normalize_null_strings(obj):
@@ -38,42 +40,51 @@ def normalize_null_strings(obj):
 
 
 def load_yaml(path):
-    """Load a YAML file. Print + exit on missing file or parse error;
-    raise ValueError when the root is not a mapping (no silent {} fallback)."""
+    """Load a YAML file.
+
+    Missing/unreadable/unparseable files raise ConfigError; a YAML root that
+    is not a mapping also raises ConfigError (no silent {} fallback).
+    """
     path = Path(path)
     if not path.exists():
-        print(f"Error: YAML file not found: {path}", file=sys.stderr)
-        sys.exit(1)
+        raise ConfigError(f"YAML file not found: {path}")
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
     except yaml.YAMLError as e:
-        print(f"Error: failed to parse YAML {path}: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise ConfigError(f"failed to parse YAML {path}: {e}") from e
     except (OSError, UnicodeDecodeError) as e:
         # An existing but unreadable file (Windows file lock, non-UTF-8
-        # bytes) gets the same print + exit contract as a parse error.
-        print(f"Error: failed to read YAML {path}: {e}", file=sys.stderr)
-        sys.exit(1)
+        # bytes) gets the same contract as a parse error.
+        raise ConfigError(f"failed to read YAML {path}: {e}") from e
     if data is None:
         return {}
     if not isinstance(data, dict):
-        raise ValueError(
-            f"Error: YAML root must be a mapping, got {type(data).__name__} in {path}"
+        raise ConfigError(
+            f"YAML root must be a mapping, got {type(data).__name__} in {path}"
         )
     return normalize_null_strings(data)
 
 
 def save_yaml(path, data):
-    """Save data as YAML. Creates parent dirs. Print + exit on error."""
+    """Save data as YAML atomically (temp file + os.replace).
+
+    A crash mid-write must never truncate the previous file (session.yml is
+    shared by microProfiler and microVis). Write failures raise DataError.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
+        os.replace(tmp, path)
     except Exception as e:
-        print(f"Error: failed to write YAML {path}: {e}", file=sys.stderr)
-        sys.exit(1)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise DataError(f"failed to write YAML {path}: {e}") from e
 
 
 def _deep_merge(base, overlay):

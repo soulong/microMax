@@ -1,6 +1,6 @@
 """Feature-space reduction and cluster finding (CLI: micromodel reduction).
 
-show_reduction fits the configured DR methods (pca/umap/pacmap/localmap) on
+run_reduction fits the configured DR methods (pca/umap/pacmap/localmap) on
 infer.db features, writes one reduction_<method> table per method plus the
 optional find_cluster table, and saves one multi-page PDF per DR method.
 """
@@ -28,9 +28,23 @@ import umap
 import pacmap
 
 from microBase import (
+    MicroMaxError,
     build_pipeline,
     apply,
     normalize,
+)
+from microBase.db_contracts import (
+    CLUSTER_PROB_PREFIX,
+    CLUSTER_RES_PREFIX,
+    DR_METHODS,
+    FEATURES_COLUMN,
+    FIND_CLUSTER_TABLE,
+    INFERENCE_TABLE,
+    INFER_DB_NAME,
+    PRED_PROB_COLUMN,
+    UID_COLUMN,
+    reduction_coord_prefix,
+    reduction_table_name,
 )
 
 from .dataset import _compute_ref_stats, _normalize_fixed, _to_float_max
@@ -55,10 +69,8 @@ from .utils import (
 # Reduction view (pca / umap / pacmap / localmap + optional clustering)
 # ----------------------------------------------------------------------------
 
-#: Canonical DR method order — `reduction.method` is filtered against this.
-DR_METHODS = ("pca", "umap", "pacmap", "localmap")
-
 #: Pretty axis prefix per DR method (plot titles / axis labels).
+#: DR_METHODS (the canonical order) comes from microBase.db_contracts.
 DR_AXIS_NAMES = {"pca": "PC", "umap": "UMAP", "pacmap": "PaCMAP",
                  "localmap": "LocalMAP"}
 
@@ -92,10 +104,20 @@ CONTACT_SHEET_PER_CLUSTER = 10
 #: as the cluster count needs.
 CONTACT_SHEET_MAX_ROWS = 10
 
-#: The cluster-sheet page hugs its content: rows fill first (up to
-#: CONTACT_SHEET_MAX_ROWS), then each extra block-column widens the page —
-#: saved without bbox tightening, so there is no blank page margin around
-#: the grid.
+#: Cluster-block columns per sheet PAGE. Each block column is one cluster's
+#: row of images, so capping the columns per page caps the page width — and
+#: with it the size every cell is rendered at. Higher resolutions produce
+#: more clusters; without the cap they would all be squeezed onto one
+#: ever-wider page (60 clusters -> a ~6x-wider sheet -> cells shrunk 6x the
+#: moment the viewer fits the page to the screen). Extra clusters continue
+#: onto the next page of the same PDF at the SAME cell size.
+CONTACT_SHEET_GROUPS_PER_PAGE = 2
+
+#: Each page hugs its content: rows fill first (up to CONTACT_SHEET_MAX_ROWS),
+#: then each extra block-column widens the page (up to
+#: CONTACT_SHEET_GROUPS_PER_PAGE) — saved without bbox tightening, so there
+#: is no blank page margin around the grid and the per-cell size is identical
+#: on every page.
 
 #: Sheet representatives are drawn RANDOMLY from the densest
 #: CONTACT_SHEET_DENSITY_KEEP fraction of each cluster (local density =
@@ -362,16 +384,14 @@ def _build_cell_view(config, mode, channels, channel_layout):
     """
     model_path = config.get("model")
     if not isinstance(model_path, str) or not model_path or not os.path.exists(model_path):
-        print(f"Error: the cluster contact sheet needs the model bundle "
+        raise MicroMaxError(f"Error: the cluster contact sheet needs the model bundle "
               f"(inference-time preprocessing), but model is missing or not "
-              f"found: {model_path}", file=sys.stderr)
-        sys.exit(1)
+              f"found: {model_path}")
     bundle = torch.load(model_path, map_location="cpu", weights_only=False)
     meta = bundle.get("meta") or {}
     if "augmentation_infer" not in meta:
-        print("Error: bundle meta missing 'augmentation_infer' — cannot "
-              "rebuild the inference input for the contact sheet", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError("Error: bundle meta missing 'augmentation_infer' — cannot "
+              "rebuild the inference input for the contact sheet")
     aug_spec = meta["augmentation_infer"]
     return {
         "aug": build_pipeline(aug_spec) if aug_spec else None,
@@ -395,12 +415,14 @@ def _load_cell_image(d, mode, view):
     Returns a (H, W, 3) uint8 display image, or None on failure.
     """
     from microBase import read_tiff_channels, read_image, read_mask, crop_cell, get_labels
-    directory = d.get("directory") or ""
+    from microBase.db_contracts import resolve_directory
+    # directory is stored relative to the row's dataset root (_root injected
+    # at load time); resolving here also accepts legacy absolute values.
+    directory = resolve_directory(d.get("directory") or "", d.get("_root", ""))
     try:
         if mode == "whole_image":
             ch_files = json.loads(d["filename"])
-            arrays = [read_image(os.path.join(directory, f) if directory else f)
-                      for f in ch_files]
+            arrays = [read_image(os.path.join(directory, f)) for f in ch_files]
             img = np.stack(arrays, axis=-1)
             mask_m = read_mask(d.get("mask_filename") or "")
             label = int(d.get("label") or 0)
@@ -408,7 +430,7 @@ def _load_cell_image(d, mode, view):
                 return None
             img, _, _ = crop_cell(img, mask_m, label, padding=4)
         else:
-            path = os.path.join(directory, d["filename"]) if directory else d["filename"]
+            path = os.path.join(directory, d["filename"])
             img = read_tiff_channels(path, view["channels"],
                                      channel_layout=view["channel_layout"])
         img = _to_float_max(img, view["max_value"])
@@ -431,7 +453,7 @@ def _load_cell_image(d, mode, view):
                             clip_low=view["clip_low"], clip_high=view["clip_high"])
         return _to_rgb_display(img)
     except (Exception, SystemExit) as e:
-        # microBase readers hard-exit (SystemExit) on bad files — degrade to
+        # microBase readers raise on bad files — degrade to
         # a warning + empty slot instead of aborting the whole run.
         logger.warning("Contact sheet: failed to load %s/%s: %s",
                        directory, d.get("filename"), e)
@@ -453,34 +475,30 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
     EVERY candidate fails it (glass scratches / dust — Leiden groups debris
     coherently) fall back to their unfiltered crops, still titled "no
     cell-like crops". Every cell is rendered as its inference-mode input
-    (bundle augmentation_infer pipeline -> uniform image size). Layout:
-    CONTACT_SHEET_PER_CLUSTER images per cluster; cluster blocks fill
-    COLUMN-major (top -> bottom, then the next column), at most
-    CONTACT_SHEET_MAX_ROWS rows, as many columns as the cluster count needs;
-    blocks are ordered by 1-based cluster ID. The page hugs the grid: the
-    vertical is filled first (up to CONTACT_SHEET_MAX_ROWS rows) and each
-    extra block-column widens the page, so there is no blank margin.
+    (bundle augmentation_infer pipeline -> uniform image size).
+
+    Layout: cluster blocks fill COLUMN-major (top -> bottom, then the next
+    column), at most CONTACT_SHEET_MAX_ROWS rows, and at most
+    CONTACT_SHEET_GROUPS_PER_PAGE block columns per PAGE — so the page width,
+    and with it the rendered size of every cell, stays constant no matter how
+    many clusters the resolution produced; the remaining clusters continue
+    onto the following pages of the same PDF. Blocks are ordered by 1-based
+    cluster ID and each page hugs its grid (no blank margins, no bbox
+    tightening).
     """
     n_ids = int(ids_all.max())  # IDs are 1-based
     n_per = CONTACT_SHEET_PER_CLUSTER
     rows = min(n_ids, CONTACT_SHEET_MAX_ROWS)
     groups = -(-n_ids // rows)  # ceil -> number of cluster-block columns
-    # A narrow empty spacer column after each cluster group keeps adjacent
-    # clusters visually separated.
-    width_ratios = []
-    for _ in range(groups):
-        width_ratios += [1.0] * n_per + [0.45]
-    fig, axes = plt.subplots(
-        rows, groups * (n_per + 1),
-        figsize=(1.15 * groups * (n_per + 0.45), 1.35 * rows),
-        squeeze=False, gridspec_kw={"width_ratios": width_ratios})
+    per_page = CONTACT_SHEET_GROUPS_PER_PAGE
+
+    # ---- Phase A: representatives per cluster (the slow image loading) ----
+    # reps[cid] = (imgs, debris, n_member); imgs=None marks an empty cluster.
+    reps = {}
     for cid in range(1, n_ids + 1):
         member = np.where(ids_all == cid)[0]
-        g, r = divmod(cid - 1, rows)  # column-major: fill down, then next column
-        base = g * (n_per + 1)
         if member.size == 0:
-            for j in range(n_per + 1):
-                axes[r][base + j].axis("off")
+            reps[cid] = (None, False, 0)
             continue
         # Per-cluster RNG stream: deterministic across regeneration.
         rng = np.random.default_rng([CONTACT_SHEET_SEED, cid])
@@ -532,33 +550,58 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
                            "%.0f%% foreground filter (scanned %d candidates)",
                            cid, len(imgs), n_per,
                            CONTACT_SHEET_MIN_FOREGROUND * 100, scanned)
-        for j in range(n_per):
-            ax = axes[r][base + j]
-            ax.set_xticks([])
-            ax.set_yticks([])
-            if j < len(imgs):
-                ax.imshow(imgs[j])
-            if j == 0:
-                title = f"cluster {cid} (n={member.size})"
-                if debris:
-                    title += "\nno cell-like crops"
-                ax.set_title(title, fontsize=8)
-        axes[r][base + n_per].axis("off")  # spacer after the group
-    # Any trailing cluster slot beyond n_ids stays empty.
-    for cid in range(n_ids, rows * groups):
-        g, r = divmod(cid, rows)
-        base = g * (n_per + 1)
-        for j in range(n_per + 1):
-            axes[r][base + j].axis("off")
-    # Near-zero page margins: the grid owns the whole page.
-    fig.subplots_adjust(left=0.005, right=0.995, top=0.97, bottom=0.01,
-                        wspace=0.06, hspace=0.15)
+        reps[cid] = (imgs, debris, member.size)
+
+    # ---- Phase B: paginate the cluster blocks, one figure per page ----
     with PdfPages(path) as pdf:
-        # No bbox tightening: the page is exactly CONTACT_SHEET_FIGSIZE, so
-        # every sheet keeps the same fixed aspect ratio.
-        pdf.savefig(fig, dpi=300)
-    plt.close(fig)
-    logger.info("Cluster image sheet (%d clusters) saved to %s", n_ids, path)
+        for page_start in range(0, groups, per_page):
+            page_groups = min(per_page, groups - page_start)
+            # A narrow empty spacer column after each cluster group keeps
+            # adjacent clusters visually separated.
+            width_ratios = []
+            for _ in range(page_groups):
+                width_ratios += [1.0] * n_per + [0.45]
+            fig, axes = plt.subplots(
+                rows, page_groups * (n_per + 1),
+                figsize=(1.15 * page_groups * (n_per + 0.45), 1.35 * rows),
+                squeeze=False, gridspec_kw={"width_ratios": width_ratios})
+            first_cid = page_start * rows + 1
+            last_cid = min(first_cid + page_groups * rows, n_ids + 1)
+            for cid in range(first_cid, last_cid):
+                imgs, debris, n_member = reps[cid]
+                g, r = divmod(cid - first_cid, rows)  # column-major in page
+                base = g * (n_per + 1)
+                if imgs is None:  # empty cluster: blank block, no title
+                    for j in range(n_per + 1):
+                        axes[r][base + j].axis("off")
+                    continue
+                for j in range(n_per):
+                    ax = axes[r][base + j]
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    if j < len(imgs):
+                        ax.imshow(imgs[j])
+                    if j == 0:
+                        title = "cluster %d (n=%d)" % (cid, n_member)
+                        if debris:
+                            title += "\nno cell-like crops"
+                        ax.set_title(title, fontsize=8)
+                axes[r][base + n_per].axis("off")  # spacer after the group
+            # Trailing cluster slots beyond n_ids on this page stay empty.
+            for cid in range(last_cid, first_cid + page_groups * rows):
+                g, r = divmod(cid - first_cid, rows)
+                base = g * (n_per + 1)
+                for j in range(n_per + 1):
+                    axes[r][base + j].axis("off")
+            # Near-zero page margins: the grid owns the whole page.
+            fig.subplots_adjust(left=0.005, right=0.995, top=0.97, bottom=0.01,
+                                wspace=0.06, hspace=0.15)
+            # No bbox tightening: the page size derives directly from the
+            # grid, so every page renders cells at the same physical size.
+            pdf.savefig(fig, dpi=300)
+            plt.close(fig)
+    logger.info("Cluster image sheet (%d clusters, %d page(s)) saved to %s",
+                n_ids, -(-groups // per_page), path)
 
 
 def _dr_transform(method, reducer, feats):
@@ -590,7 +633,7 @@ def _fit_embedding(method, reducer, feats_fit):
     return reducer.embedding_  # pacmap / localmap
 
 
-def show_reduction(config, save_plots=True, raise_on_error=False):
+def run_reduction(config, save_plots=True, raise_on_error=False):
     """Fit/load the configured DR methods on infer.db features and write tables.
 
     reduction.method selects from pca / umap / pacmap / localmap. PCA is fit
@@ -647,7 +690,7 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
 
     data_roots = config["data"]["root"]
     base_output_dir = config.get("output_dir")
-    db_name = inf_cfg.get("db_name", "infer.db")
+    db_name = inf_cfg.get("db_name", INFER_DB_NAME)
     seed = 42
 
     # DR methods: canonical order, unknown names dropped with a warning.
@@ -691,6 +734,10 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
         feats, dicts = _load_inference_features(db_path, raise_on_error=raise_on_error)
         if feats is None:
             continue
+        # Each row's directory is stored relative to ITS dataset root —
+        # remember which root so contact-sheet crops resolve correctly.
+        for d in dicts:
+            d["_root"] = str(data_dir)
         logger.info("Loaded %d feature vectors (dim=%d) from %s",
                     feats.shape[0], feats.shape[1], db_path)
         db_entries.append((db_path, feats, dicts))
@@ -778,15 +825,16 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
 
     # Phase 3: fit (or load) one reducer per method
     reducers = {}
+    loaded_methods = set()
     for m in methods:
         pre_path = red_cfg.get(f"reduction_{m}")
         if pre_path:
             if not os.path.exists(pre_path):
                 if raise_on_error:
                     raise RuntimeError(f"reduction_{m} not found: {pre_path}")
-                print(f"Error: reduction_{m} not found: {pre_path}", file=sys.stderr)
-                sys.exit(1)
+                raise MicroMaxError(f"Error: reduction_{m} not found: {pre_path}")
             reducers[m] = load_reducer(pre_path)
+            loaded_methods.add(m)
             if m == "pca":
                 validate_pca(reducers[m], feats_all.shape[1])
             elif m == "umap":
@@ -818,12 +866,20 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
         logger.info("%s: fitted on %d points", m.upper(), feats_fit.shape[0])
 
     # Phase 4: transform. The fit subset feeds the plots + cluster ordering;
-    # the full merge feeds the DB tables. When nothing was sampled the fit
-    # embeddings ARE the full embeddings (transform would only re-approximate
-    # them for the nonlinear methods).
+    # the full merge feeds the DB tables. When nothing was sampled, a
+    # FRESHLY fitted nonlinear reducer's fit embedding IS the full embedding
+    # (transform would only re-approximate it). A LOADED reducer's
+    # .embedding_ belongs to its baseline fit set — never this dataset's
+    # rows — so loaded methods must always transform the current features.
     X_fit = {m: _fit_embedding(m, reducers[m], feats_fit) for m in methods}
-    X_all = X_fit if not sampled else {
-        m: _dr_transform(m, reducers[m], feats_all) for m in methods}
+    X_all = {
+        m: (
+            _dr_transform(m, reducers[m], feats_all)
+            if sampled or m in loaded_methods
+            else X_fit[m]
+        )
+        for m in methods
+    }
 
     # Phase 5: cluster finding — Leiden over a kNN graph in a whitened PCA
     # space, one partition per resolution. IDs are 1-based, ordered by
@@ -840,9 +896,17 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
         if not os.path.exists(cluster_path):
             if raise_on_error:
                 raise RuntimeError(f"cluster not found: {cluster_path}")
-            print(f"Error: cluster not found: {cluster_path}", file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError(f"Error: cluster not found: {cluster_path}")
         cluster_obj = load_reducer(cluster_path)
+        if (not isinstance(cluster_obj, dict)
+                or "pca_whiten" not in cluster_obj
+                or "models" not in cluster_obj):
+            msg = (f"{cluster_path} is not a cluster.pkl "
+                   "(missing pca_whiten/models — point reduction.cluster at "
+                   "the cluster.pkl written by a previous reduction run)")
+            if raise_on_error:
+                raise RuntimeError(msg)
+            raise MicroMaxError(f"Error: {msg}")
         validate_pca(cluster_obj["pca_whiten"], feats_all.shape[1],
                      name="cluster.pkl pca_whiten")
         W = cluster_obj["pca_whiten"].transform(feats_all)
@@ -997,7 +1061,7 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
 
     for (start, end), (db_path, feats_db, db_dicts) in zip(offsets, db_entries):
         t_db0 = time.perf_counter()
-        uids = [d["uid"] for d in db_dicts]
+        uids = [d[UID_COLUMN] for d in db_dicts]
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA journal_mode=MEMORY")
         conn.execute("PRAGMA synchronous=OFF")
@@ -1007,15 +1071,31 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
         conn.execute("DROP TABLE IF EXISTS reduction_pca_variance")
 
         for m in methods:
-            col = "pc" if m == "pca" else m
+            col = reduction_coord_prefix(m)
+            table = reduction_table_name(m)
+            arr = X_all[m]
+            # Defensive guard against a reducer whose embedding does not
+            # cover this dataset (e.g. a stale pre-fit pickle): never write
+            # coordinates against mismatched uids / silently truncate.
+            if len(arr) != end - start:
+                msg = (
+                    f"{m}: embedding has {len(arr)} rows but the DB block "
+                    f"holds {end - start} rows — the reducer does not match "
+                    f"this dataset (re-fit it or provide a matching pickle)."
+                )
+                conn.close()
+                if raise_on_error:
+                    raise RuntimeError(msg)
+                raise MicroMaxError(f"Error: {msg}")
             # Drop first: the old PCA schema could carry pc_1..pc_k columns.
-            conn.execute(f"DROP TABLE IF EXISTS reduction_{m}")
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
             conn.execute(
-                f"CREATE TABLE reduction_{m} ("
-                f"uid INTEGER PRIMARY KEY, {col}_1 REAL NOT NULL, {col}_2 REAL NOT NULL)")
-            arr = X_all[m][start:end]
+                f"CREATE TABLE {table} ("
+                f"{UID_COLUMN} INTEGER PRIMARY KEY, "
+                f"{col}_1 REAL NOT NULL, {col}_2 REAL NOT NULL)")
+            arr = arr[start:end]
             conn.executemany(
-                f"INSERT OR REPLACE INTO reduction_{m} (uid, {col}_1, {col}_2) "
+                f"INSERT OR REPLACE INTO {table} ({UID_COLUMN}, {col}_1, {col}_2) "
                 f"VALUES (?, ?, ?)",
                 list(zip(uids, arr[:, 0].tolist(), arr[:, 1].tolist())))
 
@@ -1024,8 +1104,8 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
             # confidence column (kNN vote fraction, [0, 1]) per resolution.
             # Resolution tags may contain a dot ("0.5"), so every identifier
             # is quoted.
-            id_cols = [f"cluster_res_{_res_tag(r)}" for r in cluster_res_list]
-            prob_cols = [f"cluster_prob_{_res_tag(r)}" for r in cluster_res_list]
+            id_cols = [f"{CLUSTER_RES_PREFIX}{_res_tag(r)}" for r in cluster_res_list]
+            prob_cols = [f"{CLUSTER_PROB_PREFIX}{_res_tag(r)}" for r in cluster_res_list]
             cols = ", ".join(
                 [f"{sql_ident(c)} INTEGER NOT NULL" for c in id_cols]
                 + [f"{sql_ident(c)} REAL NOT NULL" for c in prob_cols])
@@ -1033,17 +1113,22 @@ def show_reduction(config, save_plots=True, raise_on_error=False):
             # The uid placeholder is written literally below; ph covers the
             # id+prob columns only.
             ph = ", ".join("?" * (len(id_cols) + len(prob_cols)))
-            conn.execute("DROP TABLE IF EXISTS find_cluster")
+            conn.execute(f"DROP TABLE IF EXISTS {FIND_CLUSTER_TABLE}")
             conn.execute(
-                f"CREATE TABLE find_cluster (uid INTEGER PRIMARY KEY, {cols})")
+                f"CREATE TABLE {FIND_CLUSTER_TABLE} "
+                f"({UID_COLUMN} INTEGER PRIMARY KEY, {cols})")
             conn.executemany(
-                f"INSERT OR REPLACE INTO find_cluster (uid, {col_names}) "
-                f"VALUES (?, {ph})",
+                f"INSERT OR REPLACE INTO {FIND_CLUSTER_TABLE} "
+                f"({UID_COLUMN}, {col_names}) VALUES (?, {ph})",
                 list(zip(uids,
                          *[cluster_ids[r][start:end].tolist()
                            for r in cluster_res_list],
                          *[cluster_probs[r][start:end].tolist()
                            for r in cluster_res_list])))
+        else:
+            # A re-run without clustering must not leave a stale find_cluster
+            # table behind (microVis merges it into the scatter).
+            conn.execute(f"DROP TABLE IF EXISTS {FIND_CLUSTER_TABLE}")
 
         conn.commit()
         conn.close()
@@ -1066,18 +1151,24 @@ def _load_inference_features(db_path, raise_on_error=False):
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='inference'")
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (INFERENCE_TABLE,))
         if not cur.fetchone():
-            logger.error("No 'inference' table in %s. Run inference first.", db_path)
+            logger.error("No '%s' table in %s. Run inference first.",
+                         INFERENCE_TABLE, db_path)
             return None, None
-        cur = conn.execute("PRAGMA table_info(inference)")
+        cur = conn.execute(f"PRAGMA table_info({INFERENCE_TABLE})")
         all_cols = [row[1] for row in cur.fetchall()]
-        col_select = ", ".join(all_cols)
-        cur = conn.execute(f"SELECT {col_select} FROM inference ORDER BY uid")
+        # Column names come from class names / regex captures and may contain
+        # spaces, dots or quotes — quote every identifier (inference creates
+        # them with sql_ident too).
+        col_select = ", ".join(sql_ident(c) for c in all_cols)
+        cur = conn.execute(
+            f"SELECT {col_select} FROM {INFERENCE_TABLE} ORDER BY {UID_COLUMN}")
         col_names = [desc[0] for desc in cur.description]
         rows = cur.fetchall()
         if not rows:
-            logger.error("No rows in inference table in %s.", db_path)
+            logger.error("No rows in %s table in %s.", INFERENCE_TABLE, db_path)
             return None, None
         dicts = [dict(zip(col_names, r)) for r in rows]
         # Merge the find_cluster columns (cluster_res_<resolution> IDs +
@@ -1086,32 +1177,35 @@ def _load_inference_features(db_path, raise_on_error=False):
         # contain a dot, so identifiers are quoted. Rows missing from a stale
         # find_cluster table simply keep no keys (d.get -> None downstream).
         has_fc = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='find_cluster'"
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (FIND_CLUSTER_TABLE,)
         ).fetchone()
         if has_fc:
-            fc_cols = [row[1] for row in conn.execute("PRAGMA table_info(find_cluster)")
-                       if row[1] != "uid"]
+            fc_cols = [
+                row[1]
+                for row in conn.execute(f"PRAGMA table_info({FIND_CLUSTER_TABLE})")
+                if row[1] != UID_COLUMN
+            ]
             if fc_cols:
-                sel = ", ".join(["uid"] + [sql_ident(c) for c in fc_cols])
+                sel = ", ".join([UID_COLUMN] + [sql_ident(c) for c in fc_cols])
                 fc_by_uid = {}
-                for row in conn.execute(f"SELECT {sel} FROM find_cluster"):
+                for row in conn.execute(f"SELECT {sel} FROM {FIND_CLUSTER_TABLE}"):
                     fc_by_uid[int(row[0])] = dict(zip(fc_cols, row[1:]))
                 for d in dicts:
-                    extra = fc_by_uid.get(d["uid"])
+                    extra = fc_by_uid.get(d[UID_COLUMN])
                     if extra:
                         d.update(extra)
         feats_arr = []
         for d in dicts:
-            f = d["features"]
+            f = d[FEATURES_COLUMN]
             if f is None:
                 msg = (
-                    f"row uid={d.get('uid')} has NULL features. "
+                    f"row uid={d.get(UID_COLUMN)} has NULL features. "
                     "Run inference with inference.feature: true"
                 )
                 if raise_on_error:
                     raise RuntimeError(f"{db_path}: {msg}")
-                print(f"Error: {msg}", file=sys.stderr)
-                sys.exit(1)
+                raise MicroMaxError(f"Error: {msg}")
             feats_arr.append(np.frombuffer(f, dtype=np.float32))
         feats = np.stack(feats_arr, axis=0)
         return feats, dicts
@@ -1131,9 +1225,9 @@ def _color_column_continuous(cb, dicts):
     whose numeric order encodes plot distance, not magnitude — they stay
     categorical no matter how many clusters a resolution produced.
     """
-    if cb.startswith("cluster_res"):
+    if cb.startswith(CLUSTER_RES_PREFIX):
         return False
-    if cb == "pred_prob" or cb.startswith("cluster_prob"):
+    if cb == PRED_PROB_COLUMN or cb.startswith(CLUSTER_PROB_PREFIX):
         return True
     nums = set()
     for d in dicts:

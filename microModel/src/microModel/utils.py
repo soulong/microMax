@@ -10,7 +10,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 
-from microBase import load_yaml, CellDataset  # re-exported from microBase
+from microBase import load_yaml, CellDataset, MicroMaxError, sql_ident  # re-exported
 
 logger = logging.getLogger("microModel")
 
@@ -169,23 +169,18 @@ def resolve_max_value(data_cfg):
     The max possible intensity of the input dtype (65535 for 16-bit, 255 for
     8-bit). Images are divided by it on load so all view pipelines and the
     fixed-reference stats share one [0, 1] domain. Shared by pretrain, train,
-    and infer — a missing or invalid value hard-exits.
+    and infer — a missing or invalid value raises MicroMaxError.
     """
     max_value = data_cfg.get("max_value")
     if max_value is None:
-        print("Error: data.max_value is required (e.g. 65535 for 16-bit, "
-              "255 for 8-bit); images are converted to float [0, 1] by it on load",
-              file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError("Error: data.max_value is required (e.g. 65535 for 16-bit, "
+              "255 for 8-bit); images are converted to float [0, 1] by it on load")
     try:
         max_value = float(max_value)
     except (TypeError, ValueError):
-        print(f"Error: data.max_value must be a number, got {max_value!r}",
-              file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: data.max_value must be a number, got {max_value!r}")
     if max_value <= 0:
-        print(f"Error: data.max_value must be > 0, got {max_value}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: data.max_value must be > 0, got {max_value}")
     return max_value
 
 
@@ -218,29 +213,20 @@ def resolve_channels(channels, n_avail, root):
     """Resolve data.channels against an indexed dataset.
 
     None means all available channels; an empty list or out-of-range
-    requests hard-exit (shared by pretrain and train).
+    requests raise errors (shared by pretrain and train).
     """
     if channels is None:
         return list(range(1, n_avail + 1))
     resolved = list(channels)
     if not resolved:
-        print("Error: data.channels is an empty list; "
-              "use null to select all channels", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError("Error: data.channels is an empty list; "
+              "use null to select all channels")
     if min(resolved) < 1:
-        print(
-            f"Error: requested channels {resolved} must be 1-based positive "
-            f"integers (got {min(resolved)})",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise MicroMaxError(f"Error: requested channels {resolved} must be 1-based positive "
+            f"integers (got {min(resolved)})")
     if max(resolved) > n_avail:
-        print(
-            f"Error: requested channels {resolved} exceed available "
-            f"channels {n_avail} in {root}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise MicroMaxError(f"Error: requested channels {resolved} exceed available "
+            f"channels {n_avail} in {root}")
     return resolved
 
 
@@ -264,7 +250,7 @@ def stratified_sample_indices(n, labels, sample_per_class, seed, uniform=False):
     """Select up to sample_per_class indices, stratified by `labels`.
 
     uniform=True samples without stratification (used for pred_prob). The
-    chosen indices are sorted. Shared by vis.show_reduction (reducer fitting)
+    chosen indices are sorted. Shared by vis.run_reduction (reducer fitting)
     and reduction_vis (browser subsampling) — identical sampling semantics.
     """
     rng = np.random.default_rng(seed)
@@ -304,14 +290,34 @@ def save_reducer(obj, path):
     logger.info("Saved reducer to %s", path)
 
 
-def sql_ident(name):
-    """Double-quote a SQLite identifier.
+def atomic_npz_save(path, **arrays):
+    """Write a .npz cache atomically (temp file + os.replace).
 
-    Class names and resolution tags become column names (prob_<class>,
-    cluster_res<resolution>) and may contain spaces or dots — unquoted
-    identifiers would make the CREATE TABLE / SELECT statements invalid SQL.
+    An interrupted write must never leave a truncated cache the next run
+    cannot load; the temp file replaces the target in one step.
     """
-    return '"' + str(name) + '"'
+    tmp = f"{path}.tmp.npz"
+    np.savez(tmp, **arrays)
+    os.replace(tmp, path)
+
+
+def load_npz_cache(path):
+    """Load a feature-cache .npz into a dict; corrupt caches return {}.
+
+    A truncated cache (interrupted write from an older version) is deleted so
+    the caller recomputes instead of crashing.
+    """
+    try:
+        with np.load(path, allow_pickle=False) as blob:
+            return {k: blob[k] for k in blob.files}
+    except Exception as e:
+        logger.warning(
+            "Ignoring unreadable feature cache %s (%s) — recomputing", path, e)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return {}
 
 
 def load_reducer(path):
@@ -324,12 +330,8 @@ def load_reducer(path):
 def validate_pca(pca, n_features, name="reduction_pca"):
     n_in = getattr(pca, "n_features_in_", None)
     if n_in is not None and n_in != n_features:
-        print(
-            f"Error: {name} n_features_in_={n_in} "
-            f"does not match input feature dimension {n_features}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise MicroMaxError(f"Error: {name} n_features_in_={n_in} "
+            f"does not match input feature dimension {n_features}")
     if hasattr(pca, "n_components") and n_in is not None:
         logger.info("%s: %d components, %d features", name, pca.n_components, n_in)
 

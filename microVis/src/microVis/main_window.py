@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import threading
 from natsort import natsort_key
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from PySide6.QtCore import QObject, Qt, QThread, QThreadPool, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QThreadPool, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -35,15 +34,19 @@ from microVis._settings import (
     PLATE_FORMATS,
     QUALITATIVE_PALETTES,
 )
-from microVis.io.data_module import DataModule, _safe_str
+from microVis.io.data_module import DataModule, _safe_str, aggregate_by_well
+from microVis.io.infer_db import InferDB, is_numeric_type
+from microVis.io.profiler_db import ProfilerDB
 from microVis.log_utils import get_logger
 from microVis.widgets._event_filter import RotatedLabel
 from microVis.widgets.path_drop import enable_path_drop
 from microVis.widgets.data_view import DataView
 from microVis.widgets.image_controls import ImageControls
 from microVis.widgets.image_display import ImageDisplay
+from microVis.widgets.infer_plot import InferPlotView
 from microVis.widgets.label_annotation import LabelAnnotationPanel, ObjectKey
 from microVis.widgets.pixel_info import PixelInfo
+from microVis.widgets.profiler_plot import ProfilerPlotView
 from microVis.widgets.well_grid_canvas import WellGridCanvas
 from microVis.widgets.well_grid_controls import WellGridControls
 from microVis.worker import CropWorker, ImageWorker, ImageWorkerConfig
@@ -87,51 +90,6 @@ def _build_meta_label(meta: "pd.DataFrame", row_idx: int,
     return f"row {row_idx}"
 
 
-
-
-class _PygwalkerDataLoader(QObject):
-    """Load and prepare PyGwalker DataFrame in a background thread."""
-
-    data_ready = Signal(object)
-    error_occurred = Signal(str)
-
-    def __init__(self, dm, table_name, metadata_df=None):
-        super().__init__()
-        self._dm = dm
-        self._table_name = table_name
-        self._metadata_df = metadata_df
-        self._profiling_cols = {"directory", "well", "field", "stack", "timepoint", "label"}
-
-    def load(self):
-        try:
-            df = self._dm.get_table_df(self._table_name)
-            if df is None or df.empty:
-                self.error_occurred.emit("No data available")
-                return
-
-            df = df.copy()
-            if self._metadata_df is not None and "well" in df.columns:
-                meta_cols = [c for c in self._metadata_df.columns if c != "well"]
-                merged = df.merge(self._metadata_df, on="well", how="left")
-                other_cols = [c for c in merged.columns if c not in meta_cols and c != "well"]
-                df = merged[["well"] + meta_cols + other_cols]
-
-            group_cols = [c for c in self._profiling_cols - {"label"} if c in df.columns]
-            sampled = False
-            before = len(df)
-            if group_cols and len(df) > 200:
-                sampled_idx = (
-                    df.groupby(group_cols, group_keys=False)
-                    .apply(lambda g: g.sample(n=min(200, len(g)), random_state=42).index)
-                    .explode()
-                    .values
-                )
-                df = df.loc[sampled_idx].reset_index(drop=True)
-                sampled = True
-
-            self.data_ready.emit((df, sampled, before))
-        except Exception as e:
-            self.error_occurred.emit(str(e))
 
 
 class MainWindow(QMainWindow):
@@ -181,12 +139,6 @@ class MainWindow(QMainWindow):
         self._overlay_cache: tuple | None = None
         self._overlay_cache_key: str | None = None
 
-        # PyGwalker server state
-        self._pgw_httpd = None
-        self._pgw_thread = None
-        self._pgw_loader = None
-        self._pgw_loader_thread = None
-
         # Full-res zoom cache
         self._thread_pool = QThreadPool.globalInstance()
         self._pending_workers: int = 0
@@ -206,7 +158,14 @@ class MainWindow(QMainWindow):
         # Metadata
         self._metadata_df: pd.DataFrame | None = None
         self._metadata_merged: pd.DataFrame | None = None
-        self._current_table: str | None = None
+
+        # Selected DBs for the Data-page plot tabs: one reader + one plot view
+        # per selected file, keyed by resolved path, so multiple DBs of the
+        # same type can be open at once (each owns its own tab).
+        self._profiler_dbs: dict[str, ProfilerDB] = {}
+        self._profiler_views: dict[str, ProfilerPlotView] = {}
+        self._infer_dbs: dict[str, InferDB] = {}
+        self._infer_views: dict[str, InferPlotView] = {}
 
         self._build_ui()
         self._connect_signals()
@@ -218,8 +177,8 @@ class MainWindow(QMainWindow):
             p = Path(dataset_dir)
             self._dataset_dir = str(p)
             self._session = SessionFile(p)
-            self._data_view.set_dataset_label(str(p))
-            self._data_view.set_db_browse_enabled(False)
+            self._data_view.set_dataset_path(str(p))
+            self._data_view.set_db_buttons_enabled(False)
             self._data_view.set_meta_browse_enabled(False)
             image_pat, mask_pat, subdir_pat = self._session.get_patterns()
             image_pat = image_pat or DEFAULT_IMAGE_PATTERN
@@ -411,22 +370,28 @@ class MainWindow(QMainWindow):
 
         # Data view
         self._data_view.dataset_browse_clicked.connect(self._on_dataset_browse)
-        # Dropping a folder/file onto the three selector buttons takes the
-        # exact same code path as the Browse dialogs.
+        # Dropping a folder/file onto the path box or a selector button takes
+        # the exact same code path as the Browse dialogs.
+        enable_path_drop(self._data_view.dataset_path_edit,
+                         on_path=self.select_dataset_dir)
         enable_path_drop(self._data_view.dataset_browse_button,
                          on_path=self.select_dataset_dir)
-        enable_path_drop(self._data_view.db_browse_button,
-                         on_path=self.load_db_file)
+        enable_path_drop(self._data_view.profiler_db_browse_button,
+                         on_path=self.load_profiler_db_files, multi=True)
+        enable_path_drop(self._data_view.infer_db_browse_button,
+                         on_path=self.load_infer_db_files, multi=True)
         enable_path_drop(self._data_view.metadata_browse_button,
                          on_path=self.load_metadata_file)
-        self._data_view.db_browse_clicked.connect(self._on_db_browse)
+        self._data_view.dataset_path_edit.editingFinished.connect(
+            self._on_dataset_path_edited)
+        self._data_view.profiler_db_browse_clicked.connect(
+            self._on_profiler_db_browse)
+        self._data_view.infer_db_browse_clicked.connect(self._on_infer_db_browse)
         self._data_view.load_dataset_clicked.connect(self._on_load_dataset_clicked)
-        self._data_view.pygwalker_open_clicked.connect(self._on_pygwalker_open)
         self._data_view.metadata_browse_clicked.connect(self._on_metadata_browse)
         self._data_view.metadata_merge_clicked.connect(self._on_metadata_merge)
         self._data_view.metadata_clear_clicked.connect(self._on_metadata_clear)
         self._data_view.write_to_db_clicked.connect(self._on_write_to_db)
-        self._data_view.table_radio_selected.connect(self._on_data_table_changed)
         self._data_view.reset_clicked.connect(self._on_full_reset)
 
     # ── Dataset Loading ──────────────────────────────────────────────────────
@@ -454,7 +419,6 @@ class MainWindow(QMainWindow):
         self._image_controls.set_export_enabled(True)
         # Dataset-scoped selections must not leak into the next dataset.
         self._object_mask_selected = ""
-        self._current_table = None
         self._label_panel.clear_all()
         self._image_controls.clear_classes()
         self._grid_canvas.clear()
@@ -462,14 +426,16 @@ class MainWindow(QMainWindow):
         self._ch_config = {}
         self._image_controls.set_channels({})
         # Drop the previous dataset's merged metadata — otherwise the new
-        # dataset's well-grid "Color by", overlay dropdowns, and table preview
-        # would list the OLD dataset's metadata columns.
+        # dataset's well-grid "Color by" and overlay dropdowns would list the
+        # OLD dataset's metadata columns.
         self._metadata_df = None
         self._metadata_merged = None
         # Close old DataModule — it's no longer needed after browsing away.
         if self._dm is not None:
             self._dm.close_db()
             self._dm = None
+        # Plot tabs are dataset-scoped: close every DB reader and drop them.
+        self._clear_plot_views()
         self._loaded_dataset_dir = None
         self._update_window_title()
 
@@ -495,7 +461,7 @@ class MainWindow(QMainWindow):
 
     def select_dataset_dir(self, path: str) -> None:
         """Select (not load) a dataset directory — shared by the Browse
-        button and directory drops onto the Select Dataset button."""
+        button, typed paths, and directory drops onto the path box."""
         p = Path(path)
         # Re-selecting the same directory preserves the user's GUI edits —
         # session.yml is not re-read, display state is not cleared.
@@ -509,8 +475,8 @@ class MainWindow(QMainWindow):
         # Set the new directory + session file.
         self._dataset_dir = str(p)
         self._session = SessionFile(p)
-        self._data_view.set_dataset_label(str(p))
-        self._data_view.set_db_browse_enabled(False)
+        self._data_view.set_dataset_path(str(p))
+        self._data_view.set_db_buttons_enabled(False)
         self._data_view.set_meta_browse_enabled(False)
 
         # Read session.yml to pre-fill GUI patterns (first browse only).
@@ -524,36 +490,93 @@ class MainWindow(QMainWindow):
             subdir=subdir_pat,
         )
 
-    def _on_db_browse(self) -> None:
-        """Open a file dialog to select a different DB file."""
+    def _on_dataset_path_edited(self) -> None:
+        """Typed dataset path: run the same selection flow as Browse/drop."""
+        path = self._data_view.get_dataset_path()
+        if path and str(Path(path)) != self._dataset_dir:
+            self.select_dataset_dir(path)
+
+    # ── Profiler / infer DB tabs (one reader + tab per selected DB) ───────
+
+    @staticmethod
+    def _db_tab_title(path: str) -> str:
+        """Tab title: just the DB filename without the .db suffix."""
+        return Path(path).stem
+
+    @staticmethod
+    def _split_paths(paths) -> list[str]:
+        """Normalize a Browse list or a ';'-joined drop into a path list."""
+        if isinstance(paths, str):
+            paths = paths.split(";")
+        out: list[str] = []
+        for p in paths:
+            p = str(p).strip()
+            if p and p not in out:
+                out.append(p)
+        return out
+
+    def _on_profiler_db_browse(self) -> None:
+        """Open a file dialog for one or more microProfiler profiler.db files."""
         from PySide6.QtWidgets import QFileDialog
         if self._dm is None:
             return
         start_dir = self._dataset_dir or ""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select DB", start_dir, "SQLite DB (*.db)"
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select Profiler DB(s)", start_dir, "SQLite DB (*.db)"
         )
-        if not path:
-            return
-        self.load_db_file(path)
+        if paths:
+            self.load_profiler_db_files(paths)
 
-    def load_db_file(self, path: str) -> None:
-        """Switch the profiling DB — shared by the Browse button and drops
-        onto the Select DB button."""
+    def load_profiler_db_files(self, paths) -> None:
+        """Open one plot tab per profiler DB (Browse / multi-file drop).
+
+        Selecting an already-open DB just activates its tab. The LAST file is
+        additionally loaded into the DataModule so the well-grid overlay and
+        metadata columns follow it.
+        """
+        if self._dm is None:
+            return
+        opened: str | None = None
+        for path in self._split_paths(paths):
+            key = str(Path(path).resolve())
+            view = self._profiler_views.get(key)
+            if view is None:
+                try:
+                    db = ProfilerDB(path)
+                except Exception as e:
+                    logger.warning("Failed to open profiler DB %s: %s", path, e)
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.warning(self, "Invalid Profiler DB", str(e))
+                    continue
+                view = ProfilerPlotView()
+                view.set_db(db, Path(path).name)
+                if self._metadata_merged is not None:
+                    view.set_metadata(self._metadata_merged)
+                self._profiler_dbs[key] = db
+                self._profiler_views[key] = view
+            self._data_view.show_plot_tab(
+                self._db_tab_title(path), view)
+            opened = path
+        if opened is not None:
+            self._load_profiler_db_into_dm(opened)
+
+    def _load_profiler_db_into_dm(self, path: str) -> None:
+        """Point the DataModule at a profiler DB for grid/overlay columns."""
+        if self._dm is None:
+            return
         try:
             self._dm.load_db(path)
         except Exception as e:
-            logger.warning("Failed to load DB %s: %s", path, e)
+            logger.warning("Failed to load profiler DB %s: %s", path, e)
             return
         # The overlay cache is keyed per DB — invalidate it so overlay data
         # is recomputed for the new database.
         self._overlay_cache = None
         self._overlay_cache_key = None
-        # Update label and refresh all DB-dependent controls. NOTE: filters
-        # and channels are dataset-dependent — _populate_image_controls must
-        # NOT be called here (it would rebuild the filter widgets and reset
-        # the user's field/stack/timepoint selections).
-        self._data_view.set_db_label(Path(path).name)
+        # Refresh all DB-dependent controls. NOTE: filters and channels are
+        # dataset-dependent — _populate_image_controls must NOT be called here
+        # (it would rebuild the filter widgets and reset the user's
+        # field/stack/timepoint selections).
         self._data_view.set_meta_browse_enabled(True)
         self._populate_data_controls()
         self._update_grid_columns()
@@ -562,7 +585,74 @@ class MainWindow(QMainWindow):
         self._dm.close_db()
         # Redraw the well grid with new DB columns (replaces clear+redraw)
         self._update_grid()
-        logger.info("Switched to DB: %s", path)
+        logger.info("Active profiler DB: %s", path)
+
+    def _on_infer_db_browse(self) -> None:
+        """Open a file dialog for one or more microModel infer.db files."""
+        from PySide6.QtWidgets import QFileDialog
+        start_dir = self._dataset_dir or ""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select Infer DB(s)", start_dir, "SQLite DB (*.db)"
+        )
+        if paths:
+            self.load_infer_db_files(paths)
+
+    def load_infer_db_files(self, paths) -> None:
+        """Open one scatter tab per infer DB (Browse / multi-file drop)."""
+        for path in self._split_paths(paths):
+            key = str(Path(path).resolve())
+            view = self._infer_views.get(key)
+            if view is None:
+                try:
+                    db = InferDB(path)
+                except Exception as e:
+                    logger.warning("Failed to open infer DB %s: %s", path, e)
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.warning(self, "Invalid Infer DB", str(e))
+                    continue
+                view = InferPlotView()
+                view.set_metadata(self._metadata_merged)
+                view.set_db(
+                    db,
+                    self._dm.directory_scopes() if self._dm else [self._dataset_dir],
+                )
+                self._infer_dbs[key] = db
+                self._infer_views[key] = view
+            self._data_view.show_plot_tab(
+                self._db_tab_title(path), view)
+            logger.info("Opened infer DB: %s", path)
+        # Infer columns are now part of both Image-panel Color-by dropdowns.
+        if self._infer_dbs and self._dm is not None:
+            self._overlay_cache = None
+            self._overlay_cache_key = None
+            self._populate_overlay_columns()
+            self._update_grid_columns()
+        # Excel plate metadata can also be merged/written into infer DBs
+        # (Write to DB updates the inference table), so enable the button
+        # whenever an infer DB is open even without a profiler DB.
+        if self._infer_dbs:
+            self._data_view.set_meta_browse_enabled(True)
+
+    def _clear_plot_views(self) -> None:
+        """Close every profiler/infer DB reader and drop their plot tabs."""
+        # clear() closes each view's matplotlib figure (pyplot keeps figures
+        # alive globally otherwise — one leak per dataset switch).
+        for view in self._profiler_views.values():
+            view.clear()
+        for view in self._infer_views.values():
+            view.clear()
+        for db in self._profiler_dbs.values():
+            db.close()
+        self._profiler_dbs.clear()
+        self._profiler_views.clear()
+        for db in self._infer_dbs.values():
+            db.close()
+        self._infer_dbs.clear()
+        self._infer_views.clear()
+        # Overlay values may have come from an infer DB — drop the cache.
+        self._overlay_cache = None
+        self._overlay_cache_key = None
+        self._data_view.clear_plot_tabs()
 
     def _load_dataset(
         self,
@@ -631,14 +721,9 @@ class MainWindow(QMainWindow):
             self._dm = dm
             self._dataset_dir = str(p)
             self._session = SessionFile(p)
-            self._data_view.set_dataset_label(str(p))
-            self._data_view.set_db_browse_enabled(True)
+            self._data_view.set_dataset_path(str(p))
+            self._data_view.set_db_buttons_enabled(True)
             self._data_view.set_meta_browse_enabled(False)
-            # Show default DB label (none until user loads a DB)
-            if self._dm and self._dm.db_path is not None:
-                self._data_view.set_db_label(self._dm.db_path.name)
-            else:
-                self._data_view.set_db_label("")
 
             # Reset UI state for new dataset
             self._image_display.clear()
@@ -722,8 +807,8 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Dataset Load Failed", f"Could not load dataset:\n{msg}")
         self._dataset_dir = p_str
         self._session = SessionFile(p_str)
-        self._data_view.set_dataset_label(p_str)
-        self._data_view.set_db_browse_enabled(False)
+        self._data_view.set_dataset_path(p_str)
+        self._data_view.set_db_buttons_enabled(False)
         self._data_view.set_meta_browse_enabled(False)
         self._switch_tab(0)
 
@@ -734,6 +819,9 @@ class MainWindow(QMainWindow):
         patterns to session.yml (so the next session restores them), then
         starts the data scan. Channel colors are also persisted.
         """
+        # Pick up a path typed since the last selection (editingFinished may
+        # not have fired yet when the button is clicked directly).
+        self._on_dataset_path_edited()
         if not self._dataset_dir:
             return
         try:
@@ -755,7 +843,7 @@ class MainWindow(QMainWindow):
                 image_subdir_pattern=subdir_pat,
             )
         except SystemExit:
-            # SessionFile.save hard-exits (print + sys.exit) on YAML write
+            # SessionFile.save raises DataError on YAML write
             # failure — SystemExit is a BaseException, so a bare
             # `except Exception` would kill the whole app.
             logger.exception("Failed to persist session.yml")
@@ -857,6 +945,25 @@ class MainWindow(QMainWindow):
         gw.palette.setCurrentText("Set1")
         gw.palette.blockSignals(False)
 
+    def _infer_color_entries(self) -> list[tuple[str, str, str, bool]]:
+        """Color-by entries for every column of every loaded infer DB.
+
+        Returns ``(label, data_key, column, is_numeric)`` where data_key is
+        ``infer:<resolved path>`` (the reader lookup key). Labels are
+        ``<db-file-stem>/<column>``; duplicate stems get a numeric suffix.
+        """
+        entries: list[tuple[str, str, str, bool]] = []
+        used: dict[str, int] = {}
+        for key, db in self._infer_dbs.items():
+            stem = Path(key).stem
+            used[stem] = used.get(stem, 0) + 1
+            label_stem = stem if used[stem] == 1 else f"{stem} ({used[stem]})"
+            data_key = f"infer:{key}"
+            for name, ctype in db.list_columns():
+                entries.append((f"{label_stem}/{name}", data_key, name,
+                                is_numeric_type(ctype)))
+        return entries
+
     def _update_grid_columns(self) -> None:
         if self._dm is None:
             return
@@ -876,6 +983,9 @@ class MainWindow(QMainWindow):
                 if col != "well":
                     is_num = pd.api.types.is_numeric_dtype(self._metadata_merged[col])
                     gw.column.addItem(f"metadata/{col}", ("metadata", col, is_num))
+        # Add loaded infer DB columns (all tables: inference + find_cluster)
+        for label, data_key, name, is_num in self._infer_color_entries():
+            gw.column.addItem(label, (data_key, name, is_num))
         gw.column.blockSignals(False)
 
     def _populate_image_controls(self) -> None:
@@ -941,6 +1051,9 @@ class MainWindow(QMainWindow):
             for col in self._metadata_merged.columns:
                 if col != "well":
                     ic.overlay_col.addItem(f"metadata/{col}", ("metadata", col))
+        # Add loaded infer DB columns (per-object overlay values)
+        for label, data_key, name, _is_num in self._infer_color_entries():
+            ic.overlay_col.addItem(label, (data_key, name))
         ic.overlay_col.blockSignals(False)
 
         ic.overlay_cmap.blockSignals(True)
@@ -952,17 +1065,9 @@ class MainWindow(QMainWindow):
         self._on_overlay_changed()
 
     def _populate_data_controls(self) -> None:
-        if self._dm is None:
-            self._data_view.set_table_names([])
-            self._data_view.clear_table()
-            self._data_view.set_pygwalker_buttons(False)
-            return
-        tables = self._dm.get_profiling_tables()
-        table_names = list(tables.keys())
-        self._data_view.set_table_names(table_names)
-        self._data_view.set_pygwalker_buttons(bool(tables))
-        if not tables:
-            self._data_view.clear_table()
+        """Refresh every profiler plot's table/column pickers."""
+        for view in self._profiler_views.values():
+            view.refresh_tables()
 
     def _populate_label_controls(self) -> None:
         """Populate mask dropdowns in label annotation + overlay controls."""
@@ -1006,7 +1111,11 @@ class MainWindow(QMainWindow):
         self._metadata_merged = self._metadata_df.copy()
         self._overlay_cache = None
 
-        self._refresh_data_table()
+        # Merge into every open plot tab (profiler + infer).
+        for view in self._profiler_views.values():
+            view.set_metadata(self._metadata_merged)
+        for view in self._infer_views.values():
+            view.set_metadata(self._metadata_merged)
         self._update_overlay_with_metadata()
 
     def _on_metadata_clear(self) -> None:
@@ -1015,37 +1124,70 @@ class MainWindow(QMainWindow):
         self._overlay_cache = None
         self._data_view.set_metadata_label(None)
 
-        self._refresh_data_table()
+        for view in self._profiler_views.values():
+            view.set_metadata(None)
+        for view in self._infer_views.values():
+            view.set_metadata(None)
         self._update_overlay_with_metadata()
 
     def _update_overlay_with_metadata(self) -> None:
         ic = self._image_controls
+        selected_data = ic.overlay_col.currentData()
         ic.overlay_col.blockSignals(True)
         # Remove existing metadata items (tagged with "metadata/" prefix)
         for i in range(ic.overlay_col.count() - 1, -1, -1):
             data = ic.overlay_col.itemData(i)
             if data and isinstance(data, tuple) and data[0] == "metadata":
                 ic.overlay_col.removeItem(i)
+        # The selected column may have been one of the removed metadata items
+        # (Clear) — reset the overlay state so stale values stop rendering.
+        if (selected_data is not None and isinstance(selected_data, tuple)
+                and selected_data[0] == "metadata"
+                and self._metadata_merged is None):
+            self._overlay_table = None
+            self._overlay_col = None
         # Add merged metadata columns
         if self._metadata_merged is not None:
             for col in self._metadata_merged.columns:
                 if col != "well":
                     ic.overlay_col.addItem(f"metadata/{col}", ("metadata", col))
         ic.overlay_col.blockSignals(False)
+        # Signals were blocked while rebuilding — redraw with the new state.
+        self._on_overlay_changed()
         # Also update the well grid Color by dropdown
         self._update_grid_columns()
 
     def _on_write_to_db(self) -> None:
-        if self._dm is None or self._metadata_merged is None:
+        """Add/update the merged metadata columns in every loaded DB.
+
+        Profiler DBs: every table that has a `well` column. Infer DBs: the
+        `inference` table. Columns are added with ALTER TABLE and rows are
+        updated by well — no table is rewritten.
+        """
+        if self._metadata_merged is None:
+            return
+        if not self._profiler_dbs and not self._infer_dbs:
+            logger.info("Write to DB: no profiler/infer DB is loaded")
             return
         try:
-            tables = self._dm.get_profiling_tables()
-            for tname in tables:
-                df = self._dm.get_table_df(tname)
-                if df is not None and "well" in df.columns:
-                    merged = self._join_metadata(df)
-                    self._dm.write_merged_table(tname, merged)
-            self._dm.invalidate_table_cache()
+            written = 0
+            for db in self._profiler_dbs.values():
+                written += db.write_metadata(self._metadata_merged)
+            for db in self._infer_dbs.values():
+                written += db.write_metadata(self._metadata_merged)
+            # Refresh the pickers so the new columns appear in the plot tabs.
+            self._refresh_profiler_plot()
+            for view in self._infer_views.values():
+                view.set_metadata(self._metadata_merged)
+            # DataModule caches schema + DataFrames; without this the grid and
+            # overlay dropdowns keep serving pre-write columns until the DB is
+            # re-selected.
+            if self._dm is not None:
+                self._dm.invalidate_table_cache()
+            self._update_grid_columns()
+            logger.info(
+                "Metadata written to %d profiler/infer DB(s) — %d column(s) updated",
+                len(self._profiler_dbs) + len(self._infer_dbs), written)
             # Write-to-DB is an action button — persist patterns + channel
             # colors to session.yml (write-on-action contract).
             if self._session is not None:
@@ -1056,148 +1198,13 @@ class MainWindow(QMainWindow):
                     image_subdir_pattern=subdir_pat,
                 )
                 self._persist_channel_colors()
-        except SystemExit:
-            logger.exception("Failed to persist session.yml")
         except Exception:
             logger.exception("Failed to write metadata to database")
 
-    def _refresh_data_table(self) -> None:
-        if self._current_table:
-            self._on_data_table_changed(self._current_table)
-
-    # ── PyGwalker ────────────────────────────────────────────────────────────
-
-    def _cleanup_pygwalker_loader(self) -> None:
-        """Quit and release an in-flight PyGwalker loader thread, if any.
-
-        A slow first load must never tear down a NEWER loader: a stale
-        data_ready from the old thread would quit/delete the new loader and
-        start the server with the old table's data.
-        """
-        if self._pgw_loader_thread is not None:
-            self._pgw_loader_thread.quit()
-            self._pgw_loader_thread.wait()
-        if self._pgw_loader is not None:
-            self._pgw_loader.deleteLater()
-            self._pgw_loader = None
-        if self._pgw_loader_thread is not None:
-            self._pgw_loader_thread.deleteLater()
-            self._pgw_loader_thread = None
-
-    def _on_pygwalker_open(self) -> None:
-        """Launch PyGwalker in the browser for the currently selected table."""
-        if self._dm is None or not self._current_table:
-            return
-
-        self._shutdown_pygwalker()
-        self._cleanup_pygwalker_loader()
-
-        self._data_view.set_pygwalker_hint(0, sampled=False)
-
-        self._pgw_loader_thread = QThread(self)
-        self._pgw_loader = _PygwalkerDataLoader(
-            self._dm, self._current_table, self._metadata_merged,
-        )
-        self._pgw_loader.moveToThread(self._pgw_loader_thread)
-        self._pgw_loader_thread.started.connect(self._pgw_loader.load)
-        self._pgw_loader.data_ready.connect(self._on_pygwalker_data_ready)
-        self._pgw_loader.error_occurred.connect(self._on_pygwalker_error)
-        self._pgw_loader_thread.start()
-
-    def _on_pygwalker_data_ready(self, payload: tuple) -> None:
-        """Receive prepared DataFrame from background loader and start server."""
-        self._pgw_loader_thread.quit()
-        self._pgw_loader_thread.wait()
-        self._pgw_loader.deleteLater()
-        self._pgw_loader = None
-        self._pgw_loader_thread.deleteLater()
-        self._pgw_loader_thread = None
-
-        df, sampled, before = payload
-        logger.info(
-            "PyGwalker: sending %d rows%s",
-            len(df),
-            f" (sampled from {before})" if sampled else "",
-        )
-
-        self._data_view.set_pygwalker_hint(len(df), sampled=sampled)
-
-        profiling_cols = {"directory", "well", "field", "stack", "timepoint", "label"}
-
-        try:
-            import os
-            os.environ.setdefault("PYGWALKER_UPDATE_CHECK", "0")
-            os.environ.setdefault("KANARIES_API_KEY", "")
-            os.environ.setdefault("PYGWALKER_TELEMETRY", "0")
-            from pygwalker.api.webserver import (
-                BaseCommunication, CustomTCPServer, PygWalker,
-                _GlobalState, _create_handler_with_walker, _open_browser, find_free_port,
-            )
-
-            from pygwalker.data_parsers.base import FieldSpec
-            field_specs = [
-                FieldSpec(fname=c, analytic_type="dimension" if c in profiling_cols else "?")
-                for c in df.columns
-            ]
-            walker = PygWalker(
-                gid="pgw",
-                dataset=df,
-                field_specs=field_specs,
-                spec="",
-                source_invoke_code="",
-                theme_key="g2",
-                appearance="media",
-                show_cloud_tool=False,
-                use_preview=False,
-                kernel_computation=None,
-                use_save_tool=True,
-                gw_mode="explore",
-                is_export_dataframe=True,
-                kanaries_api_key="",
-                default_tab="vis",
-                cloud_computation=False,
-            )
-            walker._init_callback(BaseCommunication(str(walker.gid)))
-
-            state = _GlobalState(auto_shutdown=False)
-            handler = _create_handler_with_walker(walker, state)
-            port = find_free_port()
-            address = f"http://localhost:{port}"
-
-            self._pgw_httpd = CustomTCPServer(("127.0.0.1", port), handler)
-
-            def _serve():
-                try:
-                    with self._pgw_httpd:
-                        threading.Thread(target=_open_browser, args=(address,), daemon=True).start()
-                        self._pgw_httpd.serve_forever()
-                except Exception:
-                    logger.exception("PyGwalker server error")
-                finally:
-                    self._pgw_httpd = None
-
-            self._pgw_thread = threading.Thread(target=_serve)
-            self._pgw_thread.start()
-
-        except Exception:
-            logger.exception("Failed to launch PyGwalker")
-
-    def _on_pygwalker_error(self, msg: str) -> None:
-        """Handle data loading error."""
-        self._cleanup_pygwalker_loader()
-        logger.error("PyGwalker data loading failed: %s", msg)
-
-    def _shutdown_pygwalker(self) -> None:
-        """Shut down the PyGwalker server if running."""
-        if self._pgw_httpd is not None:
-            try:
-                self._pgw_httpd.shutdown()
-            except Exception:
-                pass
-        if self._pgw_thread is not None and self._pgw_thread.is_alive():
-            self._pgw_thread.join(timeout=3)
-            self._pgw_thread = None
-        self._pgw_httpd = None
+    def _refresh_profiler_plot(self) -> None:
+        """Repopulate every profiler plot's table/column pickers from its DB."""
+        for view in self._profiler_views.values():
+            view.refresh_tables()
 
     # ── Grid Handlers ────────────────────────────────────────────────────────
 
@@ -1246,17 +1253,26 @@ class MainWindow(QMainWindow):
             col_name = None
             col_val = (None, False)
 
-        # Pre-compute metadata data_map for grid (metadata isn't in the DB)
-        metadata_map: dict[str, float | str] | None = None
-        if (
-            table_name == "metadata"
-            and col_name is not None
-            and self._metadata_merged is not None
-            and col_name in self._metadata_merged.columns
-        ):
-            metadata_map = dict(
+        # Pre-computed well→value map for sources the canvas cannot aggregate
+        # itself: merged Excel metadata and loaded infer DBs.
+        value_map: dict[str, float | str] | None = None
+        if table_name == "metadata" and col_name is not None \
+                and self._metadata_merged is not None \
+                and col_name in self._metadata_merged.columns:
+            value_map = dict(
                 zip(self._metadata_merged["well"], self._metadata_merged[col_name], strict=False)
             )
+        elif table_name.startswith("infer:") and col_name is not None:
+            db = self._infer_dbs.get(table_name[len("infer:"):])
+            if db is not None:
+                try:
+                    idf = db.load_inference(
+                        self._dm.directory_scopes() if self._dm else [self._dataset_dir]
+                    )
+                    value_map = aggregate_by_well(idf, col_name, gw.aggregation.currentText())
+                except Exception:
+                    logger.warning("Failed to aggregate infer grid values", exc_info=True)
+                    value_map = {}
 
         self._grid_canvas.update_grid(
             self._dm,
@@ -1267,7 +1283,7 @@ class MainWindow(QMainWindow):
             palette=gw.palette.currentText(),
             fmt_name=gw.plate_format.currentText(),
             selected_wells=self._selected_wells,
-            metadata_map=metadata_map,
+            value_map=value_map,
         )
 
     # ── Image Handlers ───────────────────────────────────────────────────────
@@ -1687,7 +1703,7 @@ class MainWindow(QMainWindow):
 
         # Use cached overlay data when overlay settings AND the loaded DB
         # haven't changed (the DB path is part of the key, otherwise a
-        # different result.db with the same table/column names would serve
+        # different profiler.db with the same table/column names would serve
         # stale overlay data). Keying by id(_metadata_merged) is safe only
         # because _on_metadata_merge/_on_metadata_clear null the cache
         # whenever the DataFrame is replaced — an id alone could be recycled
@@ -1780,8 +1796,19 @@ class MainWindow(QMainWindow):
             self._start_worker(worker)
 
     def _compute_overlay_data(self) -> tuple:
-        """Pre-compute overlay values, object counts, and per-object values."""
+        """Pre-compute overlay values, object counts, and per-object values.
+
+        The overlay source is either a profiler table (`table/col`), the merged
+        Excel metadata (`metadata/col`), or a loaded infer DB (`infer:<path>`,
+        directory-scoped with fallback). Infer DBs also provide object counts
+        from their `label` column when no profiler table does.
+        """
         overlay_values: dict[str, float | str] = {}
+        infer_frame: pd.DataFrame | None = None
+        infer_key = None
+        if self._overlay_table and self._overlay_table.startswith("infer:"):
+            infer_key = self._overlay_table[len("infer:"):]
+
         if self._overlay_col and self._overlay_table:
             if self._overlay_table == "metadata" and self._metadata_merged is not None:
                 if self._overlay_col in self._metadata_merged.columns:
@@ -1789,6 +1816,17 @@ class MainWindow(QMainWindow):
                     overlay_values = dict(
                         zip(meta["well"], meta[self._overlay_col], strict=False)
                     )
+            elif infer_key is not None:
+                db = self._infer_dbs.get(infer_key)
+                if db is not None:
+                    try:
+                        infer_frame = db.load_inference(
+                            self._dm.directory_scopes() if self._dm else [self._dataset_dir]
+                        )
+                        overlay_values = aggregate_by_well(
+                            infer_frame, self._overlay_col, "mean")
+                    except Exception:
+                        logger.warning("Failed to load infer overlay values", exc_info=True)
             else:
                 try:
                     overlay_values = self._dm.aggregate(
@@ -1799,59 +1837,75 @@ class MainWindow(QMainWindow):
 
         object_counts: dict[str, int] = {}
         object_table: str | None = None
-        # Prefer user-selected table if it has per-object data
-        if self._overlay_table and self._overlay_table != "metadata":
-            cols = [c for c, _, _ in self._dm.get_profiling_columns(self._overlay_table)]
-            if "label" in cols and "well" in cols:
-                object_table = self._overlay_table
-                try:
-                    df = self._dm.get_table_df(object_table)
-                    if df is not None:
-                        object_counts = df.groupby("well")["label"].nunique().to_dict()
-                except Exception:
-                    logger.warning("Failed to compute object counts", exc_info=True)
-        # Fallback: auto-discover
-        if object_table is None:
-            for tname in self._dm.get_profiling_tables():
-                cols = [c for c, _, _ in self._dm.get_profiling_columns(tname)]
+        if infer_frame is not None:
+            # Infer rows carry `label` in whole-image mode — counts and
+            # per-object values come straight from the (directory-scoped) frame.
+            if "label" in infer_frame.columns and "well" in infer_frame.columns:
+                counts_df = infer_frame[infer_frame["label"].notna()]
+                object_counts = counts_df.groupby("well")["label"].nunique().to_dict()
+        else:
+            # Prefer user-selected table if it has per-object data
+            if self._overlay_table and self._overlay_table != "metadata":
+                cols = [c for c, _, _ in self._dm.get_profiling_columns(self._overlay_table)]
                 if "label" in cols and "well" in cols:
-                    object_table = tname
+                    object_table = self._overlay_table
                     try:
-                        df = self._dm.get_table_df(tname)
+                        df = self._dm.get_table_df(object_table)
                         if df is not None:
                             object_counts = df.groupby("well")["label"].nunique().to_dict()
                     except Exception:
                         logger.warning("Failed to compute object counts", exc_info=True)
-                    break
+            # Fallback: auto-discover
+            if object_table is None:
+                for tname in self._dm.get_profiling_tables():
+                    cols = [c for c, _, _ in self._dm.get_profiling_columns(tname)]
+                    if "label" in cols and "well" in cols:
+                        object_table = tname
+                        try:
+                            df = self._dm.get_table_df(tname)
+                            if df is not None:
+                                object_counts = df.groupby("well")["label"].nunique().to_dict()
+                        except Exception:
+                            logger.warning("Failed to compute object counts", exc_info=True)
+                        break
 
         per_object_values: dict[str, dict[tuple, dict[int, float | str]]] = {}
         overlay_vmin = 0.0
         overlay_vmax = 1.0
-        if object_table and self._overlay_col:
+        source_df: pd.DataFrame | None = infer_frame
+        if source_df is None and object_table and self._overlay_col:
             try:
-                odf = self._dm.get_table_df(object_table)
-                if odf is not None and "label" in odf.columns and self._overlay_col in odf.columns:
-                    # Scope per-image to avoid label ID collisions across fields/stacks/timepoints
-                    group_cols = ["well", "field", "stack", "timepoint"]
-                    has_image_cols = all(c in odf.columns for c in group_cols)
-                    if has_image_cols:
-                        for (well, field, stack, timepoint), gdf in odf.groupby(group_cols):
-                            per_object_values.setdefault(well, {})[(str(field), str(stack), str(timepoint))] = dict(
-                                zip(gdf["label"].astype(int), gdf[self._overlay_col], strict=True)
-                            )
-                    else:
-                        for well, wdf in odf.groupby("well"):
-                            per_object_values.setdefault(well, {})[(-1, -1, -1)] = dict(
-                                zip(wdf["label"].astype(int), wdf[self._overlay_col], strict=True)
-                            )
-                    # Compute global min/max for colorbar normalization
-                    col_vals = odf[self._overlay_col]
-                    if col_vals.dtype.kind in ("i", "f"):
-                        overlay_vmin = float(col_vals.min())
-                        overlay_vmax = float(col_vals.max())
-                        if overlay_vmin == overlay_vmax:
-                            overlay_vmin = 0.0
-                            overlay_vmax = 1.0
+                source_df = self._dm.get_table_df(object_table)
+            except Exception:
+                logger.warning("Failed to compute per-object overlay values", exc_info=True)
+                source_df = None
+        if source_df is not None and self._overlay_col in source_df.columns:
+            try:
+                odf = source_df[source_df["label"].notna()].copy()
+                odf["label"] = pd.to_numeric(odf["label"], errors="coerce")
+                odf = odf[odf["label"].notna()]
+                odf["label"] = odf["label"].astype(int)
+                # Scope per-image to avoid label ID collisions across fields/stacks/timepoints
+                group_cols = ["well", "field", "stack", "timepoint"]
+                has_image_cols = all(c in odf.columns for c in group_cols)
+                if has_image_cols:
+                    for (well, field, stack, timepoint), gdf in odf.groupby(group_cols):
+                        per_object_values.setdefault(well, {})[(str(field), str(stack), str(timepoint))] = dict(
+                            zip(gdf["label"], gdf[self._overlay_col], strict=True)
+                        )
+                else:
+                    for well, wdf in odf.groupby("well"):
+                        per_object_values.setdefault(well, {})[(-1, -1, -1)] = dict(
+                            zip(wdf["label"], wdf[self._overlay_col], strict=True)
+                        )
+                # Compute global min/max for colorbar normalization
+                col_vals = odf[self._overlay_col]
+                if col_vals.dtype.kind in ("i", "f"):
+                    overlay_vmin = float(col_vals.min())
+                    overlay_vmax = float(col_vals.max())
+                    if overlay_vmin == overlay_vmax:
+                        overlay_vmin = 0.0
+                        overlay_vmax = 1.0
             except Exception:
                 logger.warning("Failed to compute per-object overlay values", exc_info=True)
 
@@ -2133,7 +2187,7 @@ class MainWindow(QMainWindow):
                 )
                 self._persist_channel_colors()
         except SystemExit:
-            # SessionFile.save hard-exits on YAML write failure — never let
+            # SessionFile.save raises DataError on YAML write failure — never let
             # it kill the app.
             logger.exception("Failed to persist session.yml")
 
@@ -2295,7 +2349,7 @@ class MainWindow(QMainWindow):
                 )
                 self._persist_channel_colors()
         except SystemExit:
-            # SessionFile.save hard-exits on YAML write failure — never let
+            # SessionFile.save raises DataError on YAML write failure — never let
             # it kill the app.
             logger.exception("Failed to persist session.yml")
 
@@ -2472,37 +2526,11 @@ class MainWindow(QMainWindow):
         self._pixel_info.set_text(f"Export error: {msg}")
         logger.warning("Export error: %s", msg)
 
-    # ── Data View Handler ────────────────────────────────────────────────────
-
-    def _on_data_table_changed(self, table_name: str) -> None:
-        if self._dm is None or not table_name:
-            return
-        self._current_table = table_name
-        try:
-            # Fetch only 20 rows via SQL LIMIT — no full table scan
-            df, total_rows = self._dm.get_table_preview(table_name, limit=20)
-            if df is not None and self._metadata_merged is not None and "well" in df.columns:
-                df = self._join_metadata(df)
-            self._data_view.set_dataframe(df)
-            self._data_view.set_preview_hint(total_rows)
-        except Exception:
-            logger.warning("Failed to load data table %s", table_name, exc_info=True)
-
-    def _join_metadata(self, df: pd.DataFrame) -> pd.DataFrame:
-        meta_cols = [c for c in self._metadata_merged.columns if c != "well"]
-        merged = df.merge(self._metadata_merged, on="well", how="left")
-        other_cols = [c for c in merged.columns if c not in meta_cols and c != "well"]
-        return merged[["well"] + meta_cols + other_cols]
-
     # ── Cleanup ──────────────────────────────────────────────────────────────
 
     def _on_full_reset(self) -> None:
         """Reset everything to initial startup state without restarting the app."""
         self._shutting_down = True
-
-        # Tear down PyGwalker
-        self._shutdown_pygwalker()
-        self._cleanup_pygwalker_loader()
 
         # Invalidate all pending workers
         self._cancel_workers()
@@ -2522,7 +2550,9 @@ class MainWindow(QMainWindow):
         self._update_window_title()
         self._metadata_df = None
         self._metadata_merged = None
-        self._current_table = None
+
+        # Close every DB reader + drop the plot tabs
+        self._clear_plot_views()
 
         # Clear caches
         self._raw_cache.clear()
@@ -2657,14 +2687,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._shutting_down = True
-        self._shutdown_pygwalker()
-        if self._pgw_loader_thread is not None and self._pgw_loader_thread.isRunning():
-            self._pgw_loader_thread.quit()
-            self._pgw_loader_thread.wait(1000)
         self._cancel_workers()
         self._thread_pool.waitForDone(2000)
         # Flush Windows message queue to clear "Not Responding" state
         QApplication.processEvents()
         if self._dm is not None:
             self._dm.close_db()
+        for db in self._profiler_dbs.values():
+            db.close()
+        for db in self._infer_dbs.values():
+            db.close()
         super().closeEvent(event)

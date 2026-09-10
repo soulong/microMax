@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from microBase import load_yaml
+from microBase.db_contracts import INFER_DB_NAME, MASK_COLUMN_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +109,7 @@ class SegmentConfig:
 
 @dataclass
 class ImageProfileConfig:
-    """Per-site whole-image intensity table (`image` in result.db)."""
+    """Per-site whole-image intensity table (`image` in profiler.db)."""
 
     run: bool = False
     n_workers: int = field(default_factory=default_n_workers)
@@ -118,7 +119,7 @@ class ImageProfileConfig:
 
 @dataclass
 class ObjectProfileEntry:
-    """Per-object features for one mask type — one table in result.db.
+    """Per-object features for one mask type — one table in profiler.db.
 
     All channel lists mean "these channels"; null/[] skips that feature
     group (never an implicit "all channels").
@@ -126,26 +127,26 @@ class ObjectProfileEntry:
 
     mask_name: Optional[str] = None                 # which masks to crop objects from
     parent_mask_name: Optional[str] = None          # parent objects this one lives in (e.g. cell for nuclei)
-    output_table_name: Optional[str] = None         # result.db table name; null = mask_name
+    output_table_name: Optional[str] = None         # profiler.db table name; null = mask_name
     overwrite_db: bool = False                      # drop + rewrite the table on re-run
     intensity_channels: Optional[List[str]] = None  # per-channel intensity stats; null/[] = block skipped
     radial_channels: Optional[List[str]] = None     # radial distribution profile channels
     radial_bins: int = 4                            # radial bins per profile
-    gran_channels: Optional[List[str]] = None       # granularity (texture spectrum) channels
-    gran_spectrum_length: Optional[int] = None      # spectrum length (resolved default 8)
-    gran_subsample_ratio: Optional[float] = None    # (0, 1] pixel subsample inside the object
-    gran_background_subsample_ratio: Optional[float] = None   # (0, 1] subsample of the background ring
-    gran_background_radius: Optional[int] = None    # background ring width (px) around the object
+    granularity_channels: Optional[List[str]] = None       # granularity (texture spectrum) channels
+    granularity_spectrum_length: Optional[int] = None      # spectrum length (resolved default 8)
+    granularity_subsample_ratio: Optional[float] = None    # (0, 1] pixel subsample inside the object
+    granularity_background_subsample_ratio: Optional[float] = None   # (0, 1] subsample of the background ring
+    granularity_background_radius: Optional[int] = None    # background ring width (px) around the object
     glcm_channels: Optional[List[str]] = None       # GLCM texture feature channels
     glcm_distances: Optional[List[int]] = None      # GLCM offsets in px (resolved default [2])
     glcm_levels: Optional[int] = None               # GLCM gray levels (resolved default 256)
     correlation_pairs: Optional[List[List[str]]] = None   # channel pairs for Pearson correlation
 
     def resolved(self) -> "ResolvedProfiling":
-        gran_spectrum_length = self.gran_spectrum_length if self.gran_spectrum_length is not None else 8
-        gran_subsample_ratio = self.gran_subsample_ratio if self.gran_subsample_ratio is not None else 0.5
-        gran_background_subsample_ratio = self.gran_background_subsample_ratio if self.gran_background_subsample_ratio is not None else 0.25
-        gran_background_radius = self.gran_background_radius if self.gran_background_radius is not None else 10
+        granularity_spectrum_length = self.granularity_spectrum_length if self.granularity_spectrum_length is not None else 8
+        granularity_subsample_ratio = self.granularity_subsample_ratio if self.granularity_subsample_ratio is not None else 0.5
+        granularity_background_subsample_ratio = self.granularity_background_subsample_ratio if self.granularity_background_subsample_ratio is not None else 0.25
+        granularity_background_radius = self.granularity_background_radius if self.granularity_background_radius is not None else 10
 
         glcm_distances = [2]
         glcm_levels: int = 256
@@ -164,11 +165,11 @@ class ObjectProfileEntry:
             intensity_channels=self.intensity_channels,
             radial_channels=self.radial_channels,
             radial_bins=self.radial_bins,
-            granularity_channels=self.gran_channels,
-            gran_spectrum_length=gran_spectrum_length,
-            gran_subsample_ratio=gran_subsample_ratio,
-            gran_background_subsample_ratio=gran_background_subsample_ratio,
-            gran_background_radius=gran_background_radius,
+            granularity_channels=self.granularity_channels,
+            granularity_spectrum_length=granularity_spectrum_length,
+            granularity_subsample_ratio=granularity_subsample_ratio,
+            granularity_background_subsample_ratio=granularity_background_subsample_ratio,
+            granularity_background_radius=granularity_background_radius,
             glcm_channels=self.glcm_channels,
             glcm_distances=glcm_distances,
             glcm_levels=glcm_levels,
@@ -185,10 +186,10 @@ class ResolvedProfiling:
     radial_channels: Optional[List[str]] = None
     radial_bins: int = 4
     granularity_channels: Optional[List[str]] = None
-    gran_spectrum_length: int = 8
-    gran_subsample_ratio: float = 0.5
-    gran_background_subsample_ratio: float = 0.25
-    gran_background_radius: int = 10
+    granularity_spectrum_length: int = 8
+    granularity_subsample_ratio: float = 0.5
+    granularity_background_subsample_ratio: float = 0.25
+    granularity_background_radius: int = 10
     glcm_channels: Optional[List[str]] = None
     glcm_distances: List[int] = field(default_factory=lambda: [2])
     glcm_levels: int = 256
@@ -248,7 +249,7 @@ class InferenceEntry:
     channels: Optional[List[str]] = None
     feature: bool = True
     pred_class: bool = True
-    output_db: str = "infer.db"
+    output_db: str = INFER_DB_NAME
     max_value: Optional[float] = None
     reduction: Optional[InferenceReductionConfig] = None
 
@@ -266,7 +267,7 @@ def resolve_inference_db(entry: InferenceEntry) -> str:
     Single source of truth used by the pipeline (steps), the CLI
     completeness check, and the microModel bridge (``db_name`` key).
     """
-    return entry.output_db or "infer.db"
+    return entry.output_db or INFER_DB_NAME
 
 
 @dataclass
@@ -367,6 +368,21 @@ def _check(value: Any, message: str) -> None:
         raise ValueError(message)
 
 
+def _check_bare_mask_name(value: Optional[str], context: str) -> None:
+    """Mask/object names in configs are BARE (``cell``), never ``mask_cell``.
+
+    The ``mask_`` prefix is microBase's metadata-column convention; config
+    values are converted on use. Rejecting the prefixed form here prevents a
+    silent "column not found" later (microModel prepends the prefix itself).
+    """
+    if value and str(value).startswith(MASK_COLUMN_PREFIX):
+        raise ValueError(
+            f"{context} must be the bare mask/object name without the "
+            f"'{MASK_COLUMN_PREFIX}' prefix (got {value!r}; use "
+            f"{str(value)[len(MASK_COLUMN_PREFIX):]!r})."
+        )
+
+
 def section_to_dataclass(attr: str, section: Dict) -> Any:
     """Convert a single section dict to its corresponding dataclass instance.
 
@@ -400,12 +416,22 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
         for e in section.get("configs", []):
             entry = _entry_from_section(attr, SegmentEntry, e)
             _check(entry.object_name, "'segment.configs[].object_name' must not be empty")
+            _check_bare_mask_name(entry.object_name, "'segment.configs[].object_name'")
             _check(entry.gpu_batch_size >= 1, "'segment.configs[].gpu_batch_size' must be >= 1")
             _check(entry.resize_factor > 0, "'segment.configs[].resize_factor' must be > 0")
             _check(entry.flow_threshold >= 0, "'segment.configs[].flow_threshold' must be >= 0")
             _check(0 <= entry.edge_pixel_ratio <= 1,
                    "'segment.configs[].edge_pixel_ratio' must be in [0, 1]")
             entries.append(entry)
+        # Duplicate object names would overwrite each other's mask file — the
+        # GUI rejects them; the CLI must too (single validation source).
+        names = [e.object_name for e in entries]
+        dups = sorted({n for n in names if names.count(n) > 1})
+        if dups:
+            raise ValueError(
+                f"Duplicate segment.configs[].object_name values: {dups}. "
+                f"Each block writes <stem>_cp_masks_<object_name>.png."
+            )
         return SegmentConfig(
             run=_coerce_bool(section.get("run", False), "segment.run"),
             configs=entries,
@@ -422,26 +448,43 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
         for e in section.get("configs", []):
             entry = _entry_from_section(attr, ObjectProfileEntry, e)
             _check(entry.mask_name, "'object_profile.configs[].mask_name' must not be empty")
+            _check_bare_mask_name(entry.mask_name, "'object_profile.configs[].mask_name'")
+            _check_bare_mask_name(entry.parent_mask_name,
+                                  "'object_profile.configs[].parent_mask_name'")
             _check(entry.radial_bins >= 1, "'object_profile.configs[].radial_bins' must be >= 1")
-            _check(entry.gran_spectrum_length is None or entry.gran_spectrum_length >= 1,
-                   "'object_profile.configs[].gran_spectrum_length' must be >= 1")
+            _check(entry.granularity_spectrum_length is None or entry.granularity_spectrum_length >= 1,
+                   "'object_profile.configs[].granularity_spectrum_length' must be >= 1")
             _check(entry.glcm_levels is None or entry.glcm_levels >= 2,
                    "'object_profile.configs[].glcm_levels' must be >= 2")
             # Range-validate the granularity/GLCM knobs here rather than per
             # row: the profiler skips failing rows silently, so an
             # out-of-range YAML value would otherwise yield empty tables
             # with no error.
-            _check(entry.gran_subsample_ratio is None or 0 < entry.gran_subsample_ratio <= 1,
-                   "'object_profile.configs[].gran_subsample_ratio' must be in (0, 1]")
-            _check(entry.gran_background_subsample_ratio is None
-                   or 0 < entry.gran_background_subsample_ratio <= 1,
-                   "'object_profile.configs[].gran_background_subsample_ratio' must be in (0, 1]")
-            _check(entry.gran_background_radius is None or entry.gran_background_radius >= 1,
-                   "'object_profile.configs[].gran_background_radius' must be >= 1")
+            _check(entry.granularity_subsample_ratio is None or 0 < entry.granularity_subsample_ratio <= 1,
+                   "'object_profile.configs[].granularity_subsample_ratio' must be in (0, 1]")
+            _check(entry.granularity_background_subsample_ratio is None
+                   or 0 < entry.granularity_background_subsample_ratio <= 1,
+                   "'object_profile.configs[].granularity_background_subsample_ratio' must be in (0, 1]")
+            _check(entry.granularity_background_radius is None or entry.granularity_background_radius >= 1,
+                   "'object_profile.configs[].granularity_background_radius' must be >= 1")
             _check(entry.glcm_distances is None
                    or all(d >= 1 for d in entry.glcm_distances),
                    "'object_profile.configs[].glcm_distances' values must be >= 1")
+            if entry.parent_mask_name and entry.parent_mask_name == entry.mask_name:
+                raise ValueError(
+                    "'object_profile.configs[].parent_mask_name' must differ "
+                    "from mask_name (a mask cannot be its own parent)."
+                )
             entries.append(entry)
+        # Duplicate output table names would replace each other (first flush
+        # uses if_exists='replace') — validate once here for GUI and CLI.
+        table_names = [e.output_table_name or e.mask_name for e in entries]
+        dups = sorted({t for t in table_names if t and table_names.count(t) > 1})
+        if dups:
+            raise ValueError(
+                f"Duplicate object_profile output table(s): {dups}. Set a "
+                f"distinct output_table_name per block."
+            )
         n_workers = section.get("n_workers")
         if n_workers is None:
             n_workers = default_n_workers()
@@ -460,6 +503,7 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
             entry = _entry_from_section(attr, InferenceEntry, entry_dict)
             if entry.model is None or not entry.model:
                 raise ValueError("'inference.configs[].model' must not be empty")
+            _check_bare_mask_name(entry.mask_name, "'inference.configs[].mask_name'")
             if entry.max_value is not None and entry.max_value <= 0:
                 raise ValueError(
                     f"'inference.configs[].max_value' must be > 0, got {entry.max_value}")
@@ -480,7 +524,24 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
                         f"'inference.configs[].reduction.method' has unknown "
                         f"entries {bad}; valid: ['pca', 'umap', 'pacmap', 'localmap']")
             entry.reduction = red_obj
+            if red_obj is not None:
+                red_runs = bool(red_obj.enabled
+                                or (red_obj.cluster_enabled and red_obj.cluster))
+                if red_runs and not entry.feature:
+                    raise ValueError(
+                        "'inference.configs[].reduction' requires feature=true "
+                        "(reduction reads the features BLOB)."
+                    )
             entries.append(entry)
+        # Duplicate output_db names would overwrite each other's inference
+        # rows — reject in both GUI and CLI (single validation source).
+        db_names = [resolve_inference_db(e) for e in entries if e.channels]
+        dups = sorted({n for n in db_names if db_names.count(n) > 1})
+        if dups:
+            raise ValueError(
+                f"Duplicate inference output_db name(s): {dups}. Rename one "
+                f"of the blocks."
+            )
         return InferenceConfig(
             run=_coerce_bool(section.get("run", False), "inference.run"),
             configs=entries,

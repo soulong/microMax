@@ -76,7 +76,7 @@ segment:
       cellprob_threshold: 0.0
       gpu_batch_size: 32
 
-# image profiling (per-site whole-image intensity table in result.db)
+# image profiling (per-site whole-image intensity table in profiler.db)
 # image_channels: null/absent/[] skips the step entirely (like the GUI's
 # blocked Run with no selection). To profile channels, list them explicitly.
 image_profile:
@@ -86,24 +86,24 @@ image_profile:
     - ch1
   image_thresholds: null               # optional per-channel foreground thresholds
 
-# object profiling (one result.db table per block; features per single cell)
+# object profiling (one profiler.db table per block; features per single cell)
 object_profile:
   run: true
   n_workers: 8
   configs:
     - mask_name: cell                 # which masks to crop objects from
       parent_mask_name: null          # parent objects this one lives in (e.g. cell for nuclei)
-      output_table_name: cell         # table name in result.db
+      output_table_name: cell         # table name in profiler.db
       intensity_channels:             # per-channel mean/std/intensity stats
         - ch1
       radial_channels: null           # radial distribution profiles; null = off
       radial_bins: 4
-      gran_channels:                  # granularity (texture spectra) channels
+      granularity_channels:                  # granularity (texture spectra) channels
         - ch1
-      gran_spectrum_length: 8
-      gran_subsample_ratio: 0.5       # pixel subsampling inside the object
-      gran_background_subsample_ratio: 0.25
-      gran_background_radius: 10      # background ring width around the object
+      granularity_spectrum_length: 8
+      granularity_subsample_ratio: 0.5       # pixel subsampling inside the object
+      granularity_background_subsample_ratio: 0.25
+      granularity_background_radius: 10      # background ring width around the object
       glcm_channels: null             # GLCM texture features; null = off
       correlation_pairs: null         # channel-pair correlations; null = off
     - mask_name: nuclei
@@ -112,7 +112,7 @@ object_profile:
       intensity_channels:
         - ch2
       radial_channels: null
-      gran_channels: null
+      granularity_channels: null
       glcm_channels: null
       correlation_pairs: null
 

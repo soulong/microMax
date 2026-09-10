@@ -8,7 +8,13 @@ from pathlib import Path
 from tifffile import imwrite
 from PIL import Image
 
-from microBase import ImageDataset
+from microBase import (
+    ConfigError,
+    DataError,
+    DatasetError,
+    ImageDataset,
+    ImageReadError,
+)
 
 
 def _make_one_channel_per_file_dataset(tmp_path, n_sites=3, n_channels=2, h=64, w=64):
@@ -230,10 +236,10 @@ def test_image_dataset_multi_channel_per_file_chw(tmp_path):
     assert ds.img_shape == (64, 64)
 
 
-def test_image_dataset_channel_layout_conflict_exits(tmp_path):
+def test_image_dataset_channel_layout_conflict_raises(tmp_path):
     """channel_layout + channel-grouped pattern should error."""
     _make_one_channel_per_file_dataset(tmp_path, n_sites=1, n_channels=1)
-    with pytest.raises(SystemExit):
+    with pytest.raises(ConfigError):
         ImageDataset(
             root=tmp_path,
             image_pattern=re.compile(r"r(?P<row>\d+)c(?P<col>\d+)-ch(?P<channel>\d+)\.tiff"),
@@ -263,8 +269,8 @@ def test_image_dataset_no_channel_group_no_layout_implicit_ch1(tmp_path):
     assert ds.intensity_colnames == ["ch1"]
 
 
-def test_image_dataset_root_not_found_exits(tmp_path):
-    with pytest.raises(SystemExit):
+def test_image_dataset_root_not_found_raises(tmp_path):
+    with pytest.raises(DatasetError):
         ImageDataset(
             root=tmp_path / "nonexistent",
             image_pattern=re.compile(r".*"),
@@ -470,7 +476,7 @@ def test_filter_metadata(tmp_path):
     assert ds.metadata["well"].iloc[0] == "A1"
 
 
-def test_filter_metadata_bad_column_exits(tmp_path):
+def test_filter_metadata_bad_column_raises(tmp_path):
     _make_one_channel_per_file_dataset(tmp_path, n_sites=1, n_channels=1)
     ds = ImageDataset(
         root=tmp_path,
@@ -479,7 +485,7 @@ def test_filter_metadata_bad_column_exits(tmp_path):
         ),
         channel_layout=None,
     )
-    with pytest.raises(SystemExit):
+    with pytest.raises(ConfigError):
         ds.filter_metadata("nonexistent_col", ".*")
 
 
@@ -536,15 +542,15 @@ def test_image_dataset_mask_files_excluded_from_images(tmp_path):
     assert len(ds) == 1
 
 
-def test_image_dataset_mask_name_missing_raises_valueerror(tmp_path):
-    """mask_pattern without mask_name group raises ValueError (not sys.exit)."""
+def test_image_dataset_mask_name_missing_raises(tmp_path):
+    """mask_pattern without mask_name group raises DatasetError."""
     _make_one_channel_per_file_dataset(tmp_path, n_sites=1, n_channels=1)
     # Mask pattern without mask_name group
     mask = np.zeros((64, 64), dtype=np.uint16)
     mask[5:15, 5:15] = 1
     Image.fromarray(mask).save(str(tmp_path / "r01c01f01p01-ch1_mask.png"))
 
-    with pytest.raises(ValueError, match="mask_name"):
+    with pytest.raises(DatasetError, match="mask_name"):
         ImageDataset(
             root=tmp_path,
             image_pattern=re.compile(
@@ -574,9 +580,9 @@ def test_image_dataset_explicit_well_natsorted(tmp_path):
     assert wells == ["A1", "A2", "A10"]
 
 
-def test_get_imageset_mask_only_row_exits(tmp_path):
-    """A row whose image files are missing (mask-only) must hard-exit with a
-    clear message, not crash with a raw TypeError."""
+def test_get_imageset_mask_only_row_raises(tmp_path):
+    """A row whose image files are missing (mask-only) must raise
+    ImageReadError with a clear message, not crash with a raw TypeError."""
     _make_one_channel_per_file_dataset_with_masks(tmp_path, n_sites=2)
     # Delete site 2's image files, keeping its mask
     for ch in (1, 2):
@@ -595,15 +601,15 @@ def test_get_imageset_mask_only_row_exits(tmp_path):
     img, masks = ds.get_imageset(0)
     assert img.shape == (64, 64, 2)
     assert "mask_cell" in masks
-    # Row 1 (site 2) is mask-only -> hard-exit
-    with pytest.raises(SystemExit):
+    # Row 1 (site 2) is mask-only -> ImageReadError for quarantine
+    with pytest.raises(ImageReadError):
         ds.get_imageset(1)
 
 
 def test_get_imageset_multi_channel_mask_only_first_row(tmp_path):
     """Multi-channel-per-file: auto-detect skips mask-only rows and the first
     real image defines shape/channels; get_imageset on the mask-only row
-    hard-exits."""
+    raises ImageReadError."""
     # Site 1: mask only (no image)
     mask = np.zeros((32, 32), dtype=np.uint16)
     mask[5:15, 5:15] = 1
@@ -628,8 +634,8 @@ def test_get_imageset_multi_channel_mask_only_first_row(tmp_path):
     # Auto-detect found properties from row 1 (first row with an image)
     assert ds.img_shape == (32, 32)
     assert ds.intensity_colnames == ["ch1", "ch2"]
-    # Mask-only row (index 0) hard-exits
-    with pytest.raises(SystemExit):
+    # Mask-only row (index 0) raises for quarantine
+    with pytest.raises(ImageReadError):
         ds.get_imageset(0)
     # Intact row works
     img, masks = ds.get_imageset(1)
@@ -637,8 +643,8 @@ def test_get_imageset_multi_channel_mask_only_first_row(tmp_path):
     assert "mask_cell" in masks
 
 
-def test_image_path_unknown_channel_exits(tmp_path):
-    """image_path with a channel not in the metadata must hard-exit cleanly."""
+def test_image_path_unknown_channel_raises(tmp_path):
+    """image_path with a channel not in the metadata must raise DataError."""
     _make_one_channel_per_file_dataset(tmp_path, n_sites=1, n_channels=2)
     ds = ImageDataset(
         root=tmp_path,
@@ -647,12 +653,12 @@ def test_image_path_unknown_channel_exits(tmp_path):
         ),
         channel_layout=None,
     )
-    with pytest.raises(SystemExit):
+    with pytest.raises(DataError):
         ds.image_path(0, "ch99")
 
 
-def test_image_path_missing_file_exits(tmp_path):
-    """image_path for a NaN (mask-only/deleted) row must hard-exit."""
+def test_image_path_missing_file_raises(tmp_path):
+    """image_path for a NaN (mask-only/deleted) row must raise ImageReadError."""
     _make_one_channel_per_file_dataset_with_masks(tmp_path, n_sites=2)
     for ch in (1, 2):
         (tmp_path / f"r02c02f01p01-ch{ch}.tiff").unlink()
@@ -666,12 +672,12 @@ def test_image_path_missing_file_exits(tmp_path):
         ),
         channel_layout=None,
     )
-    with pytest.raises(SystemExit):
+    with pytest.raises(ImageReadError):
         ds.image_path(1, "ch1")
 
 
-def test_filter_metadata_invalid_regex_exits(tmp_path):
-    """An invalid filter regex must hard-exit, never raise a raw re.error."""
+def test_filter_metadata_invalid_regex_raises(tmp_path):
+    """An invalid filter regex must raise ConfigError, never a raw re.error."""
     _make_one_channel_per_file_dataset(tmp_path, n_sites=2, n_channels=1)
     ds = ImageDataset(
         root=tmp_path,
@@ -680,5 +686,165 @@ def test_filter_metadata_invalid_regex_exits(tmp_path):
         ),
         channel_layout=None,
     )
-    with pytest.raises(SystemExit):
+    with pytest.raises(ConfigError):
         ds.filter_metadata("field", "(")
+
+
+# ---- quarantine path (missing/unreadable files) ----
+
+
+def test_get_imageset_raises_on_mask_only_row(tmp_path):
+    """Mask-only rows raise ImageReadError (the pipeline quarantine path)."""
+    _make_one_channel_per_file_dataset_with_masks(tmp_path, n_sites=2)
+    for ch in (1, 2):
+        (tmp_path / f"r02c02f01p01-ch{ch}.tiff").unlink()
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)\.tiff"
+        ),
+        mask_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)_cp_masks_(?P<mask_name>\w+)\.png"
+        ),
+        channel_layout=None,
+    )
+    with pytest.raises(ImageReadError):
+        ds.get_imageset(1)
+    # The intact row still loads.
+    img, masks = ds.get_imageset(0)
+    assert img.shape == (64, 64, 2)
+    assert "mask_cell" in masks
+
+
+def test_auto_detect_skips_broken_first_image(tmp_path):
+    """A corrupt first file must not abort dataset construction: auto-detect
+    skips it and takes shape/dtype from the next readable row."""
+    (tmp_path / "site1.tiff").write_bytes(b"not a real tiff")
+    arr = np.full((32, 48), 7, dtype=np.uint16)
+    imwrite(str(tmp_path / "site2.tiff"), arr)
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(r"site(?P<site>\d+)\.tiff"),
+        channel_layout=None,
+    )
+    assert len(ds) == 2
+    assert ds.img_shape == (32, 48)
+    assert ds.img_dtype == arr.dtype
+    with pytest.raises(ImageReadError):
+        ds.get_imageset(0)
+
+
+# ---- metadata rebuild cache invalidation ----
+
+
+def test_build_metadata_clears_stale_cache(tmp_path):
+    """build_metadata() must drop cached (image, mask) tuples.
+
+    cellpose.py rebuilds metadata after saving masks; without the cache
+    clear, get_imageset kept serving the pre-segmentation image/mask set.
+    """
+    _make_one_channel_per_file_dataset(tmp_path, n_sites=1, n_channels=1)
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)\.tiff"
+        ),
+        channel_layout=None,
+    )
+    img_before, _ = ds.get_imageset(0)
+    assert img_before[0, 0] == 1000
+
+    # Replace the on-disk image, then rebuild metadata (new content is the
+    # only difference — paths and row order stay identical).
+    arr = np.full((64, 64), 2000, dtype=np.uint16)
+    imwrite(str(tmp_path / "r01c01f01p01-ch1.tiff"), arr)
+    ds.build_metadata()
+
+    img_after, _ = ds.get_imageset(0)
+    assert img_after[0, 0] == 2000
+
+
+def test_build_metadata_picks_up_new_mask(tmp_path):
+    """A mask written after construction is visible after build_metadata()."""
+    _make_one_channel_per_file_dataset(tmp_path, n_sites=1, n_channels=1)
+    img_pat = re.compile(
+        r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)\.tiff"
+    )
+    mask_pat = re.compile(
+        r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)_cp_masks_(?P<mask_name>.+)\.png"
+    )
+    ds = ImageDataset(
+        root=tmp_path, image_pattern=img_pat, mask_pattern=mask_pat,
+        channel_layout=None,
+    )
+    _, masks_before = ds.get_imageset(0)
+    assert masks_before == {}
+
+    mask = np.zeros((64, 64), dtype=np.int32)
+    mask[10:20, 10:20] = 1
+    Image.fromarray(mask.astype(np.uint16)).save(
+        str(tmp_path / "r01c01f01p01-ch1_cp_masks_cell.png")
+    )
+    ds.build_metadata()
+    _, masks_after = ds.get_imageset(0)
+    assert "mask_cell" in masks_after
+
+
+def test_mask_in_separate_directory_keeps_image_directory(tmp_path):
+    """Mask rows must not overwrite the image record's directory.
+
+    Masks may live in a sibling subtree (e.g. masks/ vs images/); the
+    metadata `directory` must keep pointing at the images.
+    """
+    images = tmp_path / "images"
+    masks = tmp_path / "masks"
+    images.mkdir()
+    masks.mkdir()
+    for ch in (1, 2):
+        arr = np.full((32, 32), ch * 100, dtype=np.uint16)
+        imwrite(str(images / f"r01c01f01p01-ch{ch}.tiff"), arr)
+    mask = np.zeros((32, 32), dtype=np.int32)
+    mask[5:10, 5:10] = 1
+    Image.fromarray(mask.astype(np.uint16)).save(
+        str(masks / "r01c01f01p01-ch1_cp_masks_cell.png")
+    )
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)\.tiff"
+        ),
+        mask_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)_cp_masks_(?P<mask_name>.+)\.png"
+        ),
+        image_subdir_pattern="images",
+        channel_layout=None,
+    )
+    assert len(ds) == 1
+    assert ds.metadata.loc[0, "directory"] == "images"
+    img, mask_dict = ds.get_imageset(0)
+    assert img.shape == (32, 32, 2)
+    assert "mask_cell" in mask_dict
+
+
+def test_get_imageset_no_intensity_channels_raises(tmp_path):
+    """A mask-only dataset (no image matched image_pattern) must raise
+    ImageReadError instead of a raw numpy ValueError."""
+    mask = np.zeros((32, 32), dtype=np.int32)
+    mask[5:10, 5:10] = 1
+    Image.fromarray(mask.astype(np.uint16)).save(
+        str(tmp_path / "r01c01f01p01-ch1_cp_masks_cell.png")
+    )
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)\.tiff"
+        ),
+        mask_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)_cp_masks_(?P<mask_name>.+)\.png"
+        ),
+        channel_layout=None,
+    )
+    assert len(ds) == 1
+    assert ds.intensity_colnames == []
+    with pytest.raises(ImageReadError):
+        ds.get_imageset(0)

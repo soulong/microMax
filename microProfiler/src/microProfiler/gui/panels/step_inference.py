@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from microBase.db_contracts import INFER_DB_NAME
+
 from microProfiler.gui.panels.base_step_panel import BaseStepPanel, dp, make_hsep
 from microProfiler.gui.panels._block_container import BlockContainerPanel
 from microProfiler.gui.path_drop import enable_path_drop
@@ -188,7 +190,7 @@ class InferenceBlockWidget(QWidget):
         row_out.addWidget(self._pred_class_cb)
         row_out.addSpacing(10)
         row_out.addWidget(QLabel("DB:"))
-        self._output_db = QLineEdit("infer.db")
+        self._output_db = QLineEdit(INFER_DB_NAME)
         self._output_db.setMaximumWidth(150)
         self._output_db.setToolTip("SQLite DB file name written under the dataset dir (table names are fixed)")
         row_out.addWidget(self._output_db)
@@ -213,8 +215,9 @@ class InferenceBlockWidget(QWidget):
             "the plots, which this pipeline does not write). Provide one or "
             "more pre-fitted reducer pickles (pca/umap/pacmap/localmap — "
             "the type of each is detected automatically, multiple are "
-            "separated with ';' and run in order); with reducers given the "
-            "DR-method selection is ignored; leave empty to fit the "
+            "separated with ';'); with reducers given the DR-method "
+            "selection is ignored (execution follows the canonical pca -> "
+            "umap -> pacmap -> localmap order); leave empty to fit the "
             "selected methods fresh.")
         red_layout = QVBoxLayout(self._reduction_group)
         row_red = QHBoxLayout()
@@ -224,8 +227,9 @@ class InferenceBlockWidget(QWidget):
         self._reducer_path.setPlaceholderText("reducer pickles (*.pkl), ';'-separated — empty = fit the selected methods")
         self._reducer_path.setToolTip(
             "One or more pre-fitted reducer pickles (pca/umap/pacmap/"
-            "localmap), separated with ';' and run in order. When any "
-            "reducer is given, the DR-method checkboxes are ignored.")
+            "localmap), separated with ';'. When any reducer is given, the "
+            "DR-method checkboxes are ignored (execution follows the "
+            "canonical pca -> umap -> pacmap -> localmap order).")
         enable_path_drop(self._reducer_path, multi=True)
         row_red.addWidget(self._reducer_path, 1)
         self._reducer_browse_btn = QPushButton("...")
@@ -380,7 +384,7 @@ class InferenceBlockWidget(QWidget):
         return self._model_path.text().strip()
 
     def get_output_db(self) -> str:
-        return self._output_db.text().strip() or "infer.db"
+        return self._output_db.text().strip() or INFER_DB_NAME
 
     def get_mask_name(self) -> str:
         return self._mask_combo.currentText().strip() or ""
@@ -661,15 +665,17 @@ class InferenceStepPanel(BlockContainerPanel):
     def set_dataset_dtype(self, dtype) -> None:
         """Refresh per-block max_value defaults from the dataset dtype.
 
-        Config values are always trusted (never overwritten); blocks still at
-        the untouched default adopt the dtype-derived value.
+        Config/explicit values are always trusted (never overwritten). Every
+        non-explicit block adopts the new dtype's value on EVERY dataset
+        change — the previous check only fired while the value still equalled
+        DEFAULT_MAX_VALUE, so switching from a uint8 dataset to a uint16 one
+        kept max_value=255 and silently ran inference on the wrong intensity
+        domain.
         """
         derived = _max_value_for_dtype(dtype)
         self._default_max_value = derived
         for block in self._blocks:
-            # Explicitly configured max_value (config restore / block copy) is
-            # always trusted — only untouched defaults adopt the dtype value.
-            if not block._max_value_explicit and block.get_max_value() == DEFAULT_MAX_VALUE:
+            if not block._max_value_explicit:
                 block.set_max_value(derived)
 
     def max_value_mismatches(self, dtype) -> List[str]:

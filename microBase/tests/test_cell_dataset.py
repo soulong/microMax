@@ -6,7 +6,7 @@ import pytest
 from pathlib import Path
 from tifffile import imwrite
 
-from microBase import CellDataset
+from microBase import CellDataset, ConfigError, DataError, DatasetError
 
 
 def _make_cell_dataset(tmp_path, n_cells=5, n_channels=2, h=32, w=32, layout="CHW"):
@@ -74,7 +74,7 @@ def test_cell_dataset_get_cell(tmp_path):
 def test_cell_dataset_get_cell_index_out_of_range(tmp_path):
     _make_cell_dataset(tmp_path, n_cells=2, n_channels=1)
     ds = CellDataset(root=tmp_path, channel_layout="CHW")
-    with pytest.raises(SystemExit):
+    with pytest.raises(DataError):
         ds.get_cell(99)
 
 
@@ -125,14 +125,14 @@ def test_cell_dataset_no_pattern_minimal_metadata(tmp_path):
     assert "field" not in df.columns  # no pattern -> no metadata extraction
 
 
-def test_cell_dataset_root_not_found_exits(tmp_path):
-    with pytest.raises(SystemExit):
+def test_cell_dataset_root_not_found_raises(tmp_path):
+    with pytest.raises(DatasetError):
         CellDataset(root=tmp_path / "nonexistent")
 
 
-def test_cell_dataset_bad_layout_exits(tmp_path):
+def test_cell_dataset_bad_layout_raises(tmp_path):
     _make_cell_dataset(tmp_path, n_cells=1, n_channels=1)
-    with pytest.raises(SystemExit):
+    with pytest.raises(ConfigError):
         CellDataset(root=tmp_path, channel_layout="BAD")
 
 

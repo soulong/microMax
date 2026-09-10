@@ -96,8 +96,11 @@ def run_app(dataset_dir: str | None = None) -> None:
     except Exception:
         pass
 
-    # Block scroll-wheel on all input widgets app-wide
-    app.installEventFilter(_WheelBlocker(app))
+    # Block scroll-wheel on all input widgets app-wide. Keep the filter on a
+    # Python reference: an inline temp can be GC'd, losing the Python virtual
+    # override while the C++ filter stays installed.
+    app._wheel_blocker = _WheelBlocker(app)
+    app.installEventFilter(app._wheel_blocker)
     app.setApplicationName("microVis")
     app.setOrganizationName("microVis")
     from microVis import __version__

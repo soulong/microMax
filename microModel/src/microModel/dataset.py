@@ -28,6 +28,7 @@ from torch.utils.data import Dataset
 from microBase import (
     CellDataset,
     ImageDataset,
+    MicroMaxError,
     build_pipeline,
     apply,
     normalize,
@@ -169,7 +170,7 @@ def stratified_split(records, val_ratio, seed):
 
     val_ratio: 0 disables validation (val = []); values in (0, 1) keep at
     least one record per class with >= 2 samples. A ratio >= 1 would empty
-    the train set — callers must validate (train hard-exits).
+    the train set — callers must validate (train raises MicroMaxError).
     """
     rng = np.random.default_rng(seed)
     by_label = {}
@@ -261,8 +262,7 @@ def subsample(items, sample_max, sample_by, seed,
         return result
 
     else:
-        print(f"Error: unknown sample_by='{sample_by}'", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: unknown sample_by='{sample_by}'")
 
 
 # ----------------------------------------------------------------------------
@@ -298,10 +298,11 @@ class SSLMultiViewDataset(Dataset):
         cell_idx = self.indices[idx]
         try:
             img_hwc = _to_float_max(self.cell_dataset.get_cell(cell_idx), self.max_value)
-        except SystemExit as e:
-            # Convert microBase's hard-exit on missing/corrupt files into a
-            # clean exception (a sys.exit inside a DataLoader worker just
-            # kills the worker with a cryptic error).
+        except (MicroMaxError, SystemExit) as e:
+            # Convert microBase's library errors on missing/corrupt files into
+            # a clean ValueError: an exception escaping a DataLoader worker is
+            # re-raised by torch with the original message, while a sys.exit
+            # just kills the worker cryptically.
             raise ValueError(
                 f"Failed to load cell {cell_idx} from "
                 f"{self.cell_dataset.metadata.iloc[cell_idx].get('path')} ({e})"
@@ -366,11 +367,10 @@ class SingleCellDataset(Dataset):
         cell_ds, cell_idx = self.pairs[idx]
         try:
             img_hwc = _to_float_max(cell_ds.get_cell(cell_idx), self.max_value)
-        except SystemExit as e:
-            # microBase readers hard-exit (sys.exit) on missing/corrupt
-            # files; inside a DataLoader worker that surfaces as a cryptic
-            # "worker died" error, so convert it to a clean exception
-            # (same guard as WholeImageCellDataset below).
+        except (MicroMaxError, SystemExit) as e:
+            # microBase raises on missing/corrupt files; inside a DataLoader
+            # worker that must become a clean ValueError (torch re-raises it
+            # with the message instead of a cryptic "worker died").
             raise ValueError(
                 f"Failed to load cell {cell_idx} from "
                 f"{cell_ds.metadata.iloc[cell_idx].get('path')} ({e})"
@@ -458,8 +458,7 @@ class WholeImageCellDataset(Dataset):
             try:
                 mask = read_mask(mask_path)
             except Exception as e:
-                print(f"Error: failed to read mask {mask_path}: {e}", file=sys.stderr)
-                sys.exit(1)
+                raise MicroMaxError(f"Error: failed to read mask {mask_path}: {e}")
             stem = _build_field_stem(row)
             for cid in get_labels(mask):
                 self._flat_index.append((row_idx, int(cid)))
@@ -484,10 +483,9 @@ class WholeImageCellDataset(Dataset):
         try:
             crop_hwc, _, bbox = self.image_dataset.get_cropped_cell(
                 row_idx, label, self.mask_name, padding=self.padding)
-        except SystemExit as e:
-            # microBase cropping hard-exits (sys.exit) on corrupt/missing
-            # masks; inside a DataLoader worker that surfaces as a cryptic
-            # "worker died" error, so convert it to a clean exception.
+        except (MicroMaxError, SystemExit) as e:
+            # microBase raises on corrupt/missing masks or degenerate labels;
+            # inside a DataLoader worker that must become a clean ValueError.
             raise ValueError(
                 f"Degenerate cell {label} has no pixels in mask (row {row_idx}); "
                 f"mask may be corrupted or changed since indexing ({e})"

@@ -15,19 +15,11 @@ import re
 import sys
 from pathlib import Path
 
+from microBase import MicroMaxError
+from microBase.db_contracts import FIND_CLUSTER_TABLE, reduction_table_name
 from microProfiler.config import PipelineConfig, resolve_inference_db
 
 logger = logging.getLogger(__name__)
-
-# microModel's inference DB schema — table names written by run_inference /
-# show_reduction. Kept here so the CLI completeness check and the pipeline
-# never hardcode microModel's schema in two places.
-INFERENCE_TABLE = "inference"
-# Every table show_reduction may write, across all DR methods.
-REDUCTION_TABLES = frozenset({
-    "reduction_pca", "reduction_umap", "reduction_pacmap", "reduction_localmap",
-    "find_cluster",
-})
 
 
 def _detect_reducer_kind(path) -> str:
@@ -73,13 +65,12 @@ def _reduction_run_state(entry):
 
 
 def expected_reduction_tables(entry) -> frozenset:
-    """Tables show_reduction will write for one entry's reduction config.
+    """Tables run_reduction will write for one entry's reduction config.
 
     One reduction_<method> table per configured method plus find_cluster
-    when cluster prediction runs. For a single provided reducer pickle the
-    method is detected from the pickle itself; a cluster-only run uses the
-    cheap default [pca] (a table is unavoidable — show_reduction always
-    writes one per method — but no UMAP is fitted just for ordering).
+    when cluster prediction runs. Mirrors _build_mm_inference_config's method
+    selection exactly, so the completeness check can never demand a table the
+    bridge will not write (or miss one it will).
     """
     if not entry.reduction:
         return frozenset()
@@ -93,17 +84,26 @@ def expected_reduction_tables(entry) -> frozenset:
             try:
                 methods.add(_detect_reducer_kind(path))
             except OSError:
-                # Unreadable pickle: the run itself will fail loudly;
-                # demanding no tables keeps the completeness check from
-                # false-skipping.
+                # Unreadable path: the run itself will fail loudly; demanding
+                # no tables keeps the completeness check from false-skipping.
                 return frozenset()
-    elif enabled and not cluster_active:
-        methods = set(red.method if red.method else ["pca", "umap"])
+            except Exception as e:
+                # Corrupt/unknown pickle: returning "nothing expected" would
+                # silently mark the dataset complete and skip it. Raise so the
+                # caller reprocesses and surfaces the real error.
+                raise RuntimeError(
+                    f"Cannot read reducer pickle {path}: {e}") from e
     else:
-        methods = {"pca"}
-    tables = {f"reduction_{m}" for m in methods}
+        # Same defaulting as _build_mm_inference_config: explicit method wins,
+        # otherwise [pca] for a cluster-only run and [pca, umap] when the
+        # dimension-reduction group itself is enabled.
+        methods = set(
+            red.method if red.method is not None
+            else (["pca", "umap"] if red.enabled else ["pca"])
+        )
+    tables = {reduction_table_name(m) for m in methods}
     if cluster_active or red.cluster_res:
-        tables.add("find_cluster")
+        tables.add(FIND_CLUSTER_TABLE)
     return frozenset(tables)
 
 
@@ -114,9 +114,9 @@ def run_mm_inference(mm_cfg, **kwargs):
 
 
 def run_mm_reduction(mm_cfg, **kwargs):
-    """Lazily import and call microModel.reduction.show_reduction (see _call_micromodel)."""
-    from microModel.reduction import show_reduction
-    return show_reduction(mm_cfg, **kwargs)
+    """Lazily import and call microModel.reduction.run_reduction (see _call_micromodel)."""
+    from microModel.reduction import run_reduction
+    return run_reduction(mm_cfg, **kwargs)
 
 
 class _ProgressTee(io.TextIOBase):
@@ -167,6 +167,11 @@ class _ProgressTee(io.TextIOBase):
         return len(s)
 
     def flush(self) -> None:
+        # Emit a trailing partial line (no newline seen yet) so its status
+        # text is not silently lost.
+        if self._pending:
+            pending, self._pending = self._pending, ""
+            self._emit(pending)
         if self._real is not None:
             try:
                 self._real.flush()
@@ -214,14 +219,15 @@ class _MicroModelLogForwarder(logging.Handler):
 
 def _call_micromodel(fn, mm_cfg, err_prefix: str, progress=None,
                      step_key: str = "Inference", **kwargs):
-    """Call a microModel function, converting its print + sys.exit(1) error
-    paths (SystemExit) into RuntimeError with the captured stderr message, so
-    the GUI worker surfaces a popup and the CLI treats the dataset as failed.
+    """Call a microModel function, converting its MicroMaxError (library
+    exceptions) into RuntimeError with the captured stderr message, so the GUI
+    worker surfaces a popup and the CLI treats the dataset as failed.
 
+    SystemExit is still caught defensively (a dependency may call sys.exit).
     When a progress collector is given, microModel's stderr is teed to the
     real terminal AND forwarded to the collector (live tqdm progress + status
     lines); microModel's INFO logs are forwarded the same way. When the run
-    was cancelled (progress.cancel_check), a SystemExit is re-raised as
+    was cancelled (progress.cancel_check), the failure is re-raised as
     InterruptedError — a cancel is not a failure.
     """
     import contextlib
@@ -229,10 +235,12 @@ def _call_micromodel(fn, mm_cfg, err_prefix: str, progress=None,
     real_stderr = sys.stderr
     err_buf = io.StringIO()
     log_handler = None
+    prev_level = None
+    mm_logger = logging.getLogger("microModel")
     if progress is not None:
         tee = _ProgressTee(err_buf, real_stderr, progress, step_key)
         log_handler = _MicroModelLogForwarder(real_stderr, progress, step_key)
-        mm_logger = logging.getLogger("microModel")
+        prev_level = mm_logger.level
         mm_logger.setLevel(logging.INFO)
         mm_logger.addHandler(log_handler)
     else:
@@ -240,16 +248,18 @@ def _call_micromodel(fn, mm_cfg, err_prefix: str, progress=None,
     try:
         with contextlib.redirect_stderr(tee):
             fn(mm_cfg, **kwargs)
-    except SystemExit as e:
+    except (MicroMaxError, SystemExit) as e:
         if (log_handler is not None
                 and getattr(progress, "cancel_check", None)
                 and progress.cancel_check()):
             raise InterruptedError from e
-        msg = err_buf.getvalue().strip() or f"microModel failed ({e})"
+        msg = err_buf.getvalue().strip() or str(e) or f"microModel failed ({e})"
         raise RuntimeError(f"{err_prefix}: {msg}") from e
     finally:
         if log_handler is not None:
-            logging.getLogger("microModel").removeHandler(log_handler)
+            mm_logger.removeHandler(log_handler)
+            if prev_level is not None:
+                mm_logger.setLevel(prev_level)
 
 
 def _build_mm_inference_config(entry, cfg: PipelineConfig, ds, root_dir: Path) -> dict:
@@ -324,7 +334,8 @@ def _build_mm_inference_config(entry, cfg: PipelineConfig, ds, root_dir: Path) -
             # One or more user-chosen reducer pickles — detect each kind and
             # map to microModel's per-method pre-fit keys (raises ValueError
             # for an unrecognized pickle). The DR-method selection is ignored
-            # in this mode: every listed reducer transforms directly, in order.
+            # in this mode: every listed reducer transforms directly, in
+            # microModel's canonical pca -> umap -> pacmap -> localmap order.
             kinds = []
             for path in entry.reduction.reducer:
                 kind = _detect_reducer_kind(os.path.abspath(str(path)))
@@ -339,7 +350,7 @@ def _build_mm_inference_config(entry, cfg: PipelineConfig, ds, root_dir: Path) -
         else:
             # No reducer: fit fresh. Cluster-only runs keep it cheap — PCA
             # alone provides the ID-ordering reference (a reduction table
-            # per method is always a byproduct of show_reduction).
+            # per method is always a byproduct of run_reduction).
             red_cfg["method"] = (
                 entry.reduction.method if entry.reduction.method is not None
                 else (["pca", "umap"] if entry.reduction.enabled else ["pca"])

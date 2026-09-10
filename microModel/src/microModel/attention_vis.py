@@ -1,6 +1,6 @@
 """Offline DINOv3 attention diagnostics (CLI: micromodel attention-vis).
 
-vis_attention loads a trained SSL bundle (config.resume.ssl_model), recomputes
+run_attention_vis loads a trained SSL bundle (config.resume.ssl_model), recomputes
 per-head/mean CLS attention maps and patch-similarity anchor maps on a fixed
 subset of the training data, and writes one combined vis_attention.pdf.
 """
@@ -12,16 +12,19 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, ConcatDataset
 
+from microBase import MicroMaxError
+
 from . import __version__
 from .utils import logger, select_device, set_seed, add_file_logging
 from .dataset import SSLMultiViewDataset
 from .models import build_ssl_model
 from .monitor import compute_patch_similarity_maps, compute_cls_attention_maps
-from .pretrain import _load_checkpoint_state, _prepare_pretrain_data
+from .pretrain import (_load_checkpoint_state, _merge_method_config,
+                       _METHOD_ARCH_KEYS, _prepare_pretrain_data)
 from .plots import plot_attention_combined, _to_display_rgb
 
 
-def vis_attention(config, config_path=None):
+def run_attention_vis(config, config_path=None):
     """Offline DINOv3 attention + patch-similarity visualization.
 
     Loads a trained SSL bundle (config.resume.ssl_model), re-computes the
@@ -30,14 +33,11 @@ def vis_attention(config, config_path=None):
     ({output_dir}/vis_attention.pdf) — no training happens.
     """
     if config.get("method") != "dinov3":
-        print("Error: attention-vis currently supports method 'dinov3' only",
-              file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError("Error: attention-vis currently supports method 'dinov3' only")
     resume_path = (config.get("resume") or {}).get("ssl_model")
     if not resume_path or not os.path.exists(resume_path):
-        print(f"Error: resume.ssl_model not found ({resume_path!r}) — point it "
-              "at the trained bundle (e.g. <run>/model.pt)", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: resume.ssl_model not found ({resume_path!r}) — point it "
+              "at the trained bundle (e.g. <run>/model.pt)")
 
     device = select_device()
     if device.type == "cuda":
@@ -90,22 +90,29 @@ def vis_attention(config, config_path=None):
     ckpt = torch.load(resume_path, map_location=device, weights_only=False)
     meta = ckpt.get("meta") or {}
     if not meta.get("backbone"):
-        print(f"Error: bundle {resume_path} meta lacks 'backbone' — not an "
-              f"SSL bundle", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: bundle {resume_path} meta lacks 'backbone' — not an "
+              f"SSL bundle")
     backbone_cfg = {"name": meta["backbone"], "pretrained": False,
                     "in_chans": meta.get("in_chans", len(resolved_channels))}
     if backbone_cfg["in_chans"] != len(resolved_channels):
-        print(
-            f"Error: bundle in_chans={backbone_cfg['in_chans']} does not match "
+        raise MicroMaxError(f"Error: bundle in_chans={backbone_cfg['in_chans']} does not match "
             f"len(data.channels)={len(resolved_channels)}; the model "
             f"architecture is fixed by the channel count the bundle was "
-            f"trained with",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    model = build_ssl_model("dinov3", backbone_cfg, config.get("dinov3", {}),
-                            device)
+            f"trained with")
+    # Method block: the bundle's saved config wins for the architecture keys
+    # (the saved heads were built with them — building from the current
+    # config's defaults would crash load_state_dict); current-config keys
+    # win everywhere else, exactly like pretrain's continue-resume merge.
+    # Monitoring is forced off: the per-step diag tensors are never consumed
+    # by this offline pass.
+    method_cfg = config.get("dinov3", {})
+    saved_method_cfg = (ckpt.get("config") or {}).get("dinov3")
+    if isinstance(saved_method_cfg, dict):
+        method_cfg = _merge_method_config(saved_method_cfg, method_cfg,
+                                          _METHOD_ARCH_KEYS)
+    model = build_ssl_model(
+        "dinov3", backbone_cfg, {**method_cfg,
+                                 "monitoring": {"enabled": False}}, device)
     _load_checkpoint_state(model, ckpt, method="dinov3")
     model.eval()
     logger.info("Loaded bundle from epoch %d", ckpt.get("epoch", -1))

@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from microBase import io as mio
+from microBase import ConfigError, DatasetError, ImageReadError
 
 
 def _make_tiff(tmp_path, name, arr):
@@ -67,15 +68,16 @@ def test_read_mask_png(tmp_path):
     np.testing.assert_array_equal(out, arr)
 
 
-def test_read_tiff_missing_file_exits(tmp_path):
-    with pytest.raises(SystemExit):
+def test_read_tiff_missing_file_raises(tmp_path):
+    with pytest.raises(ImageReadError):
         mio.read_image(tmp_path / "nonexistent.tif")
 
 
-def test_read_tiff_channels_bad_layout_exits(tmp_path):
+def test_read_tiff_channels_bad_layout_raises_config_error(tmp_path):
     arr = np.zeros((3, 32, 32), dtype=np.uint8)
     _make_tiff(tmp_path, "img.tif", arr)
-    with pytest.raises(SystemExit):
+    # An invalid layout string is rejected before any read attempt.
+    with pytest.raises(ConfigError):
         mio.read_tiff_channels(tmp_path / "img.tif", [1], channel_layout="BAD")
 
 
@@ -103,18 +105,18 @@ def test_read_tiff_channels_none_squeezes_singleton_dim(tmp_path):
 
 
 def test_read_tiff_channels_none_rejects_multi_channel_request(tmp_path):
-    """channel_layout=None: requesting channels=[1,2] hard-exits."""
+    """channel_layout=None: requesting channels=[1,2] raises ConfigError."""
     arr = np.zeros((32, 32), dtype=np.uint8)
     _make_tiff(tmp_path, "img.tif", arr)
-    with pytest.raises(SystemExit):
+    with pytest.raises(ConfigError):
         mio.read_tiff_channels(tmp_path / "img.tif", [1, 2], channel_layout=None)
 
 
 def test_read_tiff_channels_none_rejects_3d_multi_page(tmp_path):
-    """channel_layout=None: a (3, H, W) TIFF hard-exits (not single-channel)."""
+    """channel_layout=None: a (3, H, W) TIFF raises DatasetError."""
     arr = np.zeros((3, 32, 32), dtype=np.uint8)
     _make_tiff(tmp_path, "img.tif", arr)
-    with pytest.raises(SystemExit):
+    with pytest.raises(DatasetError):
         mio.read_tiff_channels(tmp_path / "img.tif", [1], channel_layout=None)
 
 
@@ -131,8 +133,8 @@ def test_compile_pattern_passes_compiled_and_none():
     assert out.match("r1") is not None
 
 
-def test_compile_pattern_invalid_exits():
-    with pytest.raises(SystemExit):
+def test_compile_pattern_invalid_raises():
+    with pytest.raises(ConfigError):
         mio.compile_pattern("(")
 
 
@@ -164,15 +166,15 @@ def test_detect_tiff_properties_layout_none(tmp_path):
     assert dtype == arr.dtype
 
 
-def test_detect_tiff_properties_missing_file_exits(tmp_path):
-    with pytest.raises(SystemExit):
+def test_detect_tiff_properties_missing_file_raises(tmp_path):
+    with pytest.raises(ImageReadError):
         mio.detect_tiff_properties(tmp_path / "nonexistent.tif", "CHW")
 
 
-def test_read_tiff_corrupt_file_exits(tmp_path):
+def test_read_tiff_corrupt_file_raises(tmp_path):
     p = tmp_path / "corrupt.tif"
     p.write_bytes(b"not a real tiff")
-    with pytest.raises(SystemExit):
+    with pytest.raises(ImageReadError):
         mio.read_image(p)
 
 
@@ -188,24 +190,24 @@ def test_read_tiff_rgb_reduces_first_channel(tmp_path):
     np.testing.assert_array_equal(out, np.full((16, 16), 7, dtype=np.uint8))
 
 
-def test_read_tiff_channels_out_of_range_exits(tmp_path):
+def test_read_tiff_channels_out_of_range_raises(tmp_path):
     arr = np.zeros((2, 16, 16), dtype=np.uint8)
     _make_tiff(tmp_path, "img.tif", arr)
-    with pytest.raises(SystemExit):
+    with pytest.raises(DatasetError):
         mio.read_tiff_channels(tmp_path / "img.tif", [3], channel_layout="CHW")
 
 
 def test_read_tiff_channels_empty_list_raises(tmp_path):
-    """Empty channels list must raise ValueError (§3.19), never silently
-    return (H, W, 0)."""
+    """Empty channels list must raise ConfigError, never silently return
+    (H, W, 0)."""
     arr = np.zeros((2, 16, 16), dtype=np.uint8)
     _make_tiff(tmp_path, "img.tif", arr)
-    with pytest.raises(ValueError, match="must not be empty"):
+    with pytest.raises(ConfigError, match="must not be empty"):
         mio.read_tiff_channels(tmp_path / "img.tif", [], channel_layout="CHW")
 
 
-def test_read_mask_missing_file_exits(tmp_path):
-    with pytest.raises(SystemExit):
+def test_read_mask_missing_file_raises(tmp_path):
+    with pytest.raises(ImageReadError):
         mio.read_mask(tmp_path / "nonexistent.png")
 
 
@@ -215,3 +217,57 @@ def test_read_mask_tiff(tmp_path):
     out = mio.read_mask(tmp_path / "mask.tif")
     assert out.shape == (2, 3)
     np.testing.assert_array_equal(out, arr)
+
+
+# ---- reader error contract (pipeline quarantine path) ----
+
+
+def test_read_image_missing_sets_path(tmp_path):
+    p = tmp_path / "nonexistent.tif"
+    with pytest.raises(ImageReadError) as exc:
+        mio.read_image(p)
+    assert exc.value.path == p
+
+
+def test_read_image_corrupt_sets_path(tmp_path):
+    p = tmp_path / "corrupt.tif"
+    p.write_bytes(b"not a real tiff")
+    with pytest.raises(ImageReadError) as exc:
+        mio.read_image(p)
+    assert exc.value.path == p
+
+
+def test_read_mask_corrupt_raises(tmp_path):
+    p = tmp_path / "corrupt.png"
+    p.write_bytes(b"not a real png")
+    with pytest.raises(ImageReadError):
+        mio.read_mask(p)
+
+
+def test_read_tiff_channels_missing_raises(tmp_path):
+    with pytest.raises(ImageReadError):
+        mio.read_tiff_channels(
+            tmp_path / "nonexistent.tif", [1], channel_layout="CHW")
+
+
+def test_read_tiff_channels_corrupt_raises(tmp_path):
+    p = tmp_path / "corrupt.tif"
+    p.write_bytes(b"not a real tiff")
+    with pytest.raises(ImageReadError):
+        mio.read_tiff_channels(p, [1], channel_layout="CHW")
+
+
+def test_detect_tiff_properties_corrupt_raises(tmp_path):
+    p = tmp_path / "corrupt.tif"
+    p.write_bytes(b"not a real tiff")
+    with pytest.raises(ImageReadError):
+        mio.detect_tiff_properties(p, "CHW")
+
+
+def test_layout_error_is_not_image_read_error(tmp_path):
+    """Layout mistakes are dataset/config errors, not broken files — the
+    pipeline must not delete good data for them."""
+    arr = np.zeros((3, 32, 32), dtype=np.uint8)
+    _make_tiff(tmp_path, "img.tif", arr)
+    with pytest.raises(DatasetError):
+        mio.read_tiff_channels(tmp_path / "img.tif", [1], channel_layout=None)

@@ -11,7 +11,8 @@ Returns crops in (H, W, C) layout, with background pixels zeroed.
 """
 
 import numpy as np
-import sys
+
+from .errors import DataError
 
 
 def get_labels(mask):
@@ -34,42 +35,29 @@ def crop_cell(volume, mask, label, padding=4):
           crop      : (h, w, C) array, background zeroed (mask != label -> 0)
           cell_mask : (h, w) bool array, True at this cell's pixels
           bbox      : (x, y, w, h) tuple — the padded bbox used for cropping
-        Exits with error if the cell has zero pixels in mask (corruption).
+        Raises DataError for shape/label mistakes or a label with zero pixels.
     """
     if volume.ndim != 3:
-        print(
-            f"Error: crop_cell expects (H, W, C) volume, got shape {volume.shape}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise DataError(
+            f"crop_cell expects (H, W, C) volume, got shape {volume.shape}")
 
     if label < 1:
         # Label 0 is background — np.where(mask == 0) would match the whole
         # image and the zero-pixel guard below would never fire.
-        print(
-            f"Error: label must be a positive integer, got {label}.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise DataError(f"label must be a positive integer, got {label}.")
 
     if mask.shape != volume.shape[:2]:
-        # A mismatched mask would broadcast-error below; exit with the
+        # A mismatched mask would broadcast-error below; raise with the
         # project's standard clear message instead.
-        print(
-            f"Error: mask shape {mask.shape} does not match volume "
-            f"{volume.shape[:2]}.",
-            file=sys.stderr,
+        raise DataError(
+            f"mask shape {mask.shape} does not match volume {volume.shape[:2]}."
         )
-        sys.exit(1)
     padding = max(0, int(padding))
 
     ys, xs = np.where(mask == label)
     if len(ys) == 0:
-        print(
-            f"Error: label {label} has zero pixels in mask — possible corruption.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise DataError(
+            f"label {label} has zero pixels in mask — possible corruption.")
 
     h_full, w_full = mask.shape
     y_min = max(0, int(ys.min()) - padding)

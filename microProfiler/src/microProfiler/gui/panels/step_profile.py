@@ -131,76 +131,76 @@ class ObjectProfileBlockWidget(QWidget):
 
         # -- Granularity + spectrum length + subsample + image_sample + background radius --
         layout.addWidget(make_hsep())
-        self._gran_layout = QHBoxLayout()
-        self._gran_layout.setContentsMargins(0, 0, 0, 0)
+        self._granularity_layout = QHBoxLayout()
+        self._granularity_layout.setContentsMargins(0, 0, 0, 0)
         _lbl = QLabel("Granularity:")
         _lbl.setFixedWidth(dp(85))
-        self._gran_layout.addWidget(_lbl)
-        self._gran_cbs: List[QCheckBox] = []
-        self._gran_placeholder: Optional[QLabel] = None
+        self._granularity_layout.addWidget(_lbl)
+        self._granularity_cbs: List[QCheckBox] = []
+        self._granularity_placeholder: Optional[QLabel] = None
         if self._channels:
             for ch in self._channels:
                 cb = QCheckBox(ch)
-                self._gran_layout.addWidget(cb)
-                self._gran_cbs.append(cb)
+                self._granularity_layout.addWidget(cb)
+                self._granularity_cbs.append(cb)
         else:
-            self._gran_placeholder = QLabel("Load a dataset to configure")
-            self._gran_placeholder.setProperty("class", "placeholder")
-            self._gran_layout.addWidget(self._gran_placeholder)
-        self._gran_layout.addSpacing(10)
-        self._gran_layout.addWidget(QLabel("Spectrum len:"))
-        self._gran_spectrum_length = QSpinBox()
-        self._gran_spectrum_length.setRange(1, 64)
-        self._gran_spectrum_length.setValue(8)
-        self._gran_spectrum_length.setFixedWidth(50)
-        self._gran_spectrum_length.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self._gran_spectrum_length.setToolTip(
+            self._granularity_placeholder = QLabel("Load a dataset to configure")
+            self._granularity_placeholder.setProperty("class", "placeholder")
+            self._granularity_layout.addWidget(self._granularity_placeholder)
+        self._granularity_layout.addSpacing(10)
+        self._granularity_layout.addWidget(QLabel("Spectrum len:"))
+        self._granularity_spectrum_length = QSpinBox()
+        self._granularity_spectrum_length.setRange(1, 64)
+        self._granularity_spectrum_length.setValue(8)
+        self._granularity_spectrum_length.setFixedWidth(50)
+        self._granularity_spectrum_length.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self._granularity_spectrum_length.setToolTip(
             "Number of granularity spectrum bins. Each bin is one additional "
             "erosion+reconstruction step with disk(1) in the subsampled grid. "
             "Larger values extend the spectrum to coarser scales; 16 is the "
             "CellProfiler default and covers a useful size range."
         )
-        self._gran_layout.addWidget(self._gran_spectrum_length)
-        self._gran_layout.addWidget(QLabel("Subsample:"))
-        self._gran_subsample_ratio = QDoubleSpinBox()
-        self._gran_subsample_ratio.setRange(0.05, 1.0)
-        self._gran_subsample_ratio.setValue(0.5)
-        self._gran_subsample_ratio.setSingleStep(0.05)
-        self._gran_subsample_ratio.setFixedWidth(60)
-        self._gran_subsample_ratio.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self._gran_subsample_ratio.setToolTip(
+        self._granularity_layout.addWidget(self._granularity_spectrum_length)
+        self._granularity_layout.addWidget(QLabel("Subsample:"))
+        self._granularity_subsample_ratio = QDoubleSpinBox()
+        self._granularity_subsample_ratio.setRange(0.05, 1.0)
+        self._granularity_subsample_ratio.setValue(0.5)
+        self._granularity_subsample_ratio.setSingleStep(0.05)
+        self._granularity_subsample_ratio.setFixedWidth(60)
+        self._granularity_subsample_ratio.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self._granularity_subsample_ratio.setToolTip(
             "Subsampling factor for the granularity calculation. "
             "Smaller values are faster and let the spectrum cover coarser "
             "feature sizes; the CellProfiler default is 0.25."
         )
-        self._gran_layout.addWidget(self._gran_subsample_ratio)
-        self._gran_layout.addWidget(QLabel("BG sample:"))
-        self._gran_background_subsample_ratio = QDoubleSpinBox()
-        self._gran_background_subsample_ratio.setRange(0.05, 1.0)
-        self._gran_background_subsample_ratio.setValue(0.25)
-        self._gran_background_subsample_ratio.setSingleStep(0.05)
-        self._gran_background_subsample_ratio.setFixedWidth(60)
-        self._gran_background_subsample_ratio.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self._gran_background_subsample_ratio.setToolTip(
+        self._granularity_layout.addWidget(self._granularity_subsample_ratio)
+        self._granularity_layout.addWidget(QLabel("BG sample:"))
+        self._granularity_background_subsample_ratio = QDoubleSpinBox()
+        self._granularity_background_subsample_ratio.setRange(0.05, 1.0)
+        self._granularity_background_subsample_ratio.setValue(0.25)
+        self._granularity_background_subsample_ratio.setSingleStep(0.05)
+        self._granularity_background_subsample_ratio.setFixedWidth(60)
+        self._granularity_background_subsample_ratio.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self._granularity_background_subsample_ratio.setToolTip(
             "Subsampling factor for the background-reduction step. "
             "CellProfiler default is 0.25; small factors are preferred when "
             "the structures of interest are large."
         )
-        self._gran_layout.addWidget(self._gran_background_subsample_ratio)
-        self._gran_layout.addWidget(QLabel("BG radius:"))
-        self._gran_background_radius = QSpinBox()
-        self._gran_background_radius.setRange(1, 256)
-        self._gran_background_radius.setValue(10)
-        self._gran_background_radius.setFixedWidth(50)
-        self._gran_background_radius.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self._gran_background_radius.setToolTip(
+        self._granularity_layout.addWidget(self._granularity_background_subsample_ratio)
+        self._granularity_layout.addWidget(QLabel("BG radius:"))
+        self._granularity_background_radius = QSpinBox()
+        self._granularity_background_radius.setRange(1, 256)
+        self._granularity_background_radius.setValue(10)
+        self._granularity_background_radius.setFixedWidth(50)
+        self._granularity_background_radius.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self._granularity_background_radius.setToolTip(
             "Radius of the structuring element used to estimate the image "
             "background (erosion then dilation on the BG-subsampled grid). "
             "CellProfiler default is 10. Should be larger than the largest "
             "feature of interest so the background is fully removed."
         )
-        self._gran_layout.addWidget(self._gran_background_radius)
-        layout.addLayout(self._gran_layout)
+        self._granularity_layout.addWidget(self._granularity_background_radius)
+        layout.addLayout(self._granularity_layout)
 
         # -- GLCM + Distances + Levels (single row, no Angles widget) --
         layout.addWidget(make_hsep())
@@ -287,7 +287,7 @@ class ObjectProfileBlockWidget(QWidget):
 
     def _left_align_content(self):
         for lyt in [
-            self._intensity_ch_layout, self._radial_layout, self._gran_layout,
+            self._intensity_ch_layout, self._radial_layout, self._granularity_layout,
             self._glcm_layout, self._corr_layout,
         ]:
             lyt.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -336,7 +336,7 @@ class ObjectProfileBlockWidget(QWidget):
         saved = {
             "intensity": {cb.text() for cb in self._intensity_cbs if cb.isChecked()},
             "radial": {cb.text() for cb in self._radial_cbs if cb.isChecked()},
-            "granularity": {cb.text() for cb in self._gran_cbs if cb.isChecked()},
+            "granularity": {cb.text() for cb in self._granularity_cbs if cb.isChecked()},
             "glcm": {cb.text() for cb in self._glcm_cbs if cb.isChecked()},
             "correlation": {cb.data(Qt.UserRole) for cb in self._corr_cbs if cb.isChecked()},
         }
@@ -344,12 +344,12 @@ class ObjectProfileBlockWidget(QWidget):
         # Remove placeholders and existing checkboxes
         BaseStepPanel._remove_placeholder(self._intensity_ch_layout, "_intensity_placeholder", self)
         BaseStepPanel._remove_placeholder(self._radial_layout, "_radial_placeholder", self)
-        BaseStepPanel._remove_placeholder(self._gran_layout, "_gran_placeholder", self)
+        BaseStepPanel._remove_placeholder(self._granularity_layout, "_granularity_placeholder", self)
         BaseStepPanel._remove_placeholder(self._glcm_layout, "_glcm_placeholder", self)
         BaseStepPanel._remove_placeholder(self._corr_layout, "_corr_placeholder", self)
         BaseStepPanel._clear_checkboxes(self._intensity_ch_layout, self._intensity_cbs)
         BaseStepPanel._clear_checkboxes(self._radial_layout, self._radial_cbs)
-        BaseStepPanel._clear_checkboxes(self._gran_layout, self._gran_cbs)
+        BaseStepPanel._clear_checkboxes(self._granularity_layout, self._granularity_cbs)
         BaseStepPanel._clear_checkboxes(self._glcm_layout, self._glcm_cbs)
         BaseStepPanel._clear_checkboxes(self._corr_layout, self._corr_cbs)
 
@@ -357,7 +357,7 @@ class ObjectProfileBlockWidget(QWidget):
             for layout, attr in [
                 (self._intensity_ch_layout, "_intensity_placeholder"),
                 (self._radial_layout, "_radial_placeholder"),
-                (self._gran_layout, "_gran_placeholder"),
+                (self._granularity_layout, "_granularity_placeholder"),
                 (self._glcm_layout, "_glcm_placeholder"),
                 (self._corr_layout, "_corr_placeholder"),
             ]:
@@ -381,8 +381,8 @@ class ObjectProfileBlockWidget(QWidget):
 
             cb = QCheckBox(ch)
             cb.setChecked(ch in saved["granularity"])
-            self._gran_layout.insertWidget(1 + i, cb)
-            self._gran_cbs.append(cb)
+            self._granularity_layout.insertWidget(1 + i, cb)
+            self._granularity_cbs.append(cb)
 
             cb = QCheckBox(ch)
             cb.setChecked(ch in saved["glcm"])
@@ -441,11 +441,11 @@ class ObjectProfileBlockWidget(QWidget):
             "intensity_channels": BaseStepPanel._checked_checkboxes(self._intensity_cbs) or None,
             "radial_channels": BaseStepPanel._checked_checkboxes(self._radial_cbs) or None,
             "radial_bins": self._radial_bins.value(),
-            "gran_channels": BaseStepPanel._checked_checkboxes(self._gran_cbs) or None,
-            "gran_spectrum_length": self._gran_spectrum_length.value(),
-            "gran_subsample_ratio": self._gran_subsample_ratio.value(),
-            "gran_background_subsample_ratio": self._gran_background_subsample_ratio.value(),
-            "gran_background_radius": self._gran_background_radius.value(),
+            "granularity_channels": BaseStepPanel._checked_checkboxes(self._granularity_cbs) or None,
+            "granularity_spectrum_length": self._granularity_spectrum_length.value(),
+            "granularity_subsample_ratio": self._granularity_subsample_ratio.value(),
+            "granularity_background_subsample_ratio": self._granularity_background_subsample_ratio.value(),
+            "granularity_background_radius": self._granularity_background_radius.value(),
             "glcm_channels": BaseStepPanel._checked_checkboxes(self._glcm_cbs) or None,
             "glcm_distances": glcm_d,
             "glcm_levels": self._glcm_levels.value(),
@@ -645,13 +645,13 @@ class ObjectProfilingStepPanel(BlockContainerPanel):
         self._wire_param_signal(block._output_table)
         self._wire_param_signal(block._overwrite_db)
         self._wire_param_signal(block._radial_bins)
-        self._wire_param_signal(block._gran_spectrum_length)
-        self._wire_param_signal(block._gran_subsample_ratio)
-        self._wire_param_signal(block._gran_background_subsample_ratio)
-        self._wire_param_signal(block._gran_background_radius)
+        self._wire_param_signal(block._granularity_spectrum_length)
+        self._wire_param_signal(block._granularity_subsample_ratio)
+        self._wire_param_signal(block._granularity_background_subsample_ratio)
+        self._wire_param_signal(block._granularity_background_radius)
         self._wire_param_signal(block._glcm_distances)
         self._wire_param_signal(block._glcm_levels)
-        for cb_list in (block._intensity_cbs, block._radial_cbs, block._gran_cbs,
+        for cb_list in (block._intensity_cbs, block._radial_cbs, block._granularity_cbs,
                         block._glcm_cbs, block._corr_cbs):
             for cb in cb_list:
                 self._wire_param_signal(cb)
@@ -675,7 +675,7 @@ class ObjectProfilingStepPanel(BlockContainerPanel):
             for src_cbs, dst_cbs in [
                 (src._intensity_cbs, block._intensity_cbs),
                 (src._radial_cbs, block._radial_cbs),
-                (src._gran_cbs, block._gran_cbs),
+                (src._granularity_cbs, block._granularity_cbs),
                 (src._glcm_cbs, block._glcm_cbs),
                 (src._corr_cbs, block._corr_cbs),
             ]:
@@ -683,10 +683,10 @@ class ObjectProfilingStepPanel(BlockContainerPanel):
                 for cb in dst_cbs:
                     cb.setChecked(cb.text() in checked)
             block._radial_bins.setValue(src._radial_bins.value())
-            block._gran_spectrum_length.setValue(src._gran_spectrum_length.value())
-            block._gran_subsample_ratio.setValue(src._gran_subsample_ratio.value())
-            block._gran_background_subsample_ratio.setValue(src._gran_background_subsample_ratio.value())
-            block._gran_background_radius.setValue(src._gran_background_radius.value())
+            block._granularity_spectrum_length.setValue(src._granularity_spectrum_length.value())
+            block._granularity_subsample_ratio.setValue(src._granularity_subsample_ratio.value())
+            block._granularity_background_subsample_ratio.setValue(src._granularity_background_subsample_ratio.value())
+            block._granularity_background_radius.setValue(src._granularity_background_radius.value())
             block._glcm_distances.setText(src._glcm_distances.text())
             block._glcm_levels.setValue(src._glcm_levels.value())
 
@@ -734,10 +734,10 @@ class ObjectProfilingStepPanel(BlockContainerPanel):
         if hasattr(block, "_overwrite_db"):
             block._overwrite_db.setChecked(bool(cfg.get("overwrite_db", False)))
         BaseStepPanel._set_widget(block._radial_bins, cfg.get("radial_bins", 4), "radial_bins")
-        BaseStepPanel._set_widget(block._gran_spectrum_length, cfg.get("gran_spectrum_length", 8), "gran_spectrum_length")
-        BaseStepPanel._set_widget(block._gran_subsample_ratio, cfg.get("gran_subsample_ratio", 0.5), "gran_subsample_ratio")
-        BaseStepPanel._set_widget(block._gran_background_subsample_ratio, cfg.get("gran_background_subsample_ratio", 0.25), "gran_background_subsample_ratio")
-        BaseStepPanel._set_widget(block._gran_background_radius, cfg.get("gran_background_radius", 10), "gran_background_radius")
+        BaseStepPanel._set_widget(block._granularity_spectrum_length, cfg.get("granularity_spectrum_length", 8), "granularity_spectrum_length")
+        BaseStepPanel._set_widget(block._granularity_subsample_ratio, cfg.get("granularity_subsample_ratio", 0.5), "granularity_subsample_ratio")
+        BaseStepPanel._set_widget(block._granularity_background_subsample_ratio, cfg.get("granularity_background_subsample_ratio", 0.25), "granularity_background_subsample_ratio")
+        BaseStepPanel._set_widget(block._granularity_background_radius, cfg.get("granularity_background_radius", 10), "granularity_background_radius")
         glcm_d = cfg.get("glcm_distances", "")
         if glcm_d:
             if isinstance(glcm_d, list):
@@ -747,7 +747,7 @@ class ObjectProfilingStepPanel(BlockContainerPanel):
         BaseStepPanel._set_widget(block._glcm_levels, cfg.get("glcm_levels", 256), "glcm_levels")
         BaseStepPanel._set_checked_states(block._intensity_cbs, cfg.get("intensity_channels"))
         BaseStepPanel._set_checked_states(block._radial_cbs, cfg.get("radial_channels"))
-        BaseStepPanel._set_checked_states(block._gran_cbs, cfg.get("gran_channels"))
+        BaseStepPanel._set_checked_states(block._granularity_cbs, cfg.get("granularity_channels"))
         BaseStepPanel._set_checked_states(block._glcm_cbs, cfg.get("glcm_channels"))
         corr_pairs = [tuple(p) for p in (cfg.get("correlation_pairs") or [])]
         for cb in block._corr_cbs:

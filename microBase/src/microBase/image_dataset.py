@@ -19,7 +19,6 @@ re-read from disk.
 """
 
 import re
-import sys
 import logging
 import threading
 from collections import OrderedDict
@@ -31,6 +30,7 @@ from natsort import natsorted, natsort_keygen
 
 from . import cells as _cells
 from . import io as _io
+from .errors import ConfigError, DataError, DatasetError, ImageReadError
 from .schema import MetadataSchema
 
 logger = logging.getLogger(__name__)
@@ -44,21 +44,21 @@ def _pattern_string(pattern):
 
 
 def _apply_filter(df, col, pat):
-    """Filter a metadata frame by regex on a column, hard-exiting on an
-    unknown column or invalid regex. Shared by build_metadata and
-    filter_metadata."""
+    """Filter a metadata frame by regex on a column.
+
+    Unknown column / invalid or missing regex raise ConfigError. Shared by
+    build_metadata and filter_metadata.
+    """
     if col not in df.columns:
-        print(
-            f"Error: filter column '{col}' not in metadata columns: "
-            f"{list(df.columns)}",
-            file=sys.stderr,
+        raise ConfigError(
+            f"filter column '{col}' not in metadata columns: {list(df.columns)}"
         )
-        sys.exit(1)
+    if not pat:
+        raise ConfigError(f"filter on '{col}' has an empty pattern")
     try:
         re.compile(pat)
     except re.error as e:
-        print(f"Error: invalid regex for filter on '{col}': {e}", file=sys.stderr)
-        sys.exit(1)
+        raise ConfigError(f"invalid regex for filter on '{col}': {e}") from e
     return df[df[col].astype(str).str.contains(pat, regex=True, na=False)]
 
 
@@ -150,8 +150,7 @@ class ImageDataset:
     ):
         self.root = Path(root)
         if not self.root.exists():
-            print(f"Error: dataset root not found: {self.root}", file=sys.stderr)
-            sys.exit(1)
+            raise DatasetError(f"dataset root not found: {self.root}")
         self.channel_layout = channel_layout
         self.image_subdir_pattern = image_subdir_pattern
         self._filters = list(filters.items()) if filters else []
@@ -163,31 +162,30 @@ class ImageDataset:
         )
 
         if self._image_pattern is None:
-            print(
-                "Error: image_pattern is required for ImageDataset. "
-                "Set 'data.image_pattern' in the config.",
-                file=sys.stderr,
+            raise ConfigError(
+                "image_pattern is required for ImageDataset. "
+                "Set 'data.image_pattern' in the config."
             )
-            sys.exit(1)
 
         # Validate pattern vs channel_layout
         has_channel_group = "channel" in self._image_pattern.groupindex
         if channel_layout is None and not has_channel_group:
             # Implicit single-channel mode: each file is treated as channel "ch1".
-            # No hard-exit — allows simple single-channel datasets without a
-            # `channel` capture group.
+            # Allows simple single-channel datasets without a `channel` capture.
             logger.warning(
                 "channel_layout=None without a `channel` group in image_pattern — "
                 "treating each file as the single channel 'ch1'."
             )
         if channel_layout is not None and has_channel_group:
-            print(
-                "Error: channel_layout conflicts with channel-grouped pattern. "
+            raise ConfigError(
+                "channel_layout conflicts with channel-grouped pattern. "
                 "Either remove the `channel` group from image_pattern or set "
-                "channel_layout=None.",
-                file=sys.stderr,
+                "channel_layout=None."
             )
-            sys.exit(1)
+        if channel_layout not in (None, "CHW", "HWC"):
+            raise ConfigError(
+                f"channel_layout must be None, 'CHW' or 'HWC', got '{channel_layout}'"
+            )
 
         # State filled by build_metadata
         self._metadata = None
@@ -320,8 +318,11 @@ class ImageDataset:
     def build_metadata(self):
         """Scan root, parse filenames with regex, build pivoted metadata DataFrame."""
         # Any (re)build invalidates row indices — in-flight readers must not
-        # cache results keyed by the old indexing (see get_imageset).
+        # cache results keyed by the old indexing (see get_imageset), and the
+        # cache itself holds (image, mask) tuples for the old row ordering
+        # (e.g. cellpose.py rebuilds metadata after saving new masks).
         self._metadata_generation += 1
+        self._cache.clear()
         # Group 1: collect parsed records
         # Each image record: {shared_key -> {channel: filepath, ...extra meta}}
         # Mask records similar with mask_name.
@@ -373,7 +374,7 @@ class ImageDataset:
                 gd = m.groupdict()
                 shared = self._shared_key(gd)
                 if "mask_name" not in gd:
-                    raise ValueError(
+                    raise DatasetError(
                         f"mask_pattern must have a `mask_name` named group. "
                         f"File: {fname}"
                     )
@@ -399,8 +400,13 @@ class ImageDataset:
             img_rec = image_records.get(k, {})
             mask_rec = mask_records.get(k, {})
             row.update(img_rec)
-            # mask_ columns override (since they're prefixed)
+            # mask_ columns override (since they're prefixed). `directory`
+            # always belongs to the IMAGE record: a mask living in a
+            # different subtree must not redirect consumers to the mask's
+            # directory (the image is what the dataset row describes).
             for mk, mv in mask_rec.items():
+                if mk == "directory":
+                    continue
                 row[mk] = mv
             rows.append(row)
         df = pd.DataFrame(rows)
@@ -460,7 +466,12 @@ class ImageDataset:
         return self
 
     def _auto_detect_image_properties(self):
-        """Read the first image to get shape, dtype, and (for multi-channel-per-file) channels."""
+        """Read the first readable image to get shape, dtype, and channels.
+
+        Unreadable/missing candidates are skipped (warning) instead of
+        raising: a broken first file must not abort dataset construction
+        — the pipeline quarantines that row when it reaches it.
+        """
         if len(self._metadata) == 0:
             return
         if self.channel_layout is None:
@@ -469,22 +480,32 @@ class ImageDataset:
             if not ch_cols:
                 return
             # Skip mask-only rows (NaN image path) — the properties come from
-            # the first row that actually has an image file.
+            # the first row that actually has a readable image file.
             for _, row in self._metadata.iterrows():
                 first_path = row[ch_cols[0]]
                 if pd.isna(first_path):
                     continue
-                arr = _io.read_image(first_path)
+                try:
+                    arr = _io.read_image(first_path)
+                except ImageReadError as e:
+                    logger.warning(
+                        "Skipping unreadable image for shape detection: %s", e)
+                    continue
                 self._img_shape = arr.shape  # (H, W)
                 self._img_dtype = arr.dtype
                 return
         else:
-            # multi-channel-per-file: open first TIFF, count channels
+            # multi-channel-per-file: open first readable TIFF, count channels
             for _, row in self._metadata.iterrows():
                 if "__file__" not in row or pd.isna(row["__file__"]):
                     continue
-                self._img_shape, n_channels, self._img_dtype = _io.detect_tiff_properties(
-                    row["__file__"], self.channel_layout)
+                try:
+                    self._img_shape, n_channels, self._img_dtype = _io.detect_tiff_properties(
+                        row["__file__"], self.channel_layout)
+                except ImageReadError as e:
+                    logger.warning(
+                        "Skipping unreadable TIFF for shape detection: %s", e)
+                    continue
                 self._intensity_colnames = [f"ch{i}" for i in range(1, n_channels + 1)]
                 return
 
@@ -512,39 +533,51 @@ class ImageDataset:
         image_paths_dict:
           - channel_layout=None: {ch_name: path}
           - channel_layout="CHW"/"HWC": {"__file__": path}  (one file)
+
+        A row missing its image path raises ImageReadError (the pipeline
+        quarantines the row and continues); an out-of-range index raises
+        DataError.
         """
         if row_idx < 0 or row_idx >= len(self._metadata):
-            print(f"Error: row_idx {row_idx} out of range (0..{len(self)-1})", file=sys.stderr)
-            sys.exit(1)
+            raise DataError(
+                f"row_idx {row_idx} out of range (0..{len(self)-1})")
         row = self._metadata.iloc[row_idx]
         img_paths = {}
         mask_paths = {}
         if self.channel_layout is None:
+            if not self._intensity_colnames:
+                # No image matched image_pattern (mask-only dataset or every
+                # image file is gone). np.stack([]) below would raise a raw
+                # numpy ValueError that the pipeline does not quarantine on.
+                raise ImageReadError(
+                    None,
+                    "dataset has no intensity channels — no image file matched "
+                    "image_pattern (mask-only dataset or all image files are "
+                    "missing).",
+                )
             for ch in self._intensity_colnames:
                 p = row[ch]
                 if pd.isna(p):
                     # Mask-only rows (or a site missing a channel file) have
                     # NaN image paths — reading one would crash with a raw
-                    # TypeError. Hard-exit with a clear message instead.
-                    print(
-                        f"Error: row {row_idx} is missing the image file for "
+                    # TypeError. Raise so the pipeline quarantines the row.
+                    raise ImageReadError(
+                        None,
+                        f"row {row_idx} is missing the image file for "
                         f"channel '{ch}' — the file referenced by the metadata "
                         f"does not exist (mask-only or deleted file).",
-                        file=sys.stderr,
                     )
-                    sys.exit(1)
                 img_paths[ch] = p
         else:
             # multi-channel-per-file: the file path is stored under "__file__"
             # (kept as a private column, never re-parsed).
             if "__file__" not in row or pd.isna(row["__file__"]):
-                print(
-                    "Error: multi-channel-per-file mode requires __file__ column "
+                raise ImageReadError(
+                    None,
+                    "multi-channel-per-file mode requires __file__ column "
                     "(row has no image file — mask-only or deleted file). "
                     "Rebuild metadata.",
-                    file=sys.stderr,
                 )
-                sys.exit(1)
             img_paths["__file__"] = row["__file__"]
         for m in self._mask_colnames:
             mpath = row[m]
@@ -568,16 +601,22 @@ class ImageDataset:
               img_data  : (H, W, C) array
               mask_dict : {mask_col_name: (H, W) int array}
 
+        Missing/unreadable files raise ImageReadError, so pipeline callers can
+        quarantine the row (delete its files) and continue.
+
         Results are cached and shared by reference — never mutate the
         returned arrays (copy first), or the cache is corrupted for every
         subsequent reader.
         """
-        # Capture the metadata generation so a concurrent filter_metadata
-        # (GUI thread) between this miss and the put below can't leave the
-        # read cached under a row_idx that no longer means the same site.
+        # Capture the metadata generation so a concurrent filter_metadata or
+        # build_metadata (GUI thread) between this miss and the put below
+        # can't leave the read cached under a row_idx that no longer means
+        # the same site. A hit whose generation no longer matches is treated
+        # as a miss: build_metadata clears the cache, but a concurrent reader
+        # may still observe the pre-clear entry.
         generation = self._metadata_generation
         cached = self._cache.get(row_idx)
-        if cached is not None:
+        if cached is not None and generation == self._metadata_generation:
             img_data, all_masks = cached
             if masks is None:
                 return img_data, dict(all_masks)
@@ -596,7 +635,8 @@ class ImageDataset:
             n_channels = len(self._intensity_colnames)
             channels_list = list(range(1, n_channels + 1))
             img_data = _io.read_tiff_channels(
-                img_paths["__file__"], channels_list, channel_layout=self.channel_layout
+                img_paths["__file__"], channels_list,
+                channel_layout=self.channel_layout,
             )
 
         # Always load ALL masks so the cache holds the complete set;
@@ -614,35 +654,26 @@ class ImageDataset:
     def image_path(self, row_idx, channel):
         """Return the file path for a specific channel at a row. channel_layout=None only."""
         if self.channel_layout is not None:
-            print(
-                "Error: image_path() only valid for channel_layout=None "
-                "(one-channel-per-file mode).",
-                file=sys.stderr,
+            raise DataError(
+                "image_path() only valid for channel_layout=None "
+                "(one-channel-per-file mode)."
             )
-            sys.exit(1)
         if row_idx < 0 or row_idx >= len(self._metadata):
-            print(
-                f"Error: row_idx {row_idx} out of range (0..{len(self)-1})",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise DataError(f"row_idx {row_idx} out of range (0..{len(self)-1})")
         row = self._metadata.iloc[row_idx]
         if channel not in self._intensity_colnames or channel not in row:
-            print(
-                f"Error: channel '{channel}' not in metadata columns for row "
-                f"{row_idx} (available: {self._intensity_colnames})",
-                file=sys.stderr,
+            raise DataError(
+                f"channel '{channel}' not in metadata columns for row "
+                f"{row_idx} (available: {self._intensity_colnames})"
             )
-            sys.exit(1)
         p = row[channel]
         if pd.isna(p):
-            print(
-                f"Error: row {row_idx} is missing the image file for "
+            raise ImageReadError(
+                None,
+                f"row {row_idx} is missing the image file for "
                 f"channel '{channel}' — the file referenced by the metadata "
                 f"does not exist (mask-only or deleted file).",
-                file=sys.stderr,
             )
-            sys.exit(1)
         return Path(p)
 
     def filter_metadata(self, column, pattern):
@@ -668,15 +699,12 @@ class ImageDataset:
         Returns:
             (crop, cell_mask, bbox) where crop is (h, w, C) with background zeroed,
             cell_mask is (h, w) bool, bbox is (x, y, w, h).
-            Exits with error if the cell has no pixels in the mask.
+            Raises DataError if the cell has no pixels in the mask.
         """
         img_data, mask_dict = self.get_imageset(row_idx, masks=[mask_name])
         if mask_name not in mask_dict:
-            print(
-                f"Error: mask '{mask_name}' not found. Available: {list(mask_dict)}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise DataError(
+                f"mask '{mask_name}' not found. Available: {list(mask_dict)}")
         mask = mask_dict[mask_name]
         return _cells.crop_cell(img_data, mask, label, padding=padding)
 
@@ -694,11 +722,8 @@ class ImageDataset:
         """
         img_data, mask_dict = self.get_imageset(row_idx, masks=[mask_name])
         if mask_name not in mask_dict:
-            print(
-                f"Error: mask '{mask_name}' not found. Available: {list(mask_dict)}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise DataError(
+                f"mask '{mask_name}' not found. Available: {list(mask_dict)}")
         mask = mask_dict[mask_name]
         return _cells.crop_all_cells(
             img_data, mask, padding=padding, labels=labels

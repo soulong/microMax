@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
 from PySide6.QtWidgets import QWidget
@@ -20,12 +19,6 @@ class IControllerView(Protocol):
         ...
 
     def get_input_dir(self) -> str:
-        ...
-
-    def get_output_dir(self) -> str:
-        ...
-
-    def output_path(self) -> Path:
         ...
 
     def progress_reset(self) -> None:

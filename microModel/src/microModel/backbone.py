@@ -8,6 +8,8 @@ import torch.nn.functional as F
 import timm
 from timm.models.vision_transformer import VisionTransformer
 
+from microBase import MicroMaxError
+
 from .utils import logger
 
 
@@ -22,7 +24,7 @@ def build_dino_vit(vit_name, in_chans, pretrained=False):
          architecture (RoPE, register tokens, num_prefix_tokens=5) and do NOT
          accept the VisionTransformer-specific kwargs — they are created with
          a plain create_model call (dynamic_img_size is built-in).
-    Anything without a patch_embed / blocks / a class token hard-exits
+    Anything without a patch_embed / blocks / a class token raises MicroMaxError
     (no silent fallback).
 
     pretrained=True loads timm weights (ImageNet/LVD); the first conv is
@@ -39,23 +41,15 @@ def build_dino_vit(vit_name, in_chans, pretrained=False):
             vit = timm.create_model(
                 vit_name, pretrained=pretrained, in_chans=in_chans, num_classes=0)
         except Exception as e:
-            print(f"Error: failed to create DINOv3 ViT '{vit_name}': {e}",
-                  file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError(f"Error: failed to create DINOv3 ViT '{vit_name}': {e}")
     except Exception as e:
-        print(f"Error: failed to create DINO-style ViT '{vit_name}': {e}",
-              file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: failed to create DINO-style ViT '{vit_name}': {e}")
     ok = (hasattr(vit, "patch_embed") and hasattr(vit, "blocks")
           and getattr(vit, "num_prefix_tokens", 0) >= 1
           and getattr(vit, "embed_dim", None) is not None)
     if not ok:
-        print(
-            f"Error: '{vit_name}' is not a DINO-style timm ViT (needs a "
-            f"patch_embed, blocks and a class token); got {type(vit).__name__}.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise MicroMaxError(f"Error: '{vit_name}' is not a DINO-style timm ViT (needs a "
+            f"patch_embed, blocks and a class token); got {type(vit).__name__}.")
     return vit
 
 
@@ -173,12 +167,8 @@ def extract_backbone_state_dict(state_dict, method, branch="teacher"):
         prefix = "teacher_backbone.vit." if branch == "teacher" \
             else "student_backbone.vit."
     else:
-        print(
-            f"Error: cannot extract a backbone from SSL method '{method}' "
-            f"(supported: dinov3)",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise MicroMaxError(f"Error: cannot extract a backbone from SSL method '{method}' "
+            f"(supported: dinov3)")
     return {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
 
 
@@ -242,9 +232,8 @@ def load_backbone_weights(backbone, bundle, method):
     by prefix (teacher_backbone.vit.* / student_backbone.vit.* for dinov3).
     """
     if "state_dict" not in bundle:
-        print("Error: SSL bundle has no 'state_dict' key (unsupported "
-              "pre-0.2.1 bundle format)", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError("Error: SSL bundle has no 'state_dict' key (unsupported "
+              "pre-0.2.1 bundle format)")
     backbone.load_state_dict(extract_backbone_state_dict(bundle["state_dict"], method))
 
 
@@ -256,7 +245,7 @@ def load_ssl_backbone_from_bundle(bundle, device=None):
     Returns (model, feat_dim, pool_fn, meta).
     """
     meta = bundle["meta"]
-    method = meta.get("method")
+    method = meta.get("ssl_method")
     in_chans = meta["in_chans"]
 
     if method == "dinov3":

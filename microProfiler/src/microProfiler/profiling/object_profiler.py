@@ -14,6 +14,7 @@ from scipy.ndimage import find_objects
 from skimage.measure import regionprops_table
 
 from microBase import ImageDataset, edge_pixel_ratio
+from microProfiler.io import ImageReadError, quarantine_row
 from microProfiler.profiling import resolve_source_directory
 from microProfiler.profiling.batch_writer import BatchWriter
 from microProfiler.profiling.extras import (
@@ -357,7 +358,7 @@ def _process_one_object(
             k: v for k, v in row.to_dict().items()
             if k not in ds.intensity_colnames and k not in ds.mask_colnames
         }
-        meta["directory"] = resolve_source_directory(row, ds.intensity_colnames)
+        meta["directory"] = resolve_source_directory(row, ds.intensity_colnames, ds.root)
         image_data, mask_data = ds.get_imageset(idx)
         mask = _lookup_mask(mask_data, mask_name)
         if mask is None:
@@ -377,6 +378,11 @@ def _process_one_object(
             correlation_pairs=correlation_pairs,
             **measure_kwargs,
         )
+    except ImageReadError as e:
+        # Missing/unreadable file: quarantine the whole row (channels + masks)
+        # and skip — the batch continues.
+        quarantine_row(ds, idx, str(e))
+        return None
     except Exception:
         # Intentional design: a row that fails to profile is logged and
         # skipped; the batch continues by design (fix the row at the source,
@@ -458,10 +464,10 @@ def profile_objects(
     if resolved.granularity_channels:
         measure_kwargs["granularity_channels"] = resolved.granularity_channels
         measure_kwargs["granularity_kwargs"] = {
-            "spectrum_length": resolved.gran_spectrum_length,
-            "subsample_size": resolved.gran_subsample_ratio,
-            "image_sample_size": resolved.gran_background_subsample_ratio,
-            "background_radius": resolved.gran_background_radius,
+            "spectrum_length": resolved.granularity_spectrum_length,
+            "subsample_size": resolved.granularity_subsample_ratio,
+            "image_sample_size": resolved.granularity_background_subsample_ratio,
+            "background_radius": resolved.granularity_background_radius,
         }
     if resolved.glcm_channels:
         measure_kwargs["glcm_channels"] = resolved.glcm_channels
@@ -491,6 +497,7 @@ def profile_objects(
                         # Skips (missing mask) also advance the counter so the
                         # progress bar reaches n_total exactly.
                         completed += 1
+                    sp.finish(f"Profiled {mask_name}")
                 else:
                     # One executor for the whole run — chunks only bound how
                     # many images are pre-loaded into RAM at once.
@@ -513,8 +520,14 @@ def profile_objects(
                                 k: v for k, v in row.to_dict().items()
                                 if k not in ds.intensity_colnames and k not in ds.mask_colnames
                             }
-                            meta["directory"] = resolve_source_directory(row, ds.intensity_colnames)
-                            image_data, mask_data = ds.get_imageset(idx)
+                            meta["directory"] = resolve_source_directory(row, ds.intensity_colnames, ds.root)
+                            try:
+                                image_data, mask_data = ds.get_imageset(idx)
+                            except ImageReadError as e:
+                                quarantine_row(ds, idx, str(e))
+                                sp.tick("")
+                                completed += 1
+                                continue
                             tasks.append((
                                 # (global row index, worker args) — futures are
                                 # keyed by the global index so error logs point
@@ -546,6 +559,11 @@ def profile_objects(
                                 raise
                             except Exception:
                                 logger.exception("Object profiling failed for row %d — skipping", row_idx)
+                                # A failed task still advances the bar, or it
+                                # never reaches n_total and ``lost`` over-counts.
+                                completed += 1
+                                chunk_completed += 1
+                                sp.tick("")
         except InterruptedError:
             # A cancel must propagate so the pipeline treats the run as
             # interrupted (never as a completed step): the GUI relies on
@@ -564,7 +582,7 @@ def profile_objects(
             # reported complete. Batches flushed before the failure are
             # already committed; the CLI batch loop logs the dataset failure
             # and continues, and the GUI worker surfaces the error dialog.
-            # Object tables have no row-count guard — delete result.db (or
+            # Object tables have no row-count guard — delete profiler.db (or
             # the table) before re-running after a failed object run.
             if executor is not None:
                 executor.shutdown(cancel_futures=True)

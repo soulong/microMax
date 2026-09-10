@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from microBase import DataError
 from microBase.cells import (
     crop_cell,
     crop_all_cells,
@@ -64,22 +65,22 @@ def test_crop_cell_padding_clamped():
 
 
 def test_crop_cell_no_pixels():
-    """Cell ID not in mask -> exits with error (corruption)."""
+    """Cell ID not in mask -> DataError (corruption)."""
     volume, mask = _make_volume_mask(n_cells=1)
-    with pytest.raises(SystemExit):
+    with pytest.raises(DataError):
         crop_cell(volume, mask, 999)
 
 
-def test_crop_cell_label_zero_exits():
-    """Label 0 (background) must hard-exit, not crop the whole image."""
+def test_crop_cell_label_zero_raises():
+    """Label 0 (background) must raise, not crop the whole image."""
     volume, mask = _make_volume_mask(n_cells=1)
-    with pytest.raises(SystemExit):
+    with pytest.raises(DataError):
         crop_cell(volume, mask, 0)
 
 
-def test_crop_cell_negative_label_exits():
+def test_crop_cell_negative_label_raises():
     volume, mask = _make_volume_mask(n_cells=1)
-    with pytest.raises(SystemExit):
+    with pytest.raises(DataError):
         crop_cell(volume, mask, -3)
 
 

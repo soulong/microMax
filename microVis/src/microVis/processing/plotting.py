@@ -1,0 +1,551 @@
+"""Plotting helpers for the microVis Data-page DB tabs.
+
+Everything here is pure Qt-free matplotlib: the widgets load a DataFrame,
+call a ``make_*`` function, and embed the returned Figure. Vector PDF export
+keeps text editable by embedding Type-42 fonts (``pdf.fonttype = 42``).
+
+Facet semantics: the selected facet variables form the full cartesian product
+of their levels (one subplot per combination). Point caps apply to scatter
+plots only; box/bar always use every row.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+
+import matplotlib
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
+from matplotlib.lines import Line2D
+from natsort import natsort_key
+
+# Editable text in exported vector PDFs (Type-42 TrueType embedding).
+matplotlib.rcParams["pdf.fonttype"] = 42
+matplotlib.rcParams["ps.fonttype"] = 42
+
+SINGLE_COLOR = "#4a90d9"
+
+
+# ── Column classification ─────────────────────────────────────────────────
+
+
+def is_continuous(series: pd.Series) -> bool:
+    """True when a column maps to a continuous (colormap) scale."""
+    return (pd.api.types.is_numeric_dtype(series)
+            and not pd.api.types.is_bool_dtype(series))
+
+
+def numeric_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if is_continuous(df[c])]
+
+
+def categorical_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if not is_continuous(df[c])]
+
+
+def _sorted_values(series: pd.Series) -> list:
+    vals = [v for v in series.dropna().unique().tolist()]
+    return sorted(vals, key=lambda v: natsort_key(str(v)))
+
+
+def axis_values(series: pd.Series):
+    """Return ``(numeric_values, tick_labels|None)`` for any variable.
+
+    Continuous columns pass through as floats; categorical columns (meta text)
+    are mapped to their natsorted level index so they can still be placed on an
+    axis, with the level names returned for the axis ticks.
+    """
+    if is_continuous(series):
+        return pd.to_numeric(series, errors="coerce"), None
+    levels = _sorted_values(series)
+    mapping = {v: float(i) for i, v in enumerate(levels)}
+    return series.map(mapping), levels
+
+
+def _apply_categorical_axis(ax, xticks, yticks) -> None:
+    if xticks is not None:
+        ax.set_xticks(range(len(xticks)))
+        ax.set_xticklabels(xticks, fontsize=7, rotation=30, ha="right")
+    if yticks is not None:
+        ax.set_yticks(range(len(yticks)))
+        ax.set_yticklabels(yticks, fontsize=7)
+
+
+# ── Facets / sampling ─────────────────────────────────────────────────────
+
+
+def facet_groups(df: pd.DataFrame, facet_cols, max_combos: int = 24):
+    """Split *df* into one sub-frame per full combination of facet columns.
+
+    Returns ``(groups, truncated)``: groups is a list of ``(label, sub_df)``;
+    combinations beyond ``max_combos`` are dropped and ``truncated`` is True
+    so the caller can warn. Empty combinations are skipped.
+    """
+    facet_cols = [c for c in (facet_cols or []) if c in df.columns]
+    if not facet_cols:
+        return [("", df)], False
+    value_lists = [_sorted_values(df[c]) for c in facet_cols]
+    combos = list(itertools.product(*value_lists))
+    truncated = len(combos) > max_combos
+    groups = []
+    for combo in combos[:max_combos]:
+        mask = pd.Series(True, index=df.index)
+        for col, val in zip(facet_cols, combo):
+            mask &= df[col] == val
+        sub = df[mask]
+        if sub.empty:
+            continue
+        label = ", ".join(f"{col}={val}" for col, val in zip(facet_cols, combo))
+        groups.append((label, sub))
+    if not groups:
+        groups = [("", df)]
+    return groups, truncated
+
+
+def apply_point_cap(df: pd.DataFrame, cap: int, seed: int = 0):
+    """Deterministic scatter row cap. ``cap <= 0`` means no cap.
+
+    Returns ``(capped_df, sampled, total)``.
+    """
+    total = len(df)
+    if cap and total > cap:
+        return df.sample(n=int(cap), random_state=seed), True, total
+    return df, False, total
+
+
+def apply_filter(df: pd.DataFrame, expr: str):
+    """Apply a pandas query expression to a plot DataFrame.
+
+    Returns ``(filtered_df, None)`` on success or ``(None, error_message)``
+    when the expression does not parse/evaluate — callers surface the error
+    and abort the plot instead of raising.
+    """
+    expr = (expr or "").strip()
+    if not expr:
+        return df, None
+    try:
+        return df.query(expr, engine="python"), None
+    except Exception as e:
+        return None, str(e)
+
+
+# ── Internals ─────────────────────────────────────────────────────────────
+
+
+def _new_grid(n_panels: int, ncols: int):
+    """Create a facet grid sized to n_panels panels. Returns (fig, axes)."""
+    ncols_eff = max(1, min(ncols, n_panels))
+    nrows = int(math.ceil(n_panels / ncols_eff))
+    fig, axes = plt.subplots(
+        nrows, ncols_eff,
+        figsize=(4.6 * ncols_eff, 3.4 * nrows),
+        squeeze=False,
+    )
+    return fig, list(axes.ravel())
+
+
+def _palette_map(values, palette: str) -> dict:
+    """Stable value -> RGBA mapping for a categorical column."""
+    uniq = _sorted_values(pd.Series(values))
+    cmap = plt.get_cmap(palette)
+    # Sequential/qualitative colormaps both work; cycle if there are more
+    # categories than entries (keeps the plot drawable, warns via gray tones).
+    return {v: cmap((i % max(1, cmap.N - 1)) / max(1, cmap.N - 1))
+            for i, v in enumerate(uniq)}
+
+
+def _group_series(df: pd.DataFrame, y: str, keys):
+    """Split *df* into ``(key_tuple, y_series)`` groups in natsorted order."""
+    if not keys:
+        return [((), df[y].dropna())]
+    out = []
+    for key, group in df.groupby(keys, dropna=True):
+        if not isinstance(key, tuple):
+            key = (key,)
+        out.append((key, group[y].dropna()))
+    out.sort(key=lambda kv: tuple(natsort_key(str(v)) for v in kv[0]))
+    return out
+
+
+def _group_label(key) -> str:
+    return " | ".join(str(v) for v in key)
+
+
+def _axis_style(ax, title: str = ""):
+    ax.set_title(title, fontsize=9)
+    ax.grid(True, alpha=0.25, linewidth=0.6)
+
+
+def _finish_grid(fig, axes, used: int, facet_cols, truncated: bool):
+    for ax in axes[used:]:
+        ax.set_visible(False)
+    if truncated:
+        fig.text(0.99, 0.01, "facet combinations truncated", ha="right",
+                 va="bottom", fontsize=7, color="#b05050")
+    if facet_cols:
+        fig.tight_layout()
+
+
+# ── Scatter ───────────────────────────────────────────────────────────────
+
+# Identifier columns always shown in a hover tooltip when present, on top of
+# the currently mapped x/y/color/size variables.
+_HOVER_COLS = ("well", "label", "field", "stack", "timepoint")
+_HOVER_RADIUS_PX = 12.0
+
+
+def _hover_cols(kept: pd.DataFrame, x, y, color, size, exclude=()) -> list[str]:
+    cols: list[str] = []
+    for c in (x, y, color, size, *_HOVER_COLS):
+        if c and c in kept.columns and c not in cols and c not in exclude:
+            cols.append(c)
+    return cols
+
+
+def attach_hover(fig, canvas=None) -> None:
+    """Enable per-point hover tooltips on scatter collections.
+
+    ``make_scatter`` tags every scatter with the rows it drew; this connects a
+    motion handler that shows the nearest point's values in an annotation box.
+    Call it AFTER the figure is embedded in its real canvas (the handler binds
+    to that canvas). Safe to call once per figure — repeat calls are ignored.
+    """
+    canvas = canvas if canvas is not None else fig.canvas
+    if canvas is None or getattr(fig, "_microvis_hover_cid", None) is not None:
+        return
+
+    state = {"annotation": None, "key": None}
+
+    def _clear():
+        ann = state["annotation"]
+        if ann is not None:
+            ann.remove()
+            state["annotation"] = None
+        state["key"] = None
+
+    def _on_motion(event):
+        if event.inaxes is None or event.x is None or event.y is None:
+            if state["annotation"] is not None:
+                _clear()
+                event.canvas.draw_idle()
+            return
+        best = None  # (dist2, collection, point_index)
+        for coll in event.inaxes.collections:
+            rows = getattr(coll, "_microvis_rows", None)
+            if rows is None or len(rows) == 0:
+                continue
+            offsets = np.asarray(coll.get_offsets(), dtype=float)
+            if offsets.size == 0:
+                continue
+            disp = event.inaxes.transData.transform(offsets)
+            dx = disp[:, 0] - event.x
+            dy = disp[:, 1] - event.y
+            d2 = dx * dx + dy * dy
+            i = int(np.nanargmin(d2))
+            if best is None or d2[i] < best[0]:
+                best = (d2[i], coll, i)
+        if best is None or best[0] > _HOVER_RADIUS_PX ** 2:
+            if state["annotation"] is not None:
+                _clear()
+                event.canvas.draw_idle()
+            return
+        d2, coll, i = best
+        rows = coll._microvis_rows
+        offsets = np.asarray(coll.get_offsets(), dtype=float)
+        row = rows.iloc[i]
+        lines = []
+        for c in coll._microvis_cols:
+            try:
+                val = row[c]
+            except KeyError:
+                continue
+            if isinstance(val, (float, np.floating)):
+                text = f"{val:.4g}"
+            else:
+                text = str(val)
+            lines.append(f"{c}: {text}")
+        text = "\n".join(lines)
+        key = (id(coll), i, id(event.inaxes))
+        if key == state["key"]:
+            return
+        state["key"] = key
+        xy = (float(offsets[i, 0]), float(offsets[i, 1]))
+        ann = state["annotation"]
+        if ann is not None and ann.axes is event.inaxes:
+            ann.xy = xy
+            ann.set_text(text)
+        else:
+            _clear()
+            ann = event.inaxes.annotate(
+                text, xy=xy, xytext=(14, 14), textcoords="offset points",
+                fontsize=8, zorder=20,
+                bbox=dict(boxstyle="round,pad=0.4", fc="#ffffe0",
+                          ec="#888888", alpha=0.95),
+            )
+            state["annotation"] = ann
+            state["key"] = key
+        event.canvas.draw_idle()
+
+    fig._microvis_hover_cid = canvas.mpl_connect("motion_notify_event", _on_motion)
+
+
+def make_scatter(
+    df: pd.DataFrame,
+    x: str,
+    y: str,
+    color: str | None = None,
+    size: str | None = None,
+    facet_cols=(),
+    palette: str = "Set1",
+    cmap: str = "viridis",
+    point_size: float = 20.0,
+    max_size: float = 220.0,
+    ncols: int = 3,
+    title: str = "",
+    max_combos: int = 24,
+    hover_exclude=(),
+):
+    """Faceted scatter: color and size may each map one variable.
+
+    Every drawn collection is tagged with its rows so ``attach_hover`` can
+    show a point's values on mouse-over.
+    """
+    groups, truncated = facet_groups(df, facet_cols, max_combos)
+    fig, axes = _new_grid(len(groups), ncols)
+
+    color_map = None
+    norm = None
+    cmap_obj = plt.get_cmap(cmap)
+    if color and color in df.columns:
+        if is_continuous(df[color]):
+            vals = pd.to_numeric(df[color], errors="coerce")
+            norm = Normalize(vmin=np.nanmin(vals), vmax=np.nanmax(vals))
+        else:
+            color_map = _palette_map(df[color], palette)
+    if size and size in df.columns:
+        s_all = pd.to_numeric(df[size], errors="coerce")
+        s_min, s_max = np.nanmin(s_all), np.nanmax(s_all)
+    else:
+        s_min = s_max = None
+
+    size_handles = []
+    for ax, (label, sub) in zip(axes, groups):
+        xs, xticks = axis_values(sub[x])
+        ys, yticks = axis_values(sub[y])
+        keep = xs.notna() & ys.notna()
+        xs, ys = xs[keep], ys[keep]
+        kept = sub[keep].reset_index(drop=True)
+        # Point sizes
+        if s_min is None:
+            sizes = np.full(len(xs), point_size)
+        else:
+            svals = pd.to_numeric(sub[size], errors="coerce")[keep].to_numpy(dtype=float)
+            if s_max > s_min:
+                frac = (svals - s_min) / (s_max - s_min)
+            else:
+                frac = np.zeros_like(svals)
+            sizes = point_size + frac * max(0.0, max_size - point_size)
+        # Colors
+        if color_map is not None:
+            cvals = [color_map.get(v, SINGLE_COLOR) for v in sub[color][keep]]
+            coll = ax.scatter(xs, ys, s=sizes, c=cvals,
+                              linewidths=0.2, edgecolors="white")
+        elif norm is not None:
+            cvals = pd.to_numeric(sub[color], errors="coerce")[keep]
+            coll = ax.scatter(xs, ys, s=sizes, c=cvals, cmap=cmap_obj, norm=norm,
+                              linewidths=0.2, edgecolors="white")
+        else:
+            coll = ax.scatter(xs, ys, s=sizes, c=SINGLE_COLOR,
+                              linewidths=0.2, edgecolors="white")
+        # Hover metadata: exact plotted rows + the columns to show.
+        coll._microvis_rows = kept
+        coll._microvis_cols = _hover_cols(kept, x, y, color, size, hover_exclude)
+        ax.set_xlabel(x, fontsize=8)
+        ax.set_ylabel(y, fontsize=8)
+        ax.tick_params(labelsize=7)
+        _apply_categorical_axis(ax, xticks, yticks)
+        _axis_style(ax, label)
+
+    if color_map is not None:
+        handles = [Line2D([], [], marker="o", linestyle="", markersize=5,
+                          markerfacecolor=c, markeredgecolor="white", label=str(v))
+                   for v, c in color_map.items()]
+        fig.legend(handles=handles, loc="upper right", fontsize=7,
+                   title=color, frameon=False)
+    elif norm is not None:
+        sm = ScalarMappable(norm=norm, cmap=cmap_obj)
+        fig.colorbar(sm, ax=axes[:len(groups)], shrink=0.8, label=color)
+    if s_min is not None:
+        # Representative size legend on the first axis only.
+        reps = np.linspace(s_min, s_max, 3) if s_max > s_min else np.array([s_min])
+        size_handles = [
+            Line2D([], [], marker="o", linestyle="", markersize=math.sqrt(
+                point_size + (0 if s_max <= s_min else (v - s_min) / (s_max - s_min)
+                              * max(0.0, max_size - point_size))) * 0.8,
+                   markerfacecolor="none", markeredgecolor="#666666",
+                   label=f"{v:.3g}")
+            for v in reps
+        ]
+        axes[0].legend(handles=size_handles, fontsize=6, title=size,
+                       title_fontsize=6, loc="lower right", frameon=False)
+    if title:
+        fig.suptitle(title, fontsize=11)
+    _finish_grid(fig, axes, len(groups), facet_cols, truncated)
+    return fig
+
+
+# ── Boxplot / barplot ─────────────────────────────────────────────────────
+
+
+def _distribution_groups(df, y, x, color):
+    """Return (keys, labels, values_list, group_keys). Grouping keys are
+    x (optionally) and a categorical color; continuous color never splits."""
+    keys = []
+    if x:
+        keys.append(x)
+    split_color = bool(color) and not is_continuous(df[color])
+    if split_color:
+        keys.append(color)
+    raw = _group_series(df, y, keys)
+    return keys, raw, split_color
+
+
+def make_boxplot(
+    df: pd.DataFrame,
+    y: str,
+    x: str | None = None,
+    color: str | None = None,
+    facet_cols=(),
+    palette: str = "Set1",
+    show_points: bool = False,
+    ncols: int = 3,
+    title: str = "",
+    max_combos: int = 24,
+):
+    """Faceted boxplot: one box per x (and categorical color) group.
+
+    Y may be any variable: categorical values are placed on their level index
+    with the level names as y-ticks.
+    """
+    yvals, yticks = axis_values(df[y])
+    work = df.assign(__y__=yvals)
+    groups, truncated = facet_groups(work, facet_cols, max_combos)
+    fig, axes = _new_grid(len(groups), ncols)
+    keys, _, split_color = _distribution_groups(work, "__y__", x, color)
+    color_map = None
+    if split_color:
+        color_map = _palette_map(work[color], palette)
+
+    for ax, (label, sub) in zip(axes, groups):
+        grouped = _group_series(sub, "__y__", keys)
+        data = [vals.to_numpy(dtype=float) for _, vals in grouped]
+        labels = [_group_label(k) for k, _ in grouped]
+        if not data:
+            ax.set_visible(False)
+            continue
+        bp = ax.boxplot(data, tick_labels=labels, patch_artist=True,
+                        showfliers=False, widths=0.6)
+        for i, box in enumerate(bp["boxes"]):
+            if color_map is not None and keys and keys[-1] == color:
+                c = color_map.get(grouped[i][0][-1], SINGLE_COLOR)
+            else:
+                c = SINGLE_COLOR
+            box.set_facecolor(c)
+            box.set_alpha(0.85)
+        if show_points:
+            for i, (_, vals) in enumerate(grouped):
+                jitter = np.random.default_rng(0).normal(0, 0.06, len(vals))
+                ax.scatter(np.full(len(vals), i + 1) + jitter,
+                           vals.to_numpy(dtype=float), s=3, alpha=0.4,
+                           color="#333333")
+        ax.set_ylabel(y, fontsize=8)
+        ax.tick_params(labelsize=7, axis="x", rotation=30)
+        if yticks is not None:
+            ax.set_yticks(range(len(yticks)))
+            ax.set_yticklabels(yticks, fontsize=7)
+        _axis_style(ax, label)
+
+    if color_map is not None:
+        handles = [Line2D([], [], marker="s", linestyle="", markersize=6,
+                          markerfacecolor=c, markeredgecolor="none", label=str(v))
+                   for v, c in color_map.items()]
+        fig.legend(handles=handles, loc="upper right", fontsize=7,
+                   title=color, frameon=False)
+    if title:
+        fig.suptitle(title, fontsize=11)
+    _finish_grid(fig, axes, len(groups), facet_cols, truncated)
+    return fig
+
+
+def make_barplot_mean_sd(
+    df: pd.DataFrame,
+    y: str,
+    x: str | None = None,
+    color: str | None = None,
+    facet_cols=(),
+    palette: str = "Set1",
+    ncols: int = 3,
+    title: str = "",
+    max_combos: int = 24,
+):
+    """Faceted barplot: bar height = mean, error bar = SD.
+
+    Y may be any variable: categorical values are placed on their level index
+    with the level names as y-ticks.
+    """
+    yvals, yticks = axis_values(df[y])
+    work = df.assign(__y__=yvals)
+    groups, truncated = facet_groups(work, facet_cols, max_combos)
+    fig, axes = _new_grid(len(groups), ncols)
+    keys, _, split_color = _distribution_groups(work, "__y__", x, color)
+    color_map = None
+    if split_color:
+        color_map = _palette_map(work[color], palette)
+
+    for ax, (label, sub) in zip(axes, groups):
+        grouped = _group_series(sub, "__y__", keys)
+        labels = [_group_label(k) for k, _ in grouped]
+        means = [vals.mean() for _, vals in grouped]
+        stds = [vals.std(ddof=1) if len(vals) > 1 else 0.0 for _, vals in grouped]
+        if not means:
+            ax.set_visible(False)
+            continue
+        positions = np.arange(len(means))
+        colors = []
+        for i, (k, _) in enumerate(grouped):
+            if color_map is not None and keys and keys[-1] == color:
+                colors.append(color_map.get(k[-1], SINGLE_COLOR))
+            else:
+                colors.append(SINGLE_COLOR)
+        ax.bar(positions, means, yerr=stds, capsize=3, color=colors,
+               edgecolor="#333333", linewidth=0.5, alpha=0.9)
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels, fontsize=7, rotation=30, ha="right")
+        ax.set_ylabel(y, fontsize=8)
+        if yticks is not None:
+            ax.set_yticks(range(len(yticks)))
+            ax.set_yticklabels(yticks, fontsize=7)
+        _axis_style(ax, label)
+
+    if color_map is not None:
+        handles = [Line2D([], [], marker="s", linestyle="", markersize=6,
+                          markerfacecolor=c, markeredgecolor="none", label=str(v))
+                   for v, c in color_map.items()]
+        fig.legend(handles=handles, loc="upper right", fontsize=7,
+                   title=color, frameon=False)
+    if title:
+        fig.suptitle(title, fontsize=11)
+    _finish_grid(fig, axes, len(groups), facet_cols, truncated)
+    return fig
+
+
+# ── Export ────────────────────────────────────────────────────────────────
+
+
+def save_figure_pdf(fig, path) -> None:
+    """Write the figure as a vector PDF with editable text."""
+    fig.savefig(str(path), format="pdf", bbox_inches="tight")

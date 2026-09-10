@@ -13,6 +13,8 @@ import torch
 from torch.utils.data import DataLoader, ConcatDataset
 from tqdm import tqdm
 
+from microBase import MicroMaxError
+
 from . import __version__
 from .utils import (logger, set_seed, select_device, copy_config_file,
                     add_file_logging, atomic_torch_save, merge_locked_normalize,
@@ -41,16 +43,20 @@ def _save_bundle(output_dir, epoch, model, opt, loss_history, config, meta, meth
     diagnostic curves (head collapse / gram split) so their PDFs continue
     across resumed runs.
     """
+    # meta["ssl_method"] is the single method key (no top-level "method").
+    meta = dict(meta)
+    meta.setdefault("ssl_method", method)
     bundle = {
         "state_dict": model.state_dict(),
         "meta": meta,
         "config": config,
         "optimizer_state_dict": opt.state_dict(),
         "epoch": epoch,
-        "loss_history": loss_history,
+        # Bundle key naming mirrors the train bundles (meta["ssl_method"]
+        # identifies the method; no separate top-level "method").
+        "train_loss_history": loss_history,
         "component_histories": component_histories or {},
         "monitor_histories": monitor_histories or {},
-        "method": method,
     }
     fname = "model.pt" if final else f"model_{epoch}.pt"
     path = os.path.join(output_dir, fname)
@@ -169,18 +175,13 @@ def _load_checkpoint_state(model, ckpt, method=None):
     gram.ckpt-initialized value instead of failing on a mismatch.
     """
     if "state_dict" not in ckpt:
-        print("Error: bundle has no 'state_dict' key (unsupported pre-0.2.1 "
-              "bundle format)", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError("Error: bundle has no 'state_dict' key (unsupported pre-0.2.1 "
+              "bundle format)")
     meta = ckpt.get("meta") or {}
     if "method" not in meta:
-        print(
-            "Error: bundle is not an SSL bundle (meta has no 'method') — "
+        raise MicroMaxError("Error: bundle is not an SSL bundle (meta has no 'method') — "
             "resume.ssl_model expects a pretrain checkpoint, not a train "
-            "bundle.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            "bundle.")
     state = ckpt["state_dict"]
     if method == "dinov3":
         model_keys = set(model.state_dict())
@@ -250,16 +251,14 @@ def _try_resume(config, device, method):
         return None, config
 
     if not os.path.exists(resume_path):
-        print(f"Error: resume SSL model not found: {resume_path}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: resume SSL model not found: {resume_path}")
 
     ckpt = torch.load(resume_path, map_location=device, weights_only=False)
     logger.info("Loaded SSL checkpoint from epoch %d", ckpt.get("epoch", -1))
 
     saved_cfg = ckpt.get("config")
     if saved_cfg is None:
-        print(f"Error: SSL checkpoint at {resume_path} has no 'config' key", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: SSL checkpoint at {resume_path} has no 'config' key")
 
     # Locked keys (bundle wins on mismatch): method, backbone.name, normalize.*
     # augmentation_views is deliberately NOT locked: the current run's view
@@ -314,7 +313,7 @@ def _try_resume(config, device, method):
     # shape mismatch; every other key follows the CURRENT config, so a
     # stage-2 run can re-tune schedules/loss weights freely (logged, never
     # silent). See _merge_method_config.
-    final_method = (ckpt.get("meta") or {}).get("method", method)
+    final_method = (ckpt.get("meta") or {}).get("ssl_method", method)
     sm = saved_cfg.get(final_method, {})
     cm = config.get(final_method, {})
     if str(cm) != str(sm):
@@ -358,7 +357,7 @@ def _build_step_info(method, method_cfg, train_cfg, global_step, total_steps, wa
         "global_step": global_step,
         "total_steps": total_steps,
         "warmup_steps": warmup_steps,
-        # Must match pretrain_ssl's optimizer default — train_step drives
+        # Must match run_pretrain's optimizer default — train_step drives
         # every group's lr from this value each step, so the optimizer's
         # initial lr is only a placeholder.
         "lr_peak": train_cfg.get("lr", 0.0005),
@@ -379,7 +378,7 @@ def _build_step_info(method, method_cfg, train_cfg, global_step, total_steps, wa
 
 def _prepare_pretrain_data(config):
     """Resolve data roots -> (cell, idx) pairs plus the channels/normalize/
-    input settings shared by pretrain_ssl and the offline vis_attention
+    input settings shared by run_pretrain and the offline run_attention_vis
     command.
 
     -> (all_pairs, resolved_channels, channel_layout, image_pattern,
@@ -414,22 +413,17 @@ def _prepare_pretrain_data(config):
         root_of_pair.extend([r] * len(recs))
 
     if not all_pairs:
-        print(f"Error: no records found in {roots}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: no records found in {roots}")
 
     # All roots must resolve to the same channel set — one bundle carries a
     # single `channels` meta, so a heterogeneous resolution would silently
     # train on the wrong channels for some roots (last-root-wins bug).
     unique_resolved = {tuple(v) for v in resolved_per_root.values()}
     if len(unique_resolved) > 1:
-        print(
-            f"Error: data roots resolve to different channel sets: "
+        raise MicroMaxError(f"Error: data roots resolve to different channel sets: "
             f"{ {r: v for r, v in resolved_per_root.items()} }. "
             f"Give every root the same channel count or set data.channels "
-            f"explicitly.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            f"explicitly.")
     resolved_channels = list(next(iter(unique_resolved))) if unique_resolved else channels
 
     # Subsample
@@ -447,12 +441,8 @@ def _prepare_pretrain_data(config):
 
     augmentation_infer = config.get("augmentation_infer")
     if augmentation_infer is None:
-        print(
-            "Error: augmentation_infer is required in pretrain config (must be a "
-            "deterministic pipeline for inference/UMAP-check). Set it explicitly.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise MicroMaxError("Error: augmentation_infer is required in pretrain config (must be a "
+            "deterministic pipeline for inference/UMAP-check). Set it explicitly.")
     return (all_pairs, resolved_channels, channel_layout, image_pattern,
             max_value, normalize_method, with_masking, clip_low, clip_high,
             fixed_reference, augmentation_infer)
@@ -460,20 +450,16 @@ def _prepare_pretrain_data(config):
 
 
 
-def pretrain_ssl(config, config_path=None):
+def run_pretrain(config, config_path=None):
     """Generic SSL pretraining loop. Dispatches on config['method']."""
     method = config.get("method")
     if method != "dinov3":
-        print(f"Error: unknown SSL method '{method}'. Available: dinov3",
-              file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: unknown SSL method '{method}'. Available: dinov3")
 
     mode = config.get("mode", "single_cell")
     if mode not in ("single_cell",):
-        print(f"Error: pretrain mode '{mode}' is not supported. Available: "
-              f"single_cell (whole_image is planned but not yet implemented)",
-              file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: pretrain mode '{mode}' is not supported. Available: "
+              f"single_cell (whole_image is planned but not yet implemented)")
 
     device = select_device()
     if device.type == "cuda":
@@ -488,9 +474,7 @@ def pretrain_ssl(config, config_path=None):
     # the model was ACTUALLY built with.
     method = config["method"]
     if method != "dinov3":
-        print(f"Error: unknown SSL method '{method}'. Available: dinov3",
-              file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: unknown SSL method '{method}'. Available: dinov3")
 
     # resume.type: 'continue' = exact same-data extension (schedules/optimizer/
     # epoch counter continue where the interrupted run left off); 'transfer' =
@@ -498,17 +482,15 @@ def pretrain_ssl(config, config_path=None):
     # optimizer state reset) initialized from the bundle weights.
     resume_type = config.get("resume", {}).get("type", "continue")
     if resume_type not in ("continue", "transfer"):
-        print(f"Error: unknown resume.type '{resume_type}'. "
-              f"Available: continue, transfer", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: unknown resume.type '{resume_type}'. "
+              f"Available: continue, transfer")
 
     train_cfg = config["training"]
     # backbone block: required for dinov3 (name/pretrained).
     backbone_cfg = config.get("backbone") or {}
     if method == "dinov3" and not backbone_cfg.get("name"):
-        print("Error: dinov3 requires a backbone: block with name/pretrained "
-              "(e.g. name: vit_small_patch16_dinov3)", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError("Error: dinov3 requires a backbone: block with name/pretrained "
+              "(e.g. name: vit_small_patch16_dinov3)")
     method_cfg = config.get(method, {})
     aug_views_cfg = config.get("augmentation_views", [])
     monitoring_cfg = _resolve_monitoring_cfg(config.get("monitoring"))
@@ -526,10 +508,9 @@ def pretrain_ssl(config, config_path=None):
                              and not gram_cfg.get("ema_teacher", False)) else 0
         min_views = 3 + n_gram_views
         if len(aug_views_cfg) < min_views:
-            print(f"Error: DINOv3 requires at least {min_views} views "
+            raise MicroMaxError(f"Error: DINOv3 requires at least {min_views} views "
                   f"(2 global + 1 local{' + 2 gram-teacher crops' if n_gram_views else ''}), "
-                  f"got {len(aug_views_cfg)}", file=sys.stderr)
-            sys.exit(1)
+                  f"got {len(aug_views_cfg)}")
 
     seed = 42
     output_dir = config.get("output_dir", "runs")
@@ -549,7 +530,7 @@ def pretrain_ssl(config, config_path=None):
     set_seed(seed)
 
     # ---- Resolve data ----
-    # The config data block (shared with the offline vis_attention command).
+    # The config data block (shared with the offline run_attention_vis command).
     (all_pairs, resolved_channels, channel_layout, image_pattern,
      max_value, normalize_method, with_masking, clip_low, clip_high,
      fixed_reference, augmentation_infer) = _prepare_pretrain_data(config)
@@ -599,21 +580,24 @@ def pretrain_ssl(config, config_path=None):
     # ---- Build model + optimizer + criterion ----
     # backbone.in_chans is NOT a config key — it is derived from the resolved
     # data channels. On resume the bundle's in_chans wins (the model was built
-    # with it), so a changed data.channels hard-exits instead of crashing.
+    # with it), so a changed data.channels raises a clear error instead of crashing.
     if checkpoint is not None and "meta" in checkpoint:
         backbone_cfg["in_chans"] = checkpoint["meta"].get(
             "in_chans", len(resolved_channels))
     else:
         backbone_cfg["in_chans"] = len(resolved_channels)
     if backbone_cfg["in_chans"] != len(resolved_channels):
-        print(
-            f"Error: bundle in_chans={backbone_cfg['in_chans']} does not match "
+        raise MicroMaxError(f"Error: bundle in_chans={backbone_cfg['in_chans']} does not match "
             f"len(data.channels)={len(resolved_channels)}; the model architecture "
-            f"is fixed by the channel count the bundle was trained with",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    model = build_ssl_model(method, backbone_cfg, method_cfg, device)
+            f"is fixed by the channel count the bundle was trained with")
+    # The in-model diagnostics flag rides on the method block (build_dinov3
+    # reads method_cfg["monitoring"]["enabled"]) — wire the resolved top-level
+    # monitoring block through on a copy, so `monitoring.enabled: false` also
+    # stops the model from building per-step diag tensors. method_cfg itself
+    # stays clean (it is what gets saved into the bundle config).
+    model = build_ssl_model(
+        method, backbone_cfg, {**method_cfg, "monitoring": monitoring_cfg},
+        device)
 
     # DINOv3 gram anchoring phase 2: initialize the frozen gram teacher from
     # gram.ckpt (an earlier SSL bundle, typically the phase-1 model.pt). When
@@ -630,7 +614,7 @@ def pretrain_ssl(config, config_path=None):
     # Bundle meta — needed by every saved bundle (infer/train consumers).
     feat_dim = model.student_backbone.vit.num_features
     meta = {
-        "method": method,
+        "ssl_method": method,
         "backbone": backbone_cfg["name"],
         "in_chans": backbone_cfg["in_chans"],
         "channels": resolved_channels,
@@ -696,8 +680,7 @@ def pretrain_ssl(config, config_path=None):
             betas=tuple(train_cfg.get("betas", (0.9, 0.999))),
         )
     else:
-        print(f"Error: unknown optimizer '{optimizer_name}'", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: unknown optimizer '{optimizer_name}'")
 
     criterion = get_criterion(method, method_cfg, device)
     train_step_fn = get_train_step(method)
@@ -710,9 +693,8 @@ def pretrain_ssl(config, config_path=None):
     save_interval = train_cfg.get("save_interval")
     grad_accum_steps = train_cfg.get("grad_accum_steps", 1)
     if not isinstance(grad_accum_steps, int) or grad_accum_steps < 1:
-        print(f"Error: training.grad_accum_steps must be an integer >= 1, "
-              f"got {grad_accum_steps}", file=sys.stderr)
-        sys.exit(1)
+        raise MicroMaxError(f"Error: training.grad_accum_steps must be an integer >= 1, "
+              f"got {grad_accum_steps}")
 
     start_epoch = 0
     loss_history = []
@@ -745,7 +727,7 @@ def pretrain_ssl(config, config_path=None):
                 epochs = start_epoch + epochs
             if "optimizer_state_dict" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            loss_history = checkpoint.get("loss_history", [])
+            loss_history = checkpoint.get("train_loss_history", [])
             component_histories = dict(checkpoint.get("component_histories", {}))
             for k, v in (checkpoint.get("monitor_histories") or {}).items():
                 monitor_histories[k] = list(v)
@@ -788,13 +770,9 @@ def pretrain_ssl(config, config_path=None):
         try:
             n_image_umap = int(n_image_umap)
         except (TypeError, ValueError):
-            print(f"Error: training.n_image_umap must be an integer, got {n_image_umap!r}",
-                  file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError(f"Error: training.n_image_umap must be an integer, got {n_image_umap!r}")
         if n_image_umap < 0:
-            print("Error: training.n_image_umap must be >= 0 (0 = disabled)",
-                  file=sys.stderr)
-            sys.exit(1)
+            raise MicroMaxError("Error: training.n_image_umap must be >= 0 (0 = disabled)")
     umap_check_loader = None
     last_umap_epoch = None
     if n_image_umap:
@@ -839,7 +817,7 @@ def pretrain_ssl(config, config_path=None):
 
     # ---- Training loop ----
     # Uniform train_step protocol: every registered method returns
-    # (loss_value, {component_name: float}) — pretrain_ssl aggregates,
+    # (loss_value, {component_name: float}) — run_pretrain aggregates,
     # logs and persists components generically, so adding a loss/head never
     # touches this loop.
     diag_enabled = (monitoring_cfg["enabled"] and method == "dinov3")
@@ -878,10 +856,8 @@ def pretrain_ssl(config, config_path=None):
                     device, criterion, step_info,
                     scaler, grad_clip, do_step)
             if not math.isfinite(loss_val):
-                print(f"Error: non-finite loss ({loss_val}) at epoch {epoch + 1}; "
-                      f"aborting to avoid writing a corrupted SSL bundle",
-                      file=sys.stderr)
-                sys.exit(1)
+                raise MicroMaxError(f"Error: non-finite loss ({loss_val}) at epoch {epoch + 1}; "
+                      f"aborting to avoid writing a corrupted SSL bundle")
             tot_loss += loss_val
             for k, v in components.items():
                 tot_comp[k] = tot_comp.get(k, 0.0) + v

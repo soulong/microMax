@@ -221,7 +221,7 @@ class ImageWorker(QRunnable):
                 result["raw_data"] = (img_data, mask_dict)
             self.signals.finished.emit(result)
         except SystemExit as e:
-            # microBase hard-exits (sys.exit) when a file/mask vanished or is
+            # microBase raises MicroMaxError when a file/mask vanished or is
             # out of range — convert to a skip (error signal; the gen-guarded
             # _on_worker_error handler just decrements pending + logs, so the
             # thumbnail simply doesn't render).
@@ -456,10 +456,10 @@ class _DatasetLoadWorker(QObject):
             )
             self.finished.emit(dm)
         except SystemExit as e:
-            # microBase hard-exits (print + sys.exit) on bad dataset state
+            # microBase raises MicroMaxError on bad dataset state (SystemExit is caught defensively)
             # (missing root, invalid pattern) — SystemExit is not an
             # Exception, so without this the modal dialog never closes.
-            logger.exception("Dataset load failed (microBase hard-exit)")
+            logger.exception("Dataset load failed")
             self.error.emit(str(e) or "Dataset load failed")
         except Exception as e:
             logger.exception("Dataset load failed")
@@ -629,7 +629,7 @@ class ObjectExportWorker(QRunnable):
             for img_idx, (row_idx, well, field, stack, timepoint) in enumerate(rows):
                 try:
                     # A row whose mask is missing (NaN path, e.g. Cellpose
-                    # found zero cells) makes microBase hard-exit (sys.exit).
+                    # found zero cells) raises DataError.
                     # Intentional skip+warn design: the export continues with
                     # the remaining rows and reports the skipped count.
                     try:
@@ -690,8 +690,9 @@ class ObjectExportWorker(QRunnable):
                         obj_save_dir.mkdir(parents=True, exist_ok=True)
 
                         # Subset to the enabled channels. crop is (H, W, C_all)
-                        # from microBase.get_cropped_cells; we slice to (H, W, C_enabled)
-                        # so the exported TIFF matches self._channel_names / Labels / Colors.
+                        # from ImageDataset.get_cropped_cells; we slice to
+                        # (H, W, C_enabled) so the exported TIFF matches
+                        # self._channel_names / Labels / Colors.
                         if ch_indices and ch_indices != list(range(crop.shape[2])):
                             crop_out = crop[:, :, ch_indices]
                         else:
