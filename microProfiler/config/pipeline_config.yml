@@ -1,3 +1,8 @@
+# microProfiler batch-run pipeline config (`microprofiler run --config <this file>`).
+# GUI and CLI build the same PipelineConfig — every key here has a panel
+# equivalent. Unknown keys raise a validation error listing the valid ones.
+# Each step has a `run` flag (default false — nothing runs unless enabled).
+
 # dataset format
 # NOTE: The leading `r` in the patterns below is a literal character (part of the naming convention),
 # NOT a Python raw-string prefix. It is not regex syntax.
@@ -35,7 +40,7 @@ zproject:
 
 basic:
   run: false
-  mode: fit-transform                 # fit shading models + apply them
+  mode: fit-transform                 # fit | transform | fit-transform
   n_image: 100                        # images sampled to fit the models
   working_size: 64                    # downscaled width used while fitting
   enable_darkfield: false             # also estimate + remove darkfield offset
@@ -45,23 +50,24 @@ tile:
   tile_width: 1024                    # needs a `field` column; only complete
   tile_height: 1024                   # tiles are written
 
-# segmentation
+# segmentation (one mask file per block: <stem>_cp_masks_<object_name>.png)
 segment:
   run: true
   configs:
-    - object_name: cell
-      model_name: cpdino
-      chan1:                           # cytoplasm channel(s); averaged if several
+    - object_name: cell               # BARE mask/object name (no 'mask_' prefix)
+      model_name: cpdino              # cellpose model (cpdino / cpdino-vitb / ...)
+      chan1:                          # cytoplasm channel(s); averaged if several
         - ch1
-        - ch2
-      chan2: null                      # nuclear channel (cellpose two-channel mode)
-      merge1: mean                     # how chan1 channels combine before the model
+      chan2: null                     # nuclear channel (cellpose two-channel mode)
+      merge1: mean                    # how chan1 channels combine before the model
       merge2: mean
-      resize_factor: 0.5               # images are downscaled before segmentation
-      diameter: null                   # null = cellpose auto diameter
+      resize_factor: 0.5              # images are downscaled before segmentation
+      diameter: null                  # null = cellpose auto diameter
       flow_threshold: 0.4
       cellprob_threshold: 0.0
-      gpu_batch_size: 32               # images per GPU batch (0/1 = no batching)
+      edge_pixel_ratio: 0.4           # drop masks whose edge-pixel/perimeter ratio exceeds this ([0, 1]; 1 = keep all)
+      gpu_batch_size: 32              # images per GPU batch (0/1 = no batching)
+      overwrite_mask: false           # re-segment when a mask file already exists
     - object_name: nuclei
       model_name: cpdino
       chan1:
@@ -71,12 +77,13 @@ segment:
       merge2: mean
       resize_factor: 0.5
       diameter: null
-      edge_pixel_ratio: 0.4     # drop masks whose edge-pixel/perimeter ratio exceeds this ([0, 1]; 1 = keep all)
       flow_threshold: 0.4
       cellprob_threshold: 0.0
+      edge_pixel_ratio: 0.4
       gpu_batch_size: 32
+      overwrite_mask: false
 
-# image profiling (per-site whole-image intensity table in profiler.db)
+# image profiling (per-site whole-image intensity table `image` in profiler.db)
 # image_channels: null/absent/[] skips the step entirely (like the GUI's
 # blocked Run with no selection). To profile channels, list them explicitly.
 image_profile:
@@ -86,48 +93,64 @@ image_profile:
     - ch1
   image_thresholds: null               # optional per-channel foreground thresholds
 
-# object profiling (one profiler.db table per block; features per single cell)
+# object profiling (one profiler.db table per block; features per single cell).
+# Every block is bookkept in profiler.db's `_table_masks` (table -> mask),
+# which drives the per-mask merges of the inference step.
 object_profile:
   run: true
   n_workers: 8
   configs:
-    - mask_name: cell                 # which masks to crop objects from
+    - mask_name: cell                 # which masks to crop objects from (bare name)
       parent_mask_name: null          # parent objects this one lives in (e.g. cell for nuclei)
-      output_table_name: cell         # table name in profiler.db
-      intensity_channels:             # per-channel mean/std/intensity stats
+      output_table_name: cell         # table name in profiler.db (null = mask_name)
+      overwrite_db: false             # drop + rewrite the table on re-run
+      intensity_channels:             # per-channel mean/median/std/sum stats
         - ch1
       radial_channels: null           # radial distribution profiles; null = off
       radial_bins: 4
-      granularity_channels:                  # granularity (texture spectra) channels
+      granularity_channels:           # granularity (texture spectra); null = off
         - ch1
       granularity_spectrum_length: 8
       granularity_subsample_ratio: 0.5       # pixel subsampling inside the object
       granularity_background_subsample_ratio: 0.25
       granularity_background_radius: 10      # background ring width around the object
       glcm_channels: null             # GLCM texture features; null = off
+      glcm_distances: null            # GLCM offsets in px (null = default [2])
+      glcm_levels: null               # GLCM gray levels (null = default 256)
       correlation_pairs: null         # channel-pair correlations; null = off
     - mask_name: nuclei
       parent_mask_name: cell
       output_table_name: nuclei
+      overwrite_db: false
       intensity_channels:
         - ch2
       radial_channels: null
+      radial_bins: 4
       granularity_channels: null
       glcm_channels: null
+      glcm_distances: null
+      glcm_levels: null
       correlation_pairs: null
 
 # per-object inference with trained microModel bundles (optional; requires
 # microModel to be installed). Each block writes <dataset>/<output_db> with
-# the microModel CLI table format (`inference` + optional reduction tables).
+# the microModel CLI table format (`inference` + optional reduction tables),
+# then AUTO-MERGES with the profiler object table of the SAME mask into
+# <dataset>/merge_<mask>.db (source DBs are never modified).
 # max_value is REQUIRED per block (65535 for 16-bit, 255 for 8-bit) and is
 # always trusted as configured. For SSL bundles only `feature` applies —
 # pred_class is ignored (microModel downgrades with a warning). pred_prob is
 # not a config key: microModel writes it together with pred_class.
+# Every inference row stores its `mask_name` in infer.db — the per-mask
+# grouping key for the merge.
+# NOTE: the last run's model / reducer(s) / cluster.pkl are remembered at
+# user level in ~/.micromax/microprofiler.yml and pre-fill the GUI panel;
+# disable the reduction/cluster groups there per run if not wanted.
 # inference:
 #   run: true
 #   configs:
 #     - model: D:\models\runs\model.pt
-#       mask_name: cell
+#       mask_name: cell               # bare name; also recorded in infer.db rows
 #       channels: null            # ORDERED channel names; top-to-bottom = model input order; null/[] = block SKIPPED (never "all")
 #       feature: true
 #       pred_class: true

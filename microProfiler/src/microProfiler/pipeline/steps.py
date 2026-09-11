@@ -371,7 +371,9 @@ def _run_inference(
         run_mm_inference,
         run_mm_reduction,
     )
+    from microProfiler.user_defaults import update_user_defaults
 
+    ran_any = False
     for entry in section.configs:
         if not entry.channels:
             # null/[] channels means "this block is skipped" — never the
@@ -428,6 +430,25 @@ def _run_inference(
         except Exception:
             logger.warning("Auto-merge failed for mask '%s'",
                            entry.mask_name, exc_info=True)
+        ran_any = True
+
+    # Remember this run's inference choices at user level (~/.micromax):
+    # the Inference panel pre-fills new runs with the last run's model /
+    # reducer(s) / cluster.pkl. Only saved when at least one block actually
+    # ran, and only from the FIRST block (the GUI's "+ Add" copies it). A
+    # run with both groups unchecked carries no `reduction` key — the
+    # remembered reducer/cluster paths stay untouched then.
+    try:
+        first = section.configs[0]
+        updates = {"model": os.path.abspath(first.model) if first.model else None}
+        if first.reduction is not None:
+            updates["reducer"] = first.reduction.reducer
+            updates["cluster"] = first.reduction.cluster
+        if ran_any:
+            update_user_defaults("inference", updates)
+    except Exception:
+        logger.warning("Failed to remember inference defaults in ~/.micromax",
+                       exc_info=True)
     return ds
 
 

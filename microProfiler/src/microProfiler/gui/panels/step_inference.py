@@ -26,6 +26,7 @@ from microProfiler.gui.panels.base_step_panel import BaseStepPanel, make_hsep
 from microProfiler.gui.panels._block_container import BlockContainerPanel
 from microProfiler.gui.path_drop import enable_path_drop
 from microProfiler.pipeline._micromodel_bridge import read_bundle_meta
+from microProfiler.user_defaults import get_user_defaults
 
 DEFAULT_MAX_VALUE = 65535.0
 
@@ -557,6 +558,38 @@ class InferenceStepPanel(BlockContainerPanel):
         self._default_max_value = DEFAULT_MAX_VALUE
         self._build_block_container("+ Add New Inference Block")
         self._add_block_generic([])
+        self._apply_user_defaults()
+
+    def _apply_user_defaults(self) -> None:
+        """Pre-fill the first block from ~/.micromax (the LAST run's model /
+        reducer(s) / cluster.pkl — saved by the pipeline after each run).
+
+        The Dimension-reduction and Cluster groups come up CHECKED when
+        their files are remembered: they run by default, and the user
+        disables either by unchecking its group box or edits the path to
+        switch to a new model/reducer/cluster. A config load or a
+        session.yml restore overwrites these afterwards. The model's
+        capability row is intentionally NOT read here (a full torch.load
+        at startup would stall the GUI) — validate_blocks re-checks it
+        before every run.
+        """
+        defaults = get_user_defaults().get("inference") or {}
+        if not defaults:
+            return
+        block = self._blocks[0]
+        model = defaults.get("model")
+        if model:
+            block._model_path.setText(str(model))
+        reducer = defaults.get("reducer") or []
+        if isinstance(reducer, str):
+            reducer = [reducer]
+        if reducer:
+            block._reducer_path.setText(";".join(str(p) for p in reducer))
+            block._reduction_group.setChecked(True)
+        cluster = defaults.get("cluster")
+        if cluster:
+            block._cluster_path.setText(str(cluster))
+            block._cluster_group.setChecked(True)
 
     def _connect_block_signals(self, block: InferenceBlockWidget) -> None:
         super()._connect_block_signals(block)

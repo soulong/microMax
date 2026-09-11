@@ -172,6 +172,12 @@ Package layout (overview):
 
 * `cli.py` — headless run, fully equivalent to the GUI.
 
+* `user_defaults.py` — per-user defaults in `~/.micromax/microprofiler.yml`
+  (key-merged, atomic): the inference step records the last run's model /
+  reducer(s) / cluster.pkl there and the GUI panel pre-fills from it —
+  the remembered steps run by default, per-run toggle stays in the
+  panel's group checkboxes.
+
 The pipeline:
 
 * Steps run in fixed order:
@@ -206,7 +212,9 @@ The pipeline:
   inference and optional DR reduction / cluster prediction (one or more
   pre-fitted reducer pickles of any DR mix, and/or a baseline cluster.pkl
   that kNN-predicts the find_cluster table), writing a per-block DB under
-  the dataset dir. Each finished block is then AUTO-MERGED with the
+  the dataset dir and remembering the used model / reducer(s) / cluster.pkl
+  in `~/.micromax` (user level — the next run defaults to them). Each
+  finished block is then AUTO-MERGED with the
   profiler object table of the SAME mask (via microBase `db_merge`;
   sources untouched) into `<dataset>/merge_<mask>.db`. Object tables are
   bookkept in profiler.db's `_table_masks` (table -> mask) so the merges
