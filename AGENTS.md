@@ -412,10 +412,14 @@ Design:
   highest-probability class and its probability, and the full per-class
   vector is stored in fixed-order `prob_<class>` columns (single-label probs
   are a softmax distribution, multi-label independent per-class sigmoids).
-  Every row carries a `mask_name` column (the bare segmentation mask the
-  objects came from; NULL for single-cell inference) — the per-mask
-  grouping key for the downstream merges. Probability-descending ordering
-  is a display concern of reduction-vis, never baked into the DB.
+  Every row carries a `mask_name` column holding the BARE mask name (no
+  `mask_` prefix — that form is only the internal metadata column name):
+  the segmented objects' mask in whole-image mode (config value, or the
+  first available mask when null), and an optional config label for
+  single-cell mode (null yml -> NULL). This column is the per-mask
+  grouping key for the downstream merges; a NULL joins the profiler DB's
+  mask with a log hint. Probability-descending ordering is a display
+  concern of reduction-vis, never baked into the DB.
 
 * Bundles carry their meta (channels, normalization, augmentation);
   inference always uses the settings baked into the bundle at training time.

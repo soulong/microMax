@@ -24,6 +24,7 @@ data:
     - sc_dataset/p53/2026-07-18_22_63x
     - sc_dataset/p53/2026-07-18_37_63x
   image_pattern: null                 # regex for metadata extraction; null = none
+  mask_name: null                     # optional bare mask label stored on every row; null = NULL (merges then default to the profiler DB's mask)
   max_value: 65535                    # max possible intensity of the input dtype (65535 for 16-bit, 255 for 8-bit); images are divided by it on load
   channels: [1]                       # 1-based indices; null = all; must match model
   channel_layout: null                # CHW | HWC | null (one-channel-per-file)

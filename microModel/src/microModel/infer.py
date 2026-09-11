@@ -170,8 +170,10 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
 
     write_pred_class: write pred_class/pred_prob (classify-capable bundle only).
     write_features: write the features BLOB.
-    mask_name: bare mask name stored on every row (whole-image mode; NULL for
-    single-cell) — the per-mask grouping key for downstream merges.
+    mask_name: BARE mask name stored on every row (whole-image mode; NULL for
+    single-cell unless labeled in the config) — the per-mask grouping key for
+    downstream merges. A 'mask_'-prefixed input is stripped: user-facing mask
+    names never carry the internal metadata-column prefix.
     Unified layout for BOTH label modes, no threshold:
       - pred_class  : the single highest-probability class (argmax winner)
       - pred_prob   : that class's probability (REAL)
@@ -182,6 +184,9 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
     per-class sigmoids.
     """
     extra_cols = extra_cols or []
+    # Final bare-name guard: user-facing mask names never carry the
+    # internal 'mask_' metadata-column prefix.
+    mask_name = bare_mask_name(mask_name) if mask_name else None
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     logger.info("Writing to %s", db_path)
 
@@ -348,7 +353,7 @@ def _run_single_cell(data_dir, meta, model, device,
                      dl_num_workers=4, dl_prefetch_factor=2,
                      dl_persistent_workers=True,
                      sample_max=None, sample_by='per_class', seed=42,
-                     multi_label=False):
+                     multi_label=False, mask_name=None):
     logger.info("Running single-cell inference on %s", data_dir)
 
     cell_ds = CellDataset(data_dir, channel_layout=channel_layout,
@@ -432,7 +437,7 @@ def _run_single_cell(data_dir, meta, model, device,
     return _write_db(db_path, meta_rows, all_logits, all_features,
                      class_names, write_features, extra_cols=extra_cols,
                      mode="single_cell", write_pred_class=write_pred_class,
-                     multi_label=multi_label)
+                     multi_label=multi_label, mask_name=mask_name)
 
 
 # ----------------------------------------------------------------------------
@@ -702,6 +707,9 @@ def run_inference(config, config_path=None):
 
         try:
             if mode == "single_cell":
+                # Optional mask label for the results (null in yml -> None
+                # -> the DB column stays NULL and merges default to the
+                # profiler DB's mask).
                 path = _run_single_cell(
                     data_dir, meta, model, device,
                     batch_size, db_path, write_features, write_pred_class,
@@ -711,7 +719,8 @@ def run_inference(config, config_path=None):
                     dl_num_workers=dl_num_workers, dl_prefetch_factor=dl_prefetch_factor,
                     dl_persistent_workers=dl_persistent_workers,
                     sample_max=sample_max, sample_by=sample_by, seed=seed,
-                    multi_label=multi_label)
+                    multi_label=multi_label,
+                    mask_name=data_cfg.get("mask_name"))
             elif mode == "whole_image":
                 path = _run_whole_image(
                     data_dir, image_pattern_cfg, data_cfg["mask_pattern"],

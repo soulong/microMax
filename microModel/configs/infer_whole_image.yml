@@ -25,7 +25,7 @@ data:
   image_pattern: r(?P<row>\d+)c(?P<col>\d+)f0?(?P<field>\d+)p0?(?P<stack>\d+)-ch0?(?P<channel>\d+)(?:sk|t)0?(?P<timepoint>\d+).*\.tiff
   mask_pattern: r(?P<row>\d+)c(?P<col>\d+)f0?(?P<field>\d+)p0?(?P<stack>\d+)-ch0?(?P<channel>\d+)(?:sk|t)0?(?P<timepoint>\d+).*_cp_masks_(?P<mask_name>.+)\.png
   image_subdir_pattern: images        # subdirectory under root; null = scan root directly
-  mask_name: cell                     # value of mask_name regex group; null = first available
+  mask_name: cell                     # BARE mask name (no 'mask_' prefix); null = first available mask
   max_value: 65535                    # max possible intensity of the input dtype (65535 for 16-bit, 255 for 8-bit); images are divided by it on load
   channels: [1]                       # 1-based indices; null = all
   channel_layout: null                # CHW | HWC | null (one-channel-per-file)

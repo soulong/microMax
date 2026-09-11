@@ -50,6 +50,25 @@ def test_single_cell_columns_match_contract(tmp_path):
     assert row[0] is None
 
 
+def test_single_cell_optional_mask_label(tmp_path):
+    """Single-cell infer may carry an explicit mask label in the config.
+
+    The stored value is always the BARE name — a 'mask_'-prefixed input is
+    stripped (user-facing mask names never use the internal column form).
+    """
+    db = tmp_path / "infer.db"
+    meta = [{"directory": ".", "filename": "a.tiff", "ground_truth": None}]
+    _write_db(
+        str(db), meta, all_logits=[], all_features=[torch.tensor([[1.0]])],
+        class_names=[], write_features=True, mode="single_cell",
+        write_pred_class=False, mask_name="mask_cell",
+    )
+    conn = sqlite3.connect(str(db))
+    rows = conn.execute("SELECT mask_name FROM inference").fetchall()
+    conn.close()
+    assert rows == [("cell",)]
+
+
 def test_whole_image_columns_match_contract(tmp_path):
     db = tmp_path / "infer.db"
     meta = [{"directory": ".", "filename": '["a.tiff"]', "label": 1,
