@@ -4,6 +4,7 @@ Usage:
     microvis                          Launch with folder selector
     microvis /path/to/measurement     Pre-fill a dataset directory (click
                                       "Load Dataset" in the GUI to scan)
+    microvis --debug                  Launch with DEBUG console logging
     microvis --help                   Show this help
     microvis --version                Show version
 """
@@ -29,6 +30,7 @@ def main() -> int:
         print("  microvis                        Launch with folder selector")
         print("  microvis <dataset-dir>          Pre-fill a dataset directory")
         print("                                  (click 'Load Dataset' to scan)")
+        print("  microvis --debug                DEBUG-level console logging")
         return 0
 
     # Default: launch GUI

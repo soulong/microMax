@@ -187,6 +187,16 @@ def _abs_norm_dir(p) -> str:
         os.path.normpath(os.path.abspath(str(p))).replace("\\", "/"))
 
 
+def _rel_norm_dir(p) -> str:
+    """Normalized forward-slash form of a path WITHOUT anchoring it at the
+    CWD — the comparison key for DB rows written by older microModel /
+    microProfiler versions, whose `directory` is root-relative (e.g.
+    'Images'). Absolute inputs keep their absolute form, so comparing a
+    relative DB dir against an absolute one simply never matches."""
+    import os
+    return os.path.normcase(os.path.normpath(str(p)).replace("\\", "/"))
+
+
 class MainWindow(QMainWindow):
     """Top-level application window for microVis."""
 
@@ -637,6 +647,8 @@ class MainWindow(QMainWindow):
         paths = self._split_paths(paths)
         if not paths:
             return
+        logger.info("Select DB: %d file(s) — %s",
+                    len(paths), ", ".join(Path(x).name for x in paths))
         try:
             self._merged = MergedData.load(paths)
         except Exception as e:
@@ -644,6 +656,8 @@ class MainWindow(QMainWindow):
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Invalid DB", str(e))
             return
+        logger.info("Integrated table: %d rows x %d columns",
+                    len(self._merged.table), len(self._merged.table.columns))
 
         self._refresh_merged_plot()
         self._data_view.set_meta_browse_enabled(True)
@@ -730,6 +744,8 @@ class MainWindow(QMainWindow):
         # UI thread keeps the dialog responsive (no "not responding" ghost).
         from PySide6.QtWidgets import QProgressDialog
         from microVis.worker import _DatasetLoadWorker
+
+        logger.info("Loading dataset: %s", p)
 
         # Hold refs on self so they aren't GC'd mid-load
         self._loader_dialog = QProgressDialog("Loading dataset...", None, 0, 0, self)
@@ -827,6 +843,10 @@ class MainWindow(QMainWindow):
             # phase 2 callback only populates the UI.
             self._loaded_dataset_dir = str(p)
             self._update_window_title()
+            logger.info(
+                "Dataset ready: %d sites, channels %s, masks %s",
+                len(self._dm.dataset.metadata), list(self._dm.channels),
+                list(self._dm.mask_names))
 
             # Initial render
             self._update_grid()
@@ -1157,6 +1177,8 @@ class MainWindow(QMainWindow):
             return
         self._metadata_merged = self._metadata_df.copy()
         self._overlay_cache = None
+        logger.info("Merging Excel metadata (%d rows) into the integrated "
+                    "table", len(self._metadata_merged))
 
         # Merge into the integrated table (left join by well) and refresh.
         self._refresh_merged_plot()
@@ -1167,6 +1189,7 @@ class MainWindow(QMainWindow):
         self._metadata_merged = None
         self._overlay_cache = None
         self._data_view.set_metadata_label(None)
+        logger.info("Cleared merged Excel metadata")
 
         self._refresh_merged_plot()
         self._update_overlay_with_metadata()
@@ -1212,6 +1235,8 @@ class MainWindow(QMainWindow):
             return
         df = merge_metadata_into(self._merged, self._metadata_merged)
         out = str(Path(self._dataset_dir) / self._data_view.get_merge_db_name())
+        logger.info("Write to DB: %d rows x %d columns -> %s",
+                    len(df), len(df.columns), out)
         try:
             written_path = write_merged_db(df, out)
         except Exception:
@@ -2357,9 +2382,17 @@ class MainWindow(QMainWindow):
         """Answer the Data-plot's clicked point with the cropped single cell.
 
         A miss (no dataset / no object label / row or mask not resolvable)
-        hides the popup instead of showing stale imagery.
+        hides the popup instead of showing stale imagery. Any unexpected
+        resolution error is logged and treated as a miss — never propagated
+        back into the Qt slot (that would only print a traceback and leave
+        the GUI looking dead).
         """
-        pixmap = self._resolve_point_cell(row)
+        try:
+            pixmap = self._resolve_point_cell(row)
+        except Exception:
+            logger.warning("Plot click: cell resolution failed",
+                           exc_info=True)
+            pixmap = None
         if pixmap is None:
             self._plot_view.hide_cell_image()
             return
@@ -2384,29 +2417,52 @@ class MainWindow(QMainWindow):
         if meta is None:
             return None
 
-        row_idx = None
+        # Locate the metadata site of the clicked object. The identity
+        # columns (well/field/stack/timepoint) pin down the SITE; the DB
+        # directory only narrows datasets whose images live in several
+        # subdirectories. Legacy DBs written before the absolute-directory
+        # contract hold root-relative dirs ('Images'), which match EVERY
+        # site — so directory alone must never decide the site.
+        cand = pd.Series(True, index=meta.index)
+        identity_used = False
+        for col in ("well", "field", "stack", "timepoint"):
+            v = row.get(col)
+            if v is not None and col in meta.columns:
+                cand &= meta[col].astype(str) == str(v)
+                identity_used = True
+
         directory = row.get("directory")
+        dir_match_idx = None
         if directory and DIRECTORY_COLUMN in meta.columns:
-            # DB rows carry ABSOLUTE forward-slash directories while the
-            # dataset metadata stores root-RELATIVE dirs — compare both
-            # normalized to absolute forward-slash form.
-            row_dir = _abs_norm_dir(directory)
-            meta_dirs = meta[DIRECTORY_COLUMN].map(
-                lambda v: _abs_norm_dir(Path(self._dm.dataset.root) / str(v)))
-            match = meta.index[meta_dirs == row_dir]
-            if len(match):
-                row_idx = int(match[0])
-        if row_idx is None and "well" in meta.columns and row.get("well"):
-            cand = meta.index[meta["well"].astype(str) == str(row["well"])]
-            for col in ("field", "stack", "timepoint"):
-                v = row.get(col)
-                if v is not None and col in meta.columns:
-                    cand = cand[meta[col].astype(str) == str(v)]
-            if len(cand):
-                row_idx = int(cand[0])
-        if row_idx is None:
-            logger.info("Plot click: row does not match any dataset image")
+            # Current DBs hold absolute dirs → compare joined-to-root;
+            # legacy DBs hold root-relative ones → compare verbatim.
+            accepted = {_abs_norm_dir(directory), _rel_norm_dir(directory)}
+            root = Path(self._dm.dataset.root)
+
+            def _dir_match(v):
+                keys = (_abs_norm_dir(root / str(v)), _rel_norm_dir(v))
+                return keys[0] in accepted or keys[1] in accepted
+
+            dir_mask = meta[DIRECTORY_COLUMN].map(_dir_match)
+            if dir_mask.any():
+                cand &= dir_mask
+                dir_match_idx = meta.index[dir_mask]
+
+        match = meta.index[cand]
+        if len(match):
+            row_idx = int(match[0])
+        elif identity_used:
+            # Identity columns existed but pinned nothing — the row does
+            # not belong to this dataset; guessing a site would crop the
+            # WRONG cell, so show nothing instead.
+            logger.info("Plot click: row does not match any dataset image "
+                        "(identity columns had no site in common)")
             return None
+        else:
+            # No identity columns available (e.g. whole-image infer rows):
+            # fall back to the first site of the matching directory.
+            row_idx = int((dir_match_idx if dir_match_idx is not None
+                           else meta.index)[0])
 
         raw_data = self._raw_cache.get(row_idx)
         if raw_data is None:
@@ -2426,6 +2482,12 @@ class MainWindow(QMainWindow):
         if mask is None:
             logger.info("Plot click: no object mask available for the crop")
             return None
+        site = self._dm.dataset.metadata.iloc[row_idx]
+        site_desc = ", ".join(
+            f"{c}={site[c]}" for c in ("well", "field", "stack", "timepoint")
+            if c in site.index)
+        logger.info("Plot click: cropping label %s from %s (%s)",
+                    label, mask_name, site_desc)
 
         ch_config = self._image_controls.get_channel_config()
         rgb = crop_object_rgb(
@@ -2435,6 +2497,8 @@ class MainWindow(QMainWindow):
             target_size=96, padding=4,
         )
         if rgb is None:
+            logger.info("Plot click: label %s not croppable from mask '%s' "
+                        "(missing or empty object)", label, mask_name)
             return None
 
         from PySide6.QtGui import QImage, QPixmap

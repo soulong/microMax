@@ -87,6 +87,9 @@ def run_app(dataset_dir: str | None = None) -> None:
     os.environ.setdefault("QT_LOGGING_RULES", "qt.gui.icc=false")
 
     setup_logging()
+    import logging
+    from microVis import __version__
+    logging.getLogger("microVis").info("microVis %s starting", __version__)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
@@ -103,7 +106,6 @@ def run_app(dataset_dir: str | None = None) -> None:
     app.installEventFilter(app._wheel_blocker)
     app.setApplicationName("microVis")
     app.setOrganizationName("microVis")
-    from microVis import __version__
     app.setApplicationVersion(__version__)
 
     palette = QPalette()

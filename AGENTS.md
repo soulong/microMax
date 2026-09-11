@@ -225,7 +225,7 @@ buttons all drive `run_pipeline` with a section-restricted config.
 
 ## 6. microVis — interactive Qt viewer
 
-**Path:** `microMax/microVis/` · **Entry:** `microvis` (GUI only).
+**Path:** `microMax/microVis/` · **Entry:** `microvis` (GUI only). Launch logs progress to the terminal (INFO; `--debug` for DEBUG; full detail always appended to %TEMP%/microVis.log).
 
 Package layout (overview):
 

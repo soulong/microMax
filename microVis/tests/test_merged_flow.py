@@ -268,3 +268,135 @@ def test_merged_data_join_and_prefix_rules(tmp_path):
     assert "second/area" in t.columns        # colliding incoming column prefixed
     assert t["second/area"].iloc[0] == 99.0
     assert t["prob"].iloc[0] == 0.5          # non-colliding stays bare
+
+
+def test_legacy_relative_dir_click_crops_clicked_site(tmp_path, qt_app,
+                                                      monkeypatch):
+    """Legacy DBs (root-RELATIVE directory) must not break click-to-cell.
+
+    Older microModel/microProfiler writes stored `directory = 'Images'` in
+    every row — identical for ALL sites, so a directory-only match points
+    at the wrong image and the crop fails (or used to crash). The clicked
+    object must be located through its identity columns (well/field/...)
+    and cropped from ITS OWN site's mask.
+    """
+    from tifffile import imwrite
+    from PIL import Image
+
+    root = tmp_path / "legacy_ds"
+    root.mkdir()
+
+    # Per-well masks at DIFFERENT pixel positions → a crop from the wrong
+    # site's mask is detectable by content.
+    img = np.zeros((32, 32), dtype=np.uint16)
+    img[4:10, 4:10] = 3000
+    img[18:26, 18:26] = 5000
+    masks = {}
+    for well in WELLS:
+        mask = np.zeros((32, 32), dtype=np.uint8)
+        r0 = 4 if well == "A01" else 6
+        c0 = 4 if well == "A01" else 7
+        mask[r0:r0 + 6, c0:c0 + 6] = 1          # object 1
+        mask[r0 + 14:r0 + 22, c0 + 14:c0 + 20] = 2  # object 2
+        imwrite(str(root / f"{well}_f1_ch1.tiff"), img)
+        Image.fromarray(mask).save(
+            str(root / f"{well}_f1_ch1_cp_masks_cell.png"))
+        masks[well] = mask
+
+    # DBs in the LEGACY format: root-relative directory, one identical value
+    # on every row — a directory-only match therefore hits EVERY site and
+    # must not be allowed to decide the location (regression of the
+    # wrong-site bug: clicked B01 objects were cropped from A01's mask).
+    legacy_dir = "."
+    conn = sqlite3.connect(str(root / "profiler.db"))
+    conn.execute(
+        "CREATE TABLE cell (well TEXT, field TEXT, stack TEXT, timepoint TEXT, "
+        "directory TEXT, label INTEGER, area REAL)")
+    conn2 = sqlite3.connect(str(root / "infer.db"))
+    conn2.execute(
+        "CREATE TABLE inference (uid INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "directory TEXT, well TEXT, field TEXT, stack TEXT, timepoint TEXT, "
+        "label INTEGER, pred_class TEXT, pred_prob REAL)")
+    conn2.execute(
+        "CREATE TABLE reduction_umap ("
+        "uid INTEGER PRIMARY KEY, umap_1 REAL NOT NULL, umap_2 REAL NOT NULL)")
+    uid = 0
+    for well in WELLS:
+        for label, area in ((1, 36.0), (2, 64.0)):
+            conn.execute(
+                "INSERT INTO cell VALUES (?, '1', '1', '1', ?, ?, ?)",
+                (well, legacy_dir, label, area))
+            uid += 1
+            conn2.execute(
+                "INSERT INTO inference (directory, well, field, stack, "
+                "timepoint, label, pred_class, pred_prob) "
+                "VALUES (?, ?, '1', '1', '1', ?, 'drug', 0.9)",
+                (legacy_dir, well, label))
+            # Distinct coordinates per object so the scatter has one point
+            # per object and the clicked point identifies its row exactly.
+            conn2.execute("INSERT INTO reduction_umap VALUES (?, ?, ?)",
+                          (uid, float(uid), float(uid) * 10))
+    conn.commit()
+    conn.close()
+    conn2.commit()
+    conn2.close()
+
+    from microVis.main_window import MainWindow
+    win = MainWindow()
+    try:
+        win.select_dataset_dir(str(root))
+        win._data_view.set_patterns(
+            image=IMAGE_PATTERN, mask=MASK_PATTERN, subdir="")
+        win._on_load_dataset_clicked()
+        for _ in range(3000):
+            qt_app.processEvents()
+            if win._dm is not None and win._loaded_dataset_dir:
+                break
+            qt_app.thread().msleep(5)
+        qt_app.processEvents()
+        assert win._dm is not None, "dataset did not load"
+
+        win.load_db_files([root / "profiler.db", root / "infer.db"])
+        qt_app.processEvents()
+        assert win._merged is not None
+        assert len(win._merged.table) == 4   # 2 wells x 2 objects, fused
+
+        pv = win._plot_view
+        pv._x_combo.setCurrentText("umap_1")
+        pv._y_combo.setCurrentText("umap_2")
+        pv._on_plot()
+        qt_app.processEvents()
+        assert pv._figure is not None
+
+        # Which mask did the crop actually use?
+        import microVis.main_window as MW
+        real_crop = MW.crop_object_rgb
+        used = {}
+        def spy(img_data, mask, label, *a, **k):
+            used["mask"] = np.array(mask)
+            used["label"] = label
+            return real_crop(img_data, mask, label, *a, **k)
+        monkeypatch.setattr(MW, "crop_object_rgb", spy)
+
+        # Click the scatter point of well B01, label 2 (via its plotted
+        # coordinates recovered from the tagged collection).
+        from matplotlib.backend_bases import MouseEvent
+        ax = pv._figure.axes[0]
+        coll = ax.collections[0]
+        rows = coll._microvis_rows
+        target = rows.index[(rows["well"] == "B01")
+                            & (rows["label"] == 2)][0]
+        off = np.asarray(coll.get_offsets())[target]
+        x_disp, y_disp = ax.transData.transform(off)
+        ev = MouseEvent("button_press_event", pv._canvas,
+                        x_disp, y_disp, button=1)
+        pv._canvas.callbacks.process("button_press_event", ev)
+        qt_app.processEvents()
+
+        assert pv._popup.isVisible(), "popup should show for the clicked cell"
+        assert used.get("label") == 2
+        # The crop MUST come from B01's own mask, not another site's.
+        assert np.array_equal(used["mask"], masks["B01"]), \
+            "clicked cell was cropped from the WRONG site's mask"
+    finally:
+        win.close()
