@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import List, Optional
 
 import numpy as np
@@ -9,7 +10,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -27,6 +27,8 @@ from microProfiler.gui.panels._block_container import BlockContainerPanel
 from microProfiler.gui.path_drop import enable_path_drop
 from microProfiler.pipeline._micromodel_bridge import read_bundle_meta
 from microProfiler.user_defaults import get_user_defaults
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_VALUE = 65535.0
 
@@ -84,8 +86,6 @@ class InferenceBlockWidget(QWidget):
         # Common width for row-leading labels: every input starts at the
         # same x, right after its label column.
         label_w = dp(80)
-        # Compact browse buttons: the path box is the wide part of the row.
-        browse_w = dp(36)
 
         def _row_label(text: str) -> QLabel:
             lbl = QLabel(text)
@@ -93,9 +93,7 @@ class InferenceBlockWidget(QWidget):
             return lbl
 
         def _browse_button() -> QPushButton:
-            btn = QPushButton("...")
-            btn.setFixedWidth(browse_w)
-            btn.setProperty("class", "secondary")
+            btn = QPushButton("Browse...")
             btn.setToolTip("Browse... (you can also drag a file onto the input box)")
             return btn
 
@@ -109,32 +107,19 @@ class InferenceBlockWidget(QWidget):
         self._model_path.setToolTip(
             "Trained microModel bundle (SSL pretrain model.pt or train model.pt)")
         enable_path_drop(self._model_path, on_path=lambda _: self.ensure_capability())
-        row_model.addWidget(self._model_path, 1)
+        # Path box = 2/3 of the free width; Browse follows it immediately.
+        row_model.addWidget(self._model_path, 2)
         self._browse_btn = _browse_button()
         self._browse_btn.setToolTip(
             "Pick a bundle; capabilities are read from its meta")
         row_model.addWidget(self._browse_btn)
+        row_model.addStretch(1)
+        # Gap before the destructive action at the right edge.
+        row_model.addSpacing(12)
         self._remove_btn = QPushButton("✕ Remove")
-        self._remove_btn.setProperty("class", "danger")
         self._remove_btn.setToolTip("Remove this inference block")
         row_model.addWidget(self._remove_btn)
         layout.addLayout(row_model)
-
-        # Row 1b: model info (from the bundle meta) — always visible between
-        # the model selection and the mask row; "—" until a bundle is read.
-        row_info = QHBoxLayout()
-        self._model_type_label = QLabel("Model type: —")
-        self._model_type_label.setToolTip(
-            "SL - Classify = train bundle (predictions available); "
-            "SSL - Features = pretrain bundle (features only)")
-        row_info.addWidget(self._model_type_label)
-        row_info.addSpacing(10)
-        self._model_ch_info_label = QLabel("Input Channel Number: —")
-        self._model_ch_info_label.setToolTip(
-            "Number of input channels the model was trained with (bundle meta)")
-        row_info.addWidget(self._model_ch_info_label)
-        row_info.addStretch()
-        layout.addLayout(row_info)
 
         # Row 2: mask + channels (checkable row, ◀/▶ to reorder)
         row_mask = QHBoxLayout()
@@ -153,7 +138,6 @@ class InferenceBlockWidget(QWidget):
         self._ch_cbs: List[QCheckBox] = []
         self._chan_placeholder: Optional[QLabel] = None
         self._move_left_btn = QPushButton("◀")
-        self._move_left_btn.setProperty("class", "secondary")
         self._move_left_btn.setFixedWidth(24)
         self._move_left_btn.setToolTip(
             "Move the selected channel left (earlier in the model's input "
@@ -161,7 +145,6 @@ class InferenceBlockWidget(QWidget):
         self._move_left_btn.setEnabled(False)
         self._move_left_btn.clicked.connect(lambda: self._move_channel(-1))
         self._move_right_btn = QPushButton("▶")
-        self._move_right_btn.setProperty("class", "secondary")
         self._move_right_btn.setFixedWidth(24)
         self._move_right_btn.setToolTip(
             "Move the selected channel right (later in the model's input "
@@ -180,7 +163,6 @@ class InferenceBlockWidget(QWidget):
         layout.addLayout(row_mask)
 
         # Row 3: outputs + DB + max_value
-        layout.addWidget(make_hsep())
         row_out = QHBoxLayout()
         self._feature_cb = QCheckBox("feature")
         self._feature_cb.setChecked(True)
@@ -206,41 +188,29 @@ class InferenceBlockWidget(QWidget):
         row_out.addStretch()
         layout.addLayout(row_out)
 
-        # Row 4: dimension reduction group
+        # Row 4: dimension reduction — NO checkbox: a reducer file OR at
+        # least one checked DR method means the stage runs.
         layout.addWidget(make_hsep())
-        self._reduction_group = QGroupBox("Dimension reduction")
-        self._reduction_group.setCheckable(True)
-        self._reduction_group.setChecked(False)
-        self._reduction_group.setToolTip(
-            "Write reduction_<method> tables for every object (the tables "
-            "ALWAYS contain every object — a reducer or subset only shapes "
-            "the plots, which this pipeline does not write). Provide one or "
-            "more pre-fitted reducer pickles (pca/umap/pacmap/localmap — "
-            "the type of each is detected automatically, multiple are "
-            "separated with ';'); with reducers given the DR-method "
-            "selection is ignored (execution follows the canonical pca -> "
-            "umap -> pacmap -> localmap order); leave empty to fit the "
-            "selected methods fresh.")
-        red_layout = QVBoxLayout(self._reduction_group)
         row_red = QHBoxLayout()
         row_red.addWidget(_row_label("Reducer:"))
         self._reducer_path = QLineEdit()
         self._reducer_path.setObjectName("reducer_path")
-        self._reducer_path.setPlaceholderText("reducer pickles (*.pkl), ';'-separated — empty = fit the selected methods")
+        self._reducer_path.setPlaceholderText(
+            "reducer pickles (*.pkl), ';'-separated — empty + no method = skip")
         self._reducer_path.setToolTip(
             "One or more pre-fitted reducer pickles (pca/umap/pacmap/"
             "localmap), separated with ';'. When any reducer is given, the "
             "DR-method checkboxes are ignored (execution follows the "
-            "canonical pca -> umap -> pacmap -> localmap order).")
+            "canonical pca -> umap -> pacmap -> localmap order). Empty + no "
+            "method checked = dimension reduction is skipped.")
         enable_path_drop(self._reducer_path, multi=True)
-        row_red.addWidget(self._reducer_path, 1)
-        self._reducer_browse_btn = QPushButton("...")
-        self._reducer_browse_btn.setFixedWidth(browse_w)
-        self._reducer_browse_btn.setProperty("class", "secondary")
+        row_red.addWidget(self._reducer_path, 2)
+        self._reducer_browse_btn = QPushButton("Browse...")
         self._reducer_browse_btn.setToolTip(
             "Browse... (multi-select; you can also drag files onto the box)")
         row_red.addWidget(self._reducer_browse_btn)
-        red_layout.addLayout(row_red)
+        row_red.addStretch(1)
+        layout.addLayout(row_red)
         # DR-method selection — only used when NO reducer file is given.
         row_meth = QHBoxLayout()
         meth_lbl = QLabel("DR methods:")
@@ -249,42 +219,38 @@ class InferenceBlockWidget(QWidget):
         self._method_cbs = {}
         for m in _DR_METHOD_OPTIONS:
             cb = QCheckBox(m)
-            cb.setChecked(m in ("pca", "umap"))
+            cb.setChecked(False)
             cb.setToolTip(
-                "Methods fitted fresh when no reducer file is given "
-                "(all unchecked = default pca+umap). Ignored entirely "
-                "when reducer file(s) are provided.")
+                "Methods fitted fresh when no reducer file is given. Any "
+                "checked method (or a reducer file) makes the DR stage run; "
+                "none checked + no reducer = skipped. Ignored entirely when "
+                "reducer file(s) are provided.")
             row_meth.addWidget(cb)
             self._method_cbs[m] = cb
         row_meth.addStretch()
-        red_layout.addLayout(row_meth)
+        layout.addLayout(row_meth)
         # Dim the method checkboxes while reducers are in charge.
         self._reducer_path.textChanged.connect(self._update_method_enabled)
         self._update_method_enabled()
-        layout.addWidget(self._reduction_group)
 
-        # Row 5: cluster prediction group
-        self._cluster_group = QGroupBox("Cluster")
-        self._cluster_group.setCheckable(True)
-        self._cluster_group.setChecked(False)
-        self._cluster_group.setToolTip(
-            "Predict clusters for every object from a baseline cluster.pkl "
-            "(kNN vote over its stored points — cluster IDs stay "
-            "baseline-aligned) and write the find_cluster table. Requires "
-            "a cluster.pkl produced by `micromodel reduction`; checked "
-            "without a file does nothing.")
-        cl_layout = QVBoxLayout(self._cluster_group)
+        # Row 5: cluster prediction — runs when a cluster.pkl is provided.
         row_cl = QHBoxLayout()
         row_cl.addWidget(_row_label("Cluster file:"))
         self._cluster_path = QLineEdit()
         self._cluster_path.setObjectName("reducer_path")
         self._cluster_path.setPlaceholderText("cluster.pkl — empty = no prediction")
+        self._cluster_path.setToolTip(
+            "Predict clusters for every object from a baseline cluster.pkl "
+            "(kNN vote over its stored points — cluster IDs stay "
+            "baseline-aligned) and write the find_cluster table. Requires "
+            "a cluster.pkl produced by `micromodel reduction`; empty = no "
+            "prediction.")
         enable_path_drop(self._cluster_path)
-        row_cl.addWidget(self._cluster_path, 1)
+        row_cl.addWidget(self._cluster_path, 2)
         self._cluster_browse_btn = _browse_button()
         row_cl.addWidget(self._cluster_browse_btn)
-        cl_layout.addLayout(row_cl)
-        layout.addWidget(self._cluster_group)
+        row_cl.addStretch(1)
+        layout.addLayout(row_cl)
 
         # ── behavior wiring ──
         self._browse_btn.clicked.connect(self._on_browse)
@@ -304,41 +270,31 @@ class InferenceBlockWidget(QWidget):
 
     # ── Capability (bundle meta) ────────────────────────────────────────
 
-    def _update_model_info(self, meta: Optional[dict] = None) -> None:
-        """Refresh the always-visible model info row from the bundle meta."""
-        if not meta:
-            self._model_type_label.setText("Model type: —")
-            self._model_ch_info_label.setText("Input Channel Number: —")
-            return
-        is_classify = "num_classes" in meta
-        self._model_type_label.setText(
-            "Model type: SL - Classify" if is_classify else "Model type: SSL - Features")
-        in_chans = meta.get("in_chans")
-        ch_text = str(in_chans) if in_chans is not None else "—"
-        self._model_ch_info_label.setText(f"Input Channel Number: {ch_text}")
-
     def ensure_capability(self) -> Optional[str]:
         """Read the bundle meta (once per path) and gate the output checkboxes.
 
         Returns an error string on failure (caller shows a popup) or None.
+        The model type / input-channel count are written to the LOG, not to
+        the GUI (the model-info row was removed).
         """
         path = self.get_model_path()
         if not path:
-            self._update_model_info(None)
             return None
         if self._capability_checked_path == path:
             return None
         try:
             meta = read_bundle_meta(path)
         except ImportError as e:
-            self._update_model_info(None)
             return str(e)
         except Exception as e:
-            self._update_model_info(None)
             return f"Could not read model bundle {path}:\n{e}"
         self._classify_capable = "num_classes" in meta
         self._capability_checked_path = path
-        self._update_model_info(meta)
+        in_chans = meta.get("in_chans")
+        logger.info(
+            "Loaded model bundle %s: %s, input channels: %s", path,
+            "SL - Classify" if self._classify_capable else "SSL - Features",
+            in_chans if in_chans is not None else "unknown")
         self._update_capability_ui()
         return None
 
@@ -464,11 +420,15 @@ class InferenceBlockWidget(QWidget):
         self._update_move_buttons()
 
     def is_reduction_or_cluster_enabled(self) -> bool:
-        """True when the reduction run should happen at all (DR group, or the
-        Cluster group with a cluster.pkl chosen)."""
-        return (self._reduction_group.isChecked()
-                or (self._cluster_group.isChecked()
-                    and bool(self._cluster_path.text().strip())))
+        """True when any reduction/cluster stage has something to run.
+
+        There are no group checkboxes anymore: a reducer file OR at least
+        one checked DR method makes the reduction stage run, and a
+        cluster.pkl path makes the cluster prediction run.
+        """
+        dr_runs = bool(self._reducer_path.text().strip()
+                       or self._selected_methods())
+        return dr_runs or bool(self._cluster_path.text().strip())
 
     # ── Population ──────────────────────────────────────────────────────
 
@@ -522,21 +482,24 @@ class InferenceBlockWidget(QWidget):
             "output_db": self.get_output_db(),
             "max_value": self._max_value,
         }
-        if self.is_reduction_or_cluster_enabled():
-            reducers = [p.strip() for p in self._reducer_path.text().split(";")
-                        if p.strip()]
+        reducers = [p.strip() for p in self._reducer_path.text().split(";")
+                    if p.strip()]
+        methods = self._selected_methods()
+        cluster_file = self._cluster_path.text().strip()
+        if reducers or methods or cluster_file:
             section["reduction"] = {
-                # enabled = the Dimension-reduction group; the Cluster group
-                # is its own flag (prediction needs cluster_enabled + file).
-                "enabled": self._reduction_group.isChecked(),
+                # Derived flags (no group checkboxes in the GUI): the
+                # reduction runs with a reducer file or any checked method;
+                # the cluster runs with a cluster file.
+                "enabled": bool(reducers or methods),
                 "reducer": reducers or None,
-                "cluster_enabled": self._cluster_group.isChecked(),
-                "cluster": self._cluster_path.text().strip() or None,
+                "cluster_enabled": bool(cluster_file),
+                "cluster": cluster_file or None,
                 # Method checkboxes apply only without reducers (the bridge
                 # ignores them otherwise — serialize None so the YAML stays
-                # honest). None = default [pca, umap].
-                "method": (None if reducers
-                           else self._selected_methods() or None),
+                # honest). [] = nothing fitted; a cluster file still uses PCA
+                # for its reference embedding.
+                "method": (None if reducers else methods),
                 # No-widget YAML keys, round-tripped verbatim.
                 "color_by": self._color_by,
                 "cluster_res": self._cluster_res,
@@ -564,14 +527,13 @@ class InferenceStepPanel(BlockContainerPanel):
         """Pre-fill the first block from ~/.micromax (the LAST run's model /
         reducer(s) / cluster.pkl — saved by the pipeline after each run).
 
-        The Dimension-reduction and Cluster groups come up CHECKED when
-        their files are remembered: they run by default, and the user
-        disables either by unchecking its group box or edits the path to
-        switch to a new model/reducer/cluster. A config load or a
-        session.yml restore overwrites these afterwards. The model's
-        capability row is intentionally NOT read here (a full torch.load
-        at startup would stall the GUI) — validate_blocks re-checks it
-        before every run.
+        A remembered reducer/cluster path IS the "run it" flag (there are no
+        group checkboxes anymore): the stage runs because the path is
+        present, and the user skips it by clearing the path. A config load
+        or a session.yml restore overwrites these afterwards. The model's
+        capability is intentionally NOT read here (a full torch.load at
+        startup would stall the GUI) — validate_blocks re-checks it before
+        every run.
         """
         defaults = get_user_defaults().get("inference") or {}
         if not defaults:
@@ -585,11 +547,9 @@ class InferenceStepPanel(BlockContainerPanel):
             reducer = [reducer]
         if reducer:
             block._reducer_path.setText(";".join(str(p) for p in reducer))
-            block._reduction_group.setChecked(True)
         cluster = defaults.get("cluster")
         if cluster:
             block._cluster_path.setText(str(cluster))
-            block._cluster_group.setChecked(True)
 
     def _connect_block_signals(self, block: InferenceBlockWidget) -> None:
         super()._connect_block_signals(block)
@@ -598,8 +558,6 @@ class InferenceStepPanel(BlockContainerPanel):
                   block._reducer_path, block._cluster_path,
                   *block._method_cbs.values()):
             self._wire_param_signal(w)
-        for grp in (block._reduction_group, block._cluster_group):
-            grp.toggled.connect(self.parameter_changed, Qt.UniqueConnection)
         # Channel row: check/uncheck AND ◀/▶ reorder both persist to config.
         for cb in block._ch_cbs:
             cb.toggled.connect(self.parameter_changed, Qt.UniqueConnection)
@@ -628,8 +586,6 @@ class InferenceStepPanel(BlockContainerPanel):
             for i in range(src._mask_combo.count()):
                 block._mask_combo.addItem(src._mask_combo.itemText(i))
             block._mask_combo.setCurrentText(src.get_mask_name())
-            block._reduction_group.setChecked(src._reduction_group.isChecked())
-            block._cluster_group.setChecked(src._cluster_group.isChecked())
             block._reducer_path.setText(src._reducer_path.text())
             block._cluster_path.setText(src._cluster_path.text())
             for m, cb in src._method_cbs.items():
@@ -674,11 +630,8 @@ class InferenceStepPanel(BlockContainerPanel):
             )
             block.set_channel_state(order, set(channels_cfg))
         red = cfg.get("reduction") or {}
-        # enabled = the Dimension-reduction group; cluster_enabled = the
-        # Cluster group (prediction additionally needs the cluster file,
-        # which the bridge enforces).
-        block._reduction_group.setChecked(bool(red.get("enabled", False)))
-        block._cluster_group.setChecked(bool(red.get("cluster_enabled", False)))
+        # The GUI derives "run" from the paths/methods, so the stored
+        # enabled / cluster_enabled flags are ignored on restore.
         # color_by / cluster_res / sample_per_class have no GUI widget —
         # keep the config values verbatim so a YAML with custom values
         # survives a round-trip.
@@ -690,7 +643,11 @@ class InferenceStepPanel(BlockContainerPanel):
             reducer = [reducer]
         if reducer:
             block._reducer_path.setText(";".join(str(p) for p in reducer))
-        method = red.get("method") or ["pca", "umap"]  # null = effective default
+        # method: null (reducers in charge / no explicit choice) leaves every
+        # checkbox unchecked — the GUI default is "nothing fitted".
+        method = red.get("method")
+        if method is None:
+            method = []
         for m, cb in block._method_cbs.items():
             cb.setChecked(m in method)
         if red.get("cluster"):

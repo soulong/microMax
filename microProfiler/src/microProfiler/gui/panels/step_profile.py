@@ -71,8 +71,9 @@ class ObjectProfileBlockWidget(QWidget):
         self._overwrite_db.setToolTip("Drop existing table before profiling (otherwise BatchWriter replaces on first write)")
         row_top.addWidget(self._overwrite_db)
         row_top.addStretch()
+        # Gap before the destructive action at the right edge.
+        row_top.addSpacing(12)
         self._remove_btn = QPushButton("✕ Remove")
-        self._remove_btn.setProperty("class", "danger")
         self._remove_btn.setToolTip("Remove this object profiling block")
         row_top.addWidget(self._remove_btn)
         layout.addLayout(row_top)
@@ -98,7 +99,6 @@ class ObjectProfileBlockWidget(QWidget):
         layout.addLayout(self._intensity_ch_layout)
 
         # -- Radial + Bins (single row) --
-        layout.addWidget(make_hsep())
         self._radial_layout = QHBoxLayout()
         self._radial_layout.setContentsMargins(0, 0, 0, 0)
         _lbl = QLabel("Radial:")
@@ -131,7 +131,6 @@ class ObjectProfileBlockWidget(QWidget):
         layout.addLayout(self._radial_layout)
 
         # -- Granularity + spectrum length + subsample + image_sample + background radius --
-        layout.addWidget(make_hsep())
         self._granularity_layout = QHBoxLayout()
         self._granularity_layout.setContentsMargins(0, 0, 0, 0)
         _lbl = QLabel("Granularity:")
@@ -204,7 +203,6 @@ class ObjectProfileBlockWidget(QWidget):
         layout.addLayout(self._granularity_layout)
 
         # -- GLCM + Distances + Levels (single row, no Angles widget) --
-        layout.addWidget(make_hsep())
         self._glcm_layout = QHBoxLayout()
         self._glcm_layout.setContentsMargins(0, 0, 0, 0)
         _lbl = QLabel("GLCM:")
@@ -251,7 +249,6 @@ class ObjectProfileBlockWidget(QWidget):
         layout.addLayout(self._glcm_layout)
 
         # -- Correlation --
-        layout.addWidget(make_hsep())
         self._corr_layout = QHBoxLayout()
         self._corr_layout.setContentsMargins(0, 0, 0, 0)
         _lbl = QLabel("Correlation:")
@@ -454,20 +451,33 @@ class ObjectProfileBlockWidget(QWidget):
         }
 
 
-class ImageProfilingStepPanel(BaseStepPanel):
+class ImageProfileBlockWidget(QWidget):
+    """The single Image Profiling block card.
 
-    step_name = "image_profile"
+    Image Profiling has nothing repeatable (one threshold per channel), so
+    this block is fixed, but it is a real block card so its box sits at the
+    same level as the Object Profiling blocks.
+    """
 
-    def __init__(self, state, parent=None):
-        super().__init__(state, parent)
-        self.setTitle("Image Profiling")
-        self._n_workers_value = default_n_workers()
+    def __init__(self, block_index: int, channels: List[str], parent=None):
+        super().__init__(parent)
+        self.block_index = block_index
+        self._channels = list(channels)
+        self.setProperty("class", "block-card")
+        # Raw image_profile section restored before the dataset loaded;
+        # populate_channels rebuilds the grid from it instead of defaults.
+        self._pending_settings: Optional[dict] = None
         self._image_ch_cbs: List[QCheckBox] = []
         self._threshold_spins: Dict[str, QDoubleSpinBox] = {}
-        self._build_controls()
+        self._build_ui()
 
-    def _build_controls(self):
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(4)
         self._image_grid = QWidget()
+        # Transparent inner widget: the block card itself is the visible box.
+        self._image_grid.setProperty("class", "card-inner")
         self._image_grid_layout = QGridLayout(self._image_grid)
         self._image_grid_layout.setContentsMargins(0, 0, 0, 0)
         self._image_grid_layout.setHorizontalSpacing(4)
@@ -482,7 +492,9 @@ class ImageProfilingStepPanel(BaseStepPanel):
         self._threshold_placeholder = QLabel("Load a dataset to configure")
         self._threshold_placeholder.setProperty("class", "placeholder")
         self._image_grid_layout.addWidget(self._threshold_placeholder, 1, 1, 1, -1)
-        self._controls_layout.addWidget(self._image_grid)
+        layout.addWidget(self._image_grid)
+        if self._channels:
+            self.populate_channels(self._channels)
 
     # ── Helpers ───────────────────────────────────────────────────────
 
@@ -523,13 +535,6 @@ class ImageProfilingStepPanel(BaseStepPanel):
             if val > 0:
                 result[ch] = val
         return result or None
-
-    def get_n_workers(self) -> int:
-        return self._n_workers_value
-
-    def set_n_workers(self, value: int) -> None:
-        self._n_workers_value = value
-        self.parameter_changed.emit()
 
     # ── Channel population ────────────────────────────────────────────
 
@@ -576,7 +581,6 @@ class ImageProfilingStepPanel(BaseStepPanel):
                     cb.setChecked(False)
                 self._image_grid_layout.addWidget(cb, 0, col)
                 self._image_ch_cbs.append(cb)
-                self._wire_param_signal(cb)
 
                 th_widget = QDoubleSpinBox()
                 th_widget.setRange(-99999.0, 99999.0)
@@ -592,7 +596,6 @@ class ImageProfilingStepPanel(BaseStepPanel):
                     th_widget.setValue(saved_thresholds[ch])
                 self._image_grid_layout.addWidget(th_widget, 1, col)
                 self._threshold_spins[ch] = th_widget
-                self._wire_param_signal(th_widget)
 
             self._image_grid_layout.setColumnStretch(len(channels) + 1, 1)
 
@@ -604,7 +607,6 @@ class ImageProfilingStepPanel(BaseStepPanel):
     def build_config_section(self) -> dict:
         image_ch = BaseStepPanel._checked_checkboxes(self._image_ch_cbs) or None
         return {
-            "n_workers": self._n_workers_value,
             "image_channels": image_ch,
             "image_thresholds": self.get_thresholds(),
         }
@@ -614,8 +616,6 @@ class ImageProfilingStepPanel(BaseStepPanel):
     def load_config_section(self, section) -> None:
         if not section:
             return
-        if "n_workers" in section:
-            self._n_workers_value = int(section["n_workers"])
         BaseStepPanel._set_checked_states(self._image_ch_cbs, section.get("image_channels"))
         thresholds = section.get("image_thresholds") or {}
         for ch, w in self._threshold_spins.items():
@@ -625,6 +625,76 @@ class ImageProfilingStepPanel(BaseStepPanel):
         # the channel grid doesn't exist yet — when the dataset loads,
         # populate_channels rebuilds it from this config instead of defaults.
         self._pending_settings = dict(section)
+
+
+class ImageProfilingStepPanel(BlockContainerPanel):
+    """Image Profiling — ONE fixed block card (no add button).
+
+    The panel uses the same block-container layout as Object Profiling so
+    both titles sit at the same level and both content boxes are siblings.
+    """
+
+    step_name = "image_profile"
+    _block_widget_class = ImageProfileBlockWidget
+
+    def __init__(self, state, parent=None):
+        super().__init__(state, parent)
+        self.setTitle("Image Profiling")
+        self._n_workers_value = default_n_workers()
+        self._build_block_container(show_add=False)
+        # Exactly one fixed block (no dynamic add/remove).
+        block = self._block_widget_class(0, [], parent=self._block_container)
+        block.setAttribute(Qt.WA_StyledBackground, True)
+        self._blocks.append(block)
+        self._blocks_layout.addWidget(block)
+
+    def _on_channels_changed(self, channels: List[str]) -> None:
+        super()._on_channels_changed(channels)
+        # Threshold spin boxes are rebuilt by the block: wire them so edits
+        # mark the panel dirty like every other panel parameter.
+        for block in self._blocks:
+            for spin in block._threshold_spins.values():
+                self._wire_param_signal(spin)
+
+    def get_thresholds(self) -> Optional[Dict[str, float]]:
+        if self._blocks:
+            return self._blocks[0].get_thresholds()
+        return None
+
+    def get_n_workers(self) -> int:
+        return self._n_workers_value
+
+    def set_n_workers(self, value: int) -> None:
+        self._n_workers_value = value
+        self.parameter_changed.emit()
+
+    def build_config_section(self) -> dict:
+        section: dict = {"n_workers": self._n_workers_value}
+        if self._blocks:
+            section.update(self._blocks[0].build_config_section())
+        return section
+
+    # image_profile keeps its flat section dict (no "configs" wrapper).
+    def to_config(self) -> dict:
+        section = self.build_config_section()
+        section["run"] = self.isChecked()
+        return section
+
+    def from_config(self, section) -> None:
+        if not section:
+            return
+        run_val = section.get("run")
+        if isinstance(run_val, bool):
+            self.setChecked(run_val)
+        self.load_config_section(section)
+
+    def load_config_section(self, section) -> None:
+        if not section:
+            return
+        if "n_workers" in section:
+            self._n_workers_value = int(section["n_workers"])
+        if self._blocks:
+            self._blocks[0].load_config_section(section)
 
 
 class ObjectProfilingStepPanel(BlockContainerPanel):

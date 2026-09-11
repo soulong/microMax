@@ -1,5 +1,17 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   microVis Dark Theme Stylesheet
+   microMax Desktop Dark Theme — shared by microProfiler and microVis.
+
+   This file is duplicated verbatim in both packages (each app keeps its own
+   copy of resources/style.qss; there is NO shared resource file). Keep the
+   two copies in sync. Palette, typography and control rules are constrained
+   by the "GUI style conventions" section of AGENTS.md.
+
+   Flat control style: rounded boxes carry the raised surface; inputs are
+   neutral dark blocks with NO visible border; buttons are thin-outline
+   transparent blocks with accent text — ONE style everywhere (the Data-page
+   Browse button is the reference), no primary/secondary/danger variants.
+
+   Scale: window/title 11pt, panel content 9pt, auxiliary text 8pt.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 /* ── Global Defaults ────────────────────────────────────────────────────── */
@@ -20,23 +32,38 @@ QMainWindow::separator {
     height: 1px;
 }
 
+/* ── Titleless Panel Box ────────────────────────────────────────────────── */
+/* A group of controls inside one rounded surface (no title, no border). */
+QWidget[class="panel-box"] {
+    background-color: #2d2d44;
+    border: none;
+    border-radius: 8px;
+}
+
 /* ── Push Buttons ───────────────────────────────────────────────────────── */
+/* ONE button style everywhere (the microProfiler Input "Browse..." button is
+   the reference): transparent thin-outline block with accent text. Inside a
+   box the box colour shows through, on a page the page colour shows through.
+   Hover highlights the BORDER (no fill). There are NO primary/secondary/
+   danger variants — the only freedom is the button length (text width). */
 QPushButton {
     background-color: transparent;
-    color: #e0e0e0;
-    border: 1px solid #333333;
+    color: #7a9aaa;
+    border: 1px solid #444455;
     border-radius: 6px;
-    padding: 6px 16px;
+    padding: 4px 12px;
+    font-size: 9pt;
     font-weight: normal;
 }
 
 QPushButton:hover {
-    background-color: #2d2d44;
-    border-color: #555555;
+    border-color: #5a8a9a;
+    background-color: transparent;
 }
 
 QPushButton:pressed {
-    background-color: #252536;
+    border-color: #5a8a9a;
+    background-color: rgba(90, 138, 154, 0.12);
 }
 
 QPushButton:disabled {
@@ -45,71 +72,15 @@ QPushButton:disabled {
     background-color: transparent;
 }
 
-/* Primary (filled accent) */
-QPushButton[class="primary"] {
-    background-color: #4a6a7a;
-    color: #d0d8dc;
-    border-color: #4a6a7a;
-    font-weight: bold;
-    min-width: 100px;
-    min-height: 32px;
-}
-
-QPushButton[class="primary"]:hover {
-    background-color: #567a8c;
-    border-color: #567a8c;
-}
-
-QPushButton[class="primary"]:pressed {
-    background-color: #3e5a6a;
-    border-color: #3e5a6a;
-}
-
-QPushButton[class="primary"]:disabled {
-    background-color: #2d2d44;
-    color: #555555;
-    border-color: #333333;
-}
-
-/* Secondary (outlined) */
-QPushButton[class="secondary"] {
+QPushButton:checked {
+    border-color: #5a8a9a;
     background-color: transparent;
-    color: #7a9aaa;
-    border: 1px solid #5a7a8a;
-}
-
-QPushButton[class="secondary"]:hover {
-    background-color: rgba(90, 122, 138, 0.15);
-}
-
-QPushButton[class="secondary"]:pressed {
-    background-color: rgba(90, 122, 138, 0.25);
-}
-
-QPushButton[class="secondary"]:disabled {
-    color: #555555;
-    border-color: #333333;
-}
-
-/* Danger (outlined red) */
-QPushButton[class="danger"] {
-    background-color: transparent;
-    color: #f04770;
-    border: 1px solid #f04770;
-}
-
-QPushButton[class="danger"]:hover {
-    background-color: rgba(240, 71, 112, 0.1);
-}
-
-QPushButton[class="danger"]:pressed {
-    background-color: rgba(240, 71, 112, 0.2);
 }
 
 /* ── Group Box (Card Style) ─────────────────────────────────────────────── */
 QGroupBox {
     background-color: #2d2d44;
-    border: 1px solid #333333;
+    border: none;
     border-radius: 8px;
     margin-top: 8px;
     padding: 8px 12px 12px 12px;
@@ -117,11 +88,19 @@ QGroupBox {
     font-weight: bold;
 }
 
+/* Flat variant: no box of its own — used for the microProfiler Filter and
+   for block-container step panels, where each block is its own box. */
+QGroupBox[class="flat"] {
+    background-color: transparent;
+    border: none;
+}
+
 QGroupBox::title {
     subcontrol-origin: margin;
     subcontrol-position: top left;
     padding: 4px 12px;
     color: #5a8a9a;
+    font-size: 11pt;
     background-color: transparent;
 }
 
@@ -149,9 +128,9 @@ QGroupBox::indicator:checked:hover {
 /* ── Text Inputs ────────────────────────────────────────────────────────── */
 QLineEdit, QSpinBox, QDoubleSpinBox {
     background-color: #1e1e2e;
-    border: 1px solid #333333;
+    border: 1px solid transparent;
     border-radius: 6px;
-    padding: 6px 10px;
+    padding: 4px 8px;
     color: #e0e0e0;
     selection-background-color: #5a8a9a;
     selection-color: #1e1e2e;
@@ -161,37 +140,31 @@ QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
     border-color: #5a8a9a;
 }
 
+/* Data entry is typed directly: every spin box hides its up/down arrows. */
 QSpinBox::up-button, QDoubleSpinBox::up-button,
 QSpinBox::down-button, QDoubleSpinBox::down-button {
-    background-color: #2d2d44;
-    border-radius: 3px;
-    border: 1px solid #333333;
-    width: 18px;
+    width: 0px;
+    height: 0px;
+    border: none;
 }
 
-QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
-QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
-    background-color: #3a3a52;
+QSpinBox[class="sidebar-spin"], QDoubleSpinBox[class="sidebar-spin"] {
+    color: #888888;
+    font-size: 9pt;
+    padding: 2px 4px;
+    border-radius: 4px;
 }
 
-QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-bottom: 5px solid #e0e0e0;
-}
-
-QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid #e0e0e0;
+QSpinBox[class="sidebar-spin"]:focus, QDoubleSpinBox[class="sidebar-spin"]:focus {
+    border-color: #5a8a9a;
 }
 
 /* ── Combo Box ──────────────────────────────────────────────────────────── */
 QComboBox {
     background-color: #1e1e2e;
-    border: 1px solid #333333;
+    border: 1px solid transparent;
     border-radius: 6px;
-    padding: 6px 10px;
+    padding: 4px 8px;
     color: #e0e0e0;
     min-width: 80px;
 }
@@ -203,10 +176,9 @@ QComboBox:focus {
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
-    width: 24px;
-    border-left: 1px solid #333333;
-    border-top-right-radius: 6px;
-    border-bottom-right-radius: 6px;
+    width: 22px;
+    border: none;
+    background: transparent;
 }
 
 QComboBox::down-arrow {
@@ -310,13 +282,20 @@ QStatusBar QLabel {
 
 QStatusBar QPushButton {
     padding: 4px 12px;
-    font-size: 10pt;
+    font-size: 9pt;
 }
 
 QStatusBar QProgressBar {
     height: 16px;
     min-width: 200px;
     max-width: 350px;
+}
+
+/* Inline progress/status line inside the main window (microProfiler). */
+QLabel[class="status-bar"] {
+    background-color: transparent;
+    color: #888888;
+    font-size: 8pt;
 }
 
 /* ── Plain Text Edit (Log) ──────────────────────────────────────────────── */
@@ -388,6 +367,46 @@ QLabel[class="error"] {
     color: #f04770;
 }
 
+QLabel[class="hint"] {
+    color: #666666;
+    font-size: 8pt;
+    font-style: italic;
+    padding-left: 4px;
+}
+
+QLabel[class="section-title"] {
+    color: #e0e0e0;
+    font-weight: bold;
+    font-size: 11pt;
+    padding-top: 8px;
+    padding-bottom: 4px;
+}
+
+QLabel[class="info-card"] {
+    background-color: #2d2d44;
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: #e0e0e0;
+}
+
+/* ── List Widget ────────────────────────────────────────────────────────── */
+QListWidget {
+    background-color: #1e1e2e;
+    border: 1px solid #333333;
+    border-radius: 6px;
+    padding: 4px;
+}
+
+QListWidget::item {
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+
+QListWidget::item:selected {
+    background-color: #5a8a9a;
+    color: #1e1e2e;
+}
+
 /* ── Splitter ───────────────────────────────────────────────────────────── */
 QSplitter::handle {
     background-color: #333333;
@@ -401,17 +420,24 @@ QSplitter::handle:vertical {
     height: 2px;
 }
 
+/* ── Horizontal Separators ──────────────────────────────────────────────── */
+QFrame[class="separator"] {
+    background-color: #333333;
+    max-height: 1px;
+    border: none;
+}
+
 /* ── Tool Tip ───────────────────────────────────────────────────────────── */
 QToolTip {
     background-color: #2d2d44;
     color: #e0e0e0;
     border: 1px solid #333333;
-    border-radius: 2px;
-    padding: 1px 3px;
+    border-radius: 4px;
+    padding: 4px 8px;
     font-size: 8pt;
 }
 
-/* ── Sidebar ────────────────────────────────────────────────────────────── */
+/* ── Sidebar (both apps) ────────────────────────────────────────────────── */
 QWidget#sidebar {
     background-color: #1e1e2e;
     border-right: 1px solid #333333;
@@ -423,6 +449,7 @@ QWidget[active="true"] {
 }
 
 QWidget[active="false"] {
+    background-color: transparent;
     border-left: 3px solid transparent;
 }
 
@@ -439,13 +466,40 @@ QWidget[active="true"] QLabel[class="sidebar-icon"] {
 QLabel[class="sidebar-label"] {
     background-color: transparent;
     font-size: 10pt;
+    color: #888888;
 }
 
 QWidget[active="true"] QLabel[class="sidebar-label"] {
     color: #e0e0e0;
 }
 
-/* ── Tab Widget (fallback) ──────────────────────────────────────────────── */
+QWidget[class="sidebar-divider"] {
+    background-color: #333333;
+    max-height: 1px;
+    margin: 4px 8px;
+}
+
+/* Sidebar footer buttons: the shared button look plus a small side inset so
+   Run All / Cancel do not touch the sidebar edges. */
+QPushButton[class="sidebar-footer-btn"] {
+    margin: 3px 6px;
+}
+
+/* ── Block Card (repeatable blocks) ─────────────────────────────────────── */
+/* Each repeatable block is its own rounded box; block-container panels are
+   flat (QGroupBox[class="flat"]) so there is exactly one box level. */
+QWidget[class="block-card"] {
+    background-color: #2d2d44;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+QWidget[class="card-inner"] {
+    background-color: transparent;
+}
+
+/* ── Tab Widget ─────────────────────────────────────────────────────────── */
 QTabWidget::pane {
     border: none;
     background-color: #252536;
@@ -469,7 +523,7 @@ QTabBar::tab:hover:!selected {
     background-color: #2d2d44;
 }
 
-/* ── Nav Tab (vertical sidebar labels) ──────────────────────────────── */
+/* ── Nav Tab (rotated sidebar labels, microVis) ─────────────────────────── */
 QLabel[class="nav-tab"] {
     background-color: transparent;
     color: #888888;
@@ -489,8 +543,13 @@ QLabel[class="nav-tab"]:hover {
     color: #cccccc;
 }
 
-/* ── Data page: compact buttons (height just fits the text) ─────────── */
+/* ── Data page: one 9pt scale across the whole page ─────────────────────── */
+QWidget#data-view QLabel,
+QWidget#data-view QLineEdit,
+QWidget#data-view QComboBox,
+QWidget#data-view QSpinBox,
+QWidget#data-view QDoubleSpinBox,
+QWidget#data-view QCheckBox,
 QWidget#data-view QPushButton {
-    min-height: 0;
-    padding: 3px 12px;
+    font-size: 9pt;
 }

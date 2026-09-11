@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sys
 from importlib.resources import files
 
@@ -21,6 +22,12 @@ def _resource(name: str) -> str | None:
 def main() -> None:
     _ensure_std_streams()
     setup_logging()
+
+    # One startup banner per launch (same wording as microVis).
+    from microProfiler import __version__
+    logging.getLogger("microProfiler").info(
+        "microProfiler %s starting", __version__)
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("microProfiler")

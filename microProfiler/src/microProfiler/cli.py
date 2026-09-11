@@ -11,7 +11,7 @@ from microBase.db_contracts import IMAGE_TABLE, INFERENCE_TABLE, PROFILER_DB_NAM
 
 from microProfiler.config import config_to_dict, load_config, PipelineConfig, resolve_inference_db
 from microProfiler.io import Database
-from microProfiler.log_utils import set_default_logging_level, setup_logging
+from microProfiler.log_utils import set_default_logging_level, set_log_file, setup_logging
 from microProfiler.pipeline import apply_filters, run_pipeline
 from microProfiler.pipeline._micromodel_bridge import expected_reduction_tables
 
@@ -202,6 +202,9 @@ def main(argv: list[str] | None = None) -> int:
     log_level = logging.DEBUG if args.debug else logging.INFO
     set_default_logging_level(log_level)
     log = setup_logging(level=log_level, log_file=args.log_file)
+    # One startup banner per launch (same wording as the GUI / microVis).
+    from microProfiler import __version__
+    log.info("microProfiler %s starting", __version__)
     log.debug("Debug logging enabled")
 
     if args.command == "run":
@@ -271,6 +274,9 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             logger.info("Processing dataset: %s", ds_dir)
+            # Mirror the terminal log into the dataset directory for this
+            # dataset (a later dataset retargets the file handler).
+            set_log_file(ds_dir / "microProfiler.log")
             try:
                 # applied_steps are persisted inside run_pipeline (per executed
                 # step), so a later failure never loses the in-place steps.

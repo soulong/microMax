@@ -497,6 +497,9 @@ class ImageDisplay(QScrollArea):
         # Incremental display tracking: group_key → (row_widget, h_layout)
         self._row_widgets: dict = {}
         self._colorbar_added = False
+        # The colorbar widget is kept at the BOTTOM of the layout (below every
+        # image row); add_result re-positions it as rows arrive.
+        self._colorbar_widget: QWidget | None = None
         self._cached_overlay_vmin = 0.0
         self._cached_overlay_vmax = 1.0
 
@@ -510,6 +513,7 @@ class ImageDisplay(QScrollArea):
         self._results_cache = []
         self._row_widgets = {}
         self._colorbar_added = False
+        self._colorbar_widget = None
 
     def reset_all_zoom(self) -> None:
         """Reset zoom on all visible thumbnails."""
@@ -527,6 +531,7 @@ class ImageDisplay(QScrollArea):
         self._cached_thumb_size = thumb_size
         self._row_widgets = {}
         self._colorbar_added = False
+        self._colorbar_widget = None
 
     def add_result(self, result: dict, thumb_size: int, overlay_alpha: float,
                    overlay_cmap: str, saved_state: dict | None,
@@ -550,11 +555,17 @@ class ImageDisplay(QScrollArea):
             if last and last.spacerItem():
                 self._layout.takeAt(self._layout.count() - 1)
 
+        # The colorbar belongs BELOW every image row. Take it out of the
+        # layout before inserting this result (so a row that sorts last is
+        # never added beneath it), then re-add it after the rows.
+        if self._colorbar_widget is not None:
+            self._layout.removeWidget(self._colorbar_widget)
+
         # Add colorbar on first polygon result
         if not self._colorbar_added and result.get("polygons"):
             if overlay_vmin != overlay_vmax:
-                cbar = _create_colorbar_widget(overlay_cmap, overlay_vmin, overlay_vmax)
-                self._layout.addWidget(cbar)
+                self._colorbar_widget = _create_colorbar_widget(
+                    overlay_cmap, overlay_vmin, overlay_vmax)
                 self._colorbar_added = True
 
         # Find or create row widget
@@ -576,6 +587,10 @@ class ImageDisplay(QScrollArea):
                                    overlay_cmap, saved_state, sort_by_row,
                                    overlay_vmin, overlay_vmax)
 
+        # Colorbar at the very bottom, then the trailing stretch.
+        if self._colorbar_widget is not None:
+            self._layout.addWidget(self._colorbar_widget)
+
         # Re-add trailing stretch
         self._layout.addStretch()
 
@@ -594,6 +609,7 @@ class ImageDisplay(QScrollArea):
             elif item.layout():
                 self._clear_sub_layout(item.layout())
         self._row_widgets = {}
+        self._colorbar_widget = None
 
         if old_state:
             if saved_state:
@@ -666,9 +682,9 @@ class ImageDisplay(QScrollArea):
 
         has_polygons = any(r.get("polygons") for r in results)
         if has_polygons:
-            cbar_widget = _create_colorbar_widget(
+            self._colorbar_widget = _create_colorbar_widget(
                 overlay_cmap, self._cached_overlay_vmin, self._cached_overlay_vmax)
-            self._layout.addWidget(cbar_widget)
+            self._layout.addWidget(self._colorbar_widget)
         self._layout.addStretch()
 
     def _save_current_view_state(self) -> dict:
@@ -800,7 +816,7 @@ class ImageDisplay(QScrollArea):
         col.setContentsMargins(0, 0, 0, 0)
 
         meta = QLabel(r.get("meta_label", ""))
-        meta.setStyleSheet("color: #aaaaaa; font-size: 8pt;")
+        meta.setStyleSheet("color: #888888; font-size: 8pt;")
         meta.setAlignment(Qt.AlignCenter)
         col.addWidget(meta)
 
@@ -829,7 +845,7 @@ class ImageDisplay(QScrollArea):
         col.setContentsMargins(0, 0, 0, 0)
 
         meta = QLabel(r.get("meta_label", ""))
-        meta.setStyleSheet("color: #aaaaaa; font-size: 8pt;")
+        meta.setStyleSheet("color: #888888; font-size: 8pt;")
         meta.setAlignment(Qt.AlignCenter)
         col.addWidget(meta)
 
@@ -871,6 +887,9 @@ class ImageDisplay(QScrollArea):
                 w.deleteLater()
             elif item.layout():
                 self._clear_sub_layout(item.layout())
+        # The colorbar widget is deleted with the layout — drop the ref so a
+        # later add_result cannot re-add a dead widget.
+        self._colorbar_widget = None
 
 
     def _clear_sub_layout(self, layout) -> None:

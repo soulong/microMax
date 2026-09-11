@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Type
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
 from microProfiler.gui.panels.base_step_panel import BaseStepPanel
@@ -34,6 +35,9 @@ class BlockContainerPanel(BaseStepPanel):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # The step panel itself is flat: every added block is its own box
+        # (class "block-card"), so there is exactly one box level.
+        self.setProperty("class", "flat")
         self._blocks: List[QWidget] = []
         self._channels: List[str] = []
         self._block_container: Optional[QWidget] = None
@@ -56,19 +60,30 @@ class BlockContainerPanel(BaseStepPanel):
         # restored config over the user's current selections.
         self._restore_active: bool = False
 
-    def _build_block_container(self, add_btn_text: str = "+ Add New Block") -> None:
-        """Set up the block container layout with add button."""
+    def _build_block_container(self, add_btn_text: str = "+ Add New Block",
+                               show_add: bool = True) -> None:
+        """Set up the block container layout.
+
+        ``show_add=False`` is for panels that always carry exactly ONE fixed
+        block (Image Profiling): the layout is identical to the dynamic
+        panels but there is no add button.
+        """
         self._block_container = QWidget()
+        # Transparent inner widget: each block card is the visible box.
+        self._block_container.setProperty("class", "card-inner")
         self._blocks_layout = QVBoxLayout(self._block_container)
         self._blocks_layout.setContentsMargins(0, 0, 0, 0)
 
-        self._add_btn = QPushButton(add_btn_text)
-        self._add_btn.clicked.connect(self._on_add_block_clicked)
-        self._add_btn_layout = QHBoxLayout()
-        self._add_btn_layout.addStretch()
-        self._add_btn_layout.addWidget(self._add_btn)
-        self._add_btn_layout.addStretch()
-        self._blocks_layout.addLayout(self._add_btn_layout)
+        self._add_btn = None
+        self._add_btn_layout = None
+        if show_add:
+            self._add_btn = QPushButton(add_btn_text)
+            self._add_btn.clicked.connect(self._on_add_block_clicked)
+            self._add_btn_layout = QHBoxLayout()
+            self._add_btn_layout.addStretch()
+            self._add_btn_layout.addWidget(self._add_btn)
+            self._add_btn_layout.addStretch()
+            self._blocks_layout.addLayout(self._add_btn_layout)
 
         self._controls_layout.addWidget(self._block_container)
 
@@ -81,16 +96,21 @@ class BlockContainerPanel(BaseStepPanel):
         channels = channels or self._channels
         idx = len(self._blocks)
         block = self._block_widget_class(idx, channels, parent=self._block_container, **kwargs)
+        # Custom QWidget subclasses only paint their stylesheet background
+        # with this attribute set; each block is its own rounded box.
+        block.setAttribute(Qt.WA_StyledBackground, True)
         self._connect_block_signals(block)
         self._compact_block(
             block, excluded=getattr(self, "_compact_excluded_object_names", ()) or ())
-        # Move add button to bottom
-        self._blocks_layout.removeItem(self._add_btn_layout)
+        # Move add button to bottom (no-op for fixed single-block panels).
+        if self._add_btn_layout is not None:
+            self._blocks_layout.removeItem(self._add_btn_layout)
         if self._blocks:
-            self._blocks_layout.addSpacing(4)
+            self._blocks_layout.addSpacing(8)
         self._blocks.append(block)
         self._blocks_layout.addWidget(block)
-        self._blocks_layout.addLayout(self._add_btn_layout)
+        if self._add_btn_layout is not None:
+            self._blocks_layout.addLayout(self._add_btn_layout)
         return block
 
     def _remove_block_generic(self, block: QWidget) -> None:
@@ -169,7 +189,8 @@ class BlockContainerPanel(BaseStepPanel):
         self._restore_active = True
         self._masks_populated = False
         self._remove_all_blocks()
-        self._blocks_layout.removeItem(self._add_btn_layout)
+        if self._add_btn_layout is not None:
+            self._blocks_layout.removeItem(self._add_btn_layout)
 
         last_channels = self._last_channels or self._channels
         last_masks = self._last_masks
@@ -178,8 +199,9 @@ class BlockContainerPanel(BaseStepPanel):
             if not isinstance(cfg, dict):
                 continue
             if self._blocks:
-                self._blocks_layout.addSpacing(4)
+                self._blocks_layout.addSpacing(8)
             block = self._block_widget_class(len(self._blocks), last_channels, parent=self._block_container)
+            block.setAttribute(Qt.WA_StyledBackground, True)
             self._connect_block_signals(block)
             self._apply_block_config(block, cfg)
             self._compact_block(
@@ -187,7 +209,8 @@ class BlockContainerPanel(BaseStepPanel):
             self._blocks.append(block)
             self._blocks_layout.addWidget(block)
 
-        self._blocks_layout.addLayout(self._add_btn_layout)
+        if self._add_btn_layout is not None:
+            self._blocks_layout.addLayout(self._add_btn_layout)
         if last_channels:
             self.populate_channels(last_channels)
         elif last_masks:

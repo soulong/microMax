@@ -45,6 +45,8 @@ class FilterPanel(BaseStepPanel):
 
     def _build_controls(self) -> None:
         self._filters_container = QWidget()
+        # Transparent inner widget: the Filter card itself is the visible box.
+        self._filters_container.setProperty("class", "card-inner")
         self._filters_layout = QVBoxLayout(self._filters_container)
         self._filters_layout.setContentsMargins(0, 0, 0, 0)
         self._filters_layout.setSpacing(4)
@@ -54,14 +56,14 @@ class FilterPanel(BaseStepPanel):
 
         btn_row = QHBoxLayout()
         self._add_btn = QPushButton("+ Add Filter")
-        self._add_btn.setProperty("class", "secondary")
         self._add_btn.clicked.connect(self._add_filter_row)
         self._reset_btn = QPushButton("Reset All")
-        self._reset_btn.setProperty("class", "secondary")
         self._reset_btn.clicked.connect(self._reset_filters)
         btn_row.addWidget(self._add_btn)
-        btn_row.addWidget(self._reset_btn)
+        # Reset All sits at the far right, separated from the add button.
         btn_row.addStretch()
+        btn_row.addSpacing(12)
+        btn_row.addWidget(self._reset_btn)
         self._controls_layout.addLayout(btn_row)
 
     # ── Filter rows ─────────────────────────────────────────────────────
@@ -89,10 +91,15 @@ class FilterPanel(BaseStepPanel):
         pat_edit.setPlaceholderText("regex pattern…")
         pat_edit.setClearButtonEnabled(True)
         remove_btn = QPushButton("✕")
-        remove_btn.setFixedSize(28, 28)
-        remove_btn.setProperty("class", "danger")
+        remove_btn.setFixedSize(26, 26)
+        # Icon-sized button: the canonical button padding would squeeze the
+        # glyph out of a square; 26px keeps the shared button height.
+        remove_btn.setStyleSheet("padding: 0;")
+        remove_btn.setToolTip("Remove this filter row")
         row.addWidget(col_combo)
         row.addWidget(pat_edit, 1)
+        # A small gap keeps the row-delete button clear of the pattern text.
+        row.addSpacing(8)
         row.addWidget(remove_btn)
         widgets = (col_combo, pat_edit, remove_btn)
         self._filter_widgets.append(widgets)

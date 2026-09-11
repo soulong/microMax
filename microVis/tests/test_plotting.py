@@ -89,6 +89,8 @@ def test_figures_build():
     for fig in (scatter, line, box, bar):
         assert fig is not None
         assert len(fig.axes) >= 1
+        # The Data page shows no plot title — the axes labels carry the info.
+        assert fig.get_suptitle() == ""
 
 
 def test_line_groups_and_sem_points():
@@ -170,3 +172,24 @@ def test_categorical_x_and_y_are_plottable():
     assert box.axes[0].get_yticks().size == 2
     bar = P.make_barplot_mean_sem(df, y="condition", x="well")
     assert bar.axes[0].get_yticks().size == 2
+
+
+def test_legends_sit_outside_the_axes():
+    """Every figure legend lives in the right strip, never on the data."""
+    df = _df()
+    figs = [
+        P.make_scatter(df, x="value", y="area", color="condition", size="area"),
+        P.make_scatter(df, x="value", y="area", color="condition",
+                       facet_cols=["well"], ncols=2),
+        P.make_boxplot(df, y="value", x="condition", color="condition"),
+        P.make_barplot_mean_sem(df, y="value", x="well", color="condition"),
+        P.make_line(df, y="value", x="well", color="condition"),
+    ]
+    for fig in figs:
+        fig.canvas.draw()
+        width = fig.bbox.width
+        axes_right = max(ax.get_window_extent().x1 for ax in fig.axes) / width
+        assert fig.legends, "expected at least one figure legend"
+        for leg in fig.legends:
+            assert leg.get_window_extent().x0 / width >= axes_right - 0.005, (
+                "a legend overlaps the plot area")

@@ -5,7 +5,6 @@ import re
 from pathlib import Path
 from typing import Optional
 
-import yaml
 import warnings
 
 from PySide6.QtCore import Qt, QEvent, QObject
@@ -30,7 +29,6 @@ from PySide6.QtWidgets import (
 
 from microBase import (
     SessionFile,
-    normalize_null_strings,
     DEFAULT_IMAGE_PATTERN,
     DEFAULT_MASK_PATTERN,
     DEFAULT_IMAGE_SUBDIR_PATTERN,
@@ -40,6 +38,9 @@ from microProfiler.gui.pipeline_controller import PipelineController
 from microProfiler.gui.state import PipelineState
 from microProfiler.gui.ui_spec import (
     PAGE_MARGIN,
+    PANEL_CONTENT_STYLE,
+    PATTERN_EDIT_STYLE,
+    PATTERN_LABEL_STYLE,
     SCROLL_CONTENT_SPACING,
     STATUS_BAR_HEIGHT,
     WINDOW_SIZE,
@@ -48,6 +49,11 @@ from microProfiler.gui.ui_spec import (
 from microProfiler.gui.workers.preview_worker import PreviewWorker
 from microProfiler.gui.workers.dataset_load_worker import DatasetLoadWorker
 from microProfiler.gui.sidebar import Sidebar
+from microProfiler.user_defaults import (
+    ensure_user_defaults,
+    get_user_defaults,
+    update_user_defaults,
+)
 from microProfiler.gui.panels import (
     BaSiCStepPanel, FilterPanel,
     ImageProfilingStepPanel, InferenceStepPanel, ObjectProfilingStepPanel,
@@ -56,7 +62,7 @@ from microProfiler.gui.panels import (
 from microProfiler.gui.panels.base_step_panel import BaseStepPanel
 from microProfiler.gui.image_widgets import ImageViewer
 from microProfiler.gui.dpi import dp
-from microProfiler.log_utils import setup_logging
+from microProfiler.log_utils import set_log_file, setup_logging
 
 
 class WindowWheelFilter(QObject):
@@ -94,6 +100,13 @@ class WindowWheelFilter(QObject):
         return scroll
 
 
+def _pattern_label(text: str) -> QLabel:
+    """Pattern-row label on the shared 9pt panel scale (Input page)."""
+    lbl = QLabel(text)
+    lbl.setStyleSheet(PATTERN_LABEL_STYLE)
+    return lbl
+
+
 class MainWindow(QMainWindow):
 
     def __init__(self):
@@ -105,8 +118,8 @@ class MainWindow(QMainWindow):
         self._pending_filters = None
 
         self.setWindowTitle("microProfiler")
-        self.resize(*WINDOW_SIZE)
         self.setMinimumSize(*WINDOW_SIZE)
+        self._restore_window_size()
         self._running = False
 
         setup_logging(clear_existing=False)
@@ -299,6 +312,9 @@ class MainWindow(QMainWindow):
 
         # ── Page 0: Input + Filter ────────────────────────────────────
         input_page = QWidget()
+        # The Input page is a control panel: same 9pt content scale as the
+        # step cards.
+        input_page.setStyleSheet(PANEL_CONTENT_STYLE)
         input_layout = QVBoxLayout(input_page)
         input_layout.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN,
                                         PAGE_MARGIN, PAGE_MARGIN)
@@ -311,36 +327,45 @@ class MainWindow(QMainWindow):
         self._input_dir = QLineEdit()
         enable_path_drop(self._input_dir)
         self._input_browse = QPushButton("Browse...")
-        self._input_browse.setProperty("class", "secondary")
-        input_row = QHBoxLayout()
-        input_row.addWidget(self._input_dir, 1)
-        input_row.addWidget(self._input_browse)
-        input_form.addRow("Input dir:", input_row)
-
         self._load_dataset_btn = run_button("Load Dataset")
-        format_row = QHBoxLayout()
-        format_row.addStretch()
-        format_row.addWidget(self._load_dataset_btn)
-        format_row.addStretch()
-        input_form.addRow(format_row)
+        # Requested: twice the natural caption length.
+        self._load_dataset_btn.ensurePolished()
+        self._load_dataset_btn.setFixedWidth(
+            self._load_dataset_btn.sizeHint().width() * 2)
+        self._reset_btn = QPushButton("Reset")
+        self._reset_btn.setToolTip("Reset the pipeline and clear the dataset")
+        input_row = QHBoxLayout()
+        # The path box takes 2/3 of the free width; Browse / Load Dataset
+        # follow it immediately and the remaining third stays empty before
+        # the right-aligned Reset.
+        input_row.addWidget(self._input_dir, 2)
+        input_row.addWidget(self._input_browse)
+        input_row.addWidget(self._load_dataset_btn)
+        input_row.addStretch(1)
+        input_row.addSpacing(12)
+        input_row.addWidget(self._reset_btn)
+        input_form.addRow("Dataset:", input_row)
 
         img_row = QHBoxLayout()
         self._custom_image_pattern = QLineEdit()
+        self._custom_image_pattern.setStyleSheet(PATTERN_EDIT_STYLE)
         self._custom_image_pattern.setPlaceholderText(r"(?P<well>[A-Z]\d+)_f(?P<field>\d+)_ch(?P<channel>\d+)\.tif")
         img_row.addWidget(self._custom_image_pattern, 1)
-        input_form.addRow("Image pattern:", img_row)
+        input_form.addRow(_pattern_label("Image pattern:"), img_row)
 
         mask_row = QHBoxLayout()
         self._custom_mask_pattern = QLineEdit()
+        self._custom_mask_pattern.setStyleSheet(PATTERN_EDIT_STYLE)
         self._custom_mask_pattern.setPlaceholderText(r".*_masks_(?P<mask_name>.+)\.png")
         mask_row.addWidget(self._custom_mask_pattern, 1)
-        input_form.addRow("Mask pattern:", mask_row)
+        input_form.addRow(_pattern_label("Mask pattern:"), mask_row)
 
         search_row = QHBoxLayout()
         self._custom_image_subdir_pattern = QLineEdit()
+        self._custom_image_subdir_pattern.setStyleSheet(PATTERN_EDIT_STYLE)
         self._custom_image_subdir_pattern.setPlaceholderText("Leave empty to search directly")
         search_row.addWidget(self._custom_image_subdir_pattern, 1)
-        input_form.addRow("Image subdir:", search_row)
+        input_form.addRow(_pattern_label("Image subdir:"), search_row)
 
         self._dataset_info_label = QLabel("")
         self._dataset_info_label.setWordWrap(True)
@@ -350,10 +375,13 @@ class MainWindow(QMainWindow):
 
         input_layout.addWidget(input_group)
 
-        # Filter section inside input tab (no outer QGroupBox wrapper)
-        input_layout.addWidget(self._filter_panel)
+        # Filter section inside the input tab: it gets only a small share of
+        # the leftover height (requested: half its previous allocation), so
+        # the trailing spacer absorbs the rest while extra filter rows can
+        # still grow the box.
+        input_layout.addWidget(self._filter_panel, 1)
 
-        input_layout.addStretch()
+        input_layout.addStretch(3)
         self._stack.addWidget(input_page)
 
         # ── Pages 1-4: one scrollable page per pipeline stage ──────────
@@ -428,13 +456,12 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self):
         self._sidebar.navigation_changed.connect(self._on_navigation_changed)
-        self._sidebar.load_config_clicked.connect(self._load_config)
-        self._sidebar.reset_all_clicked.connect(self._reset_all)
         self._sidebar.thread_count_changed.connect(self._on_thread_count_changed)
         self._sidebar.display_range_changed.connect(self._on_vmin_vmax_changed)
         self._input_browse.clicked.connect(self._browse_input)
         self._input_dir.textChanged.connect(self._on_input_dir_edited)
         self._load_dataset_btn.clicked.connect(self._load_dataset)
+        self._reset_btn.clicked.connect(self._reset_all)
         self._sidebar.run_all_clicked.connect(self._ctrl.run_all)
         self._run_pre_btn.clicked.connect(self._ctrl.run_preprocessing)
         self._run_seg_btn.clicked.connect(self._ctrl.run_segmentation)
@@ -635,6 +662,9 @@ class MainWindow(QMainWindow):
 
             self._update_dataset_info(ds)
 
+            # Mirror the terminal log into the dataset directory (one log per
+            # dataset; a later load retargets the file handler).
+            set_log_file(Path(input_path) / "microProfiler.log")
             logging.getLogger("microProfiler").info(
                 f"Dataset loaded: {len(ds)} rows, channels={ds.intensity_colnames}"
             )
@@ -731,6 +761,31 @@ class MainWindow(QMainWindow):
         else:
             self.setWindowTitle("microProfiler")
 
+    # ── Window state (~/.micromax) ───────────────────────────────────────
+
+    def _restore_window_size(self) -> None:
+        """Start at the last closed window size (fallback: WINDOW_SIZE)."""
+        window = get_user_defaults().get("window") or {}
+        try:
+            width = int(window.get("width", 0))
+            height = int(window.get("height", 0))
+        except (TypeError, ValueError):
+            width = height = 0
+        if width >= WINDOW_SIZE[0] and height >= WINDOW_SIZE[1]:
+            self.resize(width, height)
+        else:
+            self.resize(*WINDOW_SIZE)
+
+    def _save_window_size(self) -> None:
+        """Remember the current window size for the next start.
+
+        A maximized window stores its normal (restored) size so the next
+        start comes up with a sensible non-maximized geometry.
+        """
+        size = self.normalGeometry().size() if self.isMaximized() else self.size()
+        update_user_defaults(
+            "window", {"width": int(size.width()), "height": int(size.height())})
+
     def _update_tab_status(self) -> None:
         ds = self._state.dataset
         has_ds = ds is not None and len(ds) > 0
@@ -801,44 +856,7 @@ class MainWindow(QMainWindow):
         self._dataset_info_label.setProperty("class", "placeholder")
         self._dataset_info_label.style().polish(self._dataset_info_label)
 
-    # ── Config load / reset ─────────────────────────────────────────────
-
-    def _load_config(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Config File", "",
-            "YAML files (*.yml *.yaml);;All files (*)",
-        )
-        if not file_path:
-            return
-        try:
-            with open(file_path, encoding="utf-8") as f:
-                data = normalize_null_strings(yaml.safe_load(f) or {})
-        except Exception as e:
-            logging.getLogger("microProfiler").error("Failed to load config: %s", e)
-            return
-        params = {k: v for k, v in data.items() if not k.startswith("_")}
-        # Top-level patterns + filter are part of the PipelineConfig schema;
-        # apply them to the GUI too (not only the step sections).
-        if data.get("image_pattern"):
-            self.set_image_pattern(data["image_pattern"])
-        if data.get("mask_pattern"):
-            self.set_mask_pattern(data["mask_pattern"])
-        if data.get("image_subdir_pattern"):
-            self._custom_image_subdir_pattern.setText(data["image_subdir_pattern"])
-        if data.get("filter"):
-            self._filter_panel.load_from_settings({"filter": {"filters": data["filter"]}})
-        for step in self._all_step_panels:
-            step.from_config(params.get(step.step_name, {}))
-        if self._state.dataset is not None:
-            self.refresh_step_panels(
-                self._state.dataset.intensity_colnames,
-                self._state.dataset.mask_colnames,
-            )
-        applied = data.get("applied_steps", [])
-        for step in self._all_step_panels:
-            if step.step_name in applied:
-                step.setChecked(True)
-        logging.getLogger("microProfiler").info("Config loaded from %s", file_path)
+    # ── Reset ───────────────────────────────────────────────────────────
 
     def _reset_all(self) -> None:
         if self._running:
@@ -867,12 +885,12 @@ class MainWindow(QMainWindow):
         self._clear_dataset_info()
         self._update_window_title()
         self._update_tab_status()
-        logging.getLogger("microProfiler").info("Pipeline reset complete.")
 
     def _set_running(self, running: bool) -> None:
         self._running = running
         self._input_browse.setEnabled(not running)
         self._load_dataset_btn.setEnabled(not running)
+        self._reset_btn.setEnabled(not running)
         for step in self._all_step_panels:
             step.setEnabled(not running)
         self._filter_panel.setEnabled(not running)
@@ -880,6 +898,12 @@ class MainWindow(QMainWindow):
         self._sidebar.set_cancel_visible(running)
 
     def closeEvent(self, event):
+        # Remember the window size and complete the shared GUI config before
+        # any shutdown work so a slow/cancelled worker never prevents the
+        # geometry/preferences from being persisted.
+        self._save_window_size()
+        ensure_user_defaults(
+            "inference", {"model": None, "reducer": None, "cluster": None})
         # Cooperative shutdown: signal every worker's cancel flag and wait.
         # Threads are never terminated while they execute Python code.
         workers = [self._ctrl._worker, self._ctrl._preview_worker]

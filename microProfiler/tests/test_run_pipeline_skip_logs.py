@@ -55,3 +55,14 @@ def test_run_all_enabled_step_still_logs_skip(tmp_path, caplog):
         run_pipeline(cfg, root_dir=tmp_path, ds=ds)
 
     assert "Skipping resize — already applied in previous run" in caplog.text
+
+
+def test_run_pipeline_mirrors_terminal_log_into_dataset(tmp_path):
+    """The terminal log is also written to <dataset>/microProfiler.log."""
+    ds = _make_dataset(tmp_path)
+    run_pipeline(PipelineConfig(), root_dir=tmp_path, ds=ds)
+
+    log_path = tmp_path / "microProfiler.log"
+    assert log_path.exists()
+    text = log_path.read_text(encoding="utf-8")
+    assert "Pipeline start" in text

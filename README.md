@@ -92,19 +92,19 @@ Notes:
 microprofiler
 ```
 
-Five-page flow: **Input → Pre-process → Segment → Profile → Inference**.
+Five-page flow: **Input → Preprocess → Segmentation → Profiling → Inference**.
 
 1. **Input** — Browse to a dataset folder, then press **Load Dataset**.
    The image/mask filename patterns are matched against your file naming.
    Optional filters narrow the dataset by metadata column (e.g. well).
-2. **Pre-process** (optional) — enable any of: resize, Z-projection (needs a
+2. **Preprocess** (optional) — enable any of: resize, Z-projection (needs a
    `stack` metadata column), BaSiC illumination correction, tiling (needs a
    `field` column). Run with **Run Preprocessing**. Steps run only when
    enabled — nothing runs by default.
-3. **Segment** — configure one or more Cellpose runs (object name, model,
+3. **Segmentation** — configure one or more Cellpose runs (object name, model,
    channels, diameter, thresholds), then **Run Segmentation**. Masks are
    written next to the images as `<stem>_cp_masks_<name>.png`.
-4. **Profile** — choose image-level intensity features and per-object
+4. **Profiling** — choose image-level intensity features and per-object
    features (shape, intensity, radial profiles, granularity, GLCM,
    correlations), then **Run Profiling**. Results go into
    `<dataset>/profiler.db` (tables `image`, plus one table per object type).

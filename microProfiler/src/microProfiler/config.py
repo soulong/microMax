@@ -211,8 +211,11 @@ class InferenceReductionConfig:
         tables. `reducer` takes one or MORE pre-fitted reducer pickles
         (pca / umap / pacmap / localmap; the type of each is detected when
         the microModel config is built, and they run in listed order);
-        null = fit `method` fresh (default [pca, umap]). When reducers are
-        given, the `method` selection is ignored entirely (transform only).
+        with no reducer, `method` lists the methods to fit fresh — an
+        EMPTY list means nothing is fitted, null keeps the legacy default
+        ([pca, umap] when enabled, [pca] for a cluster-only run). When
+        reducers are given, the `method` selection is ignored entirely
+        (transform only).
     cluster_enabled + cluster: the Cluster group — predict-only clustering
         from a baseline cluster.pkl (its stored kNN models label every
         object, cluster IDs stay baseline-aligned) writing the find_cluster
@@ -525,7 +528,17 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
                         f"entries {bad}; valid: ['pca', 'umap', 'pacmap', 'localmap']")
             entry.reduction = red_obj
             if red_obj is not None:
-                red_runs = bool(red_obj.enabled
+                # A checked Dimension-reduction group only runs when reducers
+                # or methods are configured; an empty method list means
+                # "nothing fitted" and needs no features. The Cluster group
+                # needs its cluster.pkl (and the feature BLOB for its PCA
+                # reference).
+                dr_will_run = bool(
+                    red_obj.enabled
+                    and (red_obj.reducer
+                         or red_obj.method is None
+                         or red_obj.method))
+                red_runs = bool(dr_will_run
                                 or (red_obj.cluster_enabled and red_obj.cluster))
                 if red_runs and not entry.feature:
                     raise ValueError(

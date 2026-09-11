@@ -94,13 +94,17 @@ def expected_reduction_tables(entry) -> frozenset:
                 raise RuntimeError(
                     f"Cannot read reducer pickle {path}: {e}") from e
     else:
-        # Same defaulting as _build_mm_inference_config: explicit method wins,
-        # otherwise [pca] for a cluster-only run and [pca, umap] when the
-        # dimension-reduction group itself is enabled.
+        # Same defaulting as _build_mm_inference_config: explicit method wins
+        # (an EMPTY list means nothing fitted), otherwise [pca] for a
+        # cluster-only run and [pca, umap] when the dimension-reduction
+        # group itself is enabled. A checked Cluster group keeps its PCA
+        # reference even when no DR method is selected.
         methods = set(
             red.method if red.method is not None
             else (["pca", "umap"] if red.enabled else ["pca"])
         )
+        if not methods and cluster_active:
+            methods = {"pca"}
     tables = {reduction_table_name(m) for m in methods}
     if cluster_active or red.cluster_res:
         tables.add(FIND_CLUSTER_TABLE)
@@ -348,13 +352,22 @@ def _build_mm_inference_config(entry, cfg: PipelineConfig, ds, root_dir: Path) -
                 red_cfg[f"reduction_{kind}"] = os.path.abspath(str(path))
             red_cfg["method"] = kinds
         else:
-            # No reducer: fit fresh. Cluster-only runs keep it cheap — PCA
-            # alone provides the ID-ordering reference (a reduction table
-            # per method is always a byproduct of run_reduction).
-            red_cfg["method"] = (
-                entry.reduction.method if entry.reduction.method is not None
-                else (["pca", "umap"] if entry.reduction.enabled else ["pca"])
-            )
+            # No reducer: fit fresh. An explicit EMPTY method list means
+            # "nothing fitted" (the GUI default) — microModel would treat an
+            # empty list as its pca+umap fallback, so the reduction stage is
+            # simply not scheduled. A checked Cluster group still needs the
+            # PCA reference embedding and falls back to [pca]; the None
+            # (absent key) fallback keeps the legacy default for CLI configs.
+            if entry.reduction.method is not None:
+                methods = list(entry.reduction.method)
+            else:
+                methods = (["pca", "umap"] if entry.reduction.enabled else ["pca"])
+            if not methods:
+                if cluster_active:
+                    methods = ["pca"]
+                else:
+                    return mm_cfg
+            red_cfg["method"] = methods
         mm_cfg["reduction"] = red_cfg
     return mm_cfg
 

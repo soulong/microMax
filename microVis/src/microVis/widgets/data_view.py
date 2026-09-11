@@ -12,7 +12,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from microVis.widgets.ui_spec import COMPACT_LINE_EDIT_STYLE, FORM_LABEL_WIDTH_WIDE
+from microVis.widgets.ui_spec import (
+    COMPACT_LINE_EDIT_STYLE,
+    FORM_LABEL_WIDTH_WIDE,
+    PATTERN_EDIT_STYLE,
+    PATTERN_LABEL_STYLE,
+)
 
 DEFAULT_MERGE_DB = "merge.db"
 
@@ -21,7 +26,8 @@ class DataView(QWidget):
     """Data tab: dataset selection + DB selection + ONE integrated plot area.
 
     The dataset directory is a type/browse/drop line edit (same style as
-    microProfiler's Input dir). "Select DB" accepts any number of profiler
+    microProfiler's Input dir). The DB "Browse..." button accepts any number
+    of profiler
     and/or infer DB files of the current dataset; their objects are merged
     into one table rendered by the single plot view set via
     :meth:`set_plot_view`. "Write to DB" persists the integrated table
@@ -40,92 +46,111 @@ class DataView(QWidget):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        # Scoped style hook: the Data page's buttons are compact (see
-        # QWidget#data-view rules in resources/style.qss).
+        # Scoped style hook: the Data page uses the shared 9pt page scale and
+        # its controls live in titleless rounded boxes (see the
+        # QWidget#data-view and panel-box rules in resources/style.qss).
         self.setObjectName("data-view")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
+        # Outer margin lines the Data page boxes up with the Image page's
+        # control boxes (the Image page adds a 6px pane margin on top of a
+        # 2px page margin, so 8px here lands the same x).
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
         # All fixed controls live in one top container whose height is capped
         # at its size hint: the plot area below absorbs the extra space, so
         # the controls never drift to the bottom when the page is empty.
         top = QWidget()
+        top.setProperty("class", "panel-box")
         top.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         top_layout = QVBoxLayout(top)
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.setSpacing(8)
+        # Compact inner rail: the plot area below should dominate the page.
+        top_layout.setContentsMargins(12, 6, 12, 6)
+        top_layout.setSpacing(4)
 
-        # ── Row 1: dataset path line edit + browse + Reset ──
+        # ── Row 1: dataset path line edit + Browse + Load Dataset + Reset ──
         row1 = QHBoxLayout()
         row1.setAlignment(Qt.AlignBottom)
+        dataset_lbl = QLabel("Dataset:")
+        dataset_lbl.setFixedWidth(FORM_LABEL_WIDTH_WIDE)
+        dataset_lbl.setStyleSheet(PATTERN_LABEL_STYLE)
+        row1.addWidget(dataset_lbl)
         self._dataset_edit = QLineEdit()
         self._dataset_edit.setPlaceholderText(
             "Dataset directory — type, browse, or drop a folder here")
-        row1.addWidget(self._dataset_edit, 1)
+        # The path box takes 2/3 of the free width; Browse / Load Dataset
+        # follow it immediately and the last third feeds the reset side.
+        row1.addWidget(self._dataset_edit, 2)
 
         self._btn_dataset_browse = QPushButton("Browse...")
-        self._btn_dataset_browse.setProperty("class", "primary")
         self._btn_dataset_browse.setToolTip("Browse for a dataset directory")
         self._btn_dataset_browse.clicked.connect(self.dataset_browse_clicked)
         row1.addWidget(self._btn_dataset_browse)
 
+        self._btn_load_dataset = QPushButton("Load Dataset")
+        # Requested: twice the natural caption length.
+        self._btn_load_dataset.ensurePolished()
+        self._btn_load_dataset.setFixedWidth(
+            self._btn_load_dataset.sizeHint().width() * 2)
+        self._btn_load_dataset.setEnabled(False)
+        self._btn_load_dataset.clicked.connect(self.load_dataset_clicked)
+        row1.addWidget(self._btn_load_dataset)
+
         self._btn_reset = QPushButton("Reset")
-        self._btn_reset.setProperty("class", "primary")
         self._btn_reset.setEnabled(False)
         self._btn_reset.clicked.connect(self.reset_clicked)
+        # Reset is a destructive action: keep it at the far right with a gap.
+        row1.addStretch(1)
+        row1.addSpacing(12)
         row1.addWidget(self._btn_reset)
         top_layout.addLayout(row1)
 
         # ── Pattern inputs (always visible so the button row never moves) ──
 
-        # Helper to build a label+input row
-        def _pattern_row(label_text: str, placeholder: str) -> tuple[QWidget, QLineEdit]:
+        # Helper to build a label+input row. The row is added as a LAYOUT
+        # directly (no wrapper QWidget): a wrapper would paint the global
+        # QWidget background over the box and create a shaded band.
+        def _pattern_row(label_text: str, placeholder: str) -> tuple[QHBoxLayout, QLineEdit]:
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(6)
             lbl = QLabel(label_text)
             lbl.setFixedWidth(FORM_LABEL_WIDTH_WIDE)
-            lbl.setStyleSheet("font-weight: bold; color: #7a9aaa;")
+            lbl.setStyleSheet(PATTERN_LABEL_STYLE)
             row.addWidget(lbl)
             edit = QLineEdit()
             edit.setPlaceholderText(placeholder)
-            edit.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
+            edit.setStyleSheet(PATTERN_EDIT_STYLE)
             row.addWidget(edit, stretch=1)
-            container = QWidget()
-            container.setLayout(row)
-            return container, edit
+            return row, edit
 
         pat1, self._pattern_image_edit = _pattern_row(
-            "Image Pattern",
+            "Image pattern:",
             r"e.g. (?P<field>\d+)...ch(?P<channel>\d+)\.tiff",
         )
-        top_layout.addWidget(pat1)
+        top_layout.addLayout(pat1)
 
         pat2, self._pattern_mask_edit = _pattern_row(
-            "Mask Pattern",
+            "Mask pattern:",
             r"e.g. ...cp_masks_(?P<mask_name>.+)\.png",
         )
-        top_layout.addWidget(pat2)
+        top_layout.addLayout(pat2)
 
         pat3, self._pattern_subdir_edit = _pattern_row(
-            "Image Subdir",
+            "Image subdir:",
             "e.g. Images/  (leave empty to scan root)",
         )
-        top_layout.addWidget(pat3)
+        top_layout.addLayout(pat3)
 
-        # ── Button row: Load Dataset + Select DB + metadata actions ──
+        # ── Button row: Select DB (+ source status) + metadata actions ──
         btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(0, 4, 0, 0)
+        btn_row.setContentsMargins(0, 0, 0, 0)
 
-        self._btn_load_dataset = QPushButton("Load Dataset")
-        self._btn_load_dataset.setProperty("class", "primary")
-        self._btn_load_dataset.setEnabled(False)
-        self._btn_load_dataset.clicked.connect(self.load_dataset_clicked)
-        btn_row.addWidget(self._btn_load_dataset)
-
-        self._btn_select_db = QPushButton("Select DB")
-        self._btn_select_db.setProperty("class", "primary")
+        self._btn_select_db = QPushButton("Select DB(s)")
+        # Requested: twice the natural caption length.
+        self._btn_select_db.ensurePolished()
+        self._btn_select_db.setFixedWidth(
+            self._btn_select_db.sizeHint().width() * 2)
         self._btn_select_db.setEnabled(False)
         self._btn_select_db.setToolTip(
             "Pick one or more profiler.db and/or infer.db files of THIS "
@@ -135,28 +160,37 @@ class DataView(QWidget):
         self._btn_select_db.clicked.connect(self.select_db_clicked)
         btn_row.addWidget(self._btn_select_db)
 
+        # Fused-source readout: "a.db + b.db (+ metadata) -> merge".
+        self._db_status_label = QLabel("")
+        self._db_status_label.setStyleSheet(
+            "font-size: 8pt; color: #888888;")
+        btn_row.addWidget(self._db_status_label)
+
         btn_row.addStretch()
 
         self._btn_meta_browse = QPushButton("Select Metadata")
-        self._btn_meta_browse.setProperty("class", "primary")
         self._btn_meta_browse.setEnabled(False)
         self._btn_meta_browse.clicked.connect(self.metadata_browse_clicked)
         btn_row.addWidget(self._btn_meta_browse)
 
         self._btn_merge = QPushButton("Merge")
-        self._btn_merge.setProperty("class", "primary")
         self._btn_merge.setEnabled(False)
         self._btn_merge.clicked.connect(self.metadata_merge_clicked)
         btn_row.addWidget(self._btn_merge)
 
+        # Clear (reset the merged metadata) sits at the right of the merge
+        # pair with a gap from Merge.
+        btn_row.addSpacing(12)
         self._btn_meta_clear = QPushButton("Clear")
-        self._btn_meta_clear.setProperty("class", "primary")
         self._btn_meta_clear.setEnabled(False)
         self._btn_meta_clear.clicked.connect(self.metadata_clear_clicked)
         btn_row.addWidget(self._btn_meta_clear)
 
+        # Gap so "Clear" (destructive-ish) and "Write to DB" cannot be
+        # mis-clicked as neighbours (large, per request).
+        btn_row.addSpacing(32)
+
         self._btn_write_db = QPushButton("Write to DB")
-        self._btn_write_db.setProperty("class", "primary")
         self._btn_write_db.setEnabled(False)
         self._btn_write_db.setToolTip(
             "Write the integrated table (profiler + infer + merged metadata "
@@ -238,6 +272,13 @@ class DataView(QWidget):
         """Write to DB needs merged DB data (not the Excel metadata)."""
         self._btn_write_db.setEnabled(enabled)
 
+    def set_db_status(self, text: str) -> None:
+        """Fused-source readout shown right after the DB Browse button.
+
+        Example: ``profiler.db + infer.db (+ metadata) -> merge``.
+        """
+        self._db_status_label.setText(text)
+
     def set_db_buttons_enabled(self, enabled: bool) -> None:
         self._btn_select_db.setEnabled(enabled)
 
@@ -266,7 +307,12 @@ class DataView(QWidget):
         self._plot_view = None
 
     def reset(self) -> None:
-        """Reset to initial startup state."""
+        """Reset to initial startup state.
+
+        The installed plot view stays installed (MainWindow clears its
+        figure separately): removing it here made the whole lower half —
+        controls and canvas — disappear forever after a Reset.
+        """
         self._dataset_edit.clear()
         self._pattern_image_edit.clear()
         self._pattern_mask_edit.clear()
@@ -278,7 +324,7 @@ class DataView(QWidget):
         self._btn_merge.setEnabled(False)
         self._btn_meta_clear.setEnabled(False)
         self._btn_write_db.setEnabled(False)
-        self.clear_plot_view()
+        self._db_status_label.clear()
 
     def _on_write_to_db(self) -> None:
         reply = QMessageBox.question(

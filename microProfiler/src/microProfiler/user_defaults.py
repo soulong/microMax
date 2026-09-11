@@ -1,10 +1,14 @@
-"""User-level defaults persisted under ``~/.micromax``.
+"""User-level GUI defaults shared by microProfiler and microVis.
 
-Per-USER, cross-dataset state (``session.yml`` is the per-dataset layer).
-Today: microProfiler's inference step remembers the last run's model
-bundle, reducer pickle(s) and baseline cluster.pkl, so the next GUI start
-pre-fills the Inference panel with them. The file is merged key-wise
-(unknown future keys survive) and written atomically.
+The single config file lives at ``~/.micromax`` (a FILE, not a directory);
+microProfiler owns the ``microprofiler`` section of it and microVis the
+``microvis`` section, so both GUIs share one file while keeping their own
+state. It is GUI-preferences only — the pipeline run config is a separate
+YAML passed to the CLI.
+
+Today microProfiler stores its remembered inference inputs (last run's model
+bundle, reducer pickle(s) and baseline cluster.pkl) and the main window size
+there. Updates are key-merged (unknown future keys survive) and atomic.
 """
 
 from __future__ import annotations
@@ -16,21 +20,29 @@ from microBase.config import load_yaml, save_yaml
 
 logger = logging.getLogger(__name__)
 
-DEFAULTS_DIR = Path.home() / ".micromax"
-DEFAULTS_FILE = DEFAULTS_DIR / "microprofiler.yml"
+# The shared GUI config file: ONE file for both desktop GUIs.
+DEFAULTS_FILE = Path.home() / ".micromax"
+# This app's top-level section inside the shared file.
+_APP_SECTION = "microprofiler"
 
 
 def get_user_defaults() -> dict:
-    """The whole user-defaults file as a dict ({} when absent/unreadable)."""
+    """This app's section of the shared ``~/.micromax`` config.
+
+    Returns {} when the file is absent/unreadable or the section is missing.
+    """
+    if not DEFAULTS_FILE.exists():
+        return {}
     try:
-        return load_yaml(DEFAULTS_FILE) or {}
+        data = load_yaml(DEFAULTS_FILE) or {}
     except Exception:
         logger.warning("Could not read %s", DEFAULTS_FILE, exc_info=True)
         return {}
+    return data.get(_APP_SECTION) or {}
 
 
 def update_user_defaults(section: str, updates: dict) -> None:
-    """Deep-merge ``updates`` into ``<section>`` of the user-defaults file.
+    """Deep-merge ``updates`` into ``microprofiler.<section>`` of ``~/.micromax``.
 
     Stored values should be ABSOLUTE paths — the defaults must survive
     whatever dataset or CWD the next run starts from. A None value overwrites
@@ -39,12 +51,42 @@ def update_user_defaults(section: str, updates: dict) -> None:
     break a finished pipeline run.
     """
     try:
-        data = get_user_defaults()
-        sect = dict(data.get(section) or {})
+        if DEFAULTS_FILE.exists():
+            data = load_yaml(DEFAULTS_FILE) or {}
+        else:
+            data = {}
+        app = dict(data.get(_APP_SECTION) or {})
+        sect = dict(app.get(section) or {})
         sect.update(updates)
-        data[section] = sect
-        DEFAULTS_DIR.mkdir(parents=True, exist_ok=True)
+        app[section] = sect
+        data[_APP_SECTION] = app
         save_yaml(DEFAULTS_FILE, data)
-        logger.debug("user defaults updated: %s -> %s", section, updates)
+        logger.debug("user defaults updated: %s.%s -> %s", _APP_SECTION, section, updates)
+    except Exception:
+        logger.warning("Could not write %s", DEFAULTS_FILE, exc_info=True)
+
+
+def ensure_user_defaults(section: str, defaults: dict) -> None:
+    """Write only the keys MISSING from ``microprofiler.<section>``.
+
+    Called after the first run so the shared ``~/.micromax`` file ends up
+    with the complete set of known keys (window size, model, reducer(s),
+    cluster) even when the user never touched a feature. Existing values are
+    never overwritten; a missing file is created.
+    """
+    try:
+        if DEFAULTS_FILE.exists():
+            data = load_yaml(DEFAULTS_FILE) or {}
+        else:
+            data = {}
+        app = dict(data.get(_APP_SECTION) or {})
+        sect = dict(app.get(section) or {})
+        if all(key in sect for key in defaults):
+            return
+        for key, value in defaults.items():
+            sect.setdefault(key, value)
+        app[section] = sect
+        data[_APP_SECTION] = app
+        save_yaml(DEFAULTS_FILE, data)
     except Exception:
         logger.warning("Could not write %s", DEFAULTS_FILE, exc_info=True)

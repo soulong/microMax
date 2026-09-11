@@ -18,6 +18,10 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QScrollArea, QWidget
 
+# ── Main window ──────────────────────────────────────────────────────────────
+WINDOW_DEFAULT_SIZE = (1500, 1000)   # first start, before a saved size exists
+WINDOW_MIN_SIZE = (1200, 800)        # panes never squeeze below this
+
 # ── Left control panes (WellGridControls / ImageControls) ────────────────────
 CONTROLS_MIN_WIDTH = 260      # splitter never shrinks a pane below this
 CONTROLS_MAX_WIDTH = 320      # splitter never grows a pane beyond this
@@ -30,55 +34,37 @@ FORM_LABEL_WIDTH_WIDE = 120   # wider label column (Data-page pattern rows)
 ROW_SPACING = 4               # gap between label and field
 
 # ── Compact inputs (combos / spinboxes / line edits in control panes) ────────
-CONTROL_MIN_H = 18
-CONTROL_MAX_H = 22
+# Panel content scale (see the GUI style section of AGENTS.md): 9pt labels /
+# inputs / buttons, while window and group titles stay 11pt. Input padding and
+# the button look come from the app stylesheet; this block only caps heights.
+CONTROL_MIN_H = 20
+CONTROL_MAX_H = 24
 # Per-widget variant for single line edits (same look as COMPACT_INPUT_STYLE,
 # for the few inputs that need the tweak individually).
 COMPACT_LINE_EDIT_STYLE = (
     f"min-height: {CONTROL_MIN_H}px; max-height: {CONTROL_MAX_H}px; "
-    "font-size: 8pt; padding: 2px 3px;"
+    "font-size: 9pt;"
 )
-# One shared font/padding tweak — applied per-pane because the app-wide
-# stylesheet must keep normal-sized inputs for the Data page.
 COMPACT_INPUT_STYLE = f"""
 QComboBox, QDoubleSpinBox, QSpinBox, QSlider {{
     min-height: {CONTROL_MIN_H}px;
     max-height: {CONTROL_MAX_H}px;
-    font-size: 8pt;
-    padding: 2px 3px;
     min-width: 0;
 }}
 QLabel {{
-    font-size: 8pt;
-}}
-QPushButton {{
     font-size: 9pt;
-    padding: 2px 6px;
 }}
 """
-# QGroupBox header look for the ImageControls panes (WellGridControls has
-# no group boxes, so it omits this block via `controls_pane_style`).
-GROUP_BOX_STYLE = """
-QGroupBox {
-    font-size: 8pt;
-    font-weight: bold;
-    color: #5a8a9a;
-    border: 1px solid #3a3a4a;
-    border-radius: 4px;
-    margin-top: 8px;
-    padding-top: 14px;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 8px;
-    padding: 0 4px;
-}
-"""
+
+# ── Pattern regex inputs (Data page; shared wording/style with
+#    microProfiler's Input page) ─────────────────────────────────────────────
+PATTERN_LABEL_STYLE = "font-size: 9pt;"
+PATTERN_EDIT_STYLE = "font-family: Consolas, monospace; font-size: 9pt;"
 
 # ── Small action buttons ─────────────────────────────────────────────────────
 BTN_STD_WIDTH = 64            # Auto / Reset / Clear
 BTN_WIDE_WIDTH = 150          # full-action buttons (Write Label to DB / Export)
-BTN_HEIGHT = 24
+BTN_HEIGHT = 26               # matches the stylesheet's natural button height
 BTN_MINI_WIDTH = 36           # Add / Del / "..."
 BTN_MINI_HEIGHT = 20
 # Font/padding shrink for the tiny buttons (Add/Del/...) and the mini
@@ -88,25 +74,24 @@ BTN_MINI_STYLE = "font-size: 8pt; padding: 1px 4px;"
 # ── Horizontal checkbox strips (filter multi-select, class checkboxes) ───────
 CHECK_STRIP_MAX_H = 24
 SMALL_CHECKBOX_STYLE = (
-    "QCheckBox { font-size: 7pt; spacing: 2px; } "
+    "QCheckBox { font-size: 8pt; spacing: 2px; } "
     "QCheckBox::indicator { width: 12px; height: 12px; }"
 )
 
 # ── Splitters of the Image page ──────────────────────────────────────────────
 H_SPLITTER_SIZES = (280, 600)         # controls | canvas (both horizontal splitters)
-V_SPLITTER_SIZES = (250, 750, 0)      # well grid | image view | label panel (hidden)
+V_SPLITTER_SIZES = (220, 780, 0)      # well grid | image view | label panel (hidden)
 LABEL_CLASS_RATIOS = (0.25, 0.50, 0.25)   # when the label panel first appears
 NO_LABEL_RATIOS = (0.30, 0.70, 0.0)       # after the last label class is removed
 
 
-def controls_pane_style(include_group_boxes: bool = False) -> str:
-    """Stylesheet for a left control pane (compact inputs + small buttons).
+def controls_pane_style() -> str:
+    """Compact 9pt content style for a left control pane.
 
-    include_group_boxes: add the group-box header block — only ImageControls
-    uses group boxes; WellGridControls lays its rows out flat.
+    Group-box and button look-and-feel come from the app stylesheet; this
+    only caps the compact input heights and label size.
     """
-    extra = GROUP_BOX_STYLE if include_group_boxes else ""
-    return COMPACT_INPUT_STYLE + extra
+    return COMPACT_INPUT_STYLE
 
 
 def form_row(label_text: str, widget: QWidget,
@@ -122,13 +107,15 @@ def form_row(label_text: str, widget: QWidget,
     return row
 
 
-def small_button(text: str, width: int = BTN_STD_WIDTH,
+def small_button(text: str, width: int | None = None,
                  height: int = BTN_HEIGHT,
                  mini_style: bool = False) -> QPushButton:
-    """Secondary-class action button with the shared fixed size."""
+    """Action button; height is fixed, width=None sizes to the text."""
     btn = QPushButton(text)
-    btn.setProperty("class", "secondary")
-    btn.setFixedSize(width, height)
+    if width is None:
+        btn.setFixedHeight(height)
+    else:
+        btn.setFixedSize(width, height)
     if mini_style:
         btn.setStyleSheet(BTN_MINI_STYLE)
     return btn

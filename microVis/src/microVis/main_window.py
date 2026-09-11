@@ -59,7 +59,10 @@ from microVis.widgets.ui_spec import (
     LABEL_CLASS_RATIOS,
     NO_LABEL_RATIOS,
     V_SPLITTER_SIZES,
+    WINDOW_DEFAULT_SIZE,
+    WINDOW_MIN_SIZE,
 )
+from microVis.user_defaults import get_user_defaults, update_user_defaults
 from microVis.widgets.well_grid_canvas import WellGridCanvas
 from microVis.widgets.well_grid_controls import WellGridControls
 from microVis.worker import CropWorker, ImageWorker, ImageWorkerConfig, crop_object_rgb
@@ -202,8 +205,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self, dataset_dir: str | None = None, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setMinimumSize(1200, 800)
-        self.resize(1500, 1000)
+        self.setMinimumSize(*WINDOW_MIN_SIZE)
+        self._restore_window_size()
         self.setWindowTitle("microVis")
 
         # Data
@@ -369,6 +372,9 @@ class MainWindow(QMainWindow):
         return page
 
     def _switch_tab(self, index: int) -> None:
+        # Leaving the Data page must also dismiss the cropped-cell popup — it
+        # is a top-level window and would otherwise float over the new page.
+        self._plot_view.hide_cell_image()
         self._stack_content.setCurrentIndex(index)
         self._nav_data.setProperty("active", index == 0)
         self._nav_plate.setProperty("active", index == 1)
@@ -405,6 +411,16 @@ class MainWindow(QMainWindow):
         middle_splitter.addWidget(self._image_controls)
         middle_splitter.addWidget(self._image_display)
         self._configure_splitter(middle_splitter, H_SPLITTER_SIZES)
+        self._image_splitter = middle_splitter
+
+        # Both horizontal splitters own a control column: keep their widths
+        # identical so the well-grid box and the Image-controls boxes line
+        # up vertically.
+        self._syncing_splitters = False
+        top_splitter.splitterMoved.connect(
+            lambda *_: self._sync_splitter_sizes(top_splitter))
+        self._image_splitter.splitterMoved.connect(
+            lambda *_: self._sync_splitter_sizes(self._image_splitter))
 
         # ── Label Annotation Panel ──
         self._label_panel = LabelAnnotationPanel()
@@ -433,6 +449,24 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes(list(sizes))
         splitter.setCollapsible(0, False)
+
+    def _sync_splitter_sizes(self, source: QSplitter) -> None:
+        """Mirror one Image-page splitter's widths onto the other.
+
+        The well-grid and image halves are independent splitters; without
+        this the two control columns would drift apart. The reentrancy flag
+        stops the mirrored ``setSizes`` from calling back into this handler.
+        """
+        if self._syncing_splitters:
+            return
+        self._syncing_splitters = True
+        try:
+            target = (self._image_splitter
+                      if source is self._well_grid_container
+                      else self._well_grid_container)
+            target.setSizes(source.sizes())
+        finally:
+            self._syncing_splitters = False
 
     # ── Signal Connections ───────────────────────────────────────────────────
 
@@ -661,6 +695,7 @@ class MainWindow(QMainWindow):
 
         self._refresh_merged_plot()
         self._data_view.set_meta_browse_enabled(True)
+        self._update_db_status()
 
         # Well-grid / overlay machinery reads through the DataModule: keep
         # pointing it at the newest profiler-type DB (infer DBs carry no
@@ -712,10 +747,26 @@ class MainWindow(QMainWindow):
         """Drop the merged table and the plot view's data."""
         self._merged = None
         self._data_view.set_write_to_db_enabled(False)
+        self._data_view.set_db_status("")
         self._plot_view.clear()
+
+    def _update_db_status(self) -> None:
+        """Show the fused DB sources next to Select DB.
+
+        Format: ``a.db + b.db (+ metadata) -> merge``.
+        """
+        if self._merged is None:
+            self._data_view.set_db_status("")
+            return
+        names = [Path(p).name for p in self._merged.paths]
+        suffix = " (+ metadata)" if self._metadata_merged is not None else ""
+        self._data_view.set_db_status(" + ".join(names) + suffix + " -> merge")
 
     def _refresh_merged_plot(self) -> None:
         """Re-apply the Excel metadata merge and feed the plot view."""
+        # Defensive: the plot view must be installed in the Data page layout
+        # (idempotent) — a Reset must never leave the lower half detached.
+        self._data_view.set_plot_view(self._plot_view)
         self._plot_view.set_frame(
             merge_metadata_into(self._merged, self._metadata_merged))
 
@@ -976,6 +1027,12 @@ class MainWindow(QMainWindow):
             return DTYPE_MAX.get(str(self._dm.img_dtype), 65535.0)
         return 65535.0
 
+    def _dtype_is_integer(self) -> bool:
+        """True for integer image dtypes (vmin/vmax then show whole numbers)."""
+        if self._dm is None or self._dm.img_dtype is None:
+            return False
+        return str(self._dm.img_dtype).startswith(("uint", "int"))
+
     def _persist_channel_colors(self) -> None:
         """Write current channel color/vmin/vmax to <dataset>/session.yml."""
         if self._session is None:
@@ -1032,11 +1089,14 @@ class MainWindow(QMainWindow):
         Returns ``(label, data_key, column, is_numeric)`` with data_key
         ``merge`` — values resolve through :meth:`_merged_frame_for_dataset`
         (aggregated per well / per object like the infer sources were).
+        Identity/path columns (directory) are skipped, matching the raw
+        profiler-table lists.
         """
         if self._merged is None:
             return []
         return [(f"merge/{name}", "merge", name, is_num)
-                for name, is_num in self._merged.display_columns()]
+                for name, is_num in self._merged.display_columns()
+                if name != DIRECTORY_COLUMN]
 
     def _update_grid_columns(self) -> None:
         if self._dm is None:
@@ -1045,11 +1105,16 @@ class MainWindow(QMainWindow):
         gw.column.blockSignals(True)
         gw.column.clear()
         gw.column.addItem("None")
-        tables = self._dm.get_profiling_tables()
-        for tname in tables:
-            cols = self._dm.get_profiling_columns(tname)
-            for name, _ctype, is_num in cols:
-                gw.column.addItem(f"{tname}/{name}", (tname, name, is_num))
+        # Once DBs are selected the integrated ``merge/*`` table replaces the
+        # raw profiler tables: listing both would show the same measurement
+        # twice (and stale duplicates from other sources). Without a merged
+        # table the profiler tables stay the only DB source.
+        if self._merged is None:
+            tables = self._dm.get_profiling_tables()
+            for tname in tables:
+                cols = self._dm.get_profiling_columns(tname)
+                for name, _ctype, is_num in cols:
+                    gw.column.addItem(f"{tname}/{name}", (tname, name, is_num))
         # Add merged metadata columns (numeric dtypes render with a colormap,
         # categoricals with the qualitative palette)
         if self._metadata_merged is not None:
@@ -1098,7 +1163,7 @@ class MainWindow(QMainWindow):
                 self._on_image_filter_changed, Qt.UniqueConnection)
 
         # Channel controls
-        ic.set_channels(self._ch_config, max_value=self._channel_max_value())
+        ic.set_channels(self._ch_config, max_value=self._channel_max_value(), integer=self._dtype_is_integer())
 
         # Overlay column (DB-dependent) + cmap
         self._populate_overlay_columns()
@@ -1116,11 +1181,14 @@ class MainWindow(QMainWindow):
         ic.overlay_col.blockSignals(True)
         ic.overlay_col.clear()
         ic.overlay_col.addItem("None")
-        tables = self._dm.get_profiling_tables()
-        for tname in tables:
-            cols = self._dm.get_profiling_columns(tname)
-            for name, _ctype, _is_num in cols:
-                ic.overlay_col.addItem(f"{tname}/{name}", (tname, name))
+        # The integrated ``merge/*`` table replaces the raw profiler tables
+        # as soon as DBs are selected (see _update_grid_columns).
+        if self._merged is None:
+            tables = self._dm.get_profiling_tables()
+            for tname in tables:
+                cols = self._dm.get_profiling_columns(tname)
+                for name, _ctype, _is_num in cols:
+                    ic.overlay_col.addItem(f"{tname}/{name}", (tname, name))
         if self._metadata_merged is not None:
             for col in self._metadata_merged.columns:
                 if col != "well":
@@ -1184,6 +1252,7 @@ class MainWindow(QMainWindow):
 
         # Merge into the integrated table (left join by well) and refresh.
         self._refresh_merged_plot()
+        self._update_db_status()
         self._update_overlay_with_metadata()
 
     def _on_metadata_clear(self) -> None:
@@ -1194,6 +1263,7 @@ class MainWindow(QMainWindow):
         logger.info("Cleared merged Excel metadata")
 
         self._refresh_merged_plot()
+        self._update_db_status()
         self._update_overlay_with_metadata()
 
     def _update_overlay_with_metadata(self) -> None:
@@ -1442,7 +1512,7 @@ class MainWindow(QMainWindow):
         ic.auto_high.blockSignals(False)
         # Re-init channel config to defaults
         self._init_channel_config(use_saved=False)
-        ic.set_channels(self._ch_config, max_value=self._channel_max_value())
+        ic.set_channels(self._ch_config, max_value=self._channel_max_value(), integer=self._dtype_is_integer())
         self._persist_channel_colors()
         # Reset image zoom
         self._image_display.reset_all_zoom()
@@ -2413,7 +2483,6 @@ class MainWindow(QMainWindow):
             return None
         label = row.get("label")
         if label is None:
-            logger.info("Plot click: row has no object label — nothing to crop")
             return None
         meta = self._dm.dataset.metadata
         if meta is None:
@@ -2457,8 +2526,6 @@ class MainWindow(QMainWindow):
             # Identity columns existed but pinned nothing — the row does
             # not belong to this dataset; guessing a site would crop the
             # WRONG cell, so show nothing instead.
-            logger.info("Plot click: row does not match any dataset image "
-                        "(identity columns had no site in common)")
             return None
         else:
             # No identity columns available (e.g. whole-image infer rows):
@@ -2482,14 +2549,7 @@ class MainWindow(QMainWindow):
             mask_name = self._dm.mask_names[0]
         mask = mask_dict.get(f"mask_{mask_name}") if mask_name else None
         if mask is None:
-            logger.info("Plot click: no object mask available for the crop")
             return None
-        site = self._dm.dataset.metadata.iloc[row_idx]
-        site_desc = ", ".join(
-            f"{c}={site[c]}" for c in ("well", "field", "stack", "timepoint")
-            if c in site.index)
-        logger.info("Plot click: cropping label %s from %s (%s)",
-                    label, mask_name, site_desc)
 
         ch_config = self._image_controls.get_channel_config()
         rgb = crop_object_rgb(
@@ -2499,8 +2559,6 @@ class MainWindow(QMainWindow):
             target_size=96, padding=4,
         )
         if rgb is None:
-            logger.info("Plot click: label %s not croppable from mask '%s' "
-                        "(missing or empty object)", label, mask_name)
             return None
 
         from PySide6.QtGui import QImage, QPixmap
@@ -2864,9 +2922,32 @@ class MainWindow(QMainWindow):
         self._switch_tab(0)
 
         self._shutting_down = False
-        logger.info("Session reset to initial state")
+
+    def _restore_window_size(self) -> None:
+        """Start at the last closed window size (fallback: defaults)."""
+        window = get_user_defaults().get("window") or {}
+        try:
+            width = int(window.get("width", 0))
+            height = int(window.get("height", 0))
+        except (TypeError, ValueError):
+            width = height = 0
+        if width >= WINDOW_MIN_SIZE[0] and height >= WINDOW_MIN_SIZE[1]:
+            self.resize(width, height)
+        else:
+            self.resize(*WINDOW_DEFAULT_SIZE)
+
+    def _save_window_size(self) -> None:
+        """Remember the current window size in ~/.micromax for the next start.
+
+        A maximized window stores its normal (restored) size so the next
+        start comes up with a sensible non-maximized geometry.
+        """
+        size = self.normalGeometry().size() if self.isMaximized() else self.size()
+        update_user_defaults(
+            "window", {"width": int(size.width()), "height": int(size.height())})
 
     def closeEvent(self, event) -> None:
+        self._save_window_size()
         self._shutting_down = True
         self._cancel_workers()
         self._thread_pool.waitForDone(2000)

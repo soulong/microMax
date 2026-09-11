@@ -10,6 +10,10 @@ from typing import Optional
 
 _DEFAULT_LEVEL: int = logging.INFO
 
+# The current per-dataset file sink (set by :func:`set_log_file`); tracked so
+# a later dataset retargets the handler instead of stacking file handlers.
+_FILE_HANDLER: logging.FileHandler | None = None
+
 
 def _ensure_std_streams() -> None:
     """Redirect ``sys.stdout`` / ``sys.stderr`` to ``os.devnull`` when ``None``.
@@ -54,7 +58,7 @@ def setup_logging(
 
     fmt = logging.Formatter(
         "[%(asctime)s] %(levelname)s | %(message)s",
-        datefmt="%H:%M",
+        datefmt="%H:%M:%S",
     )
 
     if clear_existing or not logger.hasHandlers():
@@ -85,3 +89,34 @@ def setup_logging(
     logging.getLogger("tifffile").setLevel(logging.ERROR)
 
     return logger
+
+
+def set_log_file(path) -> None:
+    """Attach/replace the per-dataset file sink (``<dataset>/microProfiler.log``).
+
+    The terminal handler (and any explicit ``--log-file`` handler) stays
+    attached; the previous dataset's file handler is removed — its file keeps
+    the records already written. Called when a dataset is loaded and when a
+    pipeline run targets a dataset directory.
+    """
+    global _FILE_HANDLER
+    logger = logging.getLogger("microProfiler")
+
+    path = Path(path).resolve()
+    if _FILE_HANDLER is not None and Path(_FILE_HANDLER.baseFilename).resolve() == path:
+        return
+    if _FILE_HANDLER is not None:
+        old = _FILE_HANDLER
+        _FILE_HANDLER = None
+        logger.removeHandler(old)
+        old.close()
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setLevel(logger.level or _DEFAULT_LEVEL)
+    handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    logger.addHandler(handler)
+    _FILE_HANDLER = handler

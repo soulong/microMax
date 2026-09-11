@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QRadioButton,
     QScrollArea,
     QVBoxLayout,
@@ -54,11 +55,11 @@ class _MultiSelectCombo(QWidget):
         header.setSpacing(4)
         header.addWidget(QLabel(label))
 
-        sel_all = small_button("All", width=42, height=18, mini_style=True)
+        sel_all = small_button("All", width=42, mini_style=True)
         sel_all.clicked.connect(lambda: self.set_all_checked(True))
         header.addWidget(sel_all)
 
-        clear_btn = small_button("Clear", width=48, height=18, mini_style=True)
+        clear_btn = small_button("Clear", width=48, mini_style=True)
         clear_btn.clicked.connect(lambda: self.set_all_checked(False))
         header.addWidget(clear_btn)
         header.addStretch()
@@ -132,7 +133,7 @@ class ImageControls(QScrollArea):
         self.setMaximumWidth(CONTROLS_MAX_WIDTH)
 
         container = QWidget()
-        container.setStyleSheet(controls_pane_style(include_group_boxes=True))
+        container.setStyleSheet(controls_pane_style())
         self._layout = QVBoxLayout(container)
         self._layout.setContentsMargins(CONTROLS_MARGIN, CONTROLS_MARGIN,
                                         CONTROLS_MARGIN, CONTROLS_MARGIN)
@@ -186,7 +187,7 @@ class ImageControls(QScrollArea):
         self._auto_low.valueChanged.connect(lambda: self.auto_range_changed.emit())
         self._auto_high.valueChanged.connect(lambda: self.auto_range_changed.emit())
 
-        # Auto / Reset (centered)
+        # Auto / Reset (evenly centered pair)
         self._auto_all_btn = small_button("Auto")
         self._auto_all_btn.clicked.connect(self.auto_all_clicked)
         self._reset_btn = small_button("Reset")
@@ -283,21 +284,23 @@ class ImageControls(QScrollArea):
         self._class_input.setPlaceholderText("New class name...")
         self._class_input.setStyleSheet(COMPACT_LINE_EDIT_STYLE)
         self._class_input.returnPressed.connect(self._on_add_class)
-        self._add_class_btn = small_button("Add", width=BTN_MINI_WIDTH, height=20,
+        self._add_class_btn = small_button("Add", width=BTN_MINI_WIDTH,
                                            mini_style=True)
         self._add_class_btn.clicked.connect(self._on_add_class)
-        self._remove_class_btn = small_button("Del", width=BTN_MINI_WIDTH, height=20,
+        self._remove_class_btn = small_button("Del", width=BTN_MINI_WIDTH,
                                               mini_style=True)
         self._remove_class_btn.clicked.connect(self._on_remove_class)
         class_input_row = form_row("Class", self._class_input)
         class_input_row.addWidget(self._add_class_btn)
+        # Gap before the remove-class action on the right.
+        class_input_row.addSpacing(8)
         class_input_row.addWidget(self._remove_class_btn)
         label_layout.addLayout(class_input_row)
 
         # Selected classes (multi-select dropdown)
         self._class_select_label = QLabel("Selected classes")
         self._class_select_label.setStyleSheet(
-            "font-size: 8pt; color: #aaaaaa; padding-top: 2px;"
+            "font-size: 8pt; color: #888888; padding-top: 2px;"
         )
         self._class_select_label.setVisible(False)
         label_layout.addWidget(self._class_select_label)
@@ -365,15 +368,18 @@ class ImageControls(QScrollArea):
         )
         export_layout.addLayout(form_row("Max obj", self._export_max_obj))
 
-        # Save directory selection
+        # Save directory selection: path box = 2/3 of the free width, Browse
+        # follows it immediately.
         self._export_dir_input = QLineEdit()
         enable_path_drop(self._export_dir_input)
         self._export_dir_input.setPlaceholderText("objects_exported")
         self._export_dir_input.setStyleSheet(COMPACT_LINE_EDIT_STYLE)
-        self._export_dir_btn = small_button("...", width=24, height=20, mini_style=True)
+        self._export_dir_btn = QPushButton("Browse...")
         self._export_dir_btn.clicked.connect(self._on_browse_export_dir)
         dir_row = form_row("Save dir", self._export_dir_input)
+        dir_row.setStretchFactor(self._export_dir_input, 2)
         dir_row.addWidget(self._export_dir_btn)
+        dir_row.addStretch(1)
         export_layout.addLayout(dir_row)
 
         # Well subdirectory toggle
@@ -391,6 +397,14 @@ class ImageControls(QScrollArea):
         self._export_btn.clicked.connect(self.export_clicked)
         export_layout.addLayout(centered_row(self._export_btn))
         self._layout.addWidget(grp_export)
+
+        # The stylesheet padding already insets the content; drop the
+        # layout's own default bottom margin so the last control sits a
+        # little closer to each box's bottom edge.
+        for _grp in (grp_filters, grp_channels, grp_overlay, grp_label, grp_export):
+            _lay = _grp.layout()
+            _m = _lay.contentsMargins()
+            _lay.setContentsMargins(_m.left(), _m.top(), _m.right(), 0)
 
         self._layout.addStretch()
         self.setWidget(container)
@@ -488,7 +502,8 @@ class ImageControls(QScrollArea):
     def get_extra_widgets(self) -> dict[str, _MultiSelectCombo]:
         return self._extra_widgets
 
-    def set_channels(self, ch_config: dict, max_value: float | None = None) -> None:
+    def set_channels(self, ch_config: dict, max_value: float | None = None,
+                     integer: bool = False) -> None:
         for w in self._channel_widgets.values():
             w.deleteLater()
         self._channel_widgets.clear()
@@ -498,7 +513,8 @@ class ImageControls(QScrollArea):
                 item.widget().deleteLater()
 
         for ch_name, cfg in ch_config.items():
-            row = ChannelControls(ch_name, cfg, max_value=max_value)
+            row = ChannelControls(ch_name, cfg, max_value=max_value,
+                                  integer=integer)
             row.config_changed.connect(lambda ch=ch_name: self.channel_config_changed.emit())
             self._ch_container.addWidget(row)
             self._channel_widgets[ch_name] = row

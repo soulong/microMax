@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
+    QHBoxLayout,
     QLabel,
     QScrollArea,
     QVBoxLayout,
@@ -17,7 +18,6 @@ from microVis.widgets.ui_spec import (
     CONTROLS_MIN_WIDTH,
     CONTROLS_SPACING,
     controls_pane_style,
-    centered_row,
     form_row,
     small_button,
 )
@@ -38,10 +38,19 @@ class WellGridControls(QScrollArea):
         self.setMaximumWidth(CONTROLS_MAX_WIDTH)
 
         container = QWidget()
-        container.setStyleSheet(controls_pane_style())
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(CONTROLS_MARGIN, CONTROLS_MARGIN,
-                                  CONTROLS_MARGIN, CONTROLS_MARGIN)
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(CONTROLS_MARGIN, CONTROLS_MARGIN,
+                                 CONTROLS_MARGIN, CONTROLS_MARGIN)
+        outer.setSpacing(0)
+
+        # Titleless rounded box around the whole well-grid control bar. It
+        # sits at the same pane margin as the Image-controls group boxes so
+        # both columns line up vertically.
+        box = QWidget()
+        box.setProperty("class", "panel-box")
+        box.setStyleSheet(controls_pane_style())
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(CONTROLS_SPACING)
 
         # Format
@@ -61,12 +70,26 @@ class WellGridControls(QScrollArea):
         self._agg = NoScrollComboBox()
         layout.addLayout(form_row("Agg", self._agg))
 
-        # Select All / Clear (centered)
-        self._select_all_btn = small_button("Select All", width=80)
+        # Select All / Clear stay left; Block Image sits after Clear at the
+        # right edge of the box. Widths follow the captions (no stretching).
+        self._select_all_btn = small_button("Select All")
         self._select_all_btn.clicked.connect(self.select_all_clicked)
-        self._clear_btn = small_button("Clear", width=64)
+        self._clear_btn = small_button("Clear")
         self._clear_btn.clicked.connect(self.clear_clicked)
-        layout.addLayout(centered_row(self._select_all_btn, self._clear_btn))
+        self._image_blocked = False
+        self._image_block_btn = small_button("Block Image")
+        self._image_block_btn.setToolTip(
+            "Block image loading and display.\n"
+            "Already shown images stay visible."
+        )
+        self._image_block_btn.clicked.connect(self._on_toggle_image_block)
+        action_row = QHBoxLayout()
+        action_row.setSpacing(4)
+        action_row.addWidget(self._select_all_btn)
+        action_row.addWidget(self._clear_btn)
+        action_row.addStretch()
+        action_row.addWidget(self._image_block_btn)
+        layout.addLayout(action_row)
 
         # Colors
         self._cmap = NoScrollComboBox()
@@ -76,18 +99,9 @@ class WellGridControls(QScrollArea):
         self._palette = NoScrollComboBox()
         layout.addLayout(form_row("Palette", self._palette))
 
-        # Image block toggle (centered)
-        self._image_blocked = False
-        self._image_block_btn = small_button("Block Image", width=100)
-        self._image_block_btn.setToolTip(
-            "Block image loading and display.\n"
-            "Already shown images stay visible."
-        )
-        self._image_block_btn.clicked.connect(self._on_toggle_image_block)
-        layout.addLayout(centered_row(self._image_block_btn))
-
         layout.addStretch()
 
+        outer.addWidget(box)
         self.setWidget(container)
 
     # ── Public API ──────────────────────────────────────────────────
@@ -114,26 +128,11 @@ class WellGridControls(QScrollArea):
 
     def _on_toggle_image_block(self) -> None:
         self._image_blocked = not self._image_blocked
-        if self._image_blocked:
-            self._image_block_btn.setText("Show Image")
-            self._image_block_btn.setProperty("class", "danger")
-            self._image_block_btn.setStyleSheet(
-                "QPushButton { background-color: #c04040; color: white; "
-                "font-size: 9pt; padding: 2px 6px; }"
-            )
-        else:
-            self._image_block_btn.setText("Block Image")
-            self._image_block_btn.setProperty("class", "secondary")
-            self._image_block_btn.setStyleSheet("")
-        self._image_block_btn.style().unpolish(self._image_block_btn)
-        self._image_block_btn.style().polish(self._image_block_btn)
+        self._image_block_btn.setText(
+            "Show Image" if self._image_blocked else "Block Image")
         self.image_block_toggled.emit(self._image_blocked)
 
     def reset_image_block(self) -> None:
         """Reset the image-block toggle to the unblocked state (full reset)."""
         self._image_blocked = False
         self._image_block_btn.setText("Block Image")
-        self._image_block_btn.setProperty("class", "secondary")
-        self._image_block_btn.setStyleSheet("")
-        self._image_block_btn.style().unpolish(self._image_block_btn)
-        self._image_block_btn.style().polish(self._image_block_btn)

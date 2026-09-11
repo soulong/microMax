@@ -8,6 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import microProfiler.user_defaults as ud  # noqa: E402
 from microProfiler.user_defaults import (  # noqa: E402
+    ensure_user_defaults,
     get_user_defaults,
     update_user_defaults,
 )
@@ -15,12 +16,11 @@ from microProfiler.user_defaults import (  # noqa: E402
 
 @pytest.fixture
 def defaults_dir(tmp_path, monkeypatch):
-    """Point ~/.micromax at a temp dir for the whole test."""
+    """Point the shared ~/.micromax config file at a temp path."""
     import microProfiler.user_defaults as ud
-    d = tmp_path / "micromax"
-    monkeypatch.setattr(ud, "DEFAULTS_DIR", d)
-    monkeypatch.setattr(ud, "DEFAULTS_FILE", d / "microprofiler.yml")
-    return d
+    f = tmp_path / ".micromax"
+    monkeypatch.setattr(ud, "DEFAULTS_FILE", f)
+    return f
 
 
 def test_update_and_get_round_trip(defaults_dir):
@@ -46,6 +46,27 @@ def test_merge_keeps_other_sections(defaults_dir):
 
 def test_get_defaults_missing_file(defaults_dir):
     assert get_user_defaults() == {}
+
+
+def test_ensure_user_defaults_fills_missing_keys(defaults_dir):
+    """The shared file is completed after the first run: existing values are
+    kept and missing keys get their defaults."""
+    update_user_defaults("window", {"width": 1200, "height": 800})
+    update_user_defaults("inference", {"model": "D:/m/model.pt"})
+
+    ensure_user_defaults(
+        "inference", {"model": None, "reducer": None, "cluster": None})
+
+    inf = get_user_defaults()["inference"]
+    assert inf["model"] == "D:/m/model.pt"      # existing value untouched
+    assert inf["reducer"] is None and inf["cluster"] is None
+    assert get_user_defaults()["window"] == {"width": 1200, "height": 800}
+
+
+def test_ensure_user_defaults_creates_missing_file(defaults_dir):
+    ensure_user_defaults("inference", {"model": None})
+    assert defaults_dir.exists()
+    assert get_user_defaults()["inference"]["model"] is None
 
 
 # ── The pipeline save hook ───────────────────────────────────────────────────
@@ -149,18 +170,112 @@ def test_panel_prefills_from_user_defaults(defaults_dir, monkeypatch):
     panel._apply_user_defaults()
 
     assert block.get_model_path() == "D:/m/model.pt"
-    assert block._reduction_group.isChecked()
     assert block._reducer_path.text() == "D:/r/pca.pkl;D:/r/umap.pkl"
-    assert block._cluster_group.isChecked()
     assert block._cluster_path.text() == "D:/r/cluster.pkl"
+    # No group checkboxes anymore — the remembered paths are the run flags.
+    assert block.is_reduction_or_cluster_enabled()
 
     # No defaults (fresh machine) -> untouched blank panel.
-    defaults_dir.joinpath("microprofiler.yml").unlink()
+    defaults_dir.unlink()
     panel2 = InferenceStepPanel.__new__(InferenceStepPanel)
     panel2._blocks = []
     block2 = InferenceBlockWidget(0, [])
     panel2._blocks.append(block2)
     panel2._apply_user_defaults()
     assert block2.get_model_path() == ""
-    assert not block2._reduction_group.isChecked()
-    assert not block2._cluster_group.isChecked()
+    assert not block2._reducer_path.text()
+    assert not block2._cluster_path.text()
+    assert not block2.is_reduction_or_cluster_enabled()
+
+
+# ── Window size persistence ──────────────────────────────────────────────────
+
+
+def test_inference_dr_methods_default_none(defaults_dir):
+    """Fresh inference blocks start with no DR method selected."""
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.instance() or QApplication([])
+    from microProfiler.gui.panels.step_inference import InferenceBlockWidget
+
+    block = InferenceBlockWidget(0, ["ch1"])
+    assert block._method_cbs
+    assert all(not cb.isChecked() for cb in block._method_cbs.values())
+    # Nothing selected and no reducer -> the DR stage is not scheduled.
+    assert block.is_reduction_or_cluster_enabled() is False
+
+
+def test_inference_reduction_flags_derive_from_paths_and_methods(defaults_dir):
+    """No group checkboxes: paths / checked methods are the run flags."""
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.instance() or QApplication([])
+    from microProfiler.gui.panels.step_inference import InferenceBlockWidget
+
+    block = InferenceBlockWidget(0, ["ch1"])
+    assert "reduction" not in block.build_config_section()
+
+    # A checked DR method alone schedules the reduction.
+    block._method_cbs["pca"].setChecked(True)
+    red = block.build_config_section()["reduction"]
+    assert red["enabled"] is True
+    assert red["cluster_enabled"] is False
+    assert red["method"] == ["pca"]
+    assert red["cluster"] is None
+
+    # A reducer file schedules it too and takes over from the methods.
+    block._reducer_path.setText("D:/r/pca.pkl")
+    red = block.build_config_section()["reduction"]
+    assert red["enabled"] is True
+    assert red["reducer"] == ["D:/r/pca.pkl"]
+    assert red["method"] is None
+
+    # Clearing everything skips the stage again.
+    block._method_cbs["pca"].setChecked(False)
+    block._reducer_path.clear()
+    assert "reduction" not in block.build_config_section()
+
+    # A cluster file alone schedules cluster prediction only.
+    block._cluster_path.setText("D:/r/cluster.pkl")
+    red = block.build_config_section()["reduction"]
+    assert red["enabled"] is False
+    assert red["cluster_enabled"] is True
+    assert red["cluster"] == "D:/r/cluster.pkl"
+
+
+def test_main_window_restores_and_saves_size(defaults_dir):
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    update_user_defaults("window", {"width": 1360, "height": 860})
+
+    from microProfiler.gui.main_window import MainWindow
+
+    win = MainWindow()
+    try:
+        assert (win.width(), win.height()) == (1360, 860)
+        win.resize(1420, 900)
+        win._save_window_size()
+    finally:
+        win.close()
+    app.processEvents()
+    assert get_user_defaults()["window"] == {"width": 1420, "height": 900}
+
+
+def test_main_window_falls_back_without_saved_size(defaults_dir):
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.instance() or QApplication([])
+
+    from microProfiler.gui.main_window import MainWindow
+    from microProfiler.gui.ui_spec import WINDOW_SIZE
+
+    win = MainWindow()
+    try:
+        assert (win.width(), win.height()) == WINDOW_SIZE
+    finally:
+        win.close()

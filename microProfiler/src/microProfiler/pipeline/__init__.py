@@ -8,7 +8,7 @@ from microBase import ImageDataset, SessionFile
 from microBase.db_contracts import PROFILER_DB_NAME
 
 from microProfiler.config import PipelineConfig
-from microProfiler.log_utils import setup_logging
+from microProfiler.log_utils import set_log_file, setup_logging
 from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
 from microProfiler.pipeline.steps import (
     PREPROC_STEPS,
@@ -62,6 +62,8 @@ def run_step(
         later fit-transform run out.
     """
     setup_logging(log_file=log_file, clear_existing=False)
+    # The terminal log is mirrored next to the sources of every dataset run.
+    set_log_file(Path(root_dir) / "microProfiler.log")
     logger.info("Running step: %s", step_name)
 
     fn = _STEP_FUNCTIONS.get(step_name)
@@ -128,6 +130,8 @@ def run_pipeline(
     to applied_steps.
     """
     setup_logging(log_file=log_file, clear_existing=False)
+    # The terminal log is mirrored next to the sources of every dataset run.
+    set_log_file(Path(root_dir) / "microProfiler.log")
     logger.info("Pipeline start — dataset: %s", root_dir)
 
     prev_applied = set(SessionFile(root_dir).get_applied_steps())

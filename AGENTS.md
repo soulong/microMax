@@ -169,14 +169,25 @@ Package layout (overview):
   step panels (one per pipeline step), background workers, progress;
   `ui_spec.py` holds the shared layout tokens (page margins, button
   heights, compact-width caps) so GUI geometry is tuned in one place.
+  Repeatable work (segmentation objects / object profiling / inference) is
+  a flat step panel hosting one independent `block-card` box per block;
+  Image Profiling uses the same block-container layout with one fixed
+  block, so both profiling titles and boxes sit at the same level.
 
 * `cli.py` — headless run, fully equivalent to the GUI.
 
-* `user_defaults.py` — per-user defaults in `~/.micromax/microprofiler.yml`
-  (key-merged, atomic): the inference step records the last run's model /
-  reducer(s) / cluster.pkl there and the GUI panel pre-fills from it —
-  the remembered steps run by default, per-run toggle stays in the
-  panel's group checkboxes.
+* `user_defaults.py` — per-user GUI defaults in the shared file `~/.micromax`
+  (microProfiler's `microprofiler` section; key-merged, atomic): the
+  inference step records the last run's model / reducer(s) / cluster.pkl
+  there and the GUI panel pre-fills from it — a remembered reducer/cluster
+  path IS the run flag (the old DR/Cluster group checkboxes are gone: an
+  empty path means the stage is skipped). The main
+  window also stores/restores its size in the `window` sub-section. A
+  missing file is ignored at startup; after the first run the file is
+  (re)created and completed with every known key (window, model,
+  reducer(s), cluster) so it can be hand-edited. This file is GUI
+  preferences only — the pipeline run config is a separate YAML passed to
+  the CLI.
 
 The pipeline:
 
@@ -223,7 +234,8 @@ The pipeline:
 * Outputs: in-place processed TIFFs, `<stem>_cp_masks_<obj>.png` masks,
   `profiler.db` (image + per-object tables), `<dataset>/<output_db>`
   (inference), `<dataset>/merge_<mask>.db` (per-mask auto-merge), and
-  `session.yml` (applied steps + patterns).
+  `session.yml` (applied steps + patterns). The terminal log is mirrored to
+  `<dataset>/microProfiler.log` (one file per dataset, INFO; GUI and CLI).
 
 **Adding a new pipeline step:** add a step module exposing
 `step_dataset(ds, **kwargs, progress=...) -> ImageDataset`; add an `XxxConfig`
@@ -239,7 +251,7 @@ buttons all drive `run_pipeline` with a section-restricted config.
 
 ## 6. microVis — interactive Qt viewer
 
-**Path:** `microMax/microVis/` · **Entry:** `microvis` (GUI only). Launch logs progress to the terminal (INFO; `--debug` for DEBUG); each dataset directory keeps its own full-detail microVis.log.
+**Path:** `microMax/microVis/` · **Entry:** `microvis` (GUI only). Launch logs progress to the terminal (INFO only); each dataset directory keeps its own `microVis.log` (also INFO).
 
 Package layout (overview):
 
@@ -272,6 +284,11 @@ Package layout (overview):
 * `main_window.py` — `MainWindow`, all signal wiring and the label-annotation
   state.
 
+* `user_defaults.py` — per-user GUI defaults in the shared file `~/.micromax`
+  (microVis's `microvis` section; key-merged, atomic): the main window
+  stores/restores its size there. A missing file is ignored at startup and
+  (re)created after the first run.
+
 Data flow:
 
 * All GUI modules go through the `DataModule` facade — widgets never
@@ -292,14 +309,21 @@ Data flow:
 
 * The Image panel's filters are labeled with their metadata column names
   (`field`/`stack`/`timepoint` + extra columns). Both "Color by" dropdowns
-  (well grid and Object Overlay) accept profiler tables (via the DataModule's
-  active DB), merged Excel metadata and every merged-table column
-  (`merge/<column>`, directory-scoped with fallback); merged columns also
-  provide object counts when no profiler table does.
+  (well grid and Object Overlay) accept the integrated merged-table columns
+  (`merge/<column>`, directory-scoped with fallback). The raw profiler-table
+  columns are listed only while NO merged table exists — once any DB is
+  selected the integrated table REPLACES them (no duplicate entries); merged
+  columns also provide object counts when no profiler table does.
 
-* The Data page selects a dataset directory via a line edit (type/browse/drop),
-  then **Select DB** accepts any number of profiler.db AND infer.db files of
-  that dataset (a single selection is used as-is). Their object rows are
+* The Data page selects a dataset directory via a line edit (type/browse/drop);
+  **Browse... → Load Dataset** sit on that row with **Reset** at the far right,
+  and the whole top control area is a titleless rounded box (as is the
+  plot-control column, whose width and x match the Image page's control boxes).
+  The DB **Select DB** button accepts any number of profiler.db AND infer.db
+  files of
+  that dataset (a single selection is used as-is); the fused sources are
+  shown next to the button as `a.db + b.db (+ metadata) -> merge`. Their
+  object rows are
   fused into ONE integrated table per mask (microBase `db_merge`: outer
   merge on the identity columns — well, label, directory, ... — so
   profiler measurements and infer predictions/coordinates meet in a single
@@ -310,19 +334,20 @@ Data flow:
   mean±SEM / boxplot / barplot mean±SEM with X/Y/color/size/facets and
   palette; X/Y accept every merged column, categoricals plotted on level
   ticks. Every picker combo is editable — type to filter long column lists.
-  A free-form pandas-expression filter is applied before plotting. Plot
+  A free-form pandas-expression filter (directly below Chart) is applied
+  before plotting. Plot
   controls sit in a left column with the interactive canvas on the right;
   hover shows a point's values and LEFT-CLICKING a scatter point shows the
   corresponding cropped single cell in a near-cursor popup (nearest point
   wins on overlap; clicking empty space hides it). All plots export vector
   PDFs with editable text. PyGwalker is not used.
 
-* Excel plate metadata (`Select Metadata`) is merged by `well` into the
-  integrated table on **Merge** (in memory — no DB write) and un-merged on
-  **Clear**. **Write to DB** writes the integrated table (profiler + infer +
-  merged metadata columns) into a NEW database next to the dataset — the
-  small edit after the button controls the file name (default merge.db,
-  table `merged`); the source DBs are never modified.
+* Excel plate metadata (**Select Metadata**) is merged by `well`
+  into the integrated table on **Merge** (in memory — no DB write) and
+  un-merged on **Clear**. **Write to DB** writes the integrated table
+  (profiler + infer + merged metadata columns) into a NEW database next to
+  the dataset — the small edit after the button controls the file name
+  (default merge.db, table `merged`); the source DBs are never modified.
 
 **Adding a new widget:** add the class under `widgets/`, instantiate it in
 `MainWindow.__init__` and wire its signals to private `_on_*` handlers; access
@@ -479,7 +504,76 @@ config lists — no microBase/microModel change needed.
 
 ***
 
-## 8. When you change something
+## 8. GUI style conventions (microProfiler + microVis)
+
+The two desktop GUIs share ONE visual language. Whenever a similar
+function/region exists in both, it must use the same wording, font size and
+control style — not necessarily the same layout.
+
+Palette (microVis is the canonical base):
+
+| Token | Value | Used for |
+| ----- | ----- | -------- |
+| window | `#1e1e2e` | main window, input/thumbnail/log backgrounds |
+| surface | `#252536` | global `QWidget`, pages, inset block cards |
+| raised | `#2d2d44` | group boxes/cards, popup menus, hover |
+| border | `#333333` | every 1px border, separator, splitter |
+| text / muted / placeholder | `#e0e0e0` / `#888888` / `#666666` | |
+| accent / accent-hover | `#5a8a9a` / `#6a9aaa` | selection, focus, progress |
+| danger / success | `#f04770` / `#06d6a0` | errors / success |
+
+Typography scale: **title 11pt / panel content 9pt / auxiliary 8pt**.
+Control panes (microVis side panels, microProfiler step cards) carry a local
+9pt content stylesheet; QGroupBox titles stay 11pt; hints, status lines,
+mini buttons, checkbox strips and thumbnail captions stay 8pt.
+
+Control rules:
+
+* `resources/style.qss` exists in each package and the two copies must stay
+  byte-identical (no shared resource file). App-specific classes
+  (microProfiler sidebar footer, microVis nav-tab) are part of the common
+  union stylesheet.
+* Flat boxes: a functional group of controls sits in a rounded `#2d2d44`
+  surface with NO border (QGroupBox, or a titleless `QWidget[class="panel-box"]`
+  for the microVis well-grid / Data-page control areas). Inner blocks are
+  transparent; only input/select widgets carry a surface of their own.
+* One box level only: in microProfiler the block-container step panels
+  (Segment / Image Profiling / Object Profiling / Inference) are
+  `QGroupBox[class="flat"]`; each block is its own
+  `QWidget[class="block-card"]` box, so adding a block adds an independent
+  box instead of nesting another frame. Image Profiling uses the same
+  container with exactly one fixed block. The Input-page Filter is a
+  regular rounded card.
+* Inputs/selects are neutral `#1e1e2e` blocks with NO visible border (a
+  transparent 1px border turns accent-colored on focus). There is exactly
+  ONE button style, and the microVis Data-page `Browse...` button is the
+  reference: a TRANSPARENT block with a thin `#444455` border and NO fill —
+  inside a box the box colour shows through, on a page the background
+  colour shows through; hover highlights the border (`#5a8a9a`); the text
+  is accent-colored. No primary/secondary/danger variants; only the length
+  follows the caption. Every button shares the same height.
+* Similar functions use the same wording: path/file pickers read `Browse...`
+  (the Data-page `Select DB` / `Select Metadata` actions keep their action
+  names); the dataset row is `Dataset` + `Browse...` / `Load Dataset` /
+  `Reset` (`Load Dataset` after `Browse...`, `Reset` right-aligned, the path
+  box taking 2/3 of the free width). Reset/remove/clear actions sit
+  right-aligned with a gap from the controls before them.
+* All data-entry spin boxes hide their up/down arrows (one QSS rule in the
+  shared file); users type the values directly.
+* Geometry tokens live in each package's `ui_spec.py`; the stylesheet owns
+  look-and-feel. Pattern regex fields use the same monospace 9pt style and
+  the same labels (`Image pattern:` / `Mask pattern:` / `Image subdir:`) in
+  both apps.
+* Window size is remembered per app in the shared GUI config `~/.micromax`
+  (`microprofiler:` / `microvis:` sections, each with
+  `window: {width, height}`): restore on start, save on close (normal size
+  when maximized); a missing file is ignored at startup and recreated with
+  all known keys after the first run. This file is GUI preferences only, not
+  a pipeline config.
+
+***
+
+## 9. When you change something
 
 * Keep this file in sync with the code's **overall design** (architecture,
   module layout, data flow, dependency graph). Remember it describes only the

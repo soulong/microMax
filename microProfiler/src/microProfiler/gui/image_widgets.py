@@ -380,10 +380,19 @@ class ChannelTile(QWidget):
         self._label_widget.setAlignment(Qt.AlignCenter)
         self._viewer = ImageViewer()
         self._viewer.setMinimumSize(200, 200)
+        # Transparent viewing surface: the tile shows only the image on the
+        # card — no grey block painted behind it (BaSiC previews).
+        self._viewer.setBackgroundBrush(Qt.transparent)
+        self._viewer.viewport().setAutoFillBackground(False)
+        self._viewer.setStyleSheet(
+            "QGraphicsView { background: transparent; }"
+            "QGraphicsView > QWidget { background: transparent; }")
         if arr is not None:
             self._viewer.set_image(arr)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setContentsMargins(2, 0, 2, 0)
+        # The caption sits directly on top of its image.
+        layout.setSpacing(0)
         layout.addWidget(self._label_widget)
         layout.addWidget(self._viewer)
 

@@ -266,7 +266,6 @@ class PipelineController(QObject):
         if self._view.running or self._missing_input():
             return
         if self._view.dataset is None:
-            logger.info("No dataset loaded - load a dataset.")
             return
         self._view.set_running(True)
 
@@ -302,7 +301,6 @@ class PipelineController(QObject):
         self._view.progress_finished()
         self._view.set_running(False)
         self._update_dataset_after_step("preprocessing")
-        logger.info("Preprocessing complete.")
         self._save_session_yml(executed_steps=self._worker._applied_steps)
 
     @_config_error_dialog
@@ -310,7 +308,6 @@ class PipelineController(QObject):
         if self._view.running or self._missing_input():
             return
         if self._view.dataset is None:
-            logger.info("No dataset loaded - load a dataset.")
             return
         error = self._validate_segment_names()
         if error:
@@ -335,7 +332,6 @@ class PipelineController(QObject):
             return
         self._view.progress_finished()
         self._view.set_running(False)
-        logger.info("Segmentation complete.")
         self._save_session_yml(executed_steps=self._worker._applied_steps)
         self._update_dataset_after_step("segment")
 
@@ -344,7 +340,6 @@ class PipelineController(QObject):
         if self._view.running or self._missing_input():
             return
         if not self._view.dataset:
-            logger.info("No dataset loaded - load a dataset.")
             return
 
         error = self._validate_object_blocks()
@@ -398,7 +393,6 @@ class PipelineController(QObject):
             return
         self._view.progress_finished()
         self._view.set_running(False)
-        logger.info("Profiling complete.")
         # Only the profiling sections that actually executed are recorded
         # (run_pipeline computes this from the config's channel selections —
         # a section with no channels is skipped and never marked applied).
@@ -409,7 +403,6 @@ class PipelineController(QObject):
         if self._view.running or self._missing_input():
             return
         if not self._view.dataset:
-            logger.info("No dataset loaded - load a dataset.")
             return
         panel = self._view.get_step_panel("inference")
         if panel is None:
@@ -440,7 +433,6 @@ class PipelineController(QObject):
             return
         self._view.progress_finished()
         self._view.set_running(False)
-        logger.info("Inference complete.")
         # Inference is non-destructive and never gates a re-run, but a
         # COMPLETED inference is recorded in applied_steps ('inference') like
         # the other steps. run_pipeline raises InterruptedError on cancel, so
@@ -520,7 +512,6 @@ class PipelineController(QObject):
             return
         self._view.progress_finished()
         self._view.set_running(False)
-        logger.info("Pipeline complete - all steps finished.")
         self._save_session_yml(executed_steps=self._worker._applied_steps)
         self._update_dataset_after_step("pipeline")
 
@@ -529,13 +520,11 @@ class PipelineController(QObject):
         if self._view.running:
             return
         if self._view.dataset is None:
-            logger.info("No dataset loaded - load a dataset.")
             return
         if not step.is_enabled():
             # An unchecked panel must never start a run: run_step would
             # execute nothing, yet _on_step_finished would record the step
             # name in applied_steps — gating the real step out forever.
-            logger.info(f"{step.step_name} is not enabled - check the box to run it.")
             self._view.progress_show_status(
                 f"{step.step_name} is not enabled — check the 'Run' box first."
             )
@@ -583,7 +572,6 @@ class PipelineController(QObject):
         self._view.progress_finished()
         self._view.set_running(False)
         step_name = step.step_name
-        logger.info(f"{step_name} complete.")
         # Persist exactly what run_step recorded: it owns the applied-steps
         # gate (fit-only BaSiC and no-op steps are never recorded). Saving
         # [step_name] unconditionally would mark a fit-only BaSiC as applied
@@ -597,7 +585,6 @@ class PipelineController(QObject):
         if self._view.running:
             return
         if self._view.dataset is None:
-            logger.info("No dataset loaded - load a dataset.")
             return
         self._view.set_running(True)
         cfg = self._build_base_config()
@@ -625,17 +612,13 @@ class PipelineController(QObject):
             return
         self._view.progress_finished()
         self._view.set_running(False)
-        logger.info("BaSiC model fit complete.")
         from PySide6.QtWidgets import QApplication
         QApplication.restoreOverrideCursor()
 
     # ── Preview ──────────────────────────────────────────────────────────
 
     def _ensure_random_row(self) -> bool:
-        if self._random_row_idx is None:
-            logger.info("Click 'Pick Random' first to select an image.")
-            return False
-        return True
+        return self._random_row_idx is not None
 
     def pick_random(self, step=None) -> None:
         ds = self._view.dataset
@@ -816,8 +799,6 @@ class PipelineController(QObject):
                 "No result dataset after step '%s'", step_name
             )
             return
-        logger.info("Updating dataset after %s: %d rows, %d channels",
-                 step_name, len(updated_ds), len(updated_ds.intensity_colnames))
         self._view.dataset = updated_ds
         self._view.original_dataset = clone_dataset(updated_ds)
         filter_panel = self._view.get_step_panel("filter")

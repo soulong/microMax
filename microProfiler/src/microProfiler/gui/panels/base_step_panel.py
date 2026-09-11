@@ -20,7 +20,11 @@ from PySide6.QtWidgets import (
 )
 
 from microProfiler.gui.state import PipelineState
-from microProfiler.gui.ui_spec import COMPACT_LINEEDIT_WIDTH, COMPACT_MAX_WIDTH
+from microProfiler.gui.ui_spec import (
+    COMPACT_LINEEDIT_WIDTH,
+    COMPACT_MAX_WIDTH,
+    PANEL_CONTENT_STYLE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,9 @@ class BaseStepPanel(QGroupBox):
         self.setChecked(False)
         self.setProperty("class", "card")
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        # Panel content uses the shared 9pt panel scale; the card title stays
+        # on the 11pt title scale via the app stylesheet.
+        self.setStyleSheet(PANEL_CONTENT_STYLE)
 
         self._controls_widget = QWidget()
         self._controls_widget.setProperty("class", "card-inner")

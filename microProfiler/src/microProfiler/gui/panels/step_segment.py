@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 
 from microProfiler.gui.path_drop import enable_path_drop
 from microProfiler.gui.dpi import dp
-from microProfiler.gui.panels.base_step_panel import BaseStepPanel
+from microProfiler.gui.panels.base_step_panel import BaseStepPanel, make_hsep
 from microProfiler.gui.panels._block_container import BlockContainerPanel
 from microProfiler.gui.image_widgets import ImageViewer
 
@@ -43,8 +43,10 @@ class SegmentBlockWidget(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 2, 0, 2)
-        layout.setSpacing(2)
+        # One spacing for every block (same as Object/Inference) so rows are
+        # equally spaced in every step, separator or not.
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(4)
 
         # Row 1: Object name + Model + Browse + Remove
         row1 = QHBoxLayout()
@@ -63,12 +65,12 @@ class SegmentBlockWidget(QWidget):
         self._model_name.setToolTip("Built-in cellpose model or path to custom model file")
         row1.addWidget(self._model_name)
         self._model_browse = QPushButton("Browse...")
-        self._model_browse.setProperty("class", "secondary")
         self._model_browse.clicked.connect(self._browse_model)
         row1.addWidget(self._model_browse)
         row1.addStretch()
+        # Give the destructive action a gap from the fields before it.
+        row1.addSpacing(12)
         self._remove_btn = QPushButton("✕ Remove")
-        self._remove_btn.setProperty("class", "danger")
         self._remove_btn.setToolTip("Remove this segmentation block")
         row1.addWidget(self._remove_btn)
         layout.addLayout(row1)
@@ -129,6 +131,9 @@ class SegmentBlockWidget(QWidget):
         row2.addStretch()
         layout.addLayout(row2)
 
+        # Section break: input channels.
+        layout.addWidget(make_hsep())
+
         # Row 3: Chan1 + Merge1
         row3 = QHBoxLayout()
         self._chan1_row = row3
@@ -179,30 +184,38 @@ class SegmentBlockWidget(QWidget):
         row4.addStretch()
         layout.addLayout(row4)
 
-        # Row 5: Right-aligned Pick Random and Preview Segment
+        # Section break: preview controls.
+        layout.addWidget(make_hsep())
+
+        # Row 5: left-aligned Pick Random, Preview Segment, Hide Mask — one
+        # identical fixed width so the three controls line up and never
+        # stretch with the card.
         row5 = QHBoxLayout()
-        row5.addStretch()
         self._pick_btn = QPushButton("Pick Random")
-        self._pick_btn.setProperty("class", "secondary")
         self._preview_btn = QPushButton("Preview Segment")
-        self._preview_btn.setProperty("class", "secondary")
-        row5.addWidget(self._pick_btn)
-        row5.addWidget(self._preview_btn)
         self._mask_toggle_btn = QPushButton("Hide Mask")
         self._mask_toggle_btn.setCheckable(True)
         self._mask_toggle_btn.setChecked(True)
-        self._mask_toggle_btn.setProperty("class", "secondary")
         self._mask_toggle_btn.setEnabled(False)
         self._mask_toggle_btn.clicked.connect(self._on_mask_toggle)
-        row5.addWidget(self._mask_toggle_btn)
-        self._mask_toggle_btn.setMinimumWidth(
-            self.fontMetrics().horizontalAdvance(self._pick_btn.text()) + 32
+        button_w = max(
+            self._pick_btn.sizeHint().width(),
+            self._preview_btn.sizeHint().width(),
+            self._mask_toggle_btn.sizeHint().width(),
         )
+        for _btn in (self._pick_btn, self._preview_btn, self._mask_toggle_btn):
+            _btn.setFixedWidth(button_w)
+        row5.addWidget(self._pick_btn)
+        row5.addWidget(self._preview_btn)
+        row5.addWidget(self._mask_toggle_btn)
+        # Keep the fixed-width buttons packed at the left; the stretch eats
+        # the leftover width so they never spread out.
+        row5.addStretch()
         layout.addLayout(row5)
 
-        # Preview row — centered C1/C2 images, tightly packed
+        # Preview row — centered C1/C2 images, tightly packed (2/3 size).
         self._preview_container = QWidget()
-        self._preview_container.setMinimumHeight(dp(220))
+        self._preview_container.setMinimumHeight(dp(146))
         preview_container_layout = QVBoxLayout(self._preview_container)
         preview_container_layout.setContentsMargins(0, 0, 0, 0)
         preview_container_layout.setSpacing(0)
@@ -221,7 +234,7 @@ class SegmentBlockWidget(QWidget):
         c1_label.setContentsMargins(0, 0, 0, 0)
         c1_col.addWidget(c1_label)
         self._c1_view = ImageViewer()
-        self._c1_view.setMinimumSize(dp(200), dp(200))
+        self._c1_view.setMinimumSize(dp(133), dp(133))
         self._c1_view.set_show_axes(True)
         c1_col.addWidget(self._c1_view)
         preview_row.addLayout(c1_col, 1)
@@ -234,7 +247,7 @@ class SegmentBlockWidget(QWidget):
         c2_label.setContentsMargins(0, 0, 0, 0)
         c2_col.addWidget(c2_label)
         self._c2_view = ImageViewer()
-        self._c2_view.setMinimumSize(dp(200), dp(200))
+        self._c2_view.setMinimumSize(dp(133), dp(133))
         self._c2_view.set_show_axes(True)
         c2_col.addWidget(self._c2_view)
         preview_row.addLayout(c2_col, 1)

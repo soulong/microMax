@@ -180,14 +180,44 @@ def _axis_style(ax, title: str = ""):
     ax.grid(True, alpha=0.25, linewidth=0.6)
 
 
-def _finish_grid(fig, axes, used: int, facet_cols, truncated: bool):
+# Fraction of the figure width reserved on the right edge for legends, so
+# they never overlap the plotted data.
+_LEGEND_STRIP = 0.11
+
+
+def _finish_grid(fig, axes, used, facet_cols, truncated,
+                 legends=(), colorbar=None):
+    """Hide unused panels and place every legend on the RIGHT edge.
+
+    All figure legends live in a reserved strip along the figure's right
+    side (stacked top/bottom), so they never sit on top of the data points.
+    A continuous-color colorbar keeps its usual place just right of the
+    axes, before the legend strip.
+    """
     for ax in axes[used:]:
         ax.set_visible(False)
+    fig.tight_layout()
+    right = 1.0 - _LEGEND_STRIP if (legends or colorbar is not None) else 1.0
+    if right < 1.0:
+        fig.subplots_adjust(right=right)
+    # Colorbar first: it needs the final axes bboxes; legends go right of it.
+    legend_left = right + 0.015
+    if colorbar is not None:
+        cbar = fig.colorbar(colorbar["mappable"], ax=axes[:used], shrink=0.8,
+                            label=colorbar.get("label") or None,
+                            fraction=0.045, pad=0.015)
+        legend_left = max(legend_left, cbar.ax.get_position().x1 + 0.01)
+    for i, spec in enumerate(legends):
+        if i == 0:
+            loc, y = "upper left", 0.99
+        else:
+            loc, y = "lower left", 0.01
+        fig.legend(handles=spec["handles"], title=spec.get("title") or None,
+                   loc=loc, bbox_to_anchor=(legend_left, y),
+                   fontsize=7, title_fontsize=7, frameon=False)
     if truncated:
-        fig.text(0.99, 0.01, "facet combinations truncated", ha="right",
-                 va="bottom", fontsize=7, color="#b05050")
-    if facet_cols:
-        fig.tight_layout()
+        fig.text(right - 0.01, 0.01, "facet combinations truncated",
+                 ha="right", va="bottom", fontsize=7, color="#b05050")
 
 
 # ── Scatter ───────────────────────────────────────────────────────────────
@@ -345,7 +375,6 @@ def make_scatter(
     point_size: float = 20.0,
     max_size: float = 220.0,
     ncols: int = 3,
-    title: str = "",
     max_combos: int = 24,
     hover_exclude=(),
 ):
@@ -410,17 +439,18 @@ def make_scatter(
         _apply_categorical_axis(ax, xticks, yticks)
         _axis_style(ax, label)
 
+    legends = []
+    colorbar = None
     if color_map is not None:
         handles = [Line2D([], [], marker="o", linestyle="", markersize=5,
                           markerfacecolor=c, markeredgecolor="white", label=str(v))
                    for v, c in color_map.items()]
-        fig.legend(handles=handles, loc="upper right", fontsize=7,
-                   title=color, frameon=False)
+        legends.append({"handles": handles, "title": color})
     elif norm is not None:
-        sm = ScalarMappable(norm=norm, cmap=cmap_obj)
-        fig.colorbar(sm, ax=axes[:len(groups)], shrink=0.8, label=color)
+        colorbar = {"mappable": ScalarMappable(norm=norm, cmap=cmap_obj),
+                    "label": color}
     if s_min is not None:
-        # Representative size legend on the first axis only.
+        # Representative size legend (right strip, below the color legend).
         reps = np.linspace(s_min, s_max, 3) if s_max > s_min else np.array([s_min])
         size_handles = [
             Line2D([], [], marker="o", linestyle="", markersize=math.sqrt(
@@ -430,11 +460,9 @@ def make_scatter(
                    label=f"{v:.3g}")
             for v in reps
         ]
-        axes[0].legend(handles=size_handles, fontsize=6, title=size,
-                       title_fontsize=6, loc="lower right", frameon=False)
-    if title:
-        fig.suptitle(title, fontsize=11)
-    _finish_grid(fig, axes, len(groups), facet_cols, truncated)
+        legends.append({"handles": size_handles, "title": size})
+    _finish_grid(fig, axes, len(groups), facet_cols, truncated,
+                 legends=legends, colorbar=colorbar)
     return fig
 
 
@@ -463,7 +491,6 @@ def make_boxplot(
     palette: str = "Set1",
     show_points: bool = False,
     ncols: int = 3,
-    title: str = "",
     max_combos: int = 24,
 ):
     """Faceted boxplot: one box per x (and categorical color) group.
@@ -509,15 +536,14 @@ def make_boxplot(
             ax.set_yticklabels(yticks, fontsize=7)
         _axis_style(ax, label)
 
+    legends = []
     if color_map is not None:
         handles = [Line2D([], [], marker="s", linestyle="", markersize=6,
                           markerfacecolor=c, markeredgecolor="none", label=str(v))
                    for v, c in color_map.items()]
-        fig.legend(handles=handles, loc="upper right", fontsize=7,
-                   title=color, frameon=False)
-    if title:
-        fig.suptitle(title, fontsize=11)
-    _finish_grid(fig, axes, len(groups), facet_cols, truncated)
+        legends.append({"handles": handles, "title": color})
+    _finish_grid(fig, axes, len(groups), facet_cols, truncated,
+                 legends=legends)
     return fig
 
 
@@ -529,7 +555,6 @@ def make_barplot_mean_sem(
     facet_cols=(),
     palette: str = "Set1",
     ncols: int = 3,
-    title: str = "",
     max_combos: int = 24,
 ):
     """Faceted barplot: bar height = mean, error bar = SEM.
@@ -572,15 +597,14 @@ def make_barplot_mean_sem(
             ax.set_yticklabels(yticks, fontsize=7)
         _axis_style(ax, label)
 
+    legends = []
     if color_map is not None:
         handles = [Line2D([], [], marker="s", linestyle="", markersize=6,
                           markerfacecolor=c, markeredgecolor="none", label=str(v))
                    for v, c in color_map.items()]
-        fig.legend(handles=handles, loc="upper right", fontsize=7,
-                   title=color, frameon=False)
-    if title:
-        fig.suptitle(title, fontsize=11)
-    _finish_grid(fig, axes, len(groups), facet_cols, truncated)
+        legends.append({"handles": handles, "title": color})
+    _finish_grid(fig, axes, len(groups), facet_cols, truncated,
+                 legends=legends)
     return fig
 
 
@@ -592,7 +616,6 @@ def make_line(
     facet_cols=(),
     palette: str = "Set1",
     ncols: int = 3,
-    title: str = "",
     max_combos: int = 24,
 ):
     """Faceted line plot over categorical x groups: mean ± SEM.
@@ -654,15 +677,14 @@ def make_line(
             ax.set_yticklabels(yticks, fontsize=7)
         _axis_style(ax, label)
 
+    legends = []
     if color_map is not None:
         handles = [Line2D([], [], marker="o", linestyle="-", markersize=5,
                           markerfacecolor=c, markeredgecolor=c, label=str(v))
                    for v, c in color_map.items()]
-        fig.legend(handles=handles, loc="upper right", fontsize=7,
-                   title=color, frameon=False)
-    if title:
-        fig.suptitle(title, fontsize=11)
-    _finish_grid(fig, axes, len(groups), facet_cols, truncated)
+        legends.append({"handles": handles, "title": color})
+    _finish_grid(fig, axes, len(groups), facet_cols, truncated,
+                 legends=legends)
     return fig
 
 

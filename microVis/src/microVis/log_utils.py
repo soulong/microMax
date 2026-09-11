@@ -33,7 +33,7 @@ def setup_logging(console_level: int = logging.INFO) -> None:
     Console (stdout, falling back to stderr): ``console_level`` (default
     INFO) with a compact ``[HH:MM:SS] LEVEL | message`` format, so a
     terminal launch shows what the app is doing — same style as
-    microProfiler. ``--debug`` on the command line promotes it to DEBUG.
+    microProfiler. microVis logs at INFO level only.
 
     Handlers sit on the ROOT logger so every package's logs (microVis,
     microBase merges, ...) reach the sinks. The file sink is attached per
@@ -45,14 +45,11 @@ def setup_logging(console_level: int = logging.INFO) -> None:
         return
     _SETUP_DONE = True
 
-    if "--debug" in sys.argv:
-        console_level = logging.DEBUG
-
     fmt = logging.Formatter("[%(asctime)s] %(levelname)s | %(message)s",
                             datefmt="%H:%M:%S")
 
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
+    root.setLevel(console_level)
 
     stream = sys.stdout if sys.stdout is not None else sys.stderr
     if stream is not None:
@@ -61,9 +58,16 @@ def setup_logging(console_level: int = logging.INFO) -> None:
         console.setFormatter(fmt)
         root.addHandler(console)
 
+    # Quiet noisy third-party libraries: fontTools logs EVERY step of its
+    # PDF font subsetting (matplotlib exports with pdf.fonttype=42), which
+    # would otherwise flood the console and the per-dataset log on each
+    # "Export PDF". Their children (fontTools.subset, ...) inherit the level.
+    for name in ("fontTools", "matplotlib.font_manager", "PIL"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 def set_log_file(path) -> None:
-    """Log everything (DEBUG) to ``path`` — one file per dataset directory.
+    """Log INFO records to ``path`` — one file per dataset directory.
 
     Called when a dataset finishes loading; a later dataset retargets the
     handler (the old file keeps the session's earlier records).
@@ -80,7 +84,7 @@ def set_log_file(path) -> None:
     handler = logging.FileHandler(str(path), mode="a", encoding="utf-8")
     handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    handler.setLevel(logging.DEBUG)
+    handler.setLevel(logging.INFO)
     root.addHandler(handler)
     _FILE_HANDLER = handler
     atexit.register(logging.shutdown)

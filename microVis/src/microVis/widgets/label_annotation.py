@@ -76,7 +76,7 @@ class _ObjectThumb(QFrame):
 
         self.setFixedSize(thumb_size + 4, thumb_size + 4)
         self.setStyleSheet(
-            "_ObjectThumb { background-color: #1e1e2e; border: 1px solid #444444; "
+            "_ObjectThumb { background-color: #1e1e2e; border: 1px solid #333333; "
             "border-radius: 4px; } "
             "_ObjectThumb:hover { border-color: #5a8a9a; }"
         )

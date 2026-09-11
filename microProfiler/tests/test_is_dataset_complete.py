@@ -70,6 +70,56 @@ def test_expected_reduction_tables_mirrors_bridge_method_choice():
         {"reduction_pca", "reduction_umap"})
 
 
+def test_empty_method_fits_nothing():
+    """Explicit [] = no DR method at all: the bridge schedules no reduction
+    stage and the completeness check expects no reduction table."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from microProfiler.pipeline._micromodel_bridge import (
+        _build_mm_inference_config,
+    )
+
+    red = InferenceReductionConfig(enabled=True, method=[])
+    entry = InferenceEntry(
+        model="m.pt", mask_name="cell", channels=["ch1"],
+        max_value=65535.0, reduction=red)
+    cfg = PipelineConfig()
+    ds = SimpleNamespace(
+        intensity_colnames=["ch1"], image_pattern="p",
+        mask_pattern="q", image_subdir_pattern="",
+    )
+    mm_cfg = _build_mm_inference_config(entry, cfg, ds, Path("."))
+    assert "reduction" not in mm_cfg
+    assert expected_reduction_tables(entry) == frozenset()
+
+
+def test_empty_method_with_cluster_still_uses_pca_reference():
+    """A checked Cluster group needs the PCA reference embedding even when
+    no DR method is selected."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from microProfiler.pipeline._micromodel_bridge import (
+        _build_mm_inference_config,
+    )
+
+    red = InferenceReductionConfig(
+        enabled=True, cluster_enabled=True, cluster="cluster.pkl", method=[])
+    entry = InferenceEntry(
+        model="m.pt", mask_name="cell", channels=["ch1"],
+        max_value=65535.0, reduction=red)
+    cfg = PipelineConfig()
+    ds = SimpleNamespace(
+        intensity_colnames=["ch1"], image_pattern="p",
+        mask_pattern="q", image_subdir_pattern="",
+    )
+    mm_cfg = _build_mm_inference_config(entry, cfg, ds, Path("."))
+    assert mm_cfg["reduction"]["method"] == ["pca"]
+    assert expected_reduction_tables(entry) == frozenset(
+        {"reduction_pca", "find_cluster"})
+
+
 def test_missing_reduction_table_marks_incomplete(tmp_path):
     red = InferenceReductionConfig(enabled=True, method=["pacmap"])
     cfg = _inference_cfg(red)

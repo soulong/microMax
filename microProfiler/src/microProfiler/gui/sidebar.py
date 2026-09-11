@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from microProfiler.gui.dpi import dp
-from microProfiler.gui.ui_spec import SIDEBAR_BTN_HEIGHT, SIDEBAR_WIDTH
+from microProfiler.gui.ui_spec import SIDEBAR_WIDTH
 
 
 def _make_divider() -> QFrame:
@@ -28,13 +28,6 @@ def _make_divider() -> QFrame:
     line.setProperty("class", "sidebar-divider")
     line.setFixedHeight(1)
     return line
-
-
-def _make_section_header(text: str) -> QLabel:
-    label = QLabel(text)
-    label.setProperty("class", "sidebar-section")
-    label.setContentsMargins(8, 4, 8, 2)
-    return label
 
 
 class SidebarItem(QWidget):
@@ -79,16 +72,14 @@ class Sidebar(QWidget):
     navigation_changed = Signal(str)
     run_all_clicked = Signal()
     cancel_clicked = Signal()
-    load_config_clicked = Signal()
-    reset_all_clicked = Signal()
     thread_count_changed = Signal(int)
     display_range_changed = Signal(float, float)
 
     PAGES = [
         ("input", "Input"),
-        ("preprocess", "Pre-process"),
-        ("segment", "Segment"),
-        ("profile", "Profile"),
+        ("preprocess", "Preprocess"),
+        ("segment", "Segmentation"),
+        ("profile", "Profiling"),
         ("inference", "Inference"),
     ]
 
@@ -102,18 +93,15 @@ class Sidebar(QWidget):
         layout.setContentsMargins(0, 6, 0, 6)
         layout.setSpacing(0)
 
-        # ── Input section ──
-        layout.addWidget(_make_section_header("INPUT"))
+        # ── Input ──
         self._add_item("input")
         layout.addWidget(_make_divider())
 
-        # ── Processing section ──
-        layout.addWidget(_make_section_header("PROC"))
+        # ── Processing ──
         self._add_item("preprocess")
         layout.addWidget(_make_divider())
 
-        # ── Analysis section ──
-        layout.addWidget(_make_section_header("ANALYSIS"))
+        # ── Analysis ──
         self._add_item("segment")
         self._add_item("profile")
         self._add_item("inference")
@@ -162,27 +150,16 @@ class Sidebar(QWidget):
         self._thread_spin.valueChanged.connect(self.thread_count_changed.emit)
         layout.addLayout(_make_spin_row("Thread", self._thread_spin, "Number of worker processes for parallel profiling"))
 
-        self._load_config_btn = QPushButton("Load")
-        self._load_config_btn.setProperty("class", "sidebar-footer-btn")
-        self._load_config_btn.setFixedHeight(dp(SIDEBAR_BTN_HEIGHT))
-        self._load_config_btn.clicked.connect(self.load_config_clicked.emit)
-        layout.addWidget(self._load_config_btn)
-
-        self._reset_all_btn = QPushButton("Reset")
-        self._reset_all_btn.setProperty("class", "sidebar-footer-btn-danger")
-        self._reset_all_btn.setFixedHeight(dp(SIDEBAR_BTN_HEIGHT))
-        self._reset_all_btn.clicked.connect(self.reset_all_clicked.emit)
-        layout.addWidget(self._reset_all_btn)
-
+        # Run All / Cancel are the only footer action buttons; both use the
+        # shared button style (thin outline, accent text) with a small side
+        # inset so they do not touch the sidebar edges.
         self._run_all_btn = QPushButton("Run All")
-        self._run_all_btn.setProperty("class", "sidebar-footer-btn-primary")
-        self._run_all_btn.setFixedHeight(dp(SIDEBAR_BTN_HEIGHT))
+        self._run_all_btn.setProperty("class", "sidebar-footer-btn")
         self._run_all_btn.clicked.connect(self.run_all_clicked.emit)
         layout.addWidget(self._run_all_btn)
 
         self._cancel_btn = QPushButton("Cancel")
-        self._cancel_btn.setProperty("class", "sidebar-footer-btn-cancel")
-        self._cancel_btn.setFixedHeight(dp(SIDEBAR_BTN_HEIGHT))
+        self._cancel_btn.setProperty("class", "sidebar-footer-btn")
         self._cancel_btn.setVisible(False)
         self._cancel_btn.clicked.connect(self.cancel_clicked.emit)
         layout.addWidget(self._cancel_btn)
@@ -202,9 +179,7 @@ class Sidebar(QWidget):
         self._cancel_btn.setVisible(visible)
 
     def set_action_buttons_enabled(self, enabled: bool) -> None:
-        """Enable/disable Load/Reset/Run All (disabled while a run is active)."""
-        self._load_config_btn.setEnabled(enabled)
-        self._reset_all_btn.setEnabled(enabled)
+        """Enable/disable Run All (disabled while a run is active)."""
         self._run_all_btn.setEnabled(enabled)
 
     def _emit_display_range(self) -> None:

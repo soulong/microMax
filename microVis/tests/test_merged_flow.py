@@ -172,6 +172,21 @@ def test_merged_db_flow(dataset, window, qt_app):
     assert set(table["pred_class"]) == {"drug", "ctrl"}
     assert (table["area"] == 36.0).sum() == 2
 
+    # ── Color by dropdowns: integrated table REPLACES raw profiler tables ──
+    gw_labels = [window._grid_controls.column.itemText(i)
+                 for i in range(window._grid_controls.column.count())]
+    ov_labels = [window._image_controls.overlay_col.itemText(i)
+                 for i in range(window._image_controls.overlay_col.count())]
+    for labels in (gw_labels, ov_labels):
+        assert "merge/area" in labels and "merge/pred_class" in labels
+        # No raw profiler-table duplicates once the merged table exists.
+        assert not any(lbl.startswith("cell/") for lbl in labels), labels
+
+    # The fused-source readout next to Select DB names the inputs + result.
+    status = window._data_view._db_status_label.text()
+    assert "profiler.db + infer.db" in status, status
+    assert status.endswith("-> merge"), status
+
     # ── The plot view has the columns and can render ──
     pv = window._plot_view
     pv._x_combo.setCurrentText("umap_1")
@@ -192,6 +207,21 @@ def test_merged_db_flow(dataset, window, qt_app):
     qt_app.processEvents()
     assert pv._popup.isVisible(), "cell popup should show after a point click"
 
+    # The popup must land AT THE CLICK, not vertically mirrored: matplotlib
+    # display coords have a bottom-left origin, Qt's mapToGlobal a top-left
+    # one. A naive mapping put top-half clicks at the bottom (and vice versa).
+    from PySide6.QtCore import QPoint
+    from microVis.widgets.data_plot import _mpl_to_qt_xy
+    dpr = pv._canvas.devicePixelRatioF() or 1.0
+    expected = pv._canvas.mapToGlobal(
+        QPoint(*_mpl_to_qt_xy(pv._canvas.height(), dpr, x_disp, y_disp)))
+    expected += QPoint(16, 16)
+    # Allow a few px of window-manager nudging (offscreen screens are small
+    # and may clamp the popup); the regression being guarded is the y mirror.
+    actual = pv._popup.pos()
+    assert abs(actual.x() - expected.x()) <= 4, (actual, expected)
+    assert abs(actual.y() - expected.y()) <= 4, (actual, expected)
+
     # ── Click on empty canvas space → popup hides ──
     far = ax.transData.transform([[offsets[:, 0].max() + 1e6,
                                    offsets[:, 1].max() + 1e6]])[0]
@@ -207,6 +237,17 @@ def test_merged_db_flow(dataset, window, qt_app):
     qt_app.processEvents()
     assert "batch" in pv._df.columns
     assert set(pv._df["batch"]) == {1, 2}
+    assert "(+ metadata)" in window._data_view._db_status_label.text()
+
+    # Clearing the metadata drops the suffix again.
+    window._on_metadata_clear()
+    qt_app.processEvents()
+    status = window._data_view._db_status_label.text()
+    assert "(+ metadata)" not in status and status.endswith("-> merge")
+    # The cleared metadata must be merged again (the write below expects it).
+    window._metadata_df = pd.DataFrame({"well": WELLS, "batch": [1, 2]})
+    window._on_metadata_merge()
+    qt_app.processEvents()
 
     # ── Write to DB → merge.db with the integrated table ──
     from PySide6.QtWidgets import QMessageBox
@@ -239,6 +280,184 @@ def test_merged_db_flow(dataset, window, qt_app):
     from microVis.io.merged_data import MergedData
     merged_again = MergedData.load([merge_db])
     assert len(merged_again.table) == 4
+
+
+def test_reset_then_reload_restores_plot_area(dataset, window, qt_app):
+    """Reset → reload → Select DB must bring the lower half back.
+
+    Regression: DataView.reset() used to detach the installed plot view, so
+    the controls+canvas column stayed gone forever after a Reset, no matter
+    which DB was selected afterwards.
+    """
+    window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
+    qt_app.processEvents()
+    assert window._data_view._plot_view is window._plot_view
+
+    window._on_full_reset()
+    qt_app.processEvents()
+    assert window._data_view._plot_view is window._plot_view, (
+        "Reset must not detach the plot view from the Data page")
+
+    # Load the dataset again and select the same DBs.
+    window.select_dataset_dir(str(dataset))
+    window._data_view.set_patterns(
+        image=IMAGE_PATTERN, mask=MASK_PATTERN, subdir="")
+    window._on_load_dataset_clicked()
+    for _ in range(3000):
+        qt_app.processEvents()
+        if window._dm is not None and window._loaded_dataset_dir:
+            break
+        qt_app.thread().msleep(5)
+    assert window._dm is not None, "dataset did not load after reset"
+    window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
+    qt_app.processEvents()
+    assert window._plot_view._df is not None
+    # The view is back in the page layout (offscreen windows are never
+    # shown, so check ancestry, not isVisible()).
+    assert window._plot_view.isVisibleTo(window._data_view)
+
+
+def test_reset_restores_plot_controls(dataset, window, qt_app):
+    """The Data-page Reset must clear the plot-control pickers too.
+
+    Regression: Reset dropped the table/figure but left every picker with
+    the previous DB's columns and options.
+    """
+    window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
+    qt_app.processEvents()
+    pv = window._plot_view
+    pv._chart_combo.setCurrentText("boxplot")
+    pv._filter_edit.setText("area > 1")
+    pv._x_combo.setCurrentText("well")
+    pv._y_combo.setCurrentText("area")
+    pv._color_combo.setCurrentText("pred_class")
+    pv._size_combo.setCurrentText("area")
+    pv._facet_filter.setText("pred")
+    pv._facet_cols.setValue(5)
+    pv._scatter_size.setValue(50.0)
+    pv._cap_spin.setValue(100)
+    pv._show_points.setChecked(False)
+    qt_app.processEvents()
+
+    window._on_full_reset()
+    qt_app.processEvents()
+
+    assert pv._df is None
+    assert pv._chart_combo.currentText() == "scatter"
+    assert pv._filter_edit.text() == ""
+    assert pv._x_combo.currentText() == ""
+    assert pv._y_combo.currentText() == ""
+    assert pv._color_combo.currentText() == ""
+    assert pv._size_combo.currentText() == ""
+    assert pv._facet_list.count() == 0
+    assert pv._facet_filter.text() == ""
+    assert pv._facet_cols.value() == 3
+    assert pv._colors_combo.count() == 0
+    assert pv._scatter_size.value() == 20.0
+    assert pv._cap_spin.value() == 20000
+    assert pv._show_points.isChecked()
+
+
+def test_cell_popup_dismissed_on_page_switch_and_outside_click(
+        dataset, window, qt_app):
+    """The cropped-cell popup must vanish as soon as the plot is left."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from matplotlib.backend_bases import MouseEvent
+
+    # The page-switch hide relies on real visibility transitions, so show
+    # the window (still offscreen) before driving the flow.
+    window.show()
+    qt_app.processEvents()
+    window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
+    qt_app.processEvents()
+    pv = window._plot_view
+    pv._x_combo.setCurrentText("umap_1")
+    pv._y_combo.setCurrentText("area")
+    pv._on_plot()
+    qt_app.processEvents()
+    assert pv._figure is not None
+
+    def click_first_point():
+        ax = pv._figure.axes[0]
+        offsets = np.asarray(ax.collections[0].get_offsets())
+        x_disp, y_disp = ax.transData.transform(offsets[0])
+        pv._canvas.callbacks.process(
+            "button_press_event",
+            MouseEvent("button_press_event", pv._canvas, x_disp, y_disp,
+                       button=1))
+        qt_app.processEvents()
+
+    # A point click shows the popup …
+    click_first_point()
+    assert pv._popup.isVisible()
+    # … switching to the Image page hides it with the view.
+    window._switch_tab(1)
+    qt_app.processEvents()
+    assert not pv._popup.isVisible(), "popup survived a page switch"
+    window._switch_tab(0)
+    qt_app.processEvents()
+
+    # Re-show it, then press a control outside the canvas.
+    click_first_point()
+    assert pv._popup.isVisible()
+    QTest.mousePress(window._data_view._btn_dataset_browse, Qt.LeftButton)
+    qt_app.processEvents()
+    assert not pv._popup.isVisible(), "popup survived an outside click"
+
+    # Losing the window / application focus (user switched apps) hides it.
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QApplication
+
+    click_first_point()
+    assert pv._popup.isVisible()
+    QApplication.sendEvent(window, QEvent(QEvent.WindowDeactivate))
+    qt_app.processEvents()
+    assert not pv._popup.isVisible(), "popup survived losing the window focus"
+
+    click_first_point()
+    assert pv._popup.isVisible()
+    QApplication.sendEvent(qt_app, QEvent(QEvent.ApplicationDeactivate))
+    qt_app.processEvents()
+    assert not pv._popup.isVisible(), "popup survived losing the app focus"
+
+
+def test_channel_vmin_vmax_follow_integer_dtype(dataset, window, qt_app):
+    """uint16 images show vmin/vmax as whole numbers (no decimals)."""
+    assert window._dm.img_dtype == "uint16"
+    rows = window._image_controls._channel_widgets
+    assert rows, "channel controls should be built after a dataset load"
+    for row in rows.values():
+        assert row._vmin.decimals() == 0
+        assert row._vmax.decimals() == 0
+        assert "." not in row._vmin.text()
+        assert "." not in row._vmax.text()
+
+    # Fractional datasets keep their decimals.
+    from microVis.widgets.channel_controls import ChannelControls
+    fl = ChannelControls("f", {}, max_value=1.0, integer=False)
+    assert fl._vmax.decimals() == 4
+
+
+def test_facet_filter_hides_columns_but_keeps_selection(dataset, window, qt_app):
+    """The type-to-filter box hides rows without touching the selection."""
+    window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
+    qt_app.processEvents()
+    pv = window._plot_view
+    checked_before = pv._facet_selected()
+
+    pv._facet_filter.setText("pred")
+    qt_app.processEvents()
+    visible = [pv._facet_list.item(i).text()
+               for i in range(pv._facet_list.count())
+               if not pv._facet_list.item(i).isHidden()]
+    assert visible and all("pred" in t.lower() for t in visible)
+    assert pv._facet_selected() == checked_before
+
+    pv._facet_filter.clear()
+    qt_app.processEvents()
+    assert all(not pv._facet_list.item(i).isHidden()
+               for i in range(pv._facet_list.count()))
 
 
 def test_merged_data_join_and_prefix_rules(tmp_path):
@@ -470,3 +689,16 @@ def test_legacy_relative_dir_click_crops_clicked_site(tmp_path, qt_app,
             "clicked cell was cropped from the WRONG site's mask"
     finally:
         win.close()
+
+
+def test_mpl_to_qt_xy_flips_and_scales():
+    """mpl physical/bottom-origin → Qt logical/top-origin conversion."""
+    from microVis.widgets.data_plot import _mpl_to_qt_xy
+
+    # y=500 physical on a 600px canvas is 100px from the top.
+    assert _mpl_to_qt_xy(600, 1.0, 100, 500) == (100, 100)
+    # HiDPI: physical coords are dpr-scaled, Qt coords are logical.
+    assert _mpl_to_qt_xy(600, 2.0, 200, 1000) == (100, 100)
+    # Canvas corners map to corners.
+    assert _mpl_to_qt_xy(600, 1.0, 0, 600) == (0, 0)
+    assert _mpl_to_qt_xy(600, 1.0, 0, 0) == (0, 600)
