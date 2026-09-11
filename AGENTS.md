@@ -102,6 +102,7 @@ Module map (overview):
 | `cell_dataset.py`  | Pre-cropped single-cell TIFF loader (one TIFF per cell)                                  |
 | `patterns.py`      | Default regex patterns for common microscope file layouts                                |
 | `db_contracts.py`  | Shared profiler.db / infer.db table+column names and SQL helpers                          |
+| `db_merge.py`      | Mask-aware merge of profiler/infer DBs into fused per-object tables (+ merge-DB writer)    |
 | `errors.py`        | Exception hierarchy (`MicroMaxError`, `ImageReadError`, `ConfigError`, ...)                |
 
 Key concepts:
@@ -205,11 +206,16 @@ The pipeline:
   inference and optional DR reduction / cluster prediction (one or more
   pre-fitted reducer pickles of any DR mix, and/or a baseline cluster.pkl
   that kNN-predicts the find_cluster table), writing a per-block DB under
-  the dataset dir.
+  the dataset dir. Each finished block is then AUTO-MERGED with the
+  profiler object table of the SAME mask (via microBase `db_merge`;
+  sources untouched) into `<dataset>/merge_<mask>.db`. Object tables are
+  bookkept in profiler.db's `_table_masks` (table -> mask) so the merges
+  group correctly even for custom `output_table_name`s.
 
 * Outputs: in-place processed TIFFs, `<stem>_cp_masks_<obj>.png` masks,
   `profiler.db` (image + per-object tables), `<dataset>/<output_db>`
-  (inference), and `session.yml` (applied steps + patterns).
+  (inference), `<dataset>/merge_<mask>.db` (per-mask auto-merge), and
+  `session.yml` (applied steps + patterns).
 
 **Adding a new pipeline step:** add a step module exposing
 `step_dataset(ds, **kwargs, progress=...) -> ImageDataset`; add an `XxxConfig`
@@ -225,19 +231,20 @@ buttons all drive `run_pipeline` with a section-restricted config.
 
 ## 6. microVis — interactive Qt viewer
 
-**Path:** `microMax/microVis/` · **Entry:** `microvis` (GUI only). Launch logs progress to the terminal (INFO; `--debug` for DEBUG; full detail always appended to %TEMP%/microVis.log).
+**Path:** `microMax/microVis/` · **Entry:** `microvis` (GUI only). Launch logs progress to the terminal (INFO; `--debug` for DEBUG); each dataset directory keeps its own full-detail microVis.log.
 
 Package layout (overview):
 
 * `io/data_module.py` — `DataModule`, the single facade over
   `microBase.ImageDataset` + `profiler.db`.
 
-* `io/merged_data.py` — `MergedData`, builds THE integrated per-object table
-  from any mix of profiler.db (object tables) and infer.db (`inference`
-  minus features, joined with every `reduction_<method>` on uid) files:
-  outer-merged per object on the identity columns (well/label/directory/...),
-  colliding columns prefixed `<db-stem>/`; also `write_merged_db` (the
-  Write-to-DB target, default merge.db, table `merged`).
+* `io/merged_data.py` — `MergedData`, a thin GUI wrapper over microBase
+  `db_merge`: the integrated per-object table from any mix of profiler.db
+  (object tables) and infer.db files, fused ONLY within the same mask
+  (identity columns well/label/directory/...; colliding columns prefixed
+  `<db-stem>/`; different masks stack, tagged in a `mask` column; infer
+  rows without mask info join the profiler's mask with a log hint). Also
+  the Excel-metadata merge and the dataset directory scoping.
 
 * `widgets/` — image display (thumbnail grid + full-res view), channel
   controls, image filters, well-grid canvas, label annotation panel, pixel
@@ -284,11 +291,14 @@ Data flow:
 
 * The Data page selects a dataset directory via a line edit (type/browse/drop),
   then **Select DB** accepts any number of profiler.db AND infer.db files of
-  that dataset. Their object rows are fused into ONE integrated table
-  (io/merged_data: outer merge on the identity columns — well, label,
-  directory, ... — so profiler measurements and infer predictions/
-  coordinates meet in a single row per object; colliding columns are
-  prefixed `<db-stem>/`). One plot area renders that table: scatter / line
+  that dataset (a single selection is used as-is). Their object rows are
+  fused into ONE integrated table per mask (microBase `db_merge`: outer
+  merge on the identity columns — well, label, directory, ... — so
+  profiler measurements and infer predictions/coordinates meet in a single
+  row per object; colliding columns are prefixed `<db-stem>/`; different
+  masks stack with a `mask` tag; infer rows without mask info join the
+  profiler's mask, logged as a hint). One plot area renders that table:
+  scatter / line
   mean±SEM / boxplot / barplot mean±SEM with X/Y/color/size/facets and
   palette; X/Y accept every merged column, categoricals plotted on level
   ticks. Every picker combo is editable — type to filter long column lists.
@@ -402,8 +412,10 @@ Design:
   highest-probability class and its probability, and the full per-class
   vector is stored in fixed-order `prob_<class>` columns (single-label probs
   are a softmax distribution, multi-label independent per-class sigmoids).
-  Probability-descending ordering is a display concern of
-  reduction-vis, never baked into the DB.
+  Every row carries a `mask_name` column (the bare segmentation mask the
+  objects came from; NULL for single-cell inference) — the per-mask
+  grouping key for the downstream merges. Probability-descending ordering
+  is a display concern of reduction-vis, never baked into the DB.
 
 * Bundles carry their meta (channels, normalization, augmentation);
   inference always uses the settings baked into the bundle at training time.

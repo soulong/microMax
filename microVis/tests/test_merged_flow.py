@@ -270,6 +270,76 @@ def test_merged_data_join_and_prefix_rules(tmp_path):
     assert t["prob"].iloc[0] == 0.5          # non-colliding stays bare
 
 
+def test_different_masks_stack_and_log_file_in_dataset(tmp_path, qt_app):
+    """Infer results of ANOTHER mask stack instead of fusing, and the
+    dataset keeps its own microVis.log once loaded."""
+    from tifffile import imwrite
+    from PIL import Image
+
+    root = tmp_path / "mask_ds"
+    root.mkdir()
+    img = np.zeros((32, 32), dtype=np.uint16)
+    img[4:10, 4:10] = 3000
+    mask = np.zeros((32, 32), dtype=np.uint8)
+    mask[4:10, 4:10] = 1
+    mask[18:26, 18:26] = 2
+    for well in WELLS:
+        imwrite(str(root / f"{well}_f1_ch1.tiff"), img)
+        Image.fromarray(mask).save(
+            str(root / f"{well}_f1_ch1_cp_masks_cell.png"))
+
+    conn = sqlite3.connect(str(root / "profiler.db"))
+    conn.execute("CREATE TABLE cell (well TEXT, field TEXT, directory TEXT, "
+                 "label INTEGER, area REAL)")
+    conn2 = sqlite3.connect(str(root / "infer.db"))
+    conn2.execute(
+        "CREATE TABLE inference (uid INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "directory TEXT, mask_name TEXT, well TEXT, field TEXT, label "
+        "INTEGER, pred_class TEXT)")
+    for well in WELLS:
+        for label in (1, 2):
+            conn.execute("INSERT INTO cell VALUES (?, '1', ?, ?, 36.0)",
+                         (well, "Images", label))
+            conn2.execute(
+                "INSERT INTO inference (directory, mask_name, well, field, "
+                "label, pred_class) VALUES (?, 'nuclei', ?, '1', ?, 'x')",
+                ("Images", well, label))
+    conn.commit()
+    conn.close()
+    conn2.commit()
+    conn2.close()
+
+    from microVis.main_window import MainWindow
+    win = MainWindow()
+    try:
+        win.select_dataset_dir(str(root))
+        win._data_view.set_patterns(
+            image=IMAGE_PATTERN, mask=MASK_PATTERN, subdir="")
+        win._on_load_dataset_clicked()
+        for _ in range(3000):
+            qt_app.processEvents()
+            if win._dm is not None and win._loaded_dataset_dir:
+                break
+            qt_app.thread().msleep(5)
+        qt_app.processEvents()
+
+        # The dataset directory owns its log file.
+        assert (root / "microVis.log").exists()
+
+        win.load_db_files([root / "profiler.db", root / "infer.db"])
+        qt_app.processEvents()
+        table = win._merged.table
+        # nuclei infer rows must NOT fuse with cell profiler rows.
+        assert len(table) == 8
+        assert set(table["mask"]) == {"cell", "nuclei"}
+        cell = table[table["mask"] == "cell"]
+        assert cell["area"].notna().all() and cell["pred_class"].isna().all()
+        nuc = table[table["mask"] == "nuclei"]
+        assert nuc["area"].isna().all() and nuc["pred_class"].notna().all()
+    finally:
+        win.close()
+
+
 def test_legacy_relative_dir_click_crops_clicked_site(tmp_path, qt_app,
                                                       monkeypatch):
     """Legacy DBs (root-RELATIVE directory) must not break click-to-cell.

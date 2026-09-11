@@ -36,6 +36,7 @@ from microBase.db_contracts import (
     INFER_DB_NAME,
     LABEL_COLUMN,
     MASK_FILENAME_COLUMN,
+    MASK_NAME_COLUMN,
     PRED_CLASS_COLUMN,
     PRED_PROB_COLUMN,
     PROB_COLUMN_PREFIX,
@@ -93,7 +94,7 @@ def _reject_reserved_extra_cols(extra_cols, class_names):
         )
 
 
-def _init_db(conn, mode, extra_cols=None, prob_cols=None):
+def _init_db(conn, mode, extra_cols=None, prob_cols=None, mask_name=None):
     """Create the single `inference` table.
 
     Existing tables whose column set differs are dropped and recreated
@@ -103,6 +104,9 @@ def _init_db(conn, mode, extra_cols=None, prob_cols=None):
 
     prob_cols: per-class probability columns, one REAL column per class in
     class_names order (both single- and multi-label bundles).
+    mask_name: bare mask name of the segmented objects (whole-image mode);
+    stored on every row so downstream merges can group per mask. Single-cell
+    inference has no mask file -> the column is written NULL.
     """
     extra_cols = extra_cols or []
     prob_cols = prob_cols or []
@@ -110,7 +114,9 @@ def _init_db(conn, mode, extra_cols=None, prob_cols=None):
         UID_COLUMN, DIRECTORY_COLUMN, FILENAME_COLUMN,
     ]
     if mode == "whole_image":
-        col_names.extend([MASK_FILENAME_COLUMN, LABEL_COLUMN])
+        col_names.extend([MASK_FILENAME_COLUMN, MASK_NAME_COLUMN, LABEL_COLUMN])
+    else:
+        col_names.append(MASK_NAME_COLUMN)
     col_names.append(GROUND_TRUTH_COLUMN)
     col_names.extend(extra_cols)
     col_names.extend([PRED_CLASS_COLUMN, PRED_PROB_COLUMN])
@@ -124,6 +130,8 @@ def _init_db(conn, mode, extra_cols=None, prob_cols=None):
     ]
     if mode == "whole_image":
         cols.append(f"{MASK_FILENAME_COLUMN} TEXT")
+    cols.append(f"{MASK_NAME_COLUMN} TEXT")
+    if mode == "whole_image":
         cols.append(f"{LABEL_COLUMN} INTEGER NOT NULL DEFAULT 0")
     cols.append(f"{GROUND_TRUTH_COLUMN} TEXT")
     # Metadata/probability column names come from regex captures / class
@@ -157,11 +165,13 @@ def _init_db(conn, mode, extra_cols=None, prob_cols=None):
 
 def _write_db(db_path, meta_rows, all_logits, all_features,
               class_names, write_features, extra_cols=None, mode="single_cell",
-              write_pred_class=False, multi_label=False):
+              write_pred_class=False, multi_label=False, mask_name=None):
     """Write meta + predictions + features into the `inference` table.
 
     write_pred_class: write pred_class/pred_prob (classify-capable bundle only).
     write_features: write the features BLOB.
+    mask_name: bare mask name stored on every row (whole-image mode; NULL for
+    single-cell) — the per-mask grouping key for downstream merges.
     Unified layout for BOTH label modes, no threshold:
       - pred_class  : the single highest-probability class (argmax winner)
       - pred_prob   : that class's probability (REAL)
@@ -195,7 +205,7 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
         [f"{PROB_COLUMN_PREFIX}{c}" for c in class_names]
         if write_pred_class else []
     )
-    _init_db(conn, mode, extra_cols, prob_cols)
+    _init_db(conn, mode, extra_cols, prob_cols, mask_name=mask_name)
 
     n = len(meta_rows)
     if write_pred_class and probs_all is not None and n != len(probs_all):
@@ -236,6 +246,8 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
     base_cols = [DIRECTORY_COLUMN, FILENAME_COLUMN]
     if mode == "whole_image":
         base_cols.append(MASK_FILENAME_COLUMN)
+    base_cols.append(MASK_NAME_COLUMN)
+    if mode == "whole_image":
         base_cols.append(LABEL_COLUMN)
     base_cols.append(GROUND_TRUTH_COLUMN)
     tail_cols = [PRED_CLASS_COLUMN, PRED_PROB_COLUMN] + prob_cols + [FEATURES_COLUMN]
@@ -257,7 +269,8 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
             pred_prob = float(row_p[pred_idx])
             probs_row = [float(v) for v in row_p.tolist()]
         feat_blob = feats_all[i].tobytes() if feats_all is not None else None
-        row = [_to_native(meta.get(c)) for c in base_cols + extra_cols]
+        row = [_to_native(mask_name if c == MASK_NAME_COLUMN else meta.get(c))
+               for c in base_cols + extra_cols]
         row.extend([pred_class, pred_prob])
         row.extend(probs_row if probs_row is not None else [None] * len(prob_cols))
         row.append(feat_blob)
@@ -477,6 +490,9 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
     else:
         mask_name = mask_cols[0]
     logger.info("Using mask column: %s", mask_name)
+    # Bare mask name stored on every row (per-mask grouping key for merges).
+    if mask_name_cfg is None:
+        mask_name_cfg = bare_mask_name(mask_name)
 
     ds = WholeImageCellDataset(
         image_ds, mask_name, channels=channels,
@@ -558,7 +574,7 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
     return _write_db(db_path, meta_rows, all_logits, all_features,
                      class_names, write_features, extra_cols=extra_cols,
                      mode="whole_image", write_pred_class=write_pred_class,
-                     multi_label=multi_label)
+                     multi_label=multi_label, mask_name=mask_name_cfg)
 
 
 # ----------------------------------------------------------------------------

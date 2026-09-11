@@ -24,16 +24,21 @@ def _ensure_std_streams() -> None:
         sys.stderr = open(os.devnull, "w")
 
 
+_FILE_HANDLER = None
+
+
 def setup_logging(console_level: int = logging.INFO) -> None:
-    """Configure logging for the GUI (idempotent).
+    """Configure console logging for the GUI (idempotent).
 
-    Two sinks:
-    - console (stdout, falling back to stderr): ``console_level`` (default
-      INFO) with a compact ``[HH:MM] LEVEL | message`` format, so a terminal
-      launch shows what the app is doing — same style as microProfiler;
-    - file: everything (DEBUG) appended to %TEMP%/microVis.log.
+    Console (stdout, falling back to stderr): ``console_level`` (default
+    INFO) with a compact ``[HH:MM:SS] LEVEL | message`` format, so a
+    terminal launch shows what the app is doing — same style as
+    microProfiler. ``--debug`` on the command line promotes it to DEBUG.
 
-    ``--debug`` on the command line promotes the console to DEBUG.
+    Handlers sit on the ROOT logger so every package's logs (microVis,
+    microBase merges, ...) reach the sinks. The file sink is attached per
+    dataset via :func:`set_log_file` — each dataset directory keeps its
+    own microVis.log.
     """
     global _SETUP_DONE
     if _SETUP_DONE:
@@ -46,10 +51,9 @@ def setup_logging(console_level: int = logging.INFO) -> None:
     fmt = logging.Formatter("[%(asctime)s] %(levelname)s | %(message)s",
                             datefmt="%H:%M:%S")
 
-    root = logging.getLogger("microVis")
+    root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    # ── Console: user-visible progress ──
     stream = sys.stdout if sys.stdout is not None else sys.stderr
     if stream is not None:
         console = logging.StreamHandler(stream)
@@ -57,17 +61,28 @@ def setup_logging(console_level: int = logging.INFO) -> None:
         console.setFormatter(fmt)
         root.addHandler(console)
 
-    # ── File: full detail for post-mortem inspection ──
-    log_dir = Path(
-        os.environ.get("TEMP", os.environ.get("TMP", os.environ.get("TMPDIR", "/tmp")))
-    )
-    handler = logging.FileHandler(str(log_dir / "microVis.log"),
-                                  mode="a", encoding="utf-8")
+
+def set_log_file(path) -> None:
+    """Log everything (DEBUG) to ``path`` — one file per dataset directory.
+
+    Called when a dataset finishes loading; a later dataset retargets the
+    handler (the old file keeps the session's earlier records).
+    """
+    global _FILE_HANDLER
+    root = logging.getLogger()
+    if _FILE_HANDLER is not None:
+        old = _FILE_HANDLER
+        _FILE_HANDLER = None
+        root.removeHandler(old)
+        old.close()
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(str(path), mode="a", encoding="utf-8")
     handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     handler.setLevel(logging.DEBUG)
     root.addHandler(handler)
-
+    _FILE_HANDLER = handler
     atexit.register(logging.shutdown)
 
 

@@ -10,7 +10,11 @@ from typing import Literal, Union
 
 import pandas as pd
 
-from microBase.db_contracts import WELL_COLUMN, sql_ident
+from microBase.db_contracts import (
+    TABLE_MASKS_TABLE,
+    WELL_COLUMN,
+    sql_ident,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +101,26 @@ class Database:
             f"INSERT INTO {SCHEMA_VERSION_TABLE} (version) VALUES (?)",
             (SCHEMA_VERSION,),
         )
+
+    def record_table_mask(self, table_name: str, mask_name: str) -> None:
+        """Bookkeep which mask (object type) an object table belongs to.
+
+        The per-mask merges (microProfiler auto-merge, microVis Select DB)
+        group frames by mask — without this mapping a custom
+        output_table_name would be indistinguishable from its mask.
+        """
+        conn = self._get_conn()
+        conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {TABLE_MASKS_TABLE} "
+            "(table_name TEXT PRIMARY KEY, mask_name TEXT)"
+        )
+        conn.execute(
+            f"INSERT OR REPLACE INTO {TABLE_MASKS_TABLE} "
+            "(table_name, mask_name) VALUES (?, ?)",
+            (table_name, mask_name),
+        )
+        conn.commit()
+        logger.debug("record_table_mask: %s -> %s", table_name, mask_name)
 
     def list_tables(self) -> "set[str]":
         """Return the set of table names in the database."""

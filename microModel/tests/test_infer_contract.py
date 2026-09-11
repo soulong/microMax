@@ -11,6 +11,7 @@ from microBase.db_contracts import (
     GROUND_TRUTH_COLUMN,
     LABEL_COLUMN,
     MASK_FILENAME_COLUMN,
+    MASK_NAME_COLUMN,
     PRED_CLASS_COLUMN,
     PRED_PROB_COLUMN,
     PROB_COLUMN_PREFIX,
@@ -38,10 +39,15 @@ def test_single_cell_columns_match_contract(tmp_path):
         extra_cols=["dose"], mode="single_cell", write_pred_class=True,
     )
     assert _columns(db) == [
-        UID_COLUMN, DIRECTORY_COLUMN, FILENAME_COLUMN, GROUND_TRUTH_COLUMN,
-        "dose", PRED_CLASS_COLUMN, PRED_PROB_COLUMN,
+        UID_COLUMN, DIRECTORY_COLUMN, FILENAME_COLUMN, MASK_NAME_COLUMN,
+        GROUND_TRUTH_COLUMN, "dose", PRED_CLASS_COLUMN, PRED_PROB_COLUMN,
         f"{PROB_COLUMN_PREFIX}a", f"{PROB_COLUMN_PREFIX}b", FEATURES_COLUMN,
     ]
+    # Single-cell inference has no mask file — the column stays NULL.
+    conn = sqlite3.connect(str(db))
+    row = conn.execute("SELECT mask_name FROM inference").fetchone()
+    conn.close()
+    assert row[0] is None
 
 
 def test_whole_image_columns_match_contract(tmp_path):
@@ -51,10 +57,16 @@ def test_whole_image_columns_match_contract(tmp_path):
     _write_db(
         str(db), meta, all_logits=[], all_features=[torch.tensor([[1.0]])],
         class_names=[], write_features=True, mode="whole_image",
-        write_pred_class=False,
+        write_pred_class=False, mask_name="cell",
     )
     assert _columns(db) == [
         UID_COLUMN, DIRECTORY_COLUMN, FILENAME_COLUMN, MASK_FILENAME_COLUMN,
-        LABEL_COLUMN, GROUND_TRUTH_COLUMN, PRED_CLASS_COLUMN,
-        PRED_PROB_COLUMN, FEATURES_COLUMN,
+        MASK_NAME_COLUMN, LABEL_COLUMN, GROUND_TRUTH_COLUMN,
+        PRED_CLASS_COLUMN, PRED_PROB_COLUMN, FEATURES_COLUMN,
     ]
+    # The bare mask name lands on every row (per-mask merge grouping key).
+    conn = sqlite3.connect(str(db))
+    rows = conn.execute(f"SELECT {MASK_NAME_COLUMN}, label FROM inference"
+                        ).fetchall()
+    conn.close()
+    assert rows == [("cell", 1)]

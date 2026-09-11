@@ -16,8 +16,9 @@ def test_init_db_rebuilds_on_schema_change(tmp_path):
     db = tmp_path / "infer.db"
     conn = sqlite3.connect(str(db))
     _init_db(conn, "single_cell", extra_cols=["a"], prob_cols=[])
-    assert _columns(conn) == ["uid", "directory", "filename", "ground_truth",
-                              "a", "pred_class", "pred_prob", "features"]
+    assert _columns(conn) == ["uid", "directory", "filename", "mask_name",
+                              "ground_truth", "a", "pred_class", "pred_prob",
+                              "features"]
 
     # Same schema again: no rebuild, no error.
     _init_db(conn, "single_cell", extra_cols=["a"], prob_cols=[])
@@ -26,7 +27,7 @@ def test_init_db_rebuilds_on_schema_change(tmp_path):
     # Changed schema (new metadata + class probs): dropped and recreated.
     _init_db(conn, "whole_image", extra_cols=["a", "b"], prob_cols=["prob_x"])
     assert _columns(conn) == [
-        "uid", "directory", "filename", "mask_filename", "label",
+        "uid", "directory", "filename", "mask_filename", "mask_name", "label",
         "ground_truth", "a", "b", "pred_class", "pred_prob", "prob_x", "features",
     ]
     conn.close()

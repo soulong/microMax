@@ -15,7 +15,7 @@ Provides:
 - db_contracts    : shared profiler.db / infer.db table/column names + SQL helpers
 """
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 import os as _os
 _os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -90,6 +90,18 @@ from .db_contracts import (
     canonical_directory,
     resolve_directory,
 )
+from .db_merge import (
+    SourceFrame,
+    KEY_COLUMNS,
+    MERGED_TABLE,
+    read_db_frames,
+    read_profiler_frames,
+    read_infer_frames,
+    read_table_masks,
+    fuse_frames,
+    merge_dbs,
+    write_merged_db,
+)
 
 
 __all__ = [
@@ -150,6 +162,16 @@ __all__ = [
     "is_numeric_sql_type",
     "canonical_directory",
     "resolve_directory",
+    "SourceFrame",
+    "KEY_COLUMNS",
+    "MERGED_TABLE",
+    "read_db_frames",
+    "read_profiler_frames",
+    "read_infer_frames",
+    "read_table_masks",
+    "fuse_frames",
+    "merge_dbs",
+    "write_merged_db",
 ]
 
 

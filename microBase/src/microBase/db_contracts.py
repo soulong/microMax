@@ -33,6 +33,7 @@ UID_COLUMN = "uid"
 DIRECTORY_COLUMN = "directory"
 FILENAME_COLUMN = "filename"
 MASK_FILENAME_COLUMN = "mask_filename"
+MASK_NAME_COLUMN = "mask_name"
 FEATURES_COLUMN = "features"
 WELL_COLUMN = "well"
 LABEL_COLUMN = "label"
@@ -46,6 +47,15 @@ CLUSTER_PROB_PREFIX = "cluster_prob_"
 # ── mask columns (microBase ImageDataset) ────────────────────────────────
 MASK_COLUMN_PREFIX = "mask_"
 
+# Bookkeeping table mapping profiler object-table / merged-table names to
+# the mask (segmentation object type) they belong to. Written by
+# microProfiler (object tables) and the merge writer (merge DBs); read by
+# every mask-aware merge so differently named tables still group correctly.
+TABLE_MASKS_TABLE = "_table_masks"
+
+# Column the fused/merged output carries: which mask a row belongs to.
+MASK_COLUMN = "mask"
+
 # Dimensionality-reduction methods, canonical order. The writer (microModel),
 # the reader (microVis) and the bridge all use this exact set.
 DR_METHODS = ("pca", "umap", "pacmap", "localmap")
@@ -54,8 +64,8 @@ DR_METHODS = ("pca", "umap", "pacmap", "localmap")
 # collide with these or CREATE TABLE / INSERT would produce duplicate names.
 _BASE_RESERVED_INFERENCE = frozenset({
     UID_COLUMN, DIRECTORY_COLUMN, FILENAME_COLUMN, MASK_FILENAME_COLUMN,
-    LABEL_COLUMN, GROUND_TRUTH_COLUMN, PRED_CLASS_COLUMN, PRED_PROB_COLUMN,
-    FEATURES_COLUMN,
+    MASK_NAME_COLUMN, LABEL_COLUMN, GROUND_TRUTH_COLUMN, PRED_CLASS_COLUMN,
+    PRED_PROB_COLUMN, FEATURES_COLUMN,
 })
 
 

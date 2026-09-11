@@ -44,7 +44,7 @@ from microVis.io.merged_data import (
     merge_metadata_into,
     write_merged_db,
 )
-from microVis.log_utils import get_logger
+from microVis.log_utils import get_logger, set_log_file
 from microVis.widgets._event_filter import RotatedLabel
 from microVis.widgets.path_drop import enable_path_drop
 from microVis.widgets.data_view import DataView
@@ -843,6 +843,8 @@ class MainWindow(QMainWindow):
             # phase 2 callback only populates the UI.
             self._loaded_dataset_dir = str(p)
             self._update_window_title()
+            # This dataset's own log file (full DEBUG detail).
+            set_log_file(Path(p_str) / "microVis.log")
             logger.info(
                 "Dataset ready: %d sites, channels %s, masks %s",
                 len(self._dm.dataset.metadata), list(self._dm.channels),

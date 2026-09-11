@@ -297,12 +297,55 @@ def _run_object_profile(
             n_workers=section.n_workers,
             obj_config=entry,
         )
+        # Bookkeep the table -> mask mapping (used by the per-mask merges).
+        db = Database(db_path)
+        try:
+            db.record_table_mask(table_name, entry.mask_name)
+        finally:
+            db.close()
         progress.step_end(
             f"object_profile ({entry.mask_name})", "Done",
         )
     # Quarantine deletes files mid-run; rescan so this step's returned
     # dataset (and later steps) never reference rows that are gone.
     return rebuild_dataset(ds)
+
+
+def _auto_merge_infer(root_dir: Path, entry, infer_db: Path) -> None:
+    """Merge one inference block's results with the profiler objects of the
+    SAME mask into ``merge_<mask>.db`` next to the dataset.
+
+    The mask comes from the infer DB's `mask_name` column (written by
+    microModel), falling back to the config entry; the profiler table is
+    matched through the `_table_masks` bookkeeping (falling back to the
+    table-name convention). Source DBs are never modified.
+    """
+    from microBase import db_merge
+
+    infer_frames = db_merge.read_infer_frames(str(infer_db))
+    # The infer DB itself names its mask (mask_name column, written by
+    # microModel); fall back to the config entry.
+    mask = (infer_frames[0].mask if infer_frames else None) or entry.mask_name
+    if not mask:
+        logger.warning("Auto-merge skipped: no mask name for %s", infer_db.name)
+        return
+
+    profiler_db = root_dir / PROFILER_DB_NAME
+    obj_frames: list = []
+    if profiler_db.exists():
+        obj_frames = [f for f in db_merge.read_profiler_frames(str(profiler_db))
+                      if f.mask == mask]
+    if not obj_frames:
+        logger.warning(
+            "Auto-merge skipped: %s has no object table for mask '%s' "
+            "(profile this mask first)", profiler_db.name, mask)
+        return
+
+    fused = db_merge.fuse_frames(obj_frames + infer_frames, default_mask=mask)
+    out = root_dir / f"merge_{mask}.db"
+    db_merge.write_merged_db(fused, out, mask=mask)
+    logger.info("Auto-merge: %d rows x %d columns -> %s",
+                len(fused), len(fused.columns), out.name)
 
 
 def _run_inference(
@@ -376,6 +419,15 @@ def _run_inference(
                 progress=progress, step_key=f"reduction ({label})",
             )
             progress.step_end(f"reduction ({label})", f"Reduction complete ({label})")
+
+        # Auto-merge this block's infer results with the profiler objects
+        # of the same mask -> merge_<mask>.db (a merge problem must not
+        # lose the just-written inference results, so only log failures).
+        try:
+            _auto_merge_infer(root_dir, entry, root_dir / db_name)
+        except Exception:
+            logger.warning("Auto-merge failed for mask '%s'",
+                           entry.mask_name, exc_info=True)
     return ds
 
 
