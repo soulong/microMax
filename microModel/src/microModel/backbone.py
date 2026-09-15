@@ -1,12 +1,9 @@
-"""Model definitions: FocalLoss, backbone builder, classification head, Model, bundle loader."""
-
-import sys
+"""Model definitions: FocalLoss, backbone builder, embedding extractor, classification head, Model, bundle loader."""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-from timm.models.vision_transformer import VisionTransformer
 
 from microBase import MicroMaxError
 
@@ -53,11 +50,120 @@ def build_dino_vit(vit_name, in_chans, pretrained=False):
     return vit
 
 
-def cls_token_pool_fn(x):
-    """ViT cls-token pooling: (B, N, C) -> (B, C)."""
-    if x.ndim == 3:
-        return x[:, 0]
-    return x
+# ----------------------------------------------------------------------------
+# Embedding readout: one pooling concept for every consumer (infer features,
+# classify Model, train, pretrain UMAP check).
+# ----------------------------------------------------------------------------
+
+EMBED_SOURCES = ("cls", "patch", "cls_patch")
+
+
+def validate_embed_source(value):
+    """Validate an embed_source config value -> normalized string."""
+    if value not in EMBED_SOURCES:
+        raise MicroMaxError(f"Error: embed_source must be one of {list(EMBED_SOURCES)}; "
+            f"got {value!r}")
+    return value
+
+
+def token_grid(backbone, x):
+    """Full token grid (B, N, C) from a timm ViT or the pretrain masked-ViT
+    wrapper (which exposes encode() instead of forward_features)."""
+    if hasattr(backbone, "encode"):
+        return backbone.encode(x)
+    return backbone.forward_features(x)
+
+
+def num_prefix_tokens(backbone):
+    """Number of non-patch prefix tokens (CLS + registers) on the wrapped ViT."""
+    vit = getattr(backbone, "vit", backbone)
+    return int(vit.num_prefix_tokens)
+
+
+def pool_embedding(tokens, num_prefix, source, patch_mask=None):
+    """Pool the token grid into an image embedding per source.
+
+    tokens: (B, N, C) with the first num_prefix tokens being CLS + registers.
+      - cls:       the CLS token.
+      - patch:     mean over the patch tokens (prefix excluded).
+      - cls_patch: concat([cls, patch_mean]) — feature dim doubles.
+    patch_mask: optional (B, H, W) 0/1 foreground mask (same input resolution
+      as the tokens' image). It is averaged onto the patch grid and BINARIZED:
+      a patch counts iff it contains any foreground pixel (no coefficients);
+      pure-background patches are dropped from the mean. Rows without any
+      foreground patch fall back to the plain full mean.
+    """
+    cls = tokens[:, 0]
+    if source == "cls":
+        return cls
+    patches = tokens[:, num_prefix:]
+    if patch_mask is not None:
+        grid = int(round(patches.shape[1] ** 0.5))
+        if grid * grid != patches.shape[1]:
+            raise MicroMaxError(f"Error: patch token count {patches.shape[1]} is not a "
+                f"square grid; cannot apply a patch mask")
+        m = patch_mask
+        if m.dim() == 4:
+            m = m.squeeze(1)
+        w = F.adaptive_avg_pool2d(m.float().unsqueeze(1), (grid, grid)).flatten(1)
+        w = (w > 0).float()
+        denom = w.sum(dim=1)
+        covered = (patches * w.unsqueeze(-1)).sum(dim=1) / denom.clamp_min(1.0).unsqueeze(-1)
+        empty = denom == 0
+        if empty.any():
+            covered[empty] = patches[empty].mean(dim=1)
+        patch_mean = covered
+    else:
+        patch_mean = patches.mean(dim=1)
+    if source == "patch":
+        return patch_mean
+    return torch.cat([cls, patch_mean], dim=-1)
+
+
+class EmbedExtractor(nn.Module):
+    """Backbone wrapper whose forward outputs the pooled image embedding (B, D).
+
+    ViT backbones (timm forward_features, or the pretrain masked-ViT wrapper's
+    encode) are pooled on the token grid per `source` (see pool_embedding);
+    conv backbones are globally mean-pooled and source/mask do not apply.
+    mask_weighted enables the binary foreground-patch selection — the mask is
+    then passed per forward call (forward(x, mask=...)).
+
+    fc_norm: timm applies its final LayerNorm AFTER pooling on the Eva/avg
+    path (DINOv3), so the pooled embedding is normed here to stay bit-equal
+    with the backbone's own forward; backbones that already norm the token
+    grid carry an Identity fc_norm, which is skipped.
+    """
+
+    def __init__(self, backbone, source="patch", mask_weighted=False):
+        super().__init__()
+        self.backbone = backbone
+        self.source = validate_embed_source(source)
+        self.mask_weighted = bool(mask_weighted)
+        self.vit = hasattr(backbone, "forward_features") or hasattr(backbone, "encode")
+        fc = getattr(backbone, "fc_norm", None)
+        self.fc_norm = None if fc is None or isinstance(fc, nn.Identity) else fc
+        if self.vit:
+            base_dim = int(getattr(backbone, "embed_dim", None)
+                           or getattr(backbone, "num_features"))
+        else:
+            base_dim = int(backbone.num_features)
+        self.feat_dim = base_dim * (2 if (self.vit and source == "cls_patch") else 1)
+
+    def forward(self, x, mask=None):
+        if not self.vit:
+            out = self.backbone(x)
+            if out.ndim == 4:
+                return out.mean(dim=(2, 3))
+            if out.ndim == 3:
+                return out.mean(dim=1)
+            return out
+        patch_mask = mask if (self.mask_weighted and mask is not None) else None
+        emb = pool_embedding(token_grid(self.backbone, x),
+                             num_prefix_tokens(self.backbone), self.source, patch_mask)
+        if self.fc_norm is not None:
+            emb = self.fc_norm(emb)
+        return emb
 
 
 class FocalLoss(nn.Module):
@@ -125,13 +231,8 @@ class BCELoss(nn.Module):
 def build_backbone(name, in_chans=1, pretrained=True):
     """Build a timm backbone (conv or ViT) for feature extraction.
 
-    Returns (model, feat_dim, pool_fn):
-      - model: timm model with num_classes=0 (feature extractor)
-      - feat_dim: model.num_features
-      - pool_fn: callable that pools raw features to (B, feat_dim)
-        - 2D (B, C) -> identity
-        - 4D (B, C, H, W) -> global mean pool over spatial dims
-        - 3D (B, N, C) -> mean over token dim N
+    Returns (model, feat_dim) — the raw timm model with num_classes=0; pooling
+    is the caller's EmbedExtractor's job.
     """
     timm_name = name.replace("-", "_")
     try:
@@ -142,14 +243,7 @@ def build_backbone(name, in_chans=1, pretrained=True):
     feat = m.num_features
     logger.info("Backbone '%s' created: in_chans=%d, feature_dim=%d, pretrained=%s",
                 name, in_chans, feat, pretrained)
-
-    def pool_fn(x):
-        if x.ndim == 2:
-            return x
-        if x.ndim == 4:
-            return x.mean(dim=(2, 3))
-        return x.mean(dim=1)
-    return m, feat, pool_fn
+    return m, feat
 
 
 def extract_backbone_state_dict(state_dict, method, branch="teacher"):
@@ -182,40 +276,39 @@ class ClassificationHead(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, backbone, pool_fn, head):
+    """Classification model: an EmbedExtractor backbone + a linear head."""
+
+    def __init__(self, backbone, head):
         super().__init__()
         self.backbone = backbone
-        self.pool_fn = pool_fn
         self.head = head
 
     def forward(self, x):
-        feats = self.backbone(x)
-        pooled = self.pool_fn(feats)
+        pooled = self.backbone(x)
         return self.head(pooled), pooled
 
 
 def load_model_from_bundle(bundle, device=None):
     """Reconstruct a classification Model from a train bundle.
 
-    For SSL-derived ViT backbones (meta.ssl_method == "dinov3"), rebuilds the
-    ViT via build_dino_vit (special init args) and uses cls-token pooling.
-    Otherwise uses build_backbone.
+    The pooling is the one the head was TRAINED with — for DINOv3 bundles
+    that is the mean-patch readout (source="patch", matching timm's built-in
+    Eva average pooling), so embed_source does not apply here.
     """
     meta = bundle["meta"]
     ssl_method = meta.get("ssl_method")
     in_chans = meta["in_chans"]
 
     if ssl_method == "dinov3":
-        backbone = build_dino_vit(meta["backbone"], in_chans, pretrained=False)
-        feat_dim = backbone.num_features
-        pool_fn = cls_token_pool_fn
+        vit = build_dino_vit(meta["backbone"], in_chans, pretrained=False)
+        backbone = EmbedExtractor(vit, source="patch")
     else:
-        # Conv backbone (scratch or non-ViT SSL) — use generic build_backbone
-        backbone, feat_dim, pool_fn = build_backbone(
-            meta["backbone"], in_chans, pretrained=False)
+        # Conv backbone (scratch or non-ViT SSL) — global mean pooling.
+        conv, _ = build_backbone(meta["backbone"], in_chans, pretrained=False)
+        backbone = EmbedExtractor(conv)
 
-    head = ClassificationHead(feat_dim, meta["num_classes"])
-    model = Model(backbone, pool_fn, head)
+    head = ClassificationHead(backbone.feat_dim, meta["num_classes"])
+    model = Model(backbone, head)
     model.load_state_dict(bundle["state_dict"])
     if device is not None:
         model = model.to(device)
@@ -237,12 +330,15 @@ def load_backbone_weights(backbone, bundle, method):
     backbone.load_state_dict(extract_backbone_state_dict(bundle["state_dict"], method))
 
 
-def load_ssl_backbone_from_bundle(bundle, device=None):
-    """Reconstruct a backbone-only feature extractor from an SSL pretrain bundle.
+def load_ssl_backbone_from_bundle(bundle, device=None,
+                                  embed_source="patch", mask_weighted=False):
+    """Reconstruct an EmbedExtractor feature extractor from an SSL pretrain bundle.
 
-    The ARCHITECTURE is resolved from the bundle's method (ViT vs conv) and
-    the pooling function chosen accordingly.
-    Returns (model, feat_dim, pool_fn, meta).
+    embed_source selects the readout (cls | patch | cls_patch) and
+    mask_weighted enables the binary foreground-patch selection (the mask is
+    then passed per forward call — callers whose datasets do not produce
+    masks keep this False; the extractor then plain-means the patches).
+    Returns (EmbedExtractor, feat_dim, meta).
     """
     meta = bundle["meta"]
     method = meta.get("ssl_method")
@@ -250,19 +346,19 @@ def load_ssl_backbone_from_bundle(bundle, device=None):
 
     if method == "dinov3":
         backbone = build_dino_vit(meta["backbone"], in_chans, pretrained=False)
-        feat_dim = backbone.num_features
-        pool_fn = cls_token_pool_fn
     else:
         # Conv backbone
-        backbone, feat_dim, pool_fn = build_backbone(
-            meta["backbone"], in_chans, pretrained=False)
+        backbone, _ = build_backbone(meta["backbone"], in_chans, pretrained=False)
 
     # Load only the backbone weights from the SSL bundle
     load_backbone_weights(backbone, bundle, method)
 
+    model = EmbedExtractor(backbone, source=embed_source, mask_weighted=mask_weighted)
     if device is not None:
-        backbone = backbone.to(device)
-    backbone.eval()
-    logger.info("SSL backbone loaded: method=%s, backbone=%s, feat_dim=%d",
-                method, meta["backbone"], feat_dim)
-    return backbone, feat_dim, pool_fn, meta
+        model = model.to(device)
+    model.eval()
+    logger.info("SSL backbone loaded: method=%s, backbone=%s, embed_source=%s, "
+                "mask_weighted=%s, feat_dim=%d",
+                method, meta["backbone"], model.source, model.mask_weighted,
+                model.feat_dim)
+    return model, model.feat_dim, meta

@@ -1,36 +1,29 @@
 # Inference config — whole-image mode.
 #
-# Scans whole-slide images + segmentation masks, crops individual cells,
-# and runs the model on each crop. Results are written to a SQLite DB.
+#  Scans whole-slide images + segmentation masks, crops individual cells, and runs the model on each crop. Results are written to a SQLite DB.
 #
-# The bundle (model) determines classify vs features-only mode:
-#   - Train bundle (model.pt): pred_class/pred_prob + features
-#   - SSL bundle (model.pt, no num_classes in meta): features only
-# augmentation_infer + normalize come from the bundle meta (not configurable).
-# All data.* keys are REQUIRED (null is allowed; missing is not).
+#   The bundle (model) determines classify vs features-only mode:
+#     - Train bundle (model.pt): pred_class/pred_prob + features
+#     - SSL bundle (model.pt, no num_classes in meta): features only augmentation_infer + normalize come from the bundle meta (not configurable). All data.*
+#      keys are REQUIRED (null is allowed; missing is not).
 
 mode: whole_image
 
-model: 20260830_dinov3_phase2/model.pt         # train bundle (model.pt) or SSL bundle (model.pt)
+model: 2026-09-14_dinov3_phase2/model_220.pt         # train bundle (model.pt) or SSL bundle (model.pt)
 
-output_dir: null           # shared DB dir for all roots; null = per-dataset
+output_dir: null           # shared DB dir for all file_dir entries; null = per-dataset
 
 data:
-  root:
-    # - 2026-07-10_63x__2026-07-10T09_27_38-Measurement 1/objects_exported_p53
-    # - 2026-07-11_63x__2026-07-11T18_11_55-Measurement 1/objects_exported_p53
-    # - 2026-07-14_63x_22_Reza__2026-07-14T18_33_00-Measurement 1/objects_exported_p53
+  file_dir:
     - 2026-07-18_22-cmpd__2026-07-18T00_00_00-Measurement 1/objects_exported_p53
-    - 2026-07-18_37-ctrl__2026-07-18T00_00_00-Measurement 1/objects_exported_p53
+    # - 2026-07-18_37-ctrl__2026-07-18T00_00_00-Measurement 1/objects_exported_p53
   image_pattern: r(?P<row>\d+)c(?P<col>\d+)f0?(?P<field>\d+)p0?(?P<stack>\d+)-ch0?(?P<channel>\d+)(?:sk|t)0?(?P<timepoint>\d+).*\.tiff
   mask_pattern: r(?P<row>\d+)c(?P<col>\d+)f0?(?P<field>\d+)p0?(?P<stack>\d+)-ch0?(?P<channel>\d+)(?:sk|t)0?(?P<timepoint>\d+).*_cp_masks_(?P<mask_name>.+)\.png
-  image_subdir_pattern: images        # subdirectory under root; null = scan root directly
+  image_subdir_pattern: images        # subdirectory under file_dir; null = scan file_dir directly
   mask_name: cell                     # BARE mask name (no 'mask_' prefix); null = first available mask
   max_value: 65535                    # max possible intensity of the input dtype (65535 for 16-bit, 255 for 8-bit); images are divided by it on load
   channels: [1]                       # 1-based indices; null = all
   channel_layout: null                # CHW | HWC | null (one-channel-per-file)
-  label_from_dir: false                # label from parent dir name
-  label_csv: null                     # CSV [path, label]; null = not used
   sample_max: null                    # null = no limit
   sample_by: per_dataset              # per_class | per_dataset
 
@@ -44,24 +37,17 @@ inference:
   feature: true                       # write features BLOB; needed by reduction
   db_name: infer.db
   batch_size: 128
+  embed_source: patch                 # 间隔 epoch UMAP 检查图的 embedding 池化来源（teacher 分支）: cls | patch | cls_patch（cls_patch = 拼接 [CLS, mean-patch]，维度翻倍）；不影响训练本身（SSL 损失直接用 CLS 和 patch token）
+  mask_weighted: true                 # UMAP 检查图池化剔除纯背景 patch（二值：patch 含任一前景像素即计入、不乘系数）；仅对 patch/cls_patch 生效
 
-# Multi-method DR — run via `micromodel reduction --config <this_file>`.
-# Reducers are fit once on merged features from all DBs, then applied per-DB.
-# Per DR method: one multi-page PDF (reduction_<method>.pdf — one page per
-# color_by entry, then one per cluster resolution; color_by null = a single
-# light-blue page) + a reduction_<method> table (pca: pc_1/pc_2, others:
-# <method>_1/<method>_2). Reducers persist to reduction_<method>.pkl.
-# With cluster_res: Leiden clustering on a kNN graph of the whitened feature
-# space -> a find_cluster table per DB (cluster_res_<resolution>, 1-based IDs
-# ordered by UMAP centroid distance from the plot origin, plus
-# cluster_prob_<resolution> = kNN vote confidence in [0,1]), extra cluster
-# color pages, and one representative-cell sheet per resolution
-# (cluster_res<resolution>.pdf, cells rendered as their inference-mode input
-# -> uniform size; needs the model bundle; skipped when show_cluster_image is
-# false). Per-resolution kNN classifiers persist to cluster.pkl.
-# cluster: <path to a baseline cluster.pkl> kNN-predicts ALL stored
-# resolutions for this dataset instead of re-fitting — cluster IDs stay
-# baseline-aligned (cluster_res is ignored then).
+#   Multi-method DR — run via `micromodel reduction --config <this_file>`. Reducers are fit once on merged features from all DBs, then applied per-DB. Per DR
+#   method: one multi-page PDF (reduction_<method>.pdf — one page per color_by entry, then one per cluster resolution; color_by null = a single light-blue page)
+#   + a reduction_<method> table (pca: pc_1/pc_2, others: <method>_1/<method>_2). Reducers persist to reduction_<method>.pkl. With cluster_res: Leiden
+#   clustering on a kNN graph of the whitened feature space -> a find_cluster table per DB (cluster_res_<resolution>, 1-based IDs ordered by UMAP centroid
+#   distance from the plot origin, plus cluster_prob_<resolution> = kNN vote confidence in [0,1]), extra cluster color pages, and one representative-cell sheet
+#   per resolution (cluster_res<resolution>.pdf, cells rendered as their inference-mode input -> uniform size; needs the model bundle; skipped when
+#   show_cluster_image is false). Per-resolution kNN classifiers persist to cluster.pkl. cluster: <path to a baseline cluster.pkl> kNN-predicts ALL stored
+#   resolutions for this dataset instead of re-fitting — cluster IDs stay baseline-aligned (cluster_res is ignored then).
 reduction:
   method: [umap]                      # list, DR methods to run (subset of pca/umap/pacmap/localmap)
   color_by: null                      # list, null = single light-blue page; entries = any inference/find_cluster column except uid/features
@@ -73,8 +59,9 @@ reduction:
   # reduction_pacmap: null              # path to a pre-fitted reduction_pacmap.pkl; null = fit new
   # reduction_localmap: null            # path to a pre-fitted reduction_localmap.pkl; null = fit new
   # cluster: null                       # path to a baseline cluster.pkl; null = fit new (and save cluster.pkl)
-  reduction_pca: D:\Model\20260830_dinov3_phase2\infer_sc\reduction_pca.pkl          # e.g. reuse the baseline reducers
-  reduction_umap: D:\Model\20260830_dinov3_phase2\infer_sc\reduction_umap.pkl
-  reduction_pacmap: D:\Model\20260830_dinov3_phase2\infer_sc\reduction_pacmap.pkl
-  reduction_localmap: D:\Model\20260830_dinov3_phase2\infer_sc\reduction_localmap.pkl
-  cluster:      D:\Model\20260830_dinov3_phase2\infer_sc\cluster.pkl                # e.g. predict the baseline clusters
+  reduction_pca: D:/Model/2026-09-14_dinov3_phase2/infer_sc/reduction_pca.pkl          # e.g. reuse the baseline reducers
+  reduction_umap: D:/Model/2026-09-14_dinov3_phase2/infer_sc/reduction_umap.pkl
+  reduction_pacmap: D:/Model/2026-09-14_dinov3_phase2/infer_sc/reduction_pacmap.pkl
+  reduction_localmap: D:/Model/2026-09-14_dinov3_phase2/infer_sc/reduction_localmap.pkl
+  cluster: D:/Model/2026-09-14_dinov3_phase2/infer_sc/cluster.pkl                # e.g. predict the baseline clusters
+

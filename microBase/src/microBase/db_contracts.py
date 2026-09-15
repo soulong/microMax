@@ -47,12 +47,6 @@ CLUSTER_PROB_PREFIX = "cluster_prob_"
 # ── mask columns (microBase ImageDataset) ────────────────────────────────
 MASK_COLUMN_PREFIX = "mask_"
 
-# Bookkeeping table mapping profiler object-table / merged-table names to
-# the mask (segmentation object type) they belong to. Written by
-# microProfiler (object tables) and the merge writer (merge DBs); read by
-# every mask-aware merge so differently named tables still group correctly.
-TABLE_MASKS_TABLE = "_table_masks"
-
 # Column the fused/merged output carries: which mask a row belongs to.
 MASK_COLUMN = "mask"
 
@@ -119,32 +113,43 @@ def is_numeric_sql_type(decl) -> bool:
     return any(token in str(decl).upper() for token in _NUMERIC_TYPE_TOKENS)
 
 
-def canonical_directory(path, root=None) -> str:
-    """The DB ``directory`` value: ABSOLUTE path with forward slashes.
+def canonical_directory(path) -> str:
+    """The DB ``directory`` value, PORTABLE-first.
 
-    All DB writers use this so ``directory`` is comparable across packages
-    (microModel inference, microProfiler profiling, microVis scoping) and
-    stays valid no matter where the dataset is mounted afterwards. A
-    relative ``path`` is anchored at ``root`` before absolutizing; an
-    absolute ``path`` ignores ``root``.
+    Stored relative to the process CWD (forward slashes) whenever the path
+    lives under it — moving the dataset and the working directory together
+    onto another computer/drive keeps every DB valid. Paths outside the CWD
+    (e.g. another drive) fall back to absolute forward-slash. Reading is the
+    inverse: :func:`resolve_directory`.
     """
-    p = str(path)
-    if root is not None and not os.path.isabs(p):
-        p = os.path.join(str(root), p)
-    return os.path.abspath(p).replace("\\", "/")
+    p = os.path.abspath(str(path))
+    try:
+        rel = os.path.relpath(p, os.getcwd())
+    except ValueError:                        # different drive (Windows)
+        return p.replace("\\", "/")
+    if rel.startswith(".."):
+        return p.replace("\\", "/")
+    return rel.replace("\\", "/")
 
 
 def resolve_directory(directory, root) -> str:
     """Absolute native-separator path for a stored ``directory`` value.
 
     Inverse of :func:`canonical_directory`. Empty means the dataset root
-    itself. Stored values are absolute forward-slash paths (normalized by
-    :func:`os.path.normpath`); legacy root-relative values are joined
-    against the root.
+    itself. Resolution order for relative values: the process CWD (how
+    canonical_directory writes them) first; the dataset ``root`` as the
+    fallback anchor for values written from a different CWD. Absolute values
+    pass through normalized (legacy DBs).
     """
     if not directory:
         return os.path.abspath(str(root))
     d = str(directory)
+    if d in (".", "./"):                      # legacy rows: "." = the root
+        return os.path.abspath(str(root))
     if os.path.isabs(d):
         return os.path.normpath(d)
-    return os.path.abspath(os.path.join(str(root), d))
+    cand = os.path.abspath(d)
+    if os.path.exists(cand):
+        return cand
+    alt = os.path.abspath(os.path.join(str(root), d))
+    return alt if os.path.exists(alt) else cand

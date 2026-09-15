@@ -22,6 +22,7 @@ import os
 import sys
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
@@ -33,7 +34,9 @@ from microBase import (
     apply,
     normalize,
     read_mask,
+    read_tiff_channels,
 )
+from microBase.io import detect_tiff_properties
 from microBase.cells import get_labels
 
 
@@ -141,24 +144,35 @@ def _normalize_fixed(img_hwc, mask, ref_stats):
 
 def _cell_to_tensor(img_hwc, channels, aug_pipeline,
                     normalize_method, clip_low, clip_high, with_masking,
-                    ref_stats=None):
+                    ref_stats=None, return_mask=False):
     """Common single-cell pipeline: channel subset -> mask -> augment -> normalize -> CHW tensor.
 
     ref_stats=None uses per-view self-normalization (microBase.normalize);
     a ref_stats list (from _compute_ref_stats on the raw image) applies the
     fixed transform instead (normalize.fixed_reference: true).
+
+    The foreground mask is derived from the raw image's zero background
+    ((img != 0).any over the model's channels) and co-transformed with the
+    image. It is handed to the normalizer only when with_masking is set
+    (bundle-baked); return_mask=True additionally returns the TRANSFORMED
+    mask for mask-weighted patch pooling.
     """
     if channels is not None:
         ch_idx = [c - 1 for c in channels]
         img_hwc = img_hwc[:, :, ch_idx]
-    mask = (img_hwc != 0).any(axis=2).astype(np.uint8) if with_masking else None
+    mask = (img_hwc != 0).any(axis=2).astype(np.uint8) \
+        if (with_masking or return_mask) else None
     img_hwc, mask = apply(aug_pipeline, img_hwc, mask)
+    norm_mask = mask if with_masking else None
     if ref_stats is not None:
-        img_hwc = _normalize_fixed(img_hwc, mask, ref_stats)
+        img_hwc = _normalize_fixed(img_hwc, norm_mask, ref_stats)
     else:
-        img_hwc = normalize(img_hwc, mask=mask, method=normalize_method,
+        img_hwc = normalize(img_hwc, mask=norm_mask, method=normalize_method,
                             clip_low=clip_low, clip_high=clip_high)
-    return torch.from_numpy(np.transpose(img_hwc, (2, 0, 1)).astype(np.float32))
+    tensor = torch.from_numpy(np.transpose(img_hwc, (2, 0, 1)).astype(np.float32))
+    if return_mask:
+        return tensor, mask
+    return tensor
 
 
 # ----------------------------------------------------------------------------
@@ -279,7 +293,8 @@ class SSLMultiViewDataset(Dataset):
     def __init__(self, cell_dataset, indices, channels,
                  augmentation_specs,              # list of N view specs
                  normalize_method, clip_low, clip_high, with_masking,
-                 fixed_reference=False, max_value=None):
+                 fixed_reference=False, max_value=None,
+                 return_mask=False):
         self.cell_dataset = cell_dataset
         self.indices = list(indices)
         self.channels = list(channels) if channels is not None else None
@@ -289,6 +304,10 @@ class SSLMultiViewDataset(Dataset):
         self.with_masking = with_masking
         self.fixed_reference = fixed_reference
         self.max_value = max_value
+        # return_mask: __getitem__ returns (views, masks) — masks is a list
+        # (one uint8 HxW foreground mask per view, derived from the zero
+        # background) for mask-weighted patch pooling.
+        self.return_mask = return_mask
         self.aug_pipelines = [build_pipeline(spec) for spec in augmentation_specs]
 
     def __len__(self):
@@ -314,11 +333,62 @@ class SSLMultiViewDataset(Dataset):
             ref_stats = _compute_ref_stats(
                 img_hwc, self.channels, self.with_masking,
                 self.clip_low, self.clip_high, self.normalize_method)
-        views = [_cell_to_tensor(img_hwc, self.channels, pipe,
-                                  self.normalize_method, self.clip_low,
-                                  self.clip_high, self.with_masking, ref_stats)
-                 for pipe in self.aug_pipelines]
-        return views
+        outs = [_cell_to_tensor(img_hwc, self.channels, pipe,
+                                self.normalize_method, self.clip_low,
+                                self.clip_high, self.with_masking, ref_stats,
+                                return_mask=self.return_mask)
+                for pipe in self.aug_pipelines]
+        # return_mask=False -> outs ARE the view tensors; True -> (view, mask).
+        if self.return_mask:
+            views = [v for v, _ in outs]
+            masks = [m for _, m in outs]
+            return views, masks
+        return outs
+
+
+# ----------------------------------------------------------------------------
+# FileListCellDataset — the data.file_list source for pretrain/train.
+# ----------------------------------------------------------------------------
+
+class FileListCellDataset:
+    """CellDataset-compatible view over an EXPLICIT file path list.
+
+    The data.file_list source for pretrain/train (e.g. deduplication's
+    curated.csv): a CSV of cell paths replaces folder enumeration. Only the
+    members the datasets touch exist — get_cell(i) (all channels, (H, W, C),
+    same contract as CellDataset.get_cell) and a metadata DataFrame with a
+    'path' column (error messages). The channel count is auto-detected from
+    the FIRST file, exactly like CellDataset; a list with mixed channel
+    counts fails later at the channel-set check.
+    """
+
+    def __init__(self, paths, channel_layout="CHW"):
+        self.paths = list(paths)
+        self.channel_layout = channel_layout
+        self.metadata = pd.DataFrame({"path": self.paths})
+        self._intensity_colnames = None
+
+    def __len__(self):
+        return len(self.paths)
+
+    @property
+    def intensity_colnames(self):
+        if self._intensity_colnames is None:
+            if not self.paths:
+                raise MicroMaxError("file list is empty")
+            _, n_channels, _ = detect_tiff_properties(
+                self.paths[0], self.channel_layout)
+            self._intensity_colnames = [f"ch{i}"
+                                        for i in range(1, n_channels + 1)]
+        return self._intensity_colnames
+
+    def get_cell(self, idx):
+        if idx < 0 or idx >= len(self.paths):
+            raise MicroMaxError(
+                f"cell index {idx} out of range (0..{len(self) - 1})")
+        channels = list(range(1, len(self.intensity_colnames) + 1))
+        return read_tiff_channels(self.paths[idx], channels,
+                                  channel_layout=self.channel_layout)
 
 
 # ----------------------------------------------------------------------------
@@ -343,7 +413,8 @@ class SingleCellDataset(Dataset):
                  fixed_reference=False,
                  max_value=None,
                  multi_label=False,
-                 label_separator=";"):
+                 label_separator=";",
+                 return_mask=False):
         self.pairs = list(pairs)
         self.labels = list(labels)
         self.label_to_idx = label_to_idx
@@ -358,6 +429,10 @@ class SingleCellDataset(Dataset):
         # float target vector (for BCELoss); absent classes are negatives.
         self.multi_label = multi_label
         self.label_separator = label_separator
+        # return_mask appends the co-transformed foreground mask (uint8 HxW,
+        # derived from the zero background) to every item for mask-weighted
+        # patch pooling.
+        self.return_mask = return_mask
         self.aug_pipeline = build_pipeline(augmentation_spec) if augmentation_spec else None
 
     def __len__(self):
@@ -380,10 +455,14 @@ class SingleCellDataset(Dataset):
             ref_stats = _compute_ref_stats(
                 img_hwc, self.channels, self.with_masking,
                 self.clip_low, self.clip_high, self.normalize_method)
-        tensor = _cell_to_tensor(
+        cell_out = _cell_to_tensor(
             img_hwc, self.channels, self.aug_pipeline,
             self.normalize_method, self.clip_low, self.clip_high, self.with_masking,
-            ref_stats)
+            ref_stats, return_mask=self.return_mask)
+        if self.return_mask:
+            tensor, mask = cell_out
+        else:
+            tensor, mask = cell_out, None
         label = self.labels[idx]
         if self.multi_label:
             # Multi-hot target: split the joined label string and mark every
@@ -402,7 +481,7 @@ class SingleCellDataset(Dataset):
                         f"({cell_ds.metadata.iloc[cell_idx].get('path')})."
                     )
                 target[cls_idx] = 1.0
-            return tensor, target
+            return (tensor, target, mask) if self.return_mask else (tensor, target)
         label_idx = self.label_to_idx.get(label, -1)
         if label_idx < 0:
             raise ValueError(
@@ -410,7 +489,7 @@ class SingleCellDataset(Dataset):
                 f"{sorted(self.label_to_idx)} — check label_csv/label_from_dir "
                 f"resolution for row {idx} ({cell_ds.metadata.iloc[cell_idx].get('path')})."
             )
-        return tensor, label_idx
+        return (tensor, label_idx, mask) if self.return_mask else (tensor, label_idx)
 
 
 # ----------------------------------------------------------------------------
@@ -430,7 +509,7 @@ class WholeImageCellDataset(Dataset):
                  normalize_method="per_channel",
                  clip_low=0.05, clip_high=99.95,
                  with_masking=False, fixed_reference=False, padding=4,
-                 max_value=None):
+                 max_value=None, return_mask=False):
         self.image_dataset = image_dataset
         self.mask_name = mask_name
         self.channels = list(channels) if channels is not None else None
@@ -441,6 +520,10 @@ class WholeImageCellDataset(Dataset):
         self.fixed_reference = fixed_reference
         self.padding = padding
         self.max_value = max_value
+        # return_mask appends the co-transformed foreground mask (uint8 HxW,
+        # derived from the zero background of the cell crop) to every item
+        # for mask-weighted patch pooling.
+        self.return_mask = return_mask
         if augmentation_spec:
             self.aug_pipeline = build_pipeline(augmentation_spec)
         else:
@@ -491,13 +574,17 @@ class WholeImageCellDataset(Dataset):
                 f"mask may be corrupted or changed since indexing ({e})"
             ) from e
         crop_hwc = _to_float_max(crop_hwc, self.max_value)
-        tensor = _cell_to_tensor(
+        cell_out = _cell_to_tensor(
             crop_hwc, self.channels, self.aug_pipeline,
             self.normalize_method, self.clip_low, self.clip_high, self.with_masking,
             _compute_ref_stats(crop_hwc, self.channels, self.with_masking,
                                self.clip_low, self.clip_high, self.normalize_method)
-            if self.fixed_reference else None)
+            if self.fixed_reference else None,
+            return_mask=self.return_mask)
         stem = self._field_stems[idx]
+        if self.return_mask:
+            tensor, mask = cell_out
+            return tensor, int(label), stem, bbox, mask
         return tensor, int(label), stem, bbox
 
     def row_channel_filenames(self, row_idx):

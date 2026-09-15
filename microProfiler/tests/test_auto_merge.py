@@ -9,23 +9,17 @@ from microProfiler.pipeline.steps import _auto_merge_infer
 
 
 def _make_profiler_db(path):
-    """One object table 'cell' (bookkept) + one custom-named 'obj_nuc'."""
+    """Object tables named after their masks: 'cell' and 'nuclei'."""
     conn = sqlite3.connect(str(path))
     conn.execute("CREATE TABLE cell (well TEXT, label INTEGER, directory TEXT, "
                  "area REAL)")
     conn.execute("INSERT INTO cell VALUES ('A1', 1, 'C:/ds/Images', 10.0)")
     conn.execute("INSERT INTO cell VALUES ('A1', 2, 'C:/ds/Images', 20.0)")
-    conn.execute("CREATE TABLE obj_nuc (well TEXT, label INTEGER, directory TEXT,"
+    conn.execute("CREATE TABLE nuclei (well TEXT, label INTEGER, directory TEXT,"
                  " area_n REAL)")
-    conn.execute("INSERT INTO obj_nuc VALUES ('A1', 1, 'C:/ds/Images', 99.0)")
+    conn.execute("INSERT INTO nuclei VALUES ('A1', 1, 'C:/ds/Images', 99.0)")
     conn.commit()
     conn.close()
-    db = Database(str(path))
-    try:
-        db.record_table_mask("cell", "cell")
-        db.record_table_mask("obj_nuc", "nuclei")
-    finally:
-        db.close()
 
 
 def _make_infer_db(path, mask_name):
@@ -65,16 +59,17 @@ def test_auto_merge_writes_per_mask_db(tmp_path):
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     df = pd.read_sql("SELECT * FROM merged", conn)
-    mapping = dict(conn.execute(
-        "SELECT table_name, mask_name FROM _table_masks").fetchall())
     conn.close()
 
     # Fused per object: profiler measurements + infer prediction + umap.
     assert len(df) == 2
     assert {"area", "pred_class", "umap_1", "well", "label"} <= set(df.columns)
     assert (df["pred_class"] == ["drug", "ctrl"]).all()
-    # Bookkeeping lets the file re-load as mask 'cell'.
-    assert "merged" in tables and mapping["merged"] == "cell"
+    # The mask column lets the file re-load as mask 'cell'; no internal
+    # bookkeeping tables are written.
+    assert "merged" in tables
+    assert (df["mask"] == "cell").all()
+    assert not any(t.startswith("_") for t in tables)
 
     # Sources untouched.
     src = sqlite3.connect(str(root / "profiler.db"))

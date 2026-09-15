@@ -1,0 +1,106 @@
+# micromodel deduplication — 全新剪枝模式（prune）
+# ====================================================================================================
+# 用 SSL 预训练 bundle 的 teacher 分支给每个裁剪单细胞提特征（提取路径与 infer 完全一致：augmentation_infer 和 normalize 全部来自 bundle meta，这里不可配置、也不应该配
+# 置），然后在 whitened-PCA + L2 归一的隐空间里用"半径覆盖贪心"选子集：按随机顺序逐个检查细胞，它到"已保留集"的最近距离 > 半径 r 才保留，否则它是已保留细胞的冗余近邻
+# 副本丢弃。性质：稀疏的隐空间区域天然全部保留（每类形态有保底）；密集区域被削薄到约 r 间距；距离在 L2 归一后定义在 [0, 2]（0 = 完全相同），r 是唯一核心旋钮。
+#
+# 本文件 = 剪枝模式：reference: null，sources = 现有全部数据，sources 之间互相竞争。给 selection.radius 直接定半径，或给 selection.target_keep 让程序自动二分搜索 r。
+# 增量模式（上一轮的 selection_state.pkl 作为不可动种子、只挑新隐空间区域）见 deduplication_incremental.yml；两者除 reference / 总量参数外其余键完全一致。
+#
+# 产出（全部写入 output_dir，源文件夹一个字节不动）：
+#   selection_state.pkl  保留集（特征+路径+label）——下一轮增量的 reference
+#   manifest.csv  每个细胞的 filepath / source / role(seed|source) / decision(keep|drop) / min_dist / label
+#   curated/<folder>/  保留文件的硬链接（跨盘自动退化为复制），镜像 root 内相对结构，可直接作为 pretrain 的 data file_dir；每次运行整个重建。<folder> 是相对所有 root 公共前缀的短名（如 opencell_single_cell）
+#   curated.csv  保留集文件清单（filepath 相对【运行 deduplication 的目录】、source、label 列，种子也包含）——train/pretrain/label 用 data.file_list 直接指向它即可，无需 curated/ 目录；相对路径按进程 CWD 解析，从同一目录启动即可
+#   keep_label.csv  file_list 格式（filepath,label 绝对路径）的保留清单，直接作为 train 的 data.file_list；仅当保留细胞有 label 时写出
+#   metrics.png  一张五联图（用运行 seed 保证可复现）：keep/drop/seed 散点（drop 灰 / keep 绿或按组着色 / 种子橙，簇中心标数字 ID）+ dropped(灰)/kept(蓝) 对照图 + 按数据来源着色图 + 质量 metrics（coverage/drop 距离 / 保留间距 / 各来源保留率）+ 每簇 keep/total 统计表
+#   features/  每 root 一个特征缓存 .npz（key = bundle路径+mtime+size、文件清单、channels/max_value/sample_max 等，任何一项变化自动失效；调 selection 参数重跑不重新提特征）
+# ====================================================================================================
+
+# SSL 预训练 bundle（model.pt）。必须是无 num_classes 的 pretrain bundle——train 分类 bundle 没有统一的嵌入空间，直接报错退出。注意：换 bundle = 换嵌入空间，特征缓存自动失效，旧 selection_state.pkl 不可再用作 reference（程序会硬报错，防止两个空间里的距离混比）。
+model: 20260830_dinov3_phase2\model.pt
+
+# 所有产出物写入这个目录（会自动创建；curated/ 每次整个重建）。
+output_dir: sc_dataset\deduplication
+
+# 剪枝模式恒为 null（sources 之间互相竞争；增量模式见 deduplication_incremental.yml）。
+reference: null
+
+data:
+  # file_list: 数据清单 CSV 列表（deduplication 上轮的 curated.csv、keep_label.csv，或任意 [filepath(,label)] 清单；统一写成列表，单个数据源也用单元素列表）。配置后清单就是全部候选，data.file_dir 被忽略（日志警告）：隐式 root = 清单文件所在的各个父目录，全局 data.* 默认对全部文件生效，CSV 自带 label 列作为每细胞 label。filepath 相对路径按进程 CWD 解析。与 file_dir 二选一。
+  file_list: null
+
+  # file_dir: 每个元素是一个"预裁剪单细胞文件夹"（递归枚举其中全部 .tif/.tiff，一个文件一个细胞，背景为 0）。字符串 = 全部继承 data.* 全局默认；字典 = {path: ..., 加任意 data.* 键做 per-folder 覆盖}。可覆盖键：image_pattern / channel_layout / channels / max_value / label_csv / label_from_dir。两个条目不能有重叠文件（硬报错）；配 model 时 channels 解析后必须等于 bundle 的 in_chans（与 infer 相同的硬校验）。
+  file_dir:
+    - sc_dataset\collection\NCOA2_293T_63x_epi
+    - sc_dataset\collection\opencell\single_cell
+    - sc_dataset\collection\p53
+    # 字典写法示例：
+    # - path: D:\Model\sc_dataset\hpa\single_cell
+    #   max_value: 255
+
+  # 从文件名提取元数据的正则（命名捕获组成为 manifest 之外的附加信息）；null = 不提取。对筛选本身无影响，只影响特征缓存 key 与将来的溯源。
+  image_pattern: null
+
+  # 通道在文件内的排布：CHW = 通道是 TIFF 的多个 page；HWC = 通道在最后一维；null = 每个文件本身就是单张 2D 图（当前数据全部是这种）。
+  channel_layout: null
+
+  # 用哪些通道提特征，1-based 列表；null = 文件里全部通道。解析后的通道数必须等于 bundle 的 in_chans，否则硬报错。
+  channels: [1]
+
+  # 强度域：图像载入后除以它归一到 [0,1]（16-bit 用 65535，8-bit 用 255）。必填（全局默认或 per-root 覆盖），填错 dtype 会让所有 percentile 归一失真。
+  max_value: 65535
+
+  # label 的两级解析（只影响 manifest 的 label 列、group_by: label 和 keep_label.csv，不影响特征）：
+  #   1. label_csv 里的 filepath->label 映射（绝对路径匹配，相对路径相对 CSV 所在目录解析）；
+  #   2. 否则 label_from_dir: true 时用文件的父目录名（如 p53 的 pos/neg）。CSV 配置了但文件不存在 = 硬报错（按 typo 处理，不静默跳过）。
+  label_from_dir: false
+  label_csv: null                      # 例如 D:\Model\sc_dataset\label.csv
+
+  # 每 root 的细胞数上限（确定性随机下采样，seed 固定则每次选到同一批）。null = 全量。适合先小规模试跑调 selection 参数，再放开全量。
+  sample_max: null
+
+selection:
+  # 总量二选一（增量模式的 max_add 见另一份配置），优先级：radius > target_keep。都为 null = 报错。
+  #   radius  直接指定多样性半径（[0, 2]）。上一轮在本数据池自动搜出 0.6562，可作量纲参考：更小 = 保留更多、更同质；更大 = 剪得更狠。配了 target_ratio 时不能用 radius（无法同时保证组配额），硬报错。
+  #   target_keep  最终池子目标总数（种子计入），程序对 r 做二分搜索，收敛到目标的 1% 容差内。
+  radius: null #0.65
+  target_keep: 40000
+  max_add: null                        # 剪枝模式不使用（增量模式专用）
+
+  # 自适应半径（可选，0 = 关闭，默认）：> 0 时按局部密度缩放每个细胞的有效半径 = radius × clip((k近邻距离/全体中位数)^adaptive, 0.5, 2.0)（k=10，倍率上下限 0.5~2.0 硬编码）——致密区域半径缩小（近邻冗余多留一些、细节更密），稀疏区域半径放大（本来就覆盖得好，少留几个锚点）。对 target_keep 的二分搜索同样生效（缩放系数无量纲，全局 radius 仍是搜索基线）。推荐 0.5~1.0 起步试。
+  adaptive: 2
+
+  # 分组比例控制（可选，作用于 target_keep 的总量之内）：
+  #   group_by  把候选细胞分成"组"，组统计与配额都以组为单位：
+  #     cluster  （默认）在隐空间上 kNN + Leiden 自动划簇 = 数据驱动的形态类群，不需要任何标签。resolution 自动决策：扫一档 resolution 梯度（0.2~3.0），取标准 modularity 达到最优值 95% 的分组里最粗的一档——把均匀群体切碎只涨一点点 modularity，却会破坏配额。
+  #     label  按 label 分组（file_list 的 label 列 / label_csv / label_from_dir 解析，无标签细胞归入 unknown）；
+  #     source  按数据集目录分组；
+  #     none  不分组（没有任何组统计；此时再配 target_ratio = 硬报错）。
+  #   target_ratio  采样后"最大组 : 最小组"的目标比例（如 10 = 100:1 压到约 10:1）。null = 不做配额，只输出组统计（manifest 的 group 列、每组汇总、UMAP 按组着色）。实现：配额 ∝ 组大小**alpha，alpha 由 log(target_ratio)/log(大小比) 解出（100:1 → 10:1 即 alpha=0.5 的平方根压缩）；组内仍走半径覆盖贪心；每组至少保留 2 个（保底不灭组）；小组放不下比例时按组大小封顶（此时比例以实际数据可达为准，汇总日志会打印压缩前后的真实比例）。
+  group_by: cluster
+  target_ratio: null
+  cluster_resolution: null             # null = 自动按 modularity 扫描决策
+
+  # 随机种子：决定遍历顺序、sample_max 下采样、Leiden、UMAP 图。固定则结果可复现。
+  seed: 42
+
+space:
+  # 筛选空间的 whitened-PCA 维数（对全部候选特征拟合，行再 L2 归一）。自动被样本数和特征维数封顶；50d 通常保留 ~85% 方差。reference 模式下本键被忽略——必须沿用 reference state 里存的那个 PCA，否则新细胞和种子不可比（程序会沿用并记一条 warning）。
+  pca_components: 50
+
+dataloader:
+  batch_size: 128                      # 特征提取的前向批大小
+  num_workers: 6                       # DataLoader 进程数（0 = 主进程加载，慢）
+  prefetch_factor: 2                   # 每 worker 预取批数（num_workers=0 时忽略）
+  persistent_workers: true             # 跨 epoch 保留 worker（推理单轮，影响不大）
+
+output:
+  # curated/ 硬链接目录。true = 构建（同盘零拷贝，跨盘自动复制）；每次运行整个目录先删后建，是纯派生产物，不要手动往里放东西。
+  link_dir: true
+
+  # keep_label.csv（file_list 格式的保留清单，直接作为 train 的 data.file_list）。保留细胞一个 label 都没有时自动跳过并记日志。
+  keep_label_csv: true
+
+  # metrics.png（对全部参与点拟合 UMAP，画 keep/drop/seed 散点 + 对照图 + 来源图 + 质量 metrics + 每簇统计）。拟合对几万个点需要一两分钟；只想快速调参数时可设 false（metrics 面板随之跳过，不影响其余产出）。
+  plot: true

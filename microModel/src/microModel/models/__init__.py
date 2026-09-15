@@ -1,7 +1,8 @@
 """SSL model registry. Add new SSL methods by creating models/<method>.py
-with a build_<method>(backbone_cfg, method_cfg, device) factory, a
-train_step function, and a get_criterion method (see dinov3.py), then
-registering the module in _SSL_REGISTRY below.
+with a build_<method>(backbone_cfg, method_cfg, device) factory and a
+train_step function, then registering the module in _SSL_REGISTRY below.
+The loss criterion is built by this module's get_criterion (currently
+DINOv3-specific, see the branch below).
 """
 
 from microBase import MicroMaxError

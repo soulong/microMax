@@ -1,11 +1,10 @@
-"""profiler.db writer hardening: lazy creation, indexes, schema version."""
+"""profiler.db writer hardening: lazy creation, clean table layout."""
 
 import sqlite3
 
 import pandas as pd
 
 from microProfiler.io import Database
-from microProfiler.io.database import SCHEMA_VERSION, SCHEMA_VERSION_TABLE
 from microProfiler.profiling.batch_writer import BatchWriter
 
 
@@ -17,18 +16,20 @@ def test_batch_writer_lazy_does_not_create_empty_db(tmp_path):
     assert not db_path.exists()
 
 
-def test_batch_writer_writes_index_and_schema_version(tmp_path):
+def test_batch_writer_writes_clean_table_layout(tmp_path):
+    """The written DB holds only the data tables: no internal bookkeeping
+    tables and no secondary indexes."""
     db_path = tmp_path / "profiler.db"
     writer = BatchWriter(db_path, "image")
     writer.add(pd.DataFrame({"well": ["A1", "A2"], "value": [1.0, 2.0]}))
     writer.close()
 
     conn = sqlite3.connect(str(db_path))
-    version = conn.execute(
-        f"SELECT version FROM {SCHEMA_VERSION_TABLE}").fetchone()[0]
-    assert version == SCHEMA_VERSION
-    indexes = [row[1] for row in conn.execute("PRAGMA index_list('image')")]
-    assert any("well" in name for name in indexes)
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert tables == {"image"}
+    assert [row[1] for row in conn.execute("PRAGMA index_list('image')")] == []
+    assert conn.execute("SELECT COUNT(*) FROM image").fetchone()[0] == 2
     conn.close()
 
 

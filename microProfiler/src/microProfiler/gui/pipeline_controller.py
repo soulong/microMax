@@ -14,7 +14,7 @@ from microProfiler.config import PipelineConfig, section_to_dataclass
 from microProfiler.gui.dataset_service import DatasetService
 from microProfiler.gui.interfaces import IControllerView
 from microProfiler.gui.workers.pipeline_worker import PipelineWorker
-from microProfiler.io import clone_dataset
+from microProfiler.io import rebuild_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +397,9 @@ class PipelineController(QObject):
         # (run_pipeline computes this from the config's channel selections —
         # a section with no channels is skipped and never marked applied).
         self._save_session_yml(executed_steps=self._worker._applied_steps)
+        # Profiling quarantines broken rows too — refresh the dataset like
+        # every other step so the GUI doesn't keep listing deleted files.
+        self._update_dataset_after_step("profiling")
 
     @_config_error_dialog
     def run_inference(self) -> None:
@@ -793,21 +796,42 @@ class PipelineController(QObject):
     # ── Helpers ──────────────────────────────────────────────────────────
 
     def _update_dataset_after_step(self, step_name: str) -> None:
+        # A step can change the row set (tiling, z-projection, quarantine) —
+        # a remembered preview row index would point past the end.
+        self._random_row_idx = None
         updated_ds = getattr(self._worker, "_result_ds", None)
         if updated_ds is None:
             logger.warning(
                 "No result dataset after step '%s'", step_name
             )
             return
-        self._view.dataset = updated_ds
-        self._view.original_dataset = clone_dataset(updated_ds)
+        # The step result derives from the FILTERED view (run_step received
+        # it), so it must never become the filter baseline directly. The
+        # baseline is the UNFILTERED on-disk state — a fresh rescan drops the
+        # carried filters while still reflecting what the step changed
+        # (tiled rows, z-projected stacks, quarantined rows, new masks).
+        # Clearing the filter afterwards therefore brings back the rows the
+        # filters had hidden, instead of freezing the filtered subset in.
+        try:
+            self._view.original_dataset = rebuild_dataset(
+                updated_ds, keep_filters=False)
+        except Exception:
+            logger.exception(
+                "Could not rescan dataset after step '%s' — keeping the "
+                "previous filter baseline", step_name)
+            self._view.dataset = updated_ds
+            self._view.update_dataset_info(updated_ds)
+            return
+        # Re-apply the panel filters onto the fresh baseline; this also
+        # reassigns view.dataset as original + current filter rows.
         filter_panel = self._view.get_step_panel("filter")
         if filter_panel is not None and hasattr(filter_panel, "_apply_filters"):
             filter_panel._apply_filters()
-        self._view.update_dataset_info(updated_ds)
-        self._view.refresh_step_panels(updated_ds.intensity_colnames)
-        self._view.set_image_pattern(updated_ds.image_pattern or "")
-        self._view.set_mask_pattern(updated_ds.mask_pattern or "")
+        final_ds = self._view.dataset or updated_ds
+        self._view.update_dataset_info(final_ds)
+        self._view.refresh_step_panels(final_ds.intensity_colnames)
+        self._view.set_image_pattern(final_ds.image_pattern or "")
+        self._view.set_mask_pattern(final_ds.mask_pattern or "")
         self._view.update_tab_status()
 
     def _sync_seg_masks_to_profiling(self) -> None:

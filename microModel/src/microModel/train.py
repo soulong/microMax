@@ -23,19 +23,21 @@ from sklearn.metrics import accuracy_score, f1_score
 from microBase import MicroMaxError
 
 from . import __version__
-from .utils import (logger, set_seed, select_device, load_label_csv, copy_config_file,
+from .utils import (logger, set_seed, select_device, copy_config_file,
                     add_file_logging, atomic_torch_save, merge_locked_normalize,
-                    resolve_channels, resolve_max_value, build_cell_datasets)
-from .dataset import SingleCellDataset, stratified_split, subsample
+                    resolve_channels, resolve_max_value, build_cell_datasets,
+                    load_file_list)
+from .dataset import (SingleCellDataset, FileListCellDataset, stratified_split,
+                      subsample)
 from .backbone import (
-    build_backbone, build_dino_vit, cls_token_pool_fn,
+    build_backbone, build_dino_vit, EmbedExtractor,
     ClassificationHead, FocalLoss, BCELoss, Model, load_backbone_weights,
 )
 
 
 def _save_bundle(output_dir, epoch, state_dict, meta, config, opt, best_state,
                  best_val, train_loss_history, val_acc_history, val_f1_history,
-                 final=False):
+                 final=False, scaler=None):
     """Save a train bundle: state_dict, meta, config, epoch, histories,
     best_val. `epoch` is 1-BASED (the last completed epoch), matching the
     filename and the pretrain bundles — the package-wide convention is
@@ -48,6 +50,10 @@ def _save_bundle(output_dir, epoch, state_dict, meta, config, opt, best_state,
     tolerates the missing keys). final=False writes model_{epoch}.pt (every
     save_interval) with the raw training weights + optimizer state + best_state
     for exact resume.
+
+    scaler: the AMP GradScaler — its state rides along with the optimizer so
+    a resumed run continues at the converged scale instead of restarting at
+    65536 and skipping steps (same convention as the pretrain bundles).
     """
     bundle = {
         "state_dict": state_dict,
@@ -63,6 +69,8 @@ def _save_bundle(output_dir, epoch, state_dict, meta, config, opt, best_state,
         # Exact-resume state — only the interval bundles carry it.
         bundle["optimizer_state_dict"] = opt.state_dict()
         bundle["best_state"] = best_state
+        bundle["scaler_state_dict"] = (
+            scaler.state_dict() if scaler is not None else None)
     fname = "model.pt" if final else f"model_{epoch}.pt"
     path = os.path.join(output_dir, fname)
     atomic_torch_save(bundle, path)
@@ -151,29 +159,21 @@ def _try_resume(config, device):
     return ckpt, config
 
 
-def _build_records_from_cell_dataset(cell_ds, root, label_from_dir, label_csv):
-    """Walk a CellDataset's metadata DataFrame and return a list of record dicts."""
-    label_map = {}
-    if label_csv:
-        # A configured-but-missing CSV is a typo — never silently fall back to
-        # directory labels (§2 no-guessing).
-        if not os.path.exists(label_csv):
-            raise MicroMaxError(f"Error: label_csv file not found: {label_csv}")
-        label_map = load_label_csv(label_csv)
+def _build_records_from_cell_dataset(cell_ds, root):
+    """Walk a CellDataset's metadata DataFrame and return a list of record dicts.
 
+    Labels come from the parent folder name (pos/neg-style layout); a file
+    directly in the dataset root has directory "." — no subfolder label, so
+    it hits the regular dropped-record warning.
+    """
     records = []
     md = cell_ds.metadata
     for i in range(len(md)):
         row = md.iloc[i]
         path = row["path"]
-        abs_path = os.path.normcase(os.path.abspath(path))
-        if abs_path in label_map:
-            label = label_map[abs_path]
-        elif label_from_dir:
-            d = row.get("directory", "")
-            label = os.path.basename(str(d).replace("\\", "/")) if d else None
-        else:
-            label = None
+        d = row.get("directory", "")
+        label = (os.path.basename(str(d).replace("\\", "/"))
+                 if d and d != "." else None)
         rec = {
             "idx": i,
             "path": path,
@@ -192,7 +192,8 @@ def _build_records_from_cell_dataset(cell_ds, root, label_from_dir, label_csv):
 def _build_model_from_ssl(ssl_bundle, model_cfg, num_classes, device):
     """Build a classification Model from an SSL pretrain bundle.
 
-    For DINOv3: rebuild ViT via build_dino_vit + cls-token pooling.
+    For DINOv3: rebuild ViT via build_dino_vit + mean-patch pooling
+    (EmbedExtractor source="patch" — the readout the timm forward gives).
     For conv backbones: use build_backbone + global mean pool.
     Returns (model, method, meta).
     """
@@ -201,20 +202,19 @@ def _build_model_from_ssl(ssl_bundle, model_cfg, num_classes, device):
     in_chans = meta["in_chans"]
 
     if method == "dinov3":
-        backbone = build_dino_vit(meta["backbone"], in_chans, pretrained=False)
-        feat_dim = backbone.num_features
-        pool_fn = cls_token_pool_fn
+        vit = build_dino_vit(meta["backbone"], in_chans, pretrained=False)
+        backbone = EmbedExtractor(vit, source="patch")
     else:
         # Conv backbone
-        backbone, feat_dim, pool_fn = build_backbone(
-            meta["backbone"], in_chans, pretrained=False)
+        conv, _ = build_backbone(meta["backbone"], in_chans, pretrained=False)
+        backbone = EmbedExtractor(conv)
 
     # Load SSL backbone weights from the bundle's full state_dict
-    load_backbone_weights(backbone, ssl_bundle, method)
+    load_backbone_weights(backbone.backbone, ssl_bundle, method)
     logger.info("Loaded SSL backbone weights (method=%s)", method)
 
-    head = ClassificationHead(feat_dim, num_classes)
-    model = Model(backbone, pool_fn, head).to(device)
+    head = ClassificationHead(backbone.feat_dim, num_classes)
+    model = Model(backbone, head).to(device)
     return model, method, meta
 
 
@@ -251,8 +251,6 @@ def run_train(config, config_path=None):
     clip_high = norm_cfg.get("clip_high", 99.95)
     fixed_reference = norm_cfg.get("fixed_reference", False)
     max_value = resolve_max_value(data_cfg)
-    label_from_dir = data_cfg.get("label_from_dir", True)
-    label_csv = data_cfg.get("label_csv")
 
     seed = 42
     output_dir = config.get("output_dir", "runs")
@@ -266,38 +264,67 @@ def run_train(config, config_path=None):
 
     set_seed(seed)
 
-    # ---- Build CellDataset + records from each root ----
-    root = data_cfg["root"]
-    roots = [root] if isinstance(root, str) else list(root)
+    # ---- Build CellDataset + records from each file_dir ----
+    root = data_cfg["file_dir"]
+    roots = [root] if isinstance(root, str) else list(root or [])
     channels = data_cfg.get("channels")
     channel_layout = data_cfg.get("channel_layout", "CHW")
     image_pattern = data_cfg.get("image_pattern")
 
-    datasets = build_cell_datasets(roots, channel_layout, image_pattern)
-    all_records = []
+    file_list = data_cfg.get("file_list")
+    if not file_list and not roots:
+        raise MicroMaxError("Error: data.file_list and data.file_dir are both "
+              "empty; set one of them (a data source is required)")
     resolved_per_root = {}
-    for r, cell_ds in datasets:
+    if file_list:
+        # File-list mode: the CSVs ARE the pool — data.file_dir is ignored.
+        # Labels come from the CSV's own label column ONLY (empty = unlabeled
+        # and dropped below).
+        if root:
+            logger.warning("data.file_list takes precedence: data.file_dir "
+                           "is ignored")
+        paths, list_labels = load_file_list(file_list)
+        cell_ds = FileListCellDataset(paths, channel_layout)
         n_avail = len(cell_ds.intensity_colnames)
-        resolved_per_root[r] = resolve_channels(channels, n_avail, r)
-        recs = _build_records_from_cell_dataset(
-            cell_ds, r, label_from_dir, label_csv)
-        for rec in recs:
-            rec["cell_dataset"] = cell_ds
-        all_records.extend(recs)
+        resolved_channels = resolve_channels(channels, n_avail, "file_list")
+        all_records = []
+        for i, p in enumerate(paths):
+            all_records.append({
+                "idx": i,
+                "path": p,
+                "label": list_labels[i],
+                "root": "file_list",
+                "directory": os.path.dirname(p),
+                "stem": os.path.splitext(os.path.basename(p))[0],
+                "cell_dataset": cell_ds,
+            })
+        if not all_records:
+            raise MicroMaxError("Error: data.file_list is empty")
+    else:
+        datasets = build_cell_datasets(roots, channel_layout, image_pattern)
+        all_records = []
+        for r, cell_ds in datasets:
+            n_avail = len(cell_ds.intensity_colnames)
+            resolved_per_root[r] = resolve_channels(channels, n_avail, r)
+            recs = _build_records_from_cell_dataset(
+                cell_ds, r)
+            for rec in recs:
+                rec["cell_dataset"] = cell_ds
+            all_records.extend(recs)
 
-    if not all_records:
-        raise MicroMaxError(f"Error: no records found in {roots}")
+        if not all_records:
+            raise MicroMaxError(f"Error: no records found in {roots}")
 
-    # All roots must resolve to the same channel set — one bundle carries a
-    # single `channels` meta, so a heterogeneous resolution would silently
-    # train on the wrong channels for some roots (last-root-wins bug).
-    unique_resolved = {tuple(v) for v in resolved_per_root.values()}
-    if len(unique_resolved) > 1:
-        raise MicroMaxError(f"Error: data roots resolve to different channel sets: "
-            f"{ {r: v for r, v in resolved_per_root.items()} }. "
-            f"Give every root the same channel count or set data.channels "
-            f"explicitly.")
-    resolved_channels = list(next(iter(unique_resolved))) if unique_resolved else channels
+        # All roots must resolve to the same channel set — one bundle carries a
+        # single `channels` meta, so a heterogeneous resolution would silently
+        # train on the wrong channels for some roots (last-root-wins bug).
+        unique_resolved = {tuple(v) for v in resolved_per_root.values()}
+        if len(unique_resolved) > 1:
+            raise MicroMaxError(f"Error: data roots resolve to different channel sets: "
+                f"{ {r: v for r, v in resolved_per_root.items()} }. "
+                f"Give every root the same channel count or set data.channels "
+                f"explicitly.")
+        resolved_channels = list(next(iter(unique_resolved))) if unique_resolved else channels
 
     # Drop records without any label (mode-independent).
     n_unlabeled = sum(1 for r in all_records if r["label"] is None)
@@ -449,11 +476,18 @@ def run_train(config, config_path=None):
                 raise MicroMaxError(f"Error: data.channels ({len(resolved_channels)}) does not match the "
                     f"resume checkpoint's input channels ({ckpt_in_chans}); re-run with "
                     f"matching data.channels or without resume.sl_model")
-        backbone, feat_dim, pool_fn = build_backbone(
+        conv, feat_dim = build_backbone(
             model_cfg["backbone"], len(resolved_channels),
             model_cfg.get("pretrained", True) if checkpoint is None else False)
         head = ClassificationHead(feat_dim, num_classes)
-        model = Model(backbone, pool_fn, head).to(device)
+        model = Model(EmbedExtractor(conv), head).to(device)
+
+    # The saved config snapshot must carry the backbone that was ACTUALLY
+    # built (a transfer run's config may hold a placeholder name). A later
+    # resume.sl_model locks model.backbone from this snapshot — with the
+    # placeholder still in it, resume would build the wrong architecture and
+    # the strict state-dict load would fail.
+    config.setdefault("model", {})["backbone"] = trained_backbone
 
     # Train bundle meta — known before training; shared by every saved
     # bundle (interval model_{epoch}.pt + final model.pt).
@@ -465,7 +499,8 @@ def run_train(config, config_path=None):
         "in_chans": trained_in_chans,
         "backbone": trained_backbone,
         "num_classes": num_classes,
-        "augmentation_train": aug_train_cfg,
+        # augmentation_infer only — the inference contract. augmentation_train
+        # lives in the saved config (resume locks it from there).
         "augmentation_infer": aug_infer_cfg,
         "normalize_method": normalize_method,
         "normalize_with_masking": with_masking,
@@ -475,10 +510,9 @@ def run_train(config, config_path=None):
         "image_pattern": image_pattern,
         "ssl_method": ssl_method,
         "loss": "bce" if multi_label else "focal",
-        # Provenance: which data + label table produced this bundle (same
-        # convention as pretrain meta.data_root).
+        # Provenance: which data produced this bundle (same convention as
+        # pretrain meta.data_root).
         "data_root": roots,
-        "label_csv": label_csv,
     }
 
     # freeze_backbone=true = linear probe: only the head receives gradients.
@@ -549,6 +583,8 @@ def run_train(config, config_path=None):
             model.load_state_dict(checkpoint["model_state_dict"])
         if "optimizer_state_dict" in checkpoint:
             opt.load_state_dict(checkpoint["optimizer_state_dict"])
+        if scaler is not None and checkpoint.get("scaler_state_dict") is not None:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
         train_loss_history = checkpoint.get("train_loss_history", [])
         val_acc_history = checkpoint.get("val_acc_history", [])
         val_f1_history = checkpoint.get("val_f1_history", [])
@@ -619,7 +655,8 @@ def run_train(config, config_path=None):
         if save_interval and (epoch + 1) % save_interval == 0:
             _save_bundle(output_dir, epoch + 1, model.state_dict(), meta, config,
                          opt, best_state, best_acc,
-                         train_loss_history, val_acc_history, val_f1_history)
+                         train_loss_history, val_acc_history, val_f1_history,
+                         scaler=scaler)
 
         logger.info("  epoch=%d  loss=%.4f  val_acc=%.4f  val_f1=%.4f  patience=%d/%d%s",
                     epoch + 1, avg_loss, acc, f1, patience_counter, patience, marker)
@@ -636,15 +673,16 @@ def run_train(config, config_path=None):
     # builds the wrong architecture and load_state_dict fails or the eval
     # model silently has random weights.
     if ssl_method == "dinov3":
-        eval_backbone = build_dino_vit(trained_backbone, trained_in_chans,
-                                       pretrained=False)
-        eval_feat_dim = eval_backbone.num_features
-        eval_pool_fn = cls_token_pool_fn
+        eval_vit = build_dino_vit(trained_backbone, trained_in_chans,
+                                  pretrained=False)
+        eval_backbone = EmbedExtractor(eval_vit, source="patch")
+        eval_feat_dim = eval_backbone.feat_dim
     else:
-        eval_backbone, eval_feat_dim, eval_pool_fn = build_backbone(
+        eval_conv, eval_feat_dim = build_backbone(
             trained_backbone, trained_in_chans, pretrained=False)
+        eval_backbone = EmbedExtractor(eval_conv)
     eval_head = ClassificationHead(eval_feat_dim, num_classes)
-    eval_model = Model(eval_backbone, eval_pool_fn, eval_head)
+    eval_model = Model(eval_backbone, eval_head)
 
     if best_state is not None:
         eval_model.load_state_dict(best_state)
@@ -708,7 +746,8 @@ def run_train(config, config_path=None):
         output_dir,
         epoch + 1 if start_epoch < epochs else start_epoch,
         eval_model.state_dict(), meta, config, opt, best_state, best_acc,
-        train_loss_history, val_acc_history, val_f1_history, final=True)
+        train_loss_history, val_acc_history, val_f1_history, final=True,
+        scaler=scaler)
     logger.info("Train bundle saved to %s", bundle_path)
     logger.info("  num_classes=%d  best_val_acc=%.4f  ssl_method=%s",
                 num_classes, best_acc, ssl_method)

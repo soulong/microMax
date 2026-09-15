@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from natsort import natsorted
 
+from microBase import normalize_well
 from microBase.db_contracts import (
     DIRECTORY_COLUMN,
     WELL_COLUMN,
@@ -120,15 +121,16 @@ class DataModule:
     def _build_row_index(self) -> None:
         """Build a composite index mapping (well, field, stack, timepoint) → [row_idx].
 
-        All key components are strings — missing columns become "". This
-        supports non-standard datasets (e.g. HPA) that only capture a subset
-        of structural groups.
+        All key components are strings — missing columns become "". Wells use
+        the canonical form (A01 -> A1), matching get_wells()/lookup_row_indices
+        and the well-grid canvas. This supports non-standard datasets (e.g.
+        HPA) that only capture a subset of structural groups.
         """
         meta = self._metadata
         self._row_index = {}
         for idx in meta.index:
             key = (
-                _safe_str(meta, idx, "well"),
+                str(normalize_well(_safe_str(meta, idx, "well"))),
                 _safe_str(meta, idx, "field"),
                 _safe_str(meta, idx, "stack"),
                 _safe_str(meta, idx, "timepoint"),
@@ -153,8 +155,8 @@ class DataModule:
             "SELECT name FROM sqlite_master WHERE type='table'"
         )
         for (tname,) in cursor.fetchall():
-            # sqlite_* are internals; _* are reserved bookkeeping tables
-            # (e.g. microProfiler's _schema_version) — never plot variables.
+            # sqlite_* are internals; _* are reserved bookkeeping tables —
+            # never plot variables.
             if tname.startswith("sqlite_") or tname.startswith("_"):
                 continue
             cur = self._db_conn.execute(f'PRAGMA table_info("{tname}")')
@@ -166,9 +168,21 @@ class DataModule:
         p = Path(db_path)
         if not p.exists():
             raise FileNotFoundError(f"DB file not found: {p}")
-        self.close_db()
-        self._df_cache.clear()
+        self.clear_db()
         self._init_db(p)
+
+    def clear_db(self) -> None:
+        """Detach any loaded DB entirely: close the connection and drop the
+        table introspection and cached frames.
+
+        Select DB replaces the whole selection — without this clear, an
+        infer-only re-selection would leave the previous profiler DB (and
+        its tables) attached as a hidden data source.
+        """
+        self.close_db()
+        self._db_path = None
+        self._db_tables.clear()
+        self._df_cache.clear()
 
     def _select_columns(self, table: str) -> list[str]:
         """Return non-BLOB column names for SELECT, or ['*'] if table unknown."""
@@ -210,8 +224,12 @@ class DataModule:
             if "well" not in self._metadata.columns:
                 self._wells_cache = []
             else:
+                # Canonical keys (A01 -> A1): the well-grid canvas speaks
+                # normalized wells, so every well comparison in the GUI goes
+                # through this accessor and stays consistent with it.
                 self._wells_cache = natsorted(
-                    str(w) for w in self._metadata["well"].dropna().unique()
+                    str(normalize_well(w))
+                    for w in self._metadata["well"].dropna().unique()
                 )
         return self._wells_cache
 
@@ -434,6 +452,10 @@ class DataModule:
         # (widget is None → get_selected_*() returns [] → no filter).
         if not wells:
             wells = sorted({k[0] for k in self._row_index})
+        else:
+            # Callers may pass raw captured wells ('A01'); the index is keyed
+            # canonically ('A1').
+            wells = [str(normalize_well(w)) for w in wells]
         if not fields:
             fields = sorted({k[1] for k in self._row_index})
         if not stacks:
@@ -565,7 +587,9 @@ def merge_metadata(
 
     Re-merging after a Write-to-DB never duplicates columns (the DB table
     already carries them), and tables without the join key are returned
-    unchanged.
+    unchanged. On the well key both sides are normalized ('A01' -> 'A1')
+    into a temp join column so captured verbatim wells still meet the
+    Excel sheet's spelling; the original well columns stay verbatim.
     """
     if df is None or metadata is None:
         return df
@@ -574,6 +598,12 @@ def merge_metadata(
     missing = [c for c in metadata.columns if c != key and c not in df.columns]
     if not missing:
         return df
+    if key == "well":
+        left = df.assign(__well_key__=df[key].map(normalize_well))
+        right = metadata[[key] + missing].assign(
+            __well_key__=metadata[key].map(normalize_well))
+        return left.merge(right.drop(columns=[key]), on="__well_key__",
+                          how="left").drop(columns=["__well_key__"])
     return df.merge(metadata[[key] + missing], on=key, how="left")
 
 

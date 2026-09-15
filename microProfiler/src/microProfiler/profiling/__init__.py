@@ -14,8 +14,8 @@ def resolve_source_directory(
     """Derive the output 'directory' from the source file path.
 
     Returns the parent directory of the first available source file path,
-    stored RELATIVE to the dataset root with forward slashes (the shared
-    microBase canonical form, matching microModel's infer.db writers).
+    stored PORTABLE-FIRST (CWD-relative via microBase canonical_directory; the shared
+    microBase canonical form, matching microModel infer.db writers).
     Shared by the image and object profilers so their tables can be joined
     on 'directory'.
     """
@@ -29,4 +29,7 @@ def resolve_source_directory(
                 break
     if not source_path:
         return ""
-    return canonical_directory(os.path.dirname(str(source_path)), root)
+    p = str(source_path)
+    if not os.path.isabs(p):
+        p = os.path.join(str(root), p)   # rows may carry root-relative paths
+    return canonical_directory(os.path.dirname(p))

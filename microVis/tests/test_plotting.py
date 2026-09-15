@@ -97,13 +97,18 @@ def test_line_groups_and_sem_points():
     df = _df()
     fig = P.make_line(df, y="value", x="well", color="condition")
     ax = fig.axes[0]
-    # One errorbar collection (mean ± SEM nodes) + one raw-points scatter
-    # per color group.
+    # Raw-points scatter + one errorbar per color group.
     assert len(ax.collections) >= 2
-    # One node per (well, condition) group, like the barplot's ticks.
+    # X ticks are the 4 well levels (color lives in the legend, NOT on the
+    # x axis) — one connected line per color group spans those levels.
     ticks = {t.get_text() for t in ax.get_xticklabels()}
-    assert len(ticks) == 8
-    assert all(t.startswith(("A0", "A1", "A2", "A3")) for t in ticks)
+    assert ticks == {"A0", "A1", "A2", "A3"}
+    # One solid connecting line per color group (2 conditions), each spanning
+    # the 4 wells; errorbar marker lines carry linestyle 'None'.
+    connect_lines = [l for l in ax.lines if l.get_linestyle() == "-"]
+    assert len(connect_lines) == 2
+    for line in connect_lines:
+        assert len(line.get_xdata()) == 4
 
 
 def test_make_line_requires_x_semantics():

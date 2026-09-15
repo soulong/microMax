@@ -304,7 +304,7 @@ def _build_mm_inference_config(entry, cfg: PipelineConfig, ds, root_dir: Path) -
         "dataloader": {"num_workers": 4, "prefetch_factor": 2,
                        "persistent_workers": False},
         "data": {
-            "root": [str(root_dir)],
+            "file_dir": [str(root_dir)],
             "channels": channels,
             "channel_layout": None,
             "image_pattern": cfg.image_pattern or ds.image_pattern,

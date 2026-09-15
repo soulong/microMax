@@ -416,8 +416,9 @@ def _load_cell_image(d, mode, view):
     """
     from microBase import read_tiff_channels, read_image, read_mask, crop_cell, get_labels
     from microBase.db_contracts import resolve_directory
-    # directory is stored relative to the row's dataset root (_root injected
-    # at load time); resolving here also accepts legacy absolute values.
+    # directory is stored ABSOLUTE (forward slashes, db_contracts contract);
+    # resolve_directory resolves relative values against the process CWD first,
+    # falling back to the dataset root (_root).
     directory = resolve_directory(d.get("directory") or "", d.get("_root", ""))
     try:
         if mode == "whole_image":
@@ -688,13 +689,17 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
     inf_cfg = config["inference"]
     red_cfg = config.get("reduction", {})
 
-    data_roots = config["data"]["root"]
+    data_roots = config["data"]["file_dir"]
     base_output_dir = config.get("output_dir")
     db_name = inf_cfg.get("db_name", INFER_DB_NAME)
     seed = 42
 
     # DR methods: canonical order, unknown names dropped with a warning.
-    methods_raw = red_cfg.get("method") or ["pca", "umap"]
+    # Only None means "legacy default" — an explicit [] fits NOTHING (that
+    # contract is written down in microProfiler's config validation).
+    methods_raw = red_cfg.get("method")
+    if methods_raw is None:
+        methods_raw = ["pca", "umap"]
     if isinstance(methods_raw, str):
         methods_raw = [methods_raw]
     unknown = [m for m in methods_raw if m not in DR_METHODS]
@@ -848,10 +853,10 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
             n_pre = min(UMAP_PRE_COMPONENTS, feats_fit.shape[0], dim)
             pca_pre = (PCA(n_components=n_pre, random_state=seed).fit(feats_fit)
                        if n_pre < dim else None)
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="n_jobs value", category=UserWarning)
-                model = umap.UMAP(random_state=seed)
-                model.fit(pca_pre.transform(feats_fit) if pca_pre is not None else feats_fit)
+            # n_jobs=1 pairs with the fixed random_state (reproducible
+            # embedding) and silences umap's override warning.
+            model = umap.UMAP(random_state=seed, n_jobs=1)
+            model.fit(pca_pre.transform(feats_fit) if pca_pre is not None else feats_fit)
             reducers[m] = {"pca_pre": pca_pre, "umap": model}
         elif m == "pacmap":
             # PaCMAP reduces its input internally (apply_pca=True default);

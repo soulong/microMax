@@ -52,6 +52,9 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
     When inference is enabled, each block's output DB must exist with its
     `inference` table (plus the reduction tables when reduction is on) —
     table existence only, no row-count guard (masks can change between runs).
+    A config that enables NO checked output at all (pure preprocessing or
+    pure segmentation) has no notion of "complete": every dataset must run,
+    and the applied_steps gate alone protects the destructive steps.
     """
     expected: set[str] = set()
 
@@ -101,7 +104,7 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
                 # the same way or filtered datasets would never be skipped.
                 apply_filters(ds, cfg.filter or [])
                 n_rows = len(ds)
-            except (Exception, SystemExit) as e:
+            except Exception as e:
                 # microBase raises MicroMaxError on bad config/dataset
                 # (missing root, absent filter column, bad regex) — convert
                 # to "not complete" so the batch logs and continues instead
@@ -142,6 +145,16 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
                     infer_db, dataset_dir, sorted(missing),
                 )
                 return False
+
+    has_inference_checks = bool(
+        cfg.inference and cfg.inference.run and cfg.inference.configs
+        and any(e.channels for e in cfg.inference.configs))
+    if not expected and not has_inference_checks:
+        # No checked output is configured (pure preprocessing / pure
+        # segmentation): the dataset is never "complete" — run it. The
+        # in-place steps are still gated by session.yml applied_steps, so
+        # re-runs never redo destructive work.
+        return False
 
     return True
 
@@ -298,15 +311,11 @@ def main(argv: list[str] | None = None) -> int:
                 logger.error("Dataset failed: %s — %s", ds_dir, e)
                 logger.info("Continuing to next dataset...")
                 print()
-            except SystemExit as e:
-                # microBase raises MicroMaxError on bad dataset state (missing
-                # files, invalid filter column, corrupt TIFF). Treat it as a
-                # per-dataset failure so one bad dataset never aborts a plate
-                # scan — the same policy _is_dataset_complete applies above.
-                logger.error("Dataset failed: %s — %s", ds_dir, e)
-                logger.info("Continuing to next dataset...")
-                print()
             except Exception as e:
+                # Includes the microBase MicroMaxError subclasses (missing
+                # files, invalid filter column, corrupt TIFF) — the same
+                # per-dataset-failure policy _is_dataset_complete applies
+                # above.
                 logger.error("Dataset failed: %s — %s", ds_dir, e)
                 logger.info("Continuing to next dataset...")
                 print()

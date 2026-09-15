@@ -1,87 +1,71 @@
 # =============================================================================
 # DINOv3 SSL 预训练 —— Phase 1：普通自监督（无 Gram 锚定）
 # =============================================================================
-# 用途：单细胞荧光 crop 图片的自监督预训练，从 timm 官方 DINOv3 预训练权重
-#       出发做迁移（backbone.pretrained=true）或继续训练（resume.ssl_model）。
+#  用途：单细胞荧光 crop 图片的自监督预训练，从 timm 官方 DINOv3 预训练权重出发做迁移（backbone.pretrained=true）或继续训练（resume.ssl_model）。
 #
-# 运行环境假设：RTX 5070Ti 16G / Windows 11 / 单通道 16-bit 荧光单细胞 crop。
-# 数据特征：crop 典型尺寸 129–224 px；训练集 ~5K–50K 细胞。
-# 本配置已按上述数据调优：global 224 (patch16→14×14)、local 112、4 个 local 视图、
-# head 原型 21845（中等数据规模更稳更省内存）、有效 batch 256、常数 WD 0.04。
-# 预训练完成后，用 Phase 1 保存的 model.pt 作为：
-#   - 下游分类/特征提取的 backbone（train / infer），或
-#   - Phase 2（Gram 锚定）的 resume.ssl_model + dinov3.gram.ckpt。
+#   运行环境假设：RTX 5070Ti 16G / Windows 11 / 单通道 16-bit 荧光单细胞 crop。数据特征：crop 典型尺寸 129–224 px；训练集 ~5K–50K 细胞。本配置已按上述数据调优：
+#   global 224 (patch16→14×14)、local 112、4 个 local 视图、head 原型 21845（中等数据规模更稳更省内存）、有效 batch 256、常数 WD 0.04。预训练完成后，用 Phase 1
+#   保存的 model.pt 作为：
+#     - 下游分类/特征提取的 backbone（train / infer），或
+#     - Phase 2（Gram 锚定）的 resume.ssl_model（同时作为 gram 冻结锚）。
 #
-# 如何切换"迁移 / 连续"：
-#   - 首次在自有数据上训练（用 timm DINOv3 权重初始化）：backbone.pretrained: true，
-#     resume.ssl_model: null。
-#   - 在同一批数据上继续上一次运行（断点续训）：resume.ssl_model: <上次 model.pt>、
-#     resume.type: continue（epochs 表示总轮数，从上次 epoch 续到 epochs；
-#     dinov3 块调度键以 bundle 为准，config 显式改写的除外——日志会注明）。
-#   - 把已有 bundle 迁移到新数据：resume.ssl_model: <bundle>、resume.type: transfer
-#     （epoch 归 0、优化器与调度重置，仅带权重）。
+#   如何切换"迁移 / 连续"：
+#     - 首次在自有数据上训练（用 timm DINOv3 权重初始化）：backbone.pretrained: true，resume.ssl_model: null。
+#     - 在同一批数据上继续上一次运行（断点续训）：resume.ssl_model: <上次 model.pt>、resume.type: continue（epochs 表示总轮数，从上次 epoch 续到 epochs；dinov3
+#      块调度键以 bundle 为准，config 显式改写的除外——日志会注明）。
+#     - 把已有 bundle 迁移到新数据：resume.ssl_model: <bundle>、resume.type: transfer（epoch 归 0、优化器与调度重置，仅带权重）。
 # =============================================================================
 
 mode: single_cell
 
 method: dinov3
 
-output_dir: 20260830_dinov3_phase1
+output_dir: 2026-09-14_dinov3_phase1
 
 data:
-  root:
-    - sc_dataset/p53/2026-07-10_63x
-    - sc_dataset/p53/2026-07-11_63x
-    - sc_dataset/p53/2026-07-14_63x
-    - sc_dataset/p53/2026-07-18_22_63x
-    - sc_dataset/p53/2026-07-18_37_63x
-    - sc_dataset/opencell/single_cell
+  #  file_list: 数据清单 CSV 列表（deduplication 的 curated.csv，或任意 [filepath(,label)] 清单；统一写成列表——单个数据源也用单元素列表，多个 CSV 的并集就是数据
+  #  池）。配置后清单就是全部数据，data.file_dir 被忽略（日志警告）。filepath 相对路径按进程 CWD 解析——与 curated.csv 的生成约定一致，从 deduplication 的运行目录启
+  #  动即可。pretrain 忽略 label 列。
+  file_list: # null
+    - sc_dataset/deduplication/curated.csv
+  file_dir:
+    # - sc_dataset/deduplication/curated/NCOA2_293T_63x_epi
+    # - sc_dataset/deduplication/curated/opencell_single_cell
+    # - sc_dataset/deduplication/curated/p53
   image_pattern: null                 # 文件名正则提取元数据；null = 不提取
-  max_value: 65535                    # 输入 dtype 最大强度（16-bit=65535 / 8-bit=255），
-                                      # 加载时图像除以它归一化到 [0,1]
+  max_value: 65535                    # 输入 dtype 最大强度（16-bit=65535 / 8-bit=255），加载时图像除以它归一化到 [0,1]
   channels: [1]                       # 1-based 通道下标；单细胞荧光通常单通道；null = 全部
   channel_layout: null                # CHW | HWC | null（一文件一通道）
-  sample_max: null                    # null = 不限制；5K 以下小数据集别设上限；
-                                      # 数据集很大(>100K)想加速迭代可设 20000
+  sample_max: null                    # null = 不限制；5K 以下小数据集别设上限；数据集很大(>100K)想加速迭代可设 20000
   sample_by: per_dataset              # per_dataset | per_class（配合 sample_max）
 
 # --- resume: 迁移/连续训练控制 ---
 # ssl_model: 微 model SSL bundle 路径（Phase1/其他方法/model.pt 均可）。
 # type:
-#   continue —— 精确续训：模型+优化器+epoch+loss 历史恢复；epochs 为"总轮数"。
-#               调度（LR/momentum/WD/temp）按"绝对步位置"衔接：
-#               · checkpoint 未达 epochs：global_step = start_epoch × len(loader)，
-#                 数据集大小不变时曲线无缝续跑；换过数据集大小则调度点随之偏移。
-#               · checkpoint 已达/超过 epochs（阶段交接）：config 的 epochs 被视为
-#                 "额外轮数"（新目标 = 已完成 + epochs），total_steps 按延长后的区间
-#                 重算——cosine 曲线是从延长曲线中段继续，而非沿用原曲线终点的值；
-#                 warmup 按当前 config 的 warmup_epochs × 新 len(loader) 重算。
-#   transfer —— 领域迁移/换权重初始化：仅权重，epoch 归 0，调度与优化器重置，
-#               使用 transfer_warmup_epochs。
+#    continue —— 精确续训：模型+优化器+epoch+loss 历史恢复；epochs 为"总轮数"。调度（LR/momentum/WD/temp）按"绝对步位置"衔接：· checkpoint 未达 epochs：
+#                global_step = start_epoch × len(loader)，数据集大小不变时曲线无缝续跑；换过数据集大小则调度点随之偏移。· checkpoint 已达/超过 epochs（阶段交接
+#                ）：config 的 epochs 被视为"额外轮数"（新目标 = 已完成 + epochs），total_steps 按延长后的区间重算——cosine 曲线是从延长曲线中段继续，而非沿用原
+#                曲线终点的值；warmup 按当前 config 的 warmup_epochs × 新 len(loader) 重算。
+#   transfer —— 领域迁移/换权重初始化：仅权重，epoch 归 0，调度与优化器重置，使用 transfer_warmup_epochs。
 resume:
   ssl_model: null
   type: continue
 
 backbone:
-  # timm DINOv3 预训练权重（LVD 蒸馏，Eva 架构，RoPE + 4 register tokens，参数量 ~22M）。
-  # 可选同族：vit_small_plus_patch16_dinov3（29M，更强）、
-  #           vit_base_patch16_dinov3（86M，16G 显存也能跑但更慢）。
-  # 注意：这些是 DINOv3 家族；单通道由 timm adapt_input_conv 自动适配。
+  #   timm DINOv3 预训练权重（LVD 蒸馏，Eva 架构，RoPE + 4 register tokens，参数量 ~22M）。可选同族：vit_small_plus_patch16_dinov3（29M，更强）、
+  #   vit_base_patch16_dinov3（86M，16G 显存也能跑但更慢）。注意：这些是 DINOv3 家族；单通道由 timm adapt_input_conv 自动适配。
   name: vit_small_patch16_dinov3
   pretrained: true                    # 首次运行自动从 timm hub 下载权重
 
 # =============================================================================
-# dinov3: —— 方法/head/loss/调度/gram 的全部参数
+# dinov3: —— 方法/head/loss/调度的全部参数（gram 锚定参数在 Phase 2 配置）
 # =============================================================================
 dinov3:
   # ---- 骨干 (backbone) ----
-  drop_path_rate: 0.1                 # 随机深度（仅 student）。小模型+预训练迁移 0.05~0.1 均可；
-                                      # 若担心过拟合/训练不稳可降到 0.05
+  drop_path_rate: 0.1                 # 随机深度（仅 student）。小模型+预训练迁移 0.05~0.1 均可；若担心过拟合/训练不稳可降到 0.05
 
-  # ---- DINO head（CLS 原型分类头）----
-  # 结构：MLP(embed→hidden→…→bottleneck) → L2-norm → Linear(bottleneck→prototypes)
-  head_n_prototypes: 21845            # 原型数。官方用 65536；对 ~5K–50K 的中等规模单细胞数据，
-                                      # 21845 收敛更稳、显存/显存占用更低（65536 亦可，偏慢）
+  #  ---- DINO head（CLS 原型分类头）----结构：MLP(embed→hidden→…→bottleneck) → L2-norm → Linear(bottleneck→prototypes)
+  head_n_prototypes: 21845            # 原型数。官方用 65536；对 ~5K–50K 的中等规模单细胞数据，21845 收敛更稳、显存/显存占用更低（65536 亦可，偏慢）
   head_hidden_dim: 2048               # head 隐藏层宽度；与官方一致
   head_bottleneck_dim: 256            # L2 归一化前的瓶颈维；256 官方值
   head_nlayers: 3                     # head MLP 层数
@@ -118,26 +102,7 @@ dinov3:
   momentum_end: 1.0                   # 到 1.0（末期近似冻结 teacher）
   lr_final: 1.0e-6                    # cosine 末端 LR（与 training.lr 呼应）
 
-  # ---- Gram 锚定（Phase 2 使用；Phase 1 必须关闭）----
-  gram:
-    use_loss: false                   # Phase 1 关闭；Phase 2 打开并指向 Phase 1 的 model.pt
-    loss_weight: 2.0                  # Gram 损失权重（Phase 2 用；官方锚定阶段最高 2.0）
-    loss_weight_schedule: null        # 权重调度 {start,peak,end,warmup_epochs,cosine_epochs}
-    ckpt: null                        # Phase 1 输出的 model.pt（冻结 gram teacher 权重源）
-    ema_teacher: false                # true = 直接用 EMA teacher 作 gram target（无需额外 crop）
-    it_load_ema_teacher: -1           # 在某个 global step 把 EMA teacher 复制进 gram teacher
-    rep_update: true                  # 是否周期性用当前 teacher 刷新 gram teacher
-    update_frequency: 20000           # 刷新间隔（global steps）
-    it_first_update: 0                # 首次刷新在 ≥ 该步之后
-    max_updates: null                 # 最多刷新次数；null = 不限
-    normalized: true                  # 计算 Gram 前对 patch 特征做 L2 归一化（官方 true）
-    img_level: true                   # true = 每图一个 Gram 矩阵；false = 整批一个
-    remove_neg: false                 # 是否把负相似度置 0 再算 MSE
-    remove_only_teacher_neg: false
-    tokens_used: all                  # all | masked | unmasked（masked/unmasked 要求 img_level=false）
-    crops_size: 448                   # gram teacher 高分辨率 crop 尺寸（须整除 patch16；448/16=28）
-    global_teacher_resize_method: bicubic   # teacher patch 特征空间重采样到 student 网格的方法
-    global_teacher_resize_antialias: false
+  # ---- Gram 锚定：Phase 2 专用，Phase 1 不启用；参数见 pretrain_dinov3_phase2.yml ----
 
 # =============================================================================
 # augmentation_views —— 多视图增强（每个顶层元素 = 一个视图流水线）
@@ -157,7 +122,7 @@ augmentation_views:
     - RandomBrightnessContrast: {brightness_range: [0, 0.01], contrast_range: [-0.1, 0.2], ensure_safe_output: True, p: 0.7}
     - RandomGamma: {gamma_range: [80, 120], p: 0.7}
     - GaussNoise: {std_range: [0.0005, 0.001], p: 0.5}
-    - GaussianBlur: {blur_range: [3, 7], sigma_range: [0.5, 2.0], p: 0.5}
+    - GaussianBlur: {blur_range: [3, 7], sigma_range: [0.25, 1.0], p: 0.3}
   # ---- Global view 2（不同尺度/对比度）----
   - - HorizontalFlip: {p: 0.5}
     - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
@@ -166,43 +131,43 @@ augmentation_views:
     - RandomResizedCrop: {size: [224, 224], scale: [0.65, 1.0], ratio: [0.9, 1.1], mask_interpolation: 0, p: 1.0}
     - RandomBrightnessContrast: {brightness_range: [0, 0.03], contrast_range: [-0.15, 0.25], ensure_safe_output: True, p: 0.7}
     - RandomGamma: {gamma_range: [80, 120], p: 0.7}
-    - GaussNoise: {std_range: [0.001, 0.004], p: 0.5}
-    - GaussianBlur: {blur_range: [1, 5], sigma_range: [0.5, 3.0], p: 0.6}
+    - GaussNoise: {std_range: [0.0005, 0.002], p: 0.5}
+    - GaussianBlur: {blur_range: [1, 5], sigma_range: [0.25, 1.5], p: 0.3}
   # ---- Local view 1（112×112；单细胞适配：scale/ratio 收窄，避免切出纯背景）----
   - - HorizontalFlip: {p: 0.5}
     - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
     - RandomResizedCrop: {size: [112, 112], scale: [0.4, 0.85], ratio: [0.9, 1.1], mask_interpolation: 0, p: 1.0}
     - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.2, 0.2], ensure_safe_output: True, p: 0.8}
-    - GaussNoise: {std_range: [0.001, 0.004], p: 0.7}
-    - GaussianBlur: {blur_range: [1, 5], sigma_range: [1.0, 4.0], p: 0.7}
-    - Downscale: {scale_range: [0.5, 0.9], p: 0.4}
+    - GaussNoise: {std_range: [0.0005, 0.002], p: 0.7}
+    - GaussianBlur: {blur_range: [1, 5], sigma_range: [0.0, 0.5], p: 0.3}
+    - Downscale: {scale_range: [0.8, 1.0], p: 0.2}
   # ---- Local view 2（更强的尺度差）----
   - - HorizontalFlip: {p: 0.5}
     - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
     - RandomResizedCrop: {size: [112, 112], scale: [0.3, 0.7], ratio: [0.85, 1.15], mask_interpolation: 0, p: 1.0}
     - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.25, 0.25], ensure_safe_output: True, p: 0.8}
     - RandomGamma: {gamma_range: [80, 120], p: 0.8}
-    - GaussNoise: {std_range: [0.001, 0.004], p: 0.7}
-    - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 4.0], p: 0.7}
-    - Downscale: {scale_range: [0.5, 0.9], p: 0.4}
-  # ---- Local view 3（硬：更强光度 + 噪声/模糊）----
+    - GaussNoise: {std_range: [0.0005, 0.002], p: 0.7}
+    - GaussianBlur: {blur_range: [3, 7], sigma_range: [0.0, 0.5], p: 0.3}
+    - Downscale: {scale_range: [0.8, 1.0], p: 0.2}
+  # ---- Local view 3（特写：小尺度裁剪 ≈ 2–3 倍有效放大，逼 patch 特征学小点；blur/Downscale 不得加强）----
   - - HorizontalFlip: {p: 0.5}
     - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
-    - RandomResizedCrop: {size: [112, 112], scale: [0.35, 0.8], ratio: [0.9, 1.1], mask_interpolation: 0, p: 1.0}
+    - RandomResizedCrop: {size: [112, 112], scale: [0.12, 0.3], ratio: [0.9, 1.1], mask_interpolation: 0, p: 1.0}
     - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.3, 0.3], p: 0.8}
     - RandomGamma: {gamma_range: [80, 120], p: 0.8}
-    - GaussNoise: {std_range: [0.001, 0.006], p: 0.7}
-    - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 5.0], p: 0.8}
-    - Downscale: {scale_range: [0.4, 0.8], p: 0.6}
-  # ---- Local view 4（硬）----
+    - GaussNoise: {std_range: [0.0005, 0.002], p: 0.7}
+    - GaussianBlur: {blur_range: [3, 7], sigma_range: [0.0, 0.5], p: 0.3}
+    - Downscale: {scale_range: [0.8, 1.0], p: 0.2}
+  # ---- Local view 4（特写，更强）----
   - - HorizontalFlip: {p: 0.5}
     - Rotate: {angle_range: [-180, 180], border_mode: 0, mask_interpolation: 0, p: 0.7}
-    - RandomResizedCrop: {size: [112, 112], scale: [0.3, 0.7], ratio: [0.85, 1.15], mask_interpolation: 0, p: 1.0}
+    - RandomResizedCrop: {size: [112, 112], scale: [0.1, 0.3], ratio: [0.85, 1.15], mask_interpolation: 0, p: 1.0}
     - RandomBrightnessContrast: {brightness_range: [0, 0.05], contrast_range: [-0.3, 0.3], p: 0.8}
     - RandomGamma: {gamma_range: [80, 120], p: 0.8}
-    - GaussNoise: {std_range: [0.001, 0.006], p: 0.7}
-    - GaussianBlur: {blur_range: [3, 7], sigma_range: [1.0, 5.0], p: 0.8}
-    - Downscale: {scale_range: [0.4, 0.8], p: 0.6}
+    - GaussNoise: {std_range: [0.0005, 0.002], p: 0.7}
+    - GaussianBlur: {blur_range: [3, 7], sigma_range: [0.0, 0.5], p: 0.3}
+    - Downscale: {scale_range: [0.8, 1.0], p: 0.2}
 
 # 推理/UMAP 用的确定性增强（必填）
 augmentation_infer:
@@ -217,7 +182,7 @@ normalize:
   clip_high: 99.95
 
 dataloader:
-  num_workers: 4                      # Windows 下 worker 过多会 spawn 开销/不稳定；4 较稳
+  num_workers: 6                      # Windows 下 worker 过多会 spawn 开销/不稳定；4 较稳
   prefetch_factor: 2
   persistent_workers: true
 
@@ -225,35 +190,34 @@ vis_augment:
   num_samples: 24
 
 # =============================================================================
-# monitoring —— 训练质量追踪（metrics.csv / tensorboard / 诊断 PDF）
-# 详见 monitor 输出：head_track.pdf、attention_epoch_N.pdf、
-# metrics.csv、tensorboard/ 目录。enabled: false 即回到纯日志行为。
+#   monitoring —— 训练质量追踪（metrics.csv / tensorboard / 诊断 PDF）详见 monitor 输出：head_track.pdf、attention_epoch_N.pdf、metrics.csv、tensorboard/ 目录。
+#   enabled: false 即回到纯日志行为。
 # =============================================================================
 monitoring:
   enabled: true
   tensorboard: true
   csv: true
-  log_every_steps: 10                 # step 级指标节流间隔
+  log_every_steps: 20                 # step 级指标节流间隔
   patch_similarity_samples: 6         # patch 相似度图与 attention map 的采样样本数
   attention_maps: true                # 每 save_interval 同时输出 CLS attention map PDF
   gram_split_stats: true              # 仅 gram 启用时有值（Phase1 自动为空）
   head_logits_track: true             # 头部坍缩指标（std/熵/teacher-student 一致性）
+  embed_source: patch                 # 间隔 epoch UMAP 检查图的 embedding 池化来源（teacher 分支）: cls | patch | cls_patch（cls_patch = 拼接 [CLS, mean-patch]，维度翻倍）；不影响训练本身（SSL 损失直接用 CLS 和 patch token）
+  mask_weighted: true                 # UMAP 检查图池化剔除纯背景 patch（二值：patch 含任一前景像素即计入、不乘系数）；仅对 patch/cls_patch 生效
 
 # =============================================================================
 # training —— 优化器/调度/批大小（针对 5070Ti 16G + 单细胞 crop 调优）
 # =============================================================================
 training:
   optimizer: adamw                    # adamw | sgd；SSL 一律 adamw
-  lr: 2.5e-4                          # 峰值 LR。从 timm DINOv3 预训练权重迁移，取比随机
-                                      # 初始化略低的 2.5e-4；训练过慢/平台期可试 5e-4，
-                                      # 出现震荡/训练不稳则降到 5e-5
+  lr: 2.5e-4                          # 峰值 LR。从 timm DINOv3 预训练权重迁移，取比随机初始化略低的 2.5e-4；训练过慢/平台期可试 5e-4，出现震荡/训练不稳则降到 5e-5
   weight_decay: 0.04                  # 初始 WD（被调度覆盖为 weight_decay_start/end）
   betas: [0.9, 0.999]
   grad_clip: 10.0                     # 全局梯度范数裁剪；null = 不裁剪
   grad_accum_steps: 8                 # 梯度累积倍数；micro-batch=32 × 8 = 有效 256
-  batch_size: 32                      # 每 micro-batch 样本数。16G + ViT-S/16 + AMP(fp16)
-                                      # 32 稳妥；OOM 则 16 + grad_accum_steps 16
-  epochs: 100                         # 总轮数（续训时表示"到第几轮为止"）
-  save_interval: 20                   # 每 N 轮保存 model_{epoch}.pt + 诊断 PDF
+  batch_size: 32                      # 每 micro-batch 样本数。16G + ViT-S/16 + AMP(fp16)，32 稳妥；OOM 则 16 + grad_accum_steps 16
+  epochs: 200                         # 总轮数（续训时表示"到第几轮为止"）
+  save_interval: 50                   # 每 N 轮保存 model_{epoch}.pt + 诊断 PDF
   n_image_umap: 10000                 # UMAP 周期检查样本数上限；0/null 关闭
   amp: true                           # 混合精度（fp16）；5070Ti 必备，省显存提速
+  

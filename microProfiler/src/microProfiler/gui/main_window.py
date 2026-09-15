@@ -328,6 +328,8 @@ class MainWindow(QMainWindow):
         enable_path_drop(self._input_dir)
         self._input_browse = QPushButton("Browse...")
         self._load_dataset_btn = run_button("Load Dataset")
+        # No directory selected yet — clicking Load Dataset would only error.
+        self._load_dataset_btn.setEnabled(False)
         # Requested: twice the natural caption length.
         self._load_dataset_btn.ensurePolished()
         self._load_dataset_btn.setFixedWidth(
@@ -460,6 +462,9 @@ class MainWindow(QMainWindow):
         self._sidebar.display_range_changed.connect(self._on_vmin_vmax_changed)
         self._input_browse.clicked.connect(self._browse_input)
         self._input_dir.textChanged.connect(self._on_input_dir_edited)
+        # Enter/focus-out on the typed path runs the same selection flow as
+        # Browse (session.yml pre-fill + default patterns).
+        self._input_dir.editingFinished.connect(self._on_input_dir_selected)
         self._load_dataset_btn.clicked.connect(self._load_dataset)
         self._reset_btn.clicked.connect(self._reset_all)
         self._sidebar.run_all_clicked.connect(self._ctrl.run_all)
@@ -524,10 +529,34 @@ class MainWindow(QMainWindow):
         if path == self._loaded_dataset_dir:
             return
         self._on_input_changed()
+        self._apply_input_selection(path)
 
+    def _on_input_dir_selected(self) -> None:
+        """editingFinished on the path edit (typed path): run the same
+        selection flow as Browse for a NEW directory — same contract as the
+        microVis Data page's typed-path handling. Re-entering the already
+        loaded directory keeps the GUI edits and the loaded dataset."""
+        path = self._input_dir.text().strip()
+        if not path or path == self._loaded_dataset_dir:
+            return
+        if not Path(path).exists():
+            return
+        self._on_input_changed()
+        self._apply_input_selection(path)
+
+    def _apply_input_selection(self, path: str) -> None:
+        """Pre-fill the GUI from a newly selected directory's session.yml.
+
+        The pattern boxes are filled only AFTER a directory is selected
+        (never at startup): the session's saved patterns win, and a dataset
+        without a session gets the microBase defaults — same as microVis.
+        """
         sf = SessionFile(path)
         session_data = sf.load()
         if not session_data:
+            self.set_image_pattern(DEFAULT_IMAGE_PATTERN)
+            self.set_mask_pattern(DEFAULT_MASK_PATTERN)
+            self._custom_image_subdir_pattern.setText(DEFAULT_IMAGE_SUBDIR_PATTERN)
             return
         params = {k: v for k, v in session_data.items() if not k.startswith("_")}
         applied = session_data.get("applied_steps", [])
@@ -535,12 +564,10 @@ class MainWindow(QMainWindow):
         saved_img = params.get("image_pattern", "")
         saved_mask = params.get("mask_pattern", "")
         saved_search = params.get("image_subdir_pattern", "")
-        if saved_img:
-            self.set_image_pattern(saved_img)
-        if saved_mask:
-            self.set_mask_pattern(saved_mask)
-        if saved_search:
-            self._custom_image_subdir_pattern.setText(saved_search)
+        self.set_image_pattern(saved_img or DEFAULT_IMAGE_PATTERN)
+        self.set_mask_pattern(saved_mask or DEFAULT_MASK_PATTERN)
+        self._custom_image_subdir_pattern.setText(
+            saved_search or DEFAULT_IMAGE_SUBDIR_PATTERN)
 
         for step in self._all_step_panels:
             step.from_config(params.get(step.step_name, {}))
@@ -558,6 +585,14 @@ class MainWindow(QMainWindow):
         # process the old dataset's files while writing to the new directory).
         if self._loaded_dataset_dir is not None and text != self._loaded_dataset_dir:
             self._on_input_changed()
+        # Load Dataset stays unclickable until a real directory is selected.
+        self._update_load_button()
+
+    def _update_load_button(self) -> None:
+        """Load Dataset is enabled only while a real directory is selected."""
+        text = self._input_dir.text().strip()
+        self._load_dataset_btn.setEnabled(
+            not self._running and bool(text) and Path(text).exists())
 
     def _load_dataset(self) -> None:
         if self._running:
@@ -717,8 +752,8 @@ class MainWindow(QMainWindow):
         # A failed load must not leave a Browse-restored config pending —
         # populating a later dataset with stale channel selections is wrong.
         img_panel = getattr(self, "_image_profile_panel", None)
-        if img_panel is not None and hasattr(img_panel, "_pending_settings"):
-            del img_panel._pending_settings
+        if img_panel is not None and hasattr(img_panel, "clear_pending_settings"):
+            img_panel.clear_pending_settings()
         QMessageBox.warning(self, "Load Failed", f"Could not load dataset:\n{msg}")
 
     def _on_input_changed(self):
@@ -728,6 +763,8 @@ class MainWindow(QMainWindow):
         self._state.original_dataset = None
         self._loaded_dataset_dir = None
         self._pending_filters = None
+        # A remembered preview row index belongs to the previous dataset.
+        self._ctrl._random_row_idx = None
         self._update_window_title()
         # Structured configs restored from a previous directory must not
         # leak into the next dataset's object-profile blocks.
@@ -740,8 +777,8 @@ class MainWindow(QMainWindow):
             inf_panel._pending_block_configs = []
             inf_panel._restore_active = False
         img_panel = getattr(self, "_image_profile_panel", None)
-        if img_panel is not None and hasattr(img_panel, "_pending_settings"):
-            del img_panel._pending_settings
+        if img_panel is not None and hasattr(img_panel, "clear_pending_settings"):
+            img_panel.clear_pending_settings()
         self._clear_dataset_info()
         if hasattr(self, '_filter_panel') and self._filter_panel is not None:
             self._filter_panel._reset_filters()
@@ -889,8 +926,13 @@ class MainWindow(QMainWindow):
     def _set_running(self, running: bool) -> None:
         self._running = running
         self._input_browse.setEnabled(not running)
-        self._load_dataset_btn.setEnabled(not running)
+        # Re-evaluated (not just enabled): after a run the button must come
+        # back only if a real directory is still selected.
+        self._update_load_button()
         self._reset_btn.setEnabled(not running)
+        # The input line edit stays editable during a run otherwise — each
+        # keystroke would re-point the session.yml save at the typed path.
+        self._input_dir.setEnabled(not running)
         for step in self._all_step_panels:
             step.setEnabled(not running)
         self._filter_panel.setEnabled(not running)

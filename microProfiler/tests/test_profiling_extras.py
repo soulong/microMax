@@ -270,3 +270,25 @@ def test_measure_objects_all_groups_smoke():
     assert "glcm_differencevariance_d2_AGP" in df.columns
     assert "correlation_pearson_DNA_AGP" in df.columns
     assert df["radial_fracatd_bin1of4_DNA"].notna().all()
+
+
+def test_failing_channel_fallback_uses_feature_names():
+    """A channel whose feature group fails must fill NaN under the REAL
+    column names (skimage names extra properties from func.__name__) —
+    bogus fallback names would poison BatchWriter's first-flush schema and
+    silently drop the real features for the whole table."""
+    from microProfiler.profiling.object_profiler import (
+        _run_per_channel_regionprops,
+    )
+
+    def boom(label, image):
+        raise RuntimeError("boom")
+
+    boom.__name__ = "intensity_mean_ch1"
+    mask = np.zeros((32, 32), dtype=int)
+    mask[8:24, 8:24] = 1
+    img = np.zeros((32, 32, 1), dtype=float)
+
+    df = _run_per_channel_regionprops(mask, img, ["ch1"], {0: [boom]})
+    assert "intensity_mean_ch1" in df.columns
+    assert df["intensity_mean_ch1"].isna().all()

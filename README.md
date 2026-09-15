@@ -15,10 +15,10 @@ microMax/
 
 | Package | Version | Console script |
 |---|---|---|
-| microBase | 0.11.0 | — (library) |
-| microProfiler | 1.10.1 | `microprofiler` |
-| microVis | 1.3.1 | `microvis` |
-| microModel | 0.10.1 | `micromodel` |
+| microBase | 0.17.0 | — (library) |
+| microProfiler | 1.19.0 | `microprofiler` |
+| microVis | 1.12.0 | `microvis` |
+| microModel | 0.20.0 | `micromodel` |
 
 - `microBase` is the only shared dependency — the three consumers never
   import each other (the one documented exception: microProfiler lazily
@@ -177,20 +177,26 @@ micromodel pretrain --config configs/pretrain_dinov3_phase2.yml
 micromodel augment-vis --config configs/pretrain_dinov3_phase1.yml
 micromodel attention-vis --config configs/pretrain_dinov3_phase1.yml
 
-# 2) Train a classifier — linear probe (freeze_backbone: true) or fine-tune
+# 2) Label — interactive multi-label annotation web app over pre-cropped
+#    cell folders. An SSL/classify bundle embeds the cells and suggests
+#    labels from your positives/negatives (ranked, uncertain and
+#    suspected-mislabel review queues); exports label_export.csv for train
+micromodel label --config configs/label.yml
+
+# 3) Train a classifier — linear probe (freeze_backbone: true) or fine-tune
 #    on the SSL backbone; train_from_scratch.yml skips the SSL bundle.
 #    Labels come from a [filepath, label] CSV; single labels train
 #    FocalLoss, ';'-joined labels train multi-label BCELoss.
 micromodel train --config configs/train_from_pretrain.yml
 micromodel train --config configs/train_from_scratch.yml
 
-# 3) Infer — write predictions + features to infer.db. single_cell mode
+# 4) Infer — write predictions + features to infer.db. single_cell mode
 #    reads pre-cropped cell TIFF folders; whole_image mode reads images +
 #    segmentation masks (e.g. straight from microProfiler output)
 micromodel infer --config configs/infer_single_cell.yml
 micromodel infer --config configs/infer_whole_image.yml
 
-# 4) Reduction — PCA/UMAP/PaCMAP/LocalMAP + Leiden clustering over the
+# 5) Reduction — PCA/UMAP/PaCMAP/LocalMAP + Leiden clustering over the
 #    infer.db features: one multi-page PDF + table per method, per-resolution
 #    cluster pages, representative-cell sheets (cluster_res<res>.pdf), and a
 #    reusable baseline cluster.pkl. reduction-vis serves the interactive
@@ -198,7 +204,7 @@ micromodel infer --config configs/infer_whole_image.yml
 micromodel reduction --config configs/infer_single_cell.yml
 micromodel reduction-vis --config configs/infer_single_cell.yml --port 5000
 
-# 5) deduplication — latent-diversity deduplication over pre-cropped cell folders.
+# 6) deduplication — latent-diversity deduplication over pre-cropped cell folders.
 #    reference: null prunes the pool to a diverse subset (radius or
 #    target_keep); reference: <selection_state.pkl> adds only new territory
 #    from new folders (max_add). Outputs curated/ hardlinks (a ready-to-use

@@ -4,6 +4,7 @@ import pytest
 
 from microBase.schema import (
     derive_well,
+    normalize_well,
     _row_to_letter,
     MetadataSchema,
 )
@@ -118,3 +119,26 @@ def test_apply_well_merge_no_op_when_not_derived():
     # Unchanged
     assert "well" not in merged.columns
     assert merged["field"].tolist() == [1, 2]
+
+
+def test_normalize_well_strips_leading_zeros():
+    """Captured 'A01' style wells normalize to the canonical 'A1' grid key."""
+    assert normalize_well("A01") == "A1"
+    assert normalize_well("A1") == "A1"
+    assert normalize_well("P012") == "P12"
+    assert normalize_well("AA03") == "AA3"
+
+
+def test_normalize_well_uppercases_row_letters():
+    """Lowercase captured wells meet their uppercase grid counterparts."""
+    assert normalize_well("a01") == "A1"
+    assert normalize_well("p12") == "P12"
+
+
+def test_normalize_well_passthrough():
+    """Anything that is not a <letters><digits> well passes through as-is."""
+    assert normalize_well("A") == "A"
+    assert normalize_well("01") == "01"
+    assert normalize_well("weird") == "weird"
+    assert normalize_well("A1b") == "A1b"
+    assert normalize_well(None) is None

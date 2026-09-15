@@ -81,7 +81,7 @@ class VisInteractiveServer:
 
         self.db_name = self.inf_cfg.get("db_name", INFER_DB_NAME)
         self.base_output_dir = self.config.get("output_dir")
-        self.data_roots = self.data_cfg["root"]
+        self.data_roots = self.data_cfg["file_dir"]
 
         # Load model bundle to get augmentation_infer + normalize defaults.
         # SSL pretrain bundles and train bundles carry the same meta fields
@@ -611,13 +611,10 @@ class VisInteractiveServer:
             result["dtype_max"] = 65535
             return jsonify(result)
 
-        except SystemExit as e:
-            # microBase raises MicroMaxError on missing files / out-of-range
-            # channels; convert to a JSON error so the server never dies.
-            logger.exception("Image fetch error: %s", e)
-            return jsonify({"error": "Data error (missing or mismatched "
-                                      "image/mask file)"}), 500
         except Exception as e:
+            # Includes the microBase MicroMaxError subclasses (missing files
+            # / out-of-range channels) — convert to a JSON error so the
+            # server never dies.
             logger.exception("Image fetch error: %s", e)
             return jsonify({"error": str(e)}), 500
 

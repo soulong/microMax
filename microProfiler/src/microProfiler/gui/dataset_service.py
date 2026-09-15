@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 
-from microBase import ImageDataset
+from microBase import ImageDataset, MicroMaxError
 from microProfiler.io import read_image
 
 
@@ -11,10 +11,11 @@ class DatasetService:
     def load_image(self, ds: ImageDataset, row_idx: int, channel: str):
         try:
             p = ds.image_path(row_idx, channel)
-        except SystemExit as e:
-            # microBase raises MicroMaxError when a row is missing
-            # the channel file. Convert to a catchable exception so the GUI
-            # pick/preview paths degrade gracefully instead of dying.
+        except MicroMaxError as e:
+            # microBase raises MicroMaxError subclasses (DataError /
+            # ImageReadError) when a row is missing the channel file.
+            # Convert to a catchable exception so the GUI pick/preview paths
+            # degrade gracefully instead of dying.
             raise FileNotFoundError(
                 f"Image not found: row={row_idx}, channel={channel}"
             ) from e

@@ -15,7 +15,7 @@ Provides:
 - db_contracts    : shared profiler.db / infer.db table/column names + SQL helpers
 """
 
-__version__ = "0.14.0"
+__version__ = "0.17.0"
 
 import os as _os
 _os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -24,6 +24,7 @@ _os.environ.setdefault("ALBUMENTATIONS_NO_TELEMETRY", "1")
 from .schema import (
     MetadataSchema,
     derive_well,
+    normalize_well,
 )
 from .errors import (
     MicroMaxError,
@@ -97,7 +98,6 @@ from .db_merge import (
     read_db_frames,
     read_profiler_frames,
     read_infer_frames,
-    read_table_masks,
     fuse_frames,
     merge_dbs,
     write_merged_db,
@@ -128,6 +128,7 @@ __all__ = [
     "apply",
     "normalize",
     "derive_well",
+    "normalize_well",
     "MetadataSchema",
     "DEFAULT_IMAGE_PATTERN",
     "DEFAULT_MASK_PATTERN",
@@ -168,7 +169,6 @@ __all__ = [
     "read_db_frames",
     "read_profiler_frames",
     "read_infer_frames",
-    "read_table_masks",
     "fuse_frames",
     "merge_dbs",
     "write_merged_db",

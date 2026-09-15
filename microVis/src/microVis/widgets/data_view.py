@@ -38,6 +38,7 @@ class DataView(QWidget):
     dataset_browse_clicked = Signal()
     load_dataset_clicked = Signal()
     select_db_clicked = Signal()
+    clear_db_clicked = Signal()
     metadata_browse_clicked = Signal()
     metadata_merge_clicked = Signal()
     metadata_clear_clicked = Signal()
@@ -160,6 +161,17 @@ class DataView(QWidget):
         self._btn_select_db.clicked.connect(self.select_db_clicked)
         btn_row.addWidget(self._btn_select_db)
 
+        # Explicit clear of the loaded/merged DB selection (sits between the
+        # Select button and its source readout). Loading a new selection
+        # clears implicitly too — this is for going back to "no DB".
+        self._btn_clear_db = QPushButton("Clear DB(s)")
+        self._btn_clear_db.setEnabled(False)
+        self._btn_clear_db.setToolTip(
+            "Unload the currently selected DB(s) and the merged table: the "
+            "well-grid color-by and plot pickers return to the no-DB state.")
+        self._btn_clear_db.clicked.connect(self.clear_db_clicked)
+        btn_row.addWidget(self._btn_clear_db)
+
         # Fused-source readout: "a.db + b.db (+ metadata) -> merge".
         self._db_status_label = QLabel("")
         self._db_status_label.setStyleSheet(
@@ -272,6 +284,10 @@ class DataView(QWidget):
         """Write to DB needs merged DB data (not the Excel metadata)."""
         self._btn_write_db.setEnabled(enabled)
 
+    def set_clear_db_enabled(self, enabled: bool) -> None:
+        """Clear DB(s) is only meaningful while a DB selection is loaded."""
+        self._btn_clear_db.setEnabled(enabled)
+
     def set_db_status(self, text: str) -> None:
         """Fused-source readout shown right after the DB Browse button.
 
@@ -324,6 +340,7 @@ class DataView(QWidget):
         self._btn_merge.setEnabled(False)
         self._btn_meta_clear.setEnabled(False)
         self._btn_write_db.setEnabled(False)
+        self.set_clear_db_enabled(False)
         self._db_status_label.clear()
 
     def _on_write_to_db(self) -> None:

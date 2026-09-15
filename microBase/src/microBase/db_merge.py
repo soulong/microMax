@@ -11,10 +11,9 @@ Merge model
     microModel). Missing column / NULL (single-cell inference over
     pre-cropped cells has no mask file) -> the frame's mask is unknown and
     the caller's default applies.
-  * profiler.db: object tables are mapped through the `_table_masks`
-    bookkeeping table (written by microProfiler). A table that carries a
-    `mask` column (a previous merge output) uses that. Otherwise the table
-    name itself is taken as the mask name.
+  * profiler.db: a table that carries a `mask` column (a previous merge
+    output) uses that; otherwise the table name itself is taken as the mask
+    name — object tables must be named after their mask.
 - Frames are fused ONLY with frames of the same mask: an outer merge on the
   intersection of the identity columns {well, field, stack, timepoint,
   directory, filename, ground_truth, label} present in both frames, so
@@ -31,8 +30,8 @@ Merge model
   `<db-stem>/<table>/<column>`, then a numeric suffix).
 
 `write_merged_db` persists a fused table into a NEW SQLite database (table
-`merged` plus the `_table_masks` bookkeeping row, so the output re-loads
-with its mask intact). Source DBs are never touched.
+`merged`, tagged with its `mask` column so the output re-loads with its
+mask intact). Source DBs are never touched.
 """
 
 from __future__ import annotations
@@ -51,9 +50,8 @@ from microBase.db_contracts import (
     MASK_COLUMN,
     MASK_NAME_COLUMN,
     REDUCTION_TABLE_PREFIX,
-    TABLE_MASKS_TABLE,
     UID_COLUMN,
-    WELL_COLUMN,
+    sql_ident,
 )
 
 logger = logging.getLogger("microBase.db_merge")
@@ -83,56 +81,41 @@ class SourceFrame:
 
 def _read_table(conn: sqlite3.Connection, table: str,
                 blob_free: bool = True) -> pd.DataFrame:
-    """Read one table; with blob_free, BLOB columns (features) are skipped."""
-    schema = [(r[1], r[2]) for r in conn.execute(f'PRAGMA table_info("{table}")')]
+    """Read one table; with blob_free, BLOB columns (features) are skipped.
+
+    Identifiers go through sql_ident: regex captures and class names become
+    column/table names and may contain embedded double quotes.
+    """
+    schema = [(r[1], r[2])
+              for r in conn.execute(f"PRAGMA table_info({sql_ident(table)})")]
     cols = [c for c, t in schema if not (blob_free and t.upper() == "BLOB")]
-    col_sql = ", ".join(f'"{c}"' for c in cols)
-    return pd.read_sql(f'SELECT {col_sql} FROM "{table}"', conn)
+    col_sql = ", ".join(sql_ident(c) for c in cols)
+    return pd.read_sql(f"SELECT {col_sql} FROM {sql_ident(table)}", conn)
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> dict[str, str]:
     """name -> declared type of every column of one table."""
-    return {r[1]: r[2] for r in conn.execute(f'PRAGMA table_info("{table}")')}
-
-
-def read_table_masks(db_path) -> dict[str, str]:
-    """The `_table_masks` bookkeeping of a DB ({} when absent)."""
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.OperationalError:
-        return {}
-    try:
-        rows = conn.execute(
-            f"SELECT table_name, mask_name FROM {TABLE_MASKS_TABLE}"
-        ).fetchall()
-        return {t: m for t, m in rows}
-    except sqlite3.OperationalError:
-        return {}
-    finally:
-        conn.close()
+    return {r[1]: r[2]
+            for r in conn.execute(f"PRAGMA table_info({sql_ident(table)})")}
 
 
 def read_profiler_frames(path: str) -> list[SourceFrame]:
     """Object tables of a profiler.db (or a written merge DB).
 
-    An object table carries the identity pair well+label; bookkeeping and
-    image-level tables are skipped. Mask resolution per table: `mask`
-    column (previous merge output) -> `_table_masks` bookkeeping -> the
-    table name itself.
+    An object table is identified by its `label` column (the per-object
+    identity); `well` is NOT required — datasets without a well capture are
+    officially supported, and such tables merge on the identity columns they
+    do carry (label, directory, ...). Bookkeeping and image-level tables are
+    skipped. Mask resolution per table: `mask` column (previous merge
+    output) -> the table name itself.
     """
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         stem = Path(path).stem
-        mapping = {}
-        if TABLE_MASKS_TABLE in _table_names(conn):
-            rows = conn.execute(
-                f"SELECT table_name, mask_name FROM {TABLE_MASKS_TABLE}"
-            ).fetchall()
-            mapping = {t: m for t, m in rows}
         frames = []
         for name in _table_names(conn):
             schema = _table_columns(conn, name)
-            if not {WELL_COLUMN, LABEL_COLUMN} <= set(schema):
+            if LABEL_COLUMN not in schema:
                 continue
             df = _read_table(conn, name)
             if df.empty:
@@ -141,14 +124,20 @@ def read_profiler_frames(path: str) -> list[SourceFrame]:
             # into one frame per distinct value so re-loading regroups
             # exactly (a single-value column is one frame).
             if MASK_COLUMN in df.columns:
-                for mval, sub in df.groupby(df[MASK_COLUMN].astype(str)):
+                # A NULL tag is NOT the mask "nan" — map it back to None so
+                # the frame falls through to the caller's default-mask logic
+                # like an infer table with NULL mask_name does. (pandas'
+                # string dtype hands group keys back as NaN, hence isna.)
+                key = df[MASK_COLUMN].map(
+                    lambda v: None if pd.isna(v) else str(v))
+                for mval, sub in df.groupby(key, dropna=False, sort=False):
                     frames.append(SourceFrame(
                         df=sub.drop(columns=[MASK_COLUMN]).reset_index(drop=True),
-                        table=name, stem=stem, mask=mval))
+                        table=name, stem=stem,
+                        mask=None if pd.isna(mval) else str(mval)))
                 continue
             frames.append(SourceFrame(
-                df=df, table=name, stem=stem,
-                mask=mapping.get(name, name)))
+                df=df, table=name, stem=stem, mask=name))
         return frames
     finally:
         conn.close()
@@ -157,9 +146,12 @@ def read_profiler_frames(path: str) -> list[SourceFrame]:
 def read_infer_frames(path: str) -> list[SourceFrame]:
     """The inference table of an infer.db joined with its reduction tables.
 
-    The features BLOB and the infer-internal uid are dropped. The frame's
-    mask comes from the `mask_name` column; a missing column or all-NULL
-    (single-cell inference) leaves it unknown -> caller's default.
+    The features BLOB and the infer-internal uid are dropped. One table can
+    hold several masks (a re-run over another mask appends rows), so the
+    frame is split per `mask_name` value — one SourceFrame each, exactly
+    like the profiler frames. A missing column or NULL (single-cell
+    inference over pre-cropped cells has no mask file) yields a frame with
+    an unknown mask -> the caller's default applies.
     """
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
@@ -181,13 +173,26 @@ def read_infer_frames(path: str) -> list[SourceFrame]:
         for col in (UID_COLUMN, FEATURES_COLUMN):
             if col in df.columns:
                 df = df.drop(columns=[col])
-        mask = None
+        frames: list[SourceFrame] = []
         if MASK_NAME_COLUMN in df.columns:
-            vals = df[MASK_NAME_COLUMN].dropna().astype(str)
-            mask = vals.iloc[0] if len(vals) else None
+            mask_vals = df[MASK_NAME_COLUMN]
             df = df.drop(columns=[MASK_NAME_COLUMN])
-        return [SourceFrame(df=df, table=INFERENCE_TABLE, stem=stem,
-                            mask=mask, is_infer=True)]
+            named = mask_vals.dropna().astype(str)
+            for mval, sub in df.loc[named.index].groupby(named):
+                frames.append(SourceFrame(
+                    df=sub.reset_index(drop=True), table=INFERENCE_TABLE,
+                    stem=stem, mask=mval, is_infer=True))
+            null_idx = mask_vals.index[mask_vals.isna()]
+            if len(null_idx):
+                frames.append(SourceFrame(
+                    df=df.loc[null_idx].reset_index(drop=True),
+                    table=INFERENCE_TABLE, stem=stem, mask=None,
+                    is_infer=True))
+        else:
+            frames.append(SourceFrame(
+                df=df, table=INFERENCE_TABLE, stem=stem, mask=None,
+                is_infer=True))
+        return frames
     finally:
         conn.close()
 
@@ -244,6 +249,10 @@ def _fold(acc: pd.DataFrame | None, frame: SourceFrame) -> pd.DataFrame:
         if col in key_set or col not in existing:
             continue
         if incoming[col].equals(acc[col]):
+            # Identical content: keep ONE copy. Leaving the incoming column
+            # in place would make the outer merge below split it into
+            # `<col>_x`/`<col>_y` duplicates carrying the same values.
+            incoming = incoming.drop(columns=[col])
             continue
         new_name = _unique_name(existing, frame.stem, frame.table, col)
         incoming = incoming.rename(columns={col: new_name})
@@ -324,10 +333,11 @@ def write_merged_db(df: pd.DataFrame, path, mask: str | None = None) -> str:
     """Write a fused table into a NEW SQLite DB (table `merged`).
 
     The parent directory is created if needed; the `merged` table is
-    replaced, other tables in the file are untouched. `_table_masks`
-    records which mask the output belongs to so re-loading the file keeps
-    the grouping (mask param wins over the frame's `mask` column; a
-    multi-mask table relies on its `mask` column on re-load instead).
+    replaced, other tables in the file are untouched. When a single mask
+    applies (the `mask` argument, or the frame's single distinct `mask`
+    value), the written table carries a `mask` column tagging every row —
+    re-loading the file then resolves the frame's mask from that column.
+    Multi-mask tables already carry the column and are written as-is.
     """
     p = Path(path)
     if p.suffix == "":
@@ -336,19 +346,18 @@ def write_merged_db(df: pd.DataFrame, path, mask: str | None = None) -> str:
     if mask is None and MASK_COLUMN in df.columns:
         uniq = df[MASK_COLUMN].dropna().astype(str).unique()
         mask = uniq[0] if len(uniq) == 1 else None
+    out = df
+    if mask is not None and MASK_COLUMN not in df.columns:
+        # Single-mask output: tag the rows so re-loading keeps the grouping
+        # (the in-memory frame the caller passed stays untouched).
+        out = df.copy()
+        out[MASK_COLUMN] = mask
     conn = sqlite3.connect(str(p))
     try:
-        df.to_sql(MERGED_TABLE, conn, if_exists="replace", index=False)
-        conn.execute(
-            f"CREATE TABLE IF NOT EXISTS {TABLE_MASKS_TABLE} "
-            "(table_name TEXT PRIMARY KEY, mask_name TEXT)")
-        conn.execute(
-            f"INSERT OR REPLACE INTO {TABLE_MASKS_TABLE} "
-            "(table_name, mask_name) VALUES (?, ?)",
-            (MERGED_TABLE, mask))
+        out.to_sql(MERGED_TABLE, conn, if_exists="replace", index=False)
         conn.commit()
     finally:
         conn.close()
     logger.info("Wrote merged table (%d rows, mask=%s) to %s",
-                len(df), mask, p)
+                len(out), mask, p)
     return str(p)

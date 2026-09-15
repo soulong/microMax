@@ -91,11 +91,15 @@ def clone_dataset(ds: ImageDataset) -> ImageDataset:
     return ds.clone()
 
 
-def rebuild_dataset(ds: ImageDataset) -> ImageDataset:
+def rebuild_dataset(ds: ImageDataset, keep_filters: bool = True) -> ImageDataset:
     """Create a fresh ImageDataset that re-scans the directory on disk.
 
     Used by preprocessing steps (resize, z-project, tile, BaSiC) after they
     modify files, so the new dataset reflects added/removed/renamed files.
+    With ``keep_filters=True`` (the default) the source's filters are carried
+    over and re-applied on the rescan; ``keep_filters=False`` yields the
+    UNFILTERED on-disk state — used by the GUI to refresh its filter baseline
+    after a step, so "clear filter" restores rows the filters previously hid.
     """
     return ImageDataset(
         root=ds.root,
@@ -103,7 +107,7 @@ def rebuild_dataset(ds: ImageDataset) -> ImageDataset:
         mask_pattern=ds.mask_pattern,
         image_subdir_pattern=ds.image_subdir_pattern,
         channel_layout=ds.channel_layout,
-        filters=dict(ds._filters) if ds._filters else None,
+        filters=dict(ds._filters) if keep_filters and ds._filters else None,
     )
 
 

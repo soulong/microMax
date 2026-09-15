@@ -406,6 +406,9 @@ class SegmentStepPanel(BlockContainerPanel):
 
     step_name = "segment"
     _block_widget_class = SegmentBlockWidget
+    # The main window never calls populate_masks on this panel — channel
+    # population alone must end the deferred restore (see _uses_masks).
+    _uses_masks = False
 
     pick_requested = Signal(int)
     preview_requested = Signal(int)

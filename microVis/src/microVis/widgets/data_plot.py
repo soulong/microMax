@@ -273,8 +273,14 @@ class DataPlotView(QWidget):
 
         controls_layout.addLayout(form)
 
-        # Plot / Export PDF are centered in the column; Plot is twice the
-        # natural caption length (per request).
+        # Row-count / status info line.
+        self._info_label = QLabel("")
+        self._info_label.setWordWrap(True)
+        self._info_label.setStyleSheet("color: #888888; font-size: 8pt;")
+        controls_layout.addWidget(self._info_label)
+
+        # Plot / Export PDF sit below the info line, centered in the column;
+        # Plot is twice the natural caption length (per request).
         self._plot_btn = QPushButton("Plot")
         self._plot_btn.ensurePolished()
         self._plot_btn.setFixedWidth(self._plot_btn.sizeHint().width() * 2)
@@ -284,11 +290,6 @@ class DataPlotView(QWidget):
         self._export_btn.setEnabled(False)
         self._export_btn.clicked.connect(self._on_export)
         controls_layout.addLayout(centered_row(self._plot_btn, self._export_btn))
-
-        self._info_label = QLabel("")
-        self._info_label.setWordWrap(True)
-        self._info_label.setStyleSheet("color: #888888; font-size: 8pt;")
-        controls_layout.addWidget(self._info_label)
         controls_layout.addStretch()
 
         controls_scroll = QScrollArea()

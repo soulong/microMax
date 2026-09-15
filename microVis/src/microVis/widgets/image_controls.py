@@ -340,18 +340,19 @@ class ImageControls(QScrollArea):
         # Object range selection dropdown
         self._export_object_combo = NoScrollComboBox()
         self._export_object_combo.addItems([
+            "Current displayed",
             "Selected wells",
-            "Selected wells (all objects)",
             "Annotated",
             "All",
         ])
         self._export_object_combo.setCurrentIndex(0)
         self._export_object_combo.setToolTip(
-            "Selected wells: objects from the currently selected wells, passing "
-            "the Image Filters (fields/stacks/timepoints/extra cols) — same "
-            "scope as the images shown in the viewer\n"
-            "Selected wells (all objects): all objects from the currently "
-            "selected wells, ignoring the Image Filters\n"
+            "Current displayed: objects from the images the viewer currently "
+            "shows — the selected wells passing the Image Filters "
+            "(fields/stacks/timepoints/extra cols); covers the WHOLE filtered "
+            "set, not just the visible thumbnail page\n"
+            "Selected wells: all objects from the selected wells, ignoring "
+            "the Image Filters\n"
             "Annotated: only manually class-labeled objects\n"
             "All: all objects from the entire dataset"
         )
@@ -743,9 +744,9 @@ class ImageControls(QScrollArea):
         if item:
             item.setEnabled(has_annotations)
         # If current selection is "Annotated" but no annotations, switch to
-        # "Selected wells" — NOT "All" or "Selected wells (all objects)",
-        # which would silently export every object in the dataset.
+        # "Current displayed" — NOT "Selected wells" or "All", which ignore
+        # the Image Filters and would silently export far more objects.
         if not has_annotations and self._export_object_combo.currentText() == "Annotated":
             self._export_object_combo.setCurrentIndex(
-                self._export_object_combo.findText("Selected wells")
+                self._export_object_combo.findText("Current displayed")
             )

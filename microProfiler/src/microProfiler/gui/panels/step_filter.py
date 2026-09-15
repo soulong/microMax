@@ -57,13 +57,13 @@ class FilterPanel(BaseStepPanel):
         btn_row = QHBoxLayout()
         self._add_btn = QPushButton("+ Add Filter")
         self._add_btn.clicked.connect(self._add_filter_row)
-        self._reset_btn = QPushButton("Reset All")
+        self._reset_btn = QPushButton("Clear Filter")
         self._reset_btn.clicked.connect(self._reset_filters)
         btn_row.addWidget(self._add_btn)
-        # Reset All sits at the far right, separated from the add button.
-        btn_row.addStretch()
+        # Clear Filter sits right after the add button, left-aligned.
         btn_row.addSpacing(12)
         btn_row.addWidget(self._reset_btn)
+        btn_row.addStretch()
         self._controls_layout.addLayout(btn_row)
 
     # ── Filter rows ─────────────────────────────────────────────────────

@@ -1,0 +1,86 @@
+# micromodel deduplication — 增量模式（augment）
+# ====================================================================================================
+# 在上一轮 deduplication 的保留集之上吸纳新数据：reference selection_state.pkl 里保留的细胞成为不可动的种子，sources 只列新数据集，只有落在所有种子 r 之外、真正
+# 带来新隐空间区域的细胞才会入选——selection.max_add 限制本次新增量（对 r 二分搜索）。若新数据与池子高度重叠，实际新增会少于 max_add——那正是"只挑有多样性的"的本意。
+# 想对已经筛过的池子再削一轮：用 deduplication_prune.yml（reference: null，sources 列 curated/ 或原文件夹）。
+#
+# 算法与产出与剪枝模式完全一致（teacher 特征 → whitened-PCA + L2 归一 → 半径覆盖贪心；selection_state.pkl / manifest.csv / curated/ / curated.csv / keep_label.csv /
+# metrics.png / features/），差异仅在：种子计入最终池子且不受配额影响；target_ratio 的组配额只作用于新增集合；space.pca_components 被忽略——必须沿用 reference state
+# 里存的那个 PCA，否则新细胞和种子不可比（程序会沿用并记一条 warning）。
+# ====================================================================================================
+
+# SSL 预训练 bundle。必须与生成 reference 的那一轮是同一个 bundle（换 bundle = 换嵌入空间，程序会硬报错，防止两个空间里的距离混比）。
+model: 20260830_dinov3_phase2\model.pt
+
+# 本轮产出写入这个目录（会自动创建；curated/ 每次整个重建，包含种子 + 本轮新增）。
+output_dir: sc_dataset\deduplication
+
+# 上一轮的 selection_state.pkl（其保留细胞全部成为不可动种子）。文件不存在 = 硬报错。
+reference: sc_dataset\deduplication\selection_state.pkl
+
+data:
+  # file_list: 新数据清单 CSV 列表（[filepath(,label)]；统一写成列表，单个数据源也用单元素列表）。配置后清单就是全部候选，data.file_dir 被忽略（日志警告）：隐式 root = 清单文件所在的各个父目录，全局 data.* 默认对全部文件生效，CSV 自带 label 列作为每细胞 label。filepath 相对路径按进程 CWD 解析。与 file_dir 二选一。
+  file_list: null
+
+  # file_dir: 本轮要吸纳的新数据集（预裁剪单细胞文件夹；递归枚举 .tif/.tiff，一个文件一个细胞，背景为 0）。字符串 = 全部继承 data.* 全局默认；字典 = {path: ..., 加任意 data.* 键做 per-folder 覆盖}。可覆盖键：image_pattern / channel_layout / channels / max_value / label_csv / label_from_dir。两个条目不能有重叠文件（硬报错）；与 reference 里已有的文件重叠同样硬报错；channels 解析后必须等于 bundle 的 in_chans。
+  file_dir:
+    - sc_dataset\collection\hpa_single_cell
+    # - sc_dataset\collection\opencell\single_cell
+
+  # 从文件名提取元数据的正则（命名捕获组成为 manifest 之外的附加信息）；null = 不提取。对筛选本身无影响，只影响特征缓存 key 与将来的溯源。
+  image_pattern: null
+
+  # 通道在文件内的排布：CHW = 通道是 TIFF 的多个 page；HWC = 通道在最后一维；null = 每个文件本身就是单张 2D 图（当前数据全部是这种）。
+  channel_layout: null
+
+  # 用哪些通道提特征，1-based 列表；null = 文件里全部通道。解析后的通道数必须等于 bundle 的 in_chans，否则硬报错。
+  channels: [1]
+
+  # 强度域：图像载入后除以它归一到 [0,1]（16-bit 用 65535，8-bit 用 255）。必填（全局默认或 per-root 覆盖），填错 dtype 会让所有 percentile 归一失真。
+  max_value: 65535
+
+  # label 的两级解析（只影响 manifest 的 label 列、group_by: label 和 keep_label.csv，不影响特征）：
+  #   1. label_csv 里的 filepath->label 映射（绝对路径匹配，相对路径相对 CSV 所在目录解析）；
+  #   2. 否则 label_from_dir: true 时用文件的父目录名（如 pos/neg）。CSV 配置了但文件不存在 = 硬报错（按 typo 处理，不静默跳过）。
+  label_from_dir: false
+  label_csv: null
+
+  # 每 root 的细胞数上限（确定性随机下采样，seed 固定则每次选到同一批）。null = 全量。
+  sample_max: null
+
+selection:
+  # 增量模式的总量 = max_add（本次最多纳入多少新细胞，对 r 二分）；radius / target_keep 留 null。
+  radius: null
+  target_keep: null
+  max_add: 20000
+
+  # 自适应半径（同剪枝模式）：> 0 时按局部密度缩放每个新细胞的有效半径 = radius × clip((k近邻距离/全体中位数)^adaptive, 0.5, 2.0)——致密区域半径缩小（多留），稀疏区域放大（少留）。推荐 0.5~1.0 起步试。
+  adaptive: 2
+
+  # 分组比例控制：配额只作用于新增集合，种子不受影响。group_by / target_ratio / cluster_resolution 语义同剪枝模式。
+  group_by: cluster
+  target_ratio: null
+  cluster_resolution: null             # null = 自动按 modularity 扫描决策
+
+  # 随机种子：决定遍历顺序、sample_max 下采样、Leiden、UMAP 图。固定则结果可复现。
+  seed: 42
+
+space:
+  # 增量模式下本键被忽略——沿用 reference state 里存的 PCA。
+  pca_components: 50
+
+dataloader:
+  batch_size: 128                      # 特征提取的前向批大小
+  num_workers: 6                       # DataLoader 进程数（0 = 主进程加载，慢）
+  prefetch_factor: 2                   # 每 worker 预取批数（num_workers=0 时忽略）
+  persistent_workers: true             # 跨 epoch 保留 worker（推理单轮，影响不大）
+
+output:
+  # curated/ 硬链接目录 = 种子 + 本轮新增（每次整个重建，直接作为 pretrain 的 data root）。
+  link_dir: true
+
+  # keep_label.csv（file_list 格式的保留清单，直接作为 train 的 data.file_list）。保留细胞一个 label 都没有时自动跳过并记日志。
+  keep_label_csv: true
+
+  # metrics.png（对全部参与点拟合 UMAP，画 keep/drop/seed 散点 + 对照图 + 来源图 + 质量 metrics + 每簇统计）。拟合对几万个点需要一两分钟；只想快速调参数时可设 false。
+  plot: true

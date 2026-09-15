@@ -10,6 +10,7 @@ import sqlite3
 
 import numpy as np
 import pacmap
+import pytest
 
 from microModel.reduction import run_reduction
 
@@ -47,7 +48,7 @@ def test_loaded_pacmap_transforms_current_features(tmp_path):
     _write_features_db(root_b / "infer.db", feats_b)
 
     config = {
-        "data": {"root": [str(root_b)]},
+        "data": {"file_dir": [str(root_b)]},
         "inference": {"db_name": "infer.db"},
         "reduction": {
             "method": ["pacmap"],
@@ -69,6 +70,19 @@ def test_loaded_pacmap_transforms_current_features(tmp_path):
     expected = reducer.transform(feats_b)
     got = np.array([[r[1], r[2]] for r in rows])
     np.testing.assert_allclose(got, expected, atol=1e-5)
+
+
+def test_empty_method_list_fits_nothing(tmp_path):
+    """Explicit `method: []` means NO DR fitting — it must not fall back to
+    the [pca, umap] legacy default (only null means default; the same
+    contract is written down in microProfiler's config validation)."""
+    config = {
+        "data": {"file_dir": [str(tmp_path)]},
+        "inference": {"db_name": "infer.db"},
+        "reduction": {"method": [], "cluster_res": []},
+    }
+    with pytest.raises(ValueError, match="No valid reduction"):
+        run_reduction(config, save_plots=False, raise_on_error=True)
 
 
 def test_loaded_reducer_reuse_with_plots_and_clusters(tmp_path):
@@ -96,7 +110,7 @@ def test_loaded_reducer_reuse_with_plots_and_clusters(tmp_path):
     _write_features_db(root_b / "infer.db", feats_b)
 
     config = {
-        "data": {"root": [str(root_b)]},
+        "data": {"file_dir": [str(root_b)]},
         "inference": {"db_name": "infer.db"},
         "reduction": {
             "method": ["pacmap"],

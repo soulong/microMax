@@ -47,11 +47,12 @@ from microBase.db_contracts import (
     reserved_inference_columns,
 )
 
-from .utils import (logger, set_seed, select_device, load_label_csv,
+from .utils import (logger, set_seed, select_device,
                     resolve_output_paths, copy_config_file,
                     add_file_logging, resolve_max_value, sql_ident)
 from .dataset import (WholeImageCellDataset, SingleCellDataset, subsample)
-from .backbone import load_model_from_bundle, load_ssl_backbone_from_bundle
+from .backbone import (load_model_from_bundle, load_ssl_backbone_from_bundle,
+                       validate_embed_source)
 
 
 # ----------------------------------------------------------------------------
@@ -94,7 +95,7 @@ def _reject_reserved_extra_cols(extra_cols, class_names):
         )
 
 
-def _init_db(conn, mode, extra_cols=None, prob_cols=None, mask_name=None):
+def _init_db(conn, mode, extra_cols=None, prob_cols=None):
     """Create the single `inference` table.
 
     Existing tables whose column set differs are dropped and recreated
@@ -103,10 +104,10 @@ def _init_db(conn, mode, extra_cols=None, prob_cols=None, mask_name=None):
     the old table does not have.
 
     prob_cols: per-class probability columns, one REAL column per class in
-    class_names order (both single- and multi-label bundles).
-    mask_name: bare mask name of the segmented objects (whole-image mode);
-    stored on every row so downstream merges can group per mask. Single-cell
-    inference has no mask file -> the column is written NULL.
+    class_names order (both single- and multi-label bundles). Every row
+    also carries a `mask_name` column (bare mask name of the segmented
+    objects in whole-image mode; NULL for single-cell inference without a
+    config label) so downstream merges can group per mask.
     """
     extra_cols = extra_cols or []
     prob_cols = prob_cols or []
@@ -205,91 +206,97 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
         feats_all = None
 
     conn = sqlite3.connect(db_path)
-    # One REAL column per class (class_names order) — both label modes.
-    prob_cols = (
-        [f"{PROB_COLUMN_PREFIX}{c}" for c in class_names]
-        if write_pred_class else []
-    )
-    _init_db(conn, mode, extra_cols, prob_cols, mask_name=mask_name)
+    # try/finally so a failed run never leaves infer.db locked (Windows).
+    try:
+        # One REAL column per class (class_names order) — both label modes.
+        prob_cols = (
+            [f"{PROB_COLUMN_PREFIX}{c}" for c in class_names]
+            if write_pred_class else []
+        )
+        _init_db(conn, mode, extra_cols, prob_cols)
 
-    n = len(meta_rows)
-    if write_pred_class and probs_all is not None and n != len(probs_all):
-        raise MicroMaxError(f"Error: meta_rows length {n} != predictions length {len(probs_all)}")
-    if write_features and feats_all is not None and n != len(feats_all):
-        raise MicroMaxError(f"Error: meta_rows length {n} != features length {len(feats_all)}")
+        n = len(meta_rows)
+        if write_pred_class and probs_all is not None and n != len(probs_all):
+            raise MicroMaxError(f"Error: meta_rows length {n} != predictions length {len(probs_all)}")
+        if write_features and feats_all is not None and n != len(feats_all):
+            raise MicroMaxError(f"Error: meta_rows length {n} != features length {len(feats_all)}")
 
-    # Re-run protection: replace THIS dataset's rows instead of appending.
-    # Scoped to the written directories so multiple datasets sharing one
-    # output DB accumulate instead of overwriting each other. Rows with an
-    # empty/missing directory (source path unavailable) must also be deleted,
-    # or re-runs accumulate duplicates for them.
-    dirs: set[str] = set()
-    has_null_dir = False
-    for m in meta_rows:
-        d = m.get("directory")
-        if d is None or d == "":
-            has_null_dir = True
-        else:
-            dirs.add(str(d))
-    if has_null_dir:
-        conn.execute(
-            f"DELETE FROM {INFERENCE_TABLE} WHERE "
-            f"{DIRECTORY_COLUMN} IS NULL OR {DIRECTORY_COLUMN} = ''")
-    if dirs:
-        ph = ", ".join("?" * len(dirs))
-        existing = conn.execute(
-            f"SELECT COUNT(*) FROM {INFERENCE_TABLE} WHERE {DIRECTORY_COLUMN} IN ({ph})",
-            tuple(dirs)).fetchone()[0]
-        if existing:
-            logger.warning("inference table already has %d rows for this "
-                           "dataset's directories; deleting them "
-                           "(rows replaced on re-run)", existing)
+        # Re-run protection: replace THIS dataset's rows instead of appending.
+        # Scoped to the written directories so multiple datasets sharing one
+        # output DB accumulate instead of overwriting each other. Rows with an
+        # empty/missing directory (source path unavailable) must also be deleted,
+        # or re-runs accumulate duplicates for them.
+        dirs: set[str] = set()
+        has_null_dir = False
+        for m in meta_rows:
+            d = m.get("directory")
+            if d is None or d == "":
+                has_null_dir = True
+            else:
+                dirs.add(str(d))
+        if has_null_dir:
             conn.execute(
-                f"DELETE FROM {INFERENCE_TABLE} WHERE {DIRECTORY_COLUMN} IN ({ph})",
-                tuple(dirs))
+                f"DELETE FROM {INFERENCE_TABLE} WHERE "
+                f"{DIRECTORY_COLUMN} IS NULL OR {DIRECTORY_COLUMN} = ''")
+        if dirs:
+            ph = ", ".join("?" * len(dirs))
+            existing = conn.execute(
+                f"SELECT COUNT(*) FROM {INFERENCE_TABLE} WHERE {DIRECTORY_COLUMN} IN ({ph})",
+                tuple(dirs)).fetchone()[0]
+            if existing:
+                logger.warning("inference table already has %d rows for this "
+                               "dataset's directories; deleting them "
+                               "(rows replaced on re-run)", existing)
+                conn.execute(
+                    f"DELETE FROM {INFERENCE_TABLE} WHERE {DIRECTORY_COLUMN} IN ({ph})",
+                    tuple(dirs))
 
-    base_cols = [DIRECTORY_COLUMN, FILENAME_COLUMN]
-    if mode == "whole_image":
-        base_cols.append(MASK_FILENAME_COLUMN)
-    base_cols.append(MASK_NAME_COLUMN)
-    if mode == "whole_image":
-        base_cols.append(LABEL_COLUMN)
-    base_cols.append(GROUND_TRUTH_COLUMN)
-    tail_cols = [PRED_CLASS_COLUMN, PRED_PROB_COLUMN] + prob_cols + [FEATURES_COLUMN]
-    all_cols = base_cols + extra_cols + tail_cols
-    col_names = ", ".join(sql_ident(c) for c in all_cols)
-    placeholders = ", ".join("?" * len(all_cols))
+        base_cols = [DIRECTORY_COLUMN, FILENAME_COLUMN]
+        if mode == "whole_image":
+            base_cols.append(MASK_FILENAME_COLUMN)
+        base_cols.append(MASK_NAME_COLUMN)
+        if mode == "whole_image":
+            base_cols.append(LABEL_COLUMN)
+        base_cols.append(GROUND_TRUTH_COLUMN)
+        tail_cols = [PRED_CLASS_COLUMN, PRED_PROB_COLUMN] + prob_cols + [FEATURES_COLUMN]
+        all_cols = base_cols + extra_cols + tail_cols
+        col_names = ", ".join(sql_ident(c) for c in all_cols)
+        placeholders = ", ".join("?" * len(all_cols))
 
-    rows = []
-    for i, meta in enumerate(meta_rows):
-        pred_class = None
-        pred_prob = None
-        probs_row = None
-        if write_pred_class and probs_all is not None:
-            row_p = probs_all[i]
-            # Winner = highest-probability class; no threshold (an argmax
-            # always exists). The full vector goes to the prob_ columns.
-            pred_idx = int(row_p.argmax())
-            pred_class = class_names[pred_idx] if class_names and pred_idx < len(class_names) else str(pred_idx)
-            pred_prob = float(row_p[pred_idx])
-            probs_row = [float(v) for v in row_p.tolist()]
-        feat_blob = feats_all[i].tobytes() if feats_all is not None else None
-        row = [_to_native(mask_name if c == MASK_NAME_COLUMN else meta.get(c))
-               for c in base_cols + extra_cols]
-        row.extend([pred_class, pred_prob])
-        row.extend(probs_row if probs_row is not None else [None] * len(prob_cols))
-        row.append(feat_blob)
-        rows.append(tuple(row))
+        rows = []
+        for i, meta in enumerate(meta_rows):
+            pred_class = None
+            pred_prob = None
+            probs_row = None
+            if write_pred_class and probs_all is not None:
+                row_p = probs_all[i]
+                # Winner = highest-probability class; no threshold (an argmax
+                # always exists). The full vector goes to the prob_ columns.
+                pred_idx = int(row_p.argmax())
+                pred_class = class_names[pred_idx] if class_names and pred_idx < len(class_names) else str(pred_idx)
+                pred_prob = float(row_p[pred_idx])
+                # Truncate to the prob-column count: with a healthy bundle
+                # class_names matches the output width exactly; the fallback
+                # branch above must not widen the row beyond prob_cols.
+                probs_row = [float(v) for v in row_p.tolist()[:len(class_names)]]
+            feat_blob = feats_all[i].tobytes() if feats_all is not None else None
+            row = [_to_native(mask_name if c == MASK_NAME_COLUMN else meta.get(c))
+                   for c in base_cols + extra_cols]
+            row.extend([pred_class, pred_prob])
+            row.extend(probs_row if probs_row is not None else [None] * len(prob_cols))
+            row.append(feat_blob)
+            rows.append(tuple(row))
 
-    conn.executemany(
-        f"INSERT INTO inference ({col_names}) VALUES ({placeholders})",
-        rows,
-    )
-    wrote = "meta" + ("+pred" if write_pred_class else "") + ("+features" if write_features else "")
-    logger.info("Wrote %d rows (%s) to %s", len(rows), wrote, db_path)
+        conn.executemany(
+            f"INSERT INTO inference ({col_names}) VALUES ({placeholders})",
+            rows,
+        )
+        wrote = "meta" + ("+pred" if write_pred_class else "") + ("+features" if write_features else "")
+        logger.info("Wrote %d rows (%s) to %s", len(rows), wrote, db_path)
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
     return db_path
 
 
@@ -298,12 +305,14 @@ def _write_db(db_path, meta_rows, all_logits, all_features,
 # ----------------------------------------------------------------------------
 
 def _forward_pass(loader, model, device, write_features, classify_mode,
-                  write_pred_class=False, pool_fn=None):
+                  write_pred_class=False, with_mask=False):
     """Run forward pass on the dataloader. Returns (all_logits, all_features).
 
     classify_mode=True: model is a classification Model; forward returns (logits, pooled).
-    classify_mode=False: model is a backbone-only feature extractor; forward returns
-        raw features; pool_fn is applied to get pooled features.
+    classify_mode=False: model is an EmbedExtractor; forward(x, mask=...)
+        returns the pooled embedding directly.
+    with_mask: pass the batch's trailing foreground mask (B, H, W) into the
+        extractor (mask-weighted patch pooling).
     write_pred_class: collect logits (only meaningful when classify_mode=True).
     write_features: collect features.
     """
@@ -316,11 +325,10 @@ def _forward_pass(loader, model, device, write_features, classify_mode,
                 logits, features = model(x)
                 if write_pred_class:
                     all_logits.append(logits.cpu())
+            elif with_mask:
+                features = model(x, mask=batch[-1].to(device))
             else:
-                raw = model(x)
-                features = pool_fn(raw) if pool_fn is not None else raw
-                if features.ndim > 2:
-                    features = features.mean(dim=(2, 3)) if features.ndim == 4 else features.mean(dim=1)
+                features = model(x)
             if write_features:
                 all_features.append(features.cpu())
     return all_logits, all_features
@@ -347,9 +355,8 @@ def _validate_channel_count(n_avail, channels, meta, data_dir):
 
 def _run_single_cell(data_dir, meta, model, device,
                      batch_size, db_path, write_features, write_pred_class,
-                     label_map, label_from_dir,
                      channels, channel_layout, image_pattern, max_value,
-                     classify_mode, pool_fn,
+                     classify_mode, with_mask,
                      dl_num_workers=4, dl_prefetch_factor=2,
                      dl_persistent_workers=True,
                      sample_max=None, sample_by='per_class', seed=42,
@@ -385,11 +392,11 @@ def _run_single_cell(data_dir, meta, model, device,
     for i in range(len(md)):
         row = md.iloc[i]
         path = row["path"]
-        abs_path = os.path.normcase(os.path.abspath(path))
         # Canonical directory form shared with microProfiler/microVis:
-        # absolute path, forward slashes.
-        file_dir = canonical_directory(os.path.dirname(path), data_dir)
-        gt = _resolve_gt(label_map, label_from_dir, abs_path, file_dir)
+        # absolute path, forward slashes. Ground truth = the parent folder
+        # name (pos/neg-style layout) — the one label convention infer knows.
+        file_dir = canonical_directory(os.path.dirname(path))
+        gt = _resolve_gt({}, True, None, file_dir)
         entry = {
             "idx": i,
             "directory": file_dir,
@@ -417,7 +424,8 @@ def _run_single_cell(data_dir, meta, model, device,
         normalize_method=normalize_method,
         clip_low=clip_low, clip_high=clip_high,
         with_masking=with_masking,
-        fixed_reference=fixed_reference, max_value=max_value)
+        fixed_reference=fixed_reference, max_value=max_value,
+        return_mask=with_mask)
     loader_kwargs = dict(batch_size=batch_size, shuffle=False,
                          num_workers=dl_num_workers,
                          persistent_workers=dl_persistent_workers)
@@ -427,7 +435,7 @@ def _run_single_cell(data_dir, meta, model, device,
 
     all_logits, all_features = _forward_pass(
         loader, model, device, write_features, classify_mode,
-        write_pred_class=write_pred_class, pool_fn=pool_fn)
+        write_pred_class=write_pred_class, with_mask=with_mask)
 
     base_keys = ("directory", "filename", "ground_truth")
     meta_rows = [
@@ -447,9 +455,9 @@ def _run_single_cell(data_dir, meta, model, device,
 def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
                      model, device, batch_size, db_path,
                      write_features, write_pred_class, image_subdir_pattern,
-                     channel_layout, channels, label_from_dir, label_map,
+                     channel_layout, channels,
                      mask_name_cfg, max_value,
-                     classify_mode, pool_fn,
+                     classify_mode, with_mask,
                      dl_num_workers=4, dl_prefetch_factor=2,
                      dl_persistent_workers=True,
                      sample_max=None, sample_by='per_class', seed=42,
@@ -504,7 +512,7 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
         augmentation_spec=augmentation_spec,
         normalize_method=normalize_method, clip_low=clip_low, clip_high=clip_high,
         with_masking=with_masking, fixed_reference=fixed_reference, padding=4,
-        max_value=max_value)
+        max_value=max_value, return_mask=with_mask)
 
     logger.info("Whole-image: %d cells across %d fields", len(ds), len(image_ds))
 
@@ -513,12 +521,10 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
         for idx in range(len(ds)):
             row_idx, label = ds._flat_index[idx]
             source_path = ds.row_source_path(row_idx)
-            abs_path = (os.path.normcase(os.path.abspath(source_path))
-                        if source_path else None)
             file_dir = (
-                canonical_directory(os.path.dirname(source_path), data_dir)
+                canonical_directory(os.path.dirname(source_path))
                 if source_path else "")
-            gt = _resolve_gt(label_map, label_from_dir, abs_path, file_dir)
+            gt = _resolve_gt({}, True, None, file_dir)
             entries.append({"idx": idx, "ground_truth": gt})
         entries = subsample(entries, sample_max, sample_by, seed,
                             label_key="ground_truth")
@@ -534,7 +540,7 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
 
     all_logits, all_features = _forward_pass(
         loader, model, device, write_features, classify_mode,
-        write_pred_class=write_pred_class, pool_fn=pool_fn)
+        write_pred_class=write_pred_class, with_mask=with_mask)
 
     md = image_ds.metadata
     _exclude = {"path", "stem", "__file__", "directory", "channel", "ext", "mask_name", "tile"}
@@ -553,18 +559,14 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
         mask_fname = ds.row_mask_filename(row_idx)
         if mask_fname:
             # Mask path is consumed directly (reduction_vis/reduction contact
-            # sheets) — anchor it now so a relative data.root cannot make it
+            # sheets) — anchor it now so a relative data.file_dir cannot make it
             # CWD-dependent later.
             mask_fname = os.path.abspath(mask_fname).replace("\\", "/")
         source_path = ds.row_source_path(row_idx)
-        # normcase matches load_label_csv's key form — without it a drive /
-        # directory case mismatch on Windows silently misses every label.
-        abs_path = (os.path.normcase(os.path.abspath(source_path))
-                    if source_path else None)
         file_dir = (
-            canonical_directory(os.path.dirname(source_path), data_dir)
+            canonical_directory(os.path.dirname(source_path))
             if source_path else "")
-        gt = _resolve_gt(label_map, label_from_dir, abs_path, file_dir)
+        gt = _resolve_gt({}, True, None, file_dir)
         meta_entry = {
             "directory": file_dir,
             "filename": filename_json,
@@ -611,21 +613,32 @@ def run_inference(config, config_path=None):
     bundle = torch.load(model_path, map_location=device, weights_only=False)
     meta = bundle["meta"]
 
+    # Embedding readout config (features mode only — classify bundles pool
+    # exactly the way their head was trained).
+    embed_source = validate_embed_source(inf_cfg.get("embed_source", "patch"))
+    mask_weighted = bool(inf_cfg.get("mask_weighted", True))
+
     # Determine model mode: classify (train bundle) vs features (SSL bundle).
     # Train bundle: "state_dict" + "num_classes" in meta.
     # SSL bundle: full "state_dict" without "num_classes".
     if "state_dict" in bundle and "num_classes" in meta:
         classify_mode = True
         model = load_model_from_bundle(bundle, device)
-        pool_fn = None  # Model.forward handles pooling
-        logger.info("Classify mode: %d classes", meta["num_classes"])
+        logger.info("Classify mode: %d classes (pooling fixed at train time; "
+                    "inference.embed_source/mask_weighted ignored)",
+                    meta["num_classes"])
     elif "state_dict" in bundle:
         classify_mode = False
-        model, feat_dim, pool_fn, meta = load_ssl_backbone_from_bundle(bundle, device)
+        model, feat_dim, meta = load_ssl_backbone_from_bundle(
+            bundle, device, embed_source=embed_source, mask_weighted=mask_weighted)
         logger.info("Features-only mode: feat_dim=%d", feat_dim)
+        if mask_weighted and embed_source == "cls":
+            logger.info("mask_weighted has no effect with embed_source='cls'")
     else:
         raise MicroMaxError("Error: bundle has no 'state_dict' key (unsupported pre-0.2.1 "
               "bundle format)")
+    # Mask threading is only meaningful in features mode with a patch readout.
+    with_mask = (not classify_mode) and mask_weighted and embed_source != "cls"
 
     # What to write (defaults: pred_class = bundle capability, feature = true).
     write_pred_class = bool(inf_cfg.get("pred_class", classify_mode))
@@ -645,8 +658,8 @@ def run_inference(config, config_path=None):
 
     # All data.* settings must be explicit
     required_data_keys = [
-        "root", "channels", "channel_layout", "image_pattern", "max_value",
-        "label_from_dir", "label_csv", "sample_max", "sample_by",
+        "file_dir", "channels", "channel_layout", "image_pattern", "max_value",
+        "sample_max", "sample_by",
     ]
     if mode == "whole_image":
         required_data_keys += ["mask_pattern", "image_subdir_pattern", "mask_name"]
@@ -657,13 +670,11 @@ def run_inference(config, config_path=None):
             f"All data.* settings must be explicit (null is allowed; "
             f"missing is not). Required for mode='{mode}': {required_data_keys}")
 
-    data_roots = data_cfg["root"]
+    data_roots = data_cfg["file_dir"]
     channels_cfg = data_cfg["channels"]
     channel_layout_cfg = data_cfg["channel_layout"]
     image_pattern_cfg = data_cfg["image_pattern"]
     max_value = resolve_max_value(data_cfg)
-    label_csv = data_cfg["label_csv"]
-    label_from_dir = data_cfg["label_from_dir"]
     sample_max = data_cfg["sample_max"]
     sample_by = data_cfg["sample_by"]
 
@@ -676,14 +687,6 @@ def run_inference(config, config_path=None):
     dl_num_workers = dl_cfg.get("num_workers", 4)
     dl_prefetch_factor = dl_cfg.get("prefetch_factor", 2)
     dl_persistent_workers = dl_cfg.get("persistent_workers", True) and dl_num_workers > 0
-
-    label_map = {}
-    if label_csv:
-        # A configured-but-missing CSV is a typo — never silently fall back
-        # to label_from_dir/NULL ground truth (same policy as train).
-        if not os.path.exists(label_csv):
-            raise MicroMaxError(f"Error: label_csv file not found: {label_csv}")
-        label_map = load_label_csv(label_csv)
 
     out_pairs = resolve_output_paths(data_roots, output_dir)
     if output_dir:
@@ -713,9 +716,8 @@ def run_inference(config, config_path=None):
                 path = _run_single_cell(
                     data_dir, meta, model, device,
                     batch_size, db_path, write_features, write_pred_class,
-                    label_map, label_from_dir,
                     channels_cfg, channel_layout_cfg, image_pattern_cfg, max_value,
-                    classify_mode, pool_fn,
+                    classify_mode, with_mask,
                     dl_num_workers=dl_num_workers, dl_prefetch_factor=dl_prefetch_factor,
                     dl_persistent_workers=dl_persistent_workers,
                     sample_max=sample_max, sample_by=sample_by, seed=seed,
@@ -728,9 +730,8 @@ def run_inference(config, config_path=None):
                     batch_size, db_path, write_features, write_pred_class,
                     data_cfg["image_subdir_pattern"],
                     channel_layout_cfg, channels_cfg,
-                    label_from_dir, label_map,
                     data_cfg["mask_name"], max_value,
-                    classify_mode, pool_fn,
+                    classify_mode, with_mask,
                     dl_num_workers=dl_num_workers, dl_prefetch_factor=dl_prefetch_factor,
                     dl_persistent_workers=dl_persistent_workers,
                     sample_max=sample_max, sample_by=sample_by, seed=seed,

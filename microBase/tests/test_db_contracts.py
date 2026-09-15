@@ -66,13 +66,16 @@ def test_canonical_directory(tmp_path):
     root = tmp_path / "dataset"
     sub = root / "images" / "wellA"
     sub.mkdir(parents=True)
-    # The DB `directory` contract: ABSOLUTE path with forward slashes.
+    # The DB `directory` contract: PORTABLE-FIRST — CWD-relative when the
+    # path lives under the CWD, absolute forward-slash otherwise (tmp_path
+    # is outside the CWD, so an absolute value is the correct fallback).
     expected = str(sub.resolve()).replace("\\", "/")
-    assert canonical_directory(sub, root) == expected
-    # A relative path is anchored at the root before absolutizing.
-    assert canonical_directory("images/wellA", root) == expected
+    assert canonical_directory(sub) == expected
+    # A relative path under the CWD stores CWD-relative (portable).
+    assert canonical_directory("images/wellA") == "images/wellA"
+
     # Forward slashes on every platform.
-    assert "\\" not in canonical_directory(sub, root)
+    assert "\\" not in canonical_directory(sub)
 
 
 def test_resolve_directory_roundtrip(tmp_path):
@@ -80,7 +83,7 @@ def test_resolve_directory_roundtrip(tmp_path):
     sub = root / "images" / "wellA"
     sub.mkdir(parents=True)
 
-    stored = canonical_directory(sub, root)
+    stored = canonical_directory(sub)
     assert resolve_directory(stored, root) == str(sub.resolve())
     # Root-relative "." resolves to the root itself (legacy rows).
     assert resolve_directory(".", root) == str(root.resolve())

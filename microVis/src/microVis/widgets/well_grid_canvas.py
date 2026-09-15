@@ -12,6 +12,7 @@ from PySide6.QtCore import QTimer, Signal
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QSizePolicy, QToolTip, QVBoxLayout, QWidget
 
+from microBase import normalize_well
 from microVis._settings import get_cmap
 from microVis.log_utils import get_logger
 
@@ -80,6 +81,7 @@ class WellGridCanvas(QWidget):
         self._scatter = None
         self._well_indices.clear()
         self._data_map.clear()
+        self._real_wells = set()
         self._col_name = None
         self._prev_dims = (0, 0)
         self._prev_fmt = ""
@@ -110,7 +112,11 @@ class WellGridCanvas(QWidget):
 
         row_labels = _row_labels(rows)
         all_wells = dm.get_wells()
-        well_set = set(all_wells)
+        # Normalize incoming well keys ('A01' -> 'A1'): the grid generates
+        # canonical no-leading-zero labels, while a captured `well` keeps its
+        # regex text verbatim — without normalization a 'A01' dataset would
+        # never match any grid cell (all-grey grid, dead clicks/labels).
+        well_set = {normalize_well(w) for w in all_wells}
         self._real_wells = well_set
 
         # Build well indices
@@ -138,6 +144,7 @@ class WellGridCanvas(QWidget):
                 except Exception as e:
                     logger.warning("Aggregation failed for %s.%s: %s", table_name, col_name, e)
                     data_map = {}
+            data_map = {normalize_well(k): v for k, v in data_map.items()}
         self._data_map = data_map
 
         marker_size = _compute_marker_size(rows, cols)

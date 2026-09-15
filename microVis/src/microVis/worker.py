@@ -8,6 +8,7 @@ import numpy as np
 from PySide6.QtCore import QObject, QRunnable, Signal
 from skimage.transform import resize as sk_resize
 
+from microBase import MicroMaxError
 from microVis.io.data_module import _safe_str
 from microVis.log_utils import get_logger
 
@@ -220,7 +221,7 @@ class ImageWorker(QRunnable):
             if loaded_from_disk:
                 result["raw_data"] = (img_data, mask_dict)
             self.signals.finished.emit(result)
-        except SystemExit as e:
+        except MicroMaxError as e:
             # microBase raises MicroMaxError when a file/mask vanished or is
             # out of range — convert to a skip (error signal; the gen-guarded
             # _on_worker_error handler just decrements pending + logs, so the
@@ -306,7 +307,7 @@ class FullResWorker(QRunnable):
                 polygons,
                 self._overlay_col or "",
                 self._overlay_vmin, self._overlay_vmax)
-        except SystemExit as e:
+        except MicroMaxError as e:
             logger.warning("Full-res worker skipped row %d: %s", self._row_idx, e)
             self.signals.error.emit(f"Row {self._row_idx} skipped (missing data): {e}")
         except Exception as e:
@@ -434,7 +435,7 @@ class CropWorker(QRunnable):
                 self._target, self._pad,
             )
             self.signals.finished.emit(rgb, self._key)
-        except SystemExit as e:
+        except MicroMaxError as e:
             logger.warning("Crop worker skipped %s: %s", self._key, e)
             self.signals.error.emit(f"Crop skipped (missing data): {e}")
         except Exception as e:
@@ -473,15 +474,12 @@ class _DatasetLoadWorker(QObject):
                 image_subdir_pattern=self._image_subdir_pattern,
             )
             self.finished.emit(dm)
-        except SystemExit as e:
-            # microBase raises MicroMaxError on bad dataset state (SystemExit is caught defensively)
-            # (missing root, invalid pattern) — SystemExit is not an
-            # Exception, so without this the modal dialog never closes.
+        except Exception:
+            # microBase raises MicroMaxError on bad dataset state (missing
+            # root, invalid pattern) — without this branch the modal dialog
+            # never closes.
             logger.exception("Dataset load failed")
-            self.error.emit(str(e) or "Dataset load failed")
-        except Exception as e:
-            logger.exception("Dataset load failed")
-            self.error.emit(str(e))
+            self.error.emit("Dataset load failed")
 
 
 # -- Object Export Worker --
@@ -652,7 +650,7 @@ class ObjectExportWorker(QRunnable):
                     # the remaining rows and reports the skipped count.
                     try:
                         cells = dataset.get_cropped_cells(row_idx, mask_col, padding=4)
-                    except SystemExit as e:
+                    except MicroMaxError as e:
                         logger.warning(
                             "Row %d (%s_f%s_z%s_t%s): mask missing — skipped (%s)",
                             row_idx, well, field, stack, timepoint, e)

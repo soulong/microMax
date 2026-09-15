@@ -297,12 +297,6 @@ def _run_object_profile(
             n_workers=section.n_workers,
             obj_config=entry,
         )
-        # Bookkeep the table -> mask mapping (used by the per-mask merges).
-        db = Database(db_path)
-        try:
-            db.record_table_mask(table_name, entry.mask_name)
-        finally:
-            db.close()
         progress.step_end(
             f"object_profile ({entry.mask_name})", "Done",
         )
@@ -317,8 +311,9 @@ def _auto_merge_infer(root_dir: Path, entry, infer_db: Path) -> None:
 
     The mask comes from the infer DB's `mask_name` column (written by
     microModel), falling back to the config entry; the profiler table is
-    matched through the `_table_masks` bookkeeping (falling back to the
-    table-name convention). Source DBs are never modified.
+    matched by the table-name convention (the table must be named after its
+    mask — a previous merge output carries a `mask` column instead). Source
+    DBs are never modified.
     """
     from microBase import db_merge
 
@@ -374,6 +369,7 @@ def _run_inference(
     from microProfiler.user_defaults import update_user_defaults
 
     ran_any = False
+    first_ran = None
     for entry in section.configs:
         if not entry.channels:
             # null/[] channels means "this block is skipped" — never the
@@ -430,25 +426,28 @@ def _run_inference(
         except Exception:
             logger.warning("Auto-merge failed for mask '%s'",
                            entry.mask_name, exc_info=True)
+        if first_ran is None:
+            first_ran = entry
         ran_any = True
 
     # Remember this run's inference choices at user level (~/.micromax):
     # the Inference panel pre-fills new runs with the last run's model /
     # reducer(s) / cluster.pkl. Only saved when at least one block actually
-    # ran, and only from the FIRST block (the GUI's "+ Add" copies it). A
+    # ran, and only from the FIRST block that ran (the GUI's "+ Add" copies
+    # it) — a skipped block 0 must not overwrite the remembered values. A
     # run with both groups unchecked carries no `reduction` key — the
     # remembered reducer/cluster paths stay untouched then.
-    try:
-        first = section.configs[0]
-        updates = {"model": os.path.abspath(first.model) if first.model else None}
-        if first.reduction is not None:
-            updates["reducer"] = first.reduction.reducer
-            updates["cluster"] = first.reduction.cluster
-        if ran_any:
+    if ran_any and first_ran is not None:
+        try:
+            updates = {"model": os.path.abspath(first_ran.model)
+                       if first_ran.model else None}
+            if first_ran.reduction is not None:
+                updates["reducer"] = first_ran.reduction.reducer
+                updates["cluster"] = first_ran.reduction.cluster
             update_user_defaults("inference", updates)
-    except Exception:
-        logger.warning("Failed to remember inference defaults in ~/.micromax",
-                       exc_info=True)
+        except Exception:
+            logger.warning("Failed to remember inference defaults in ~/.micromax",
+                           exc_info=True)
     return ds
 
 

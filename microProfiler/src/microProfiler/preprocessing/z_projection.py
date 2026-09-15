@@ -72,23 +72,7 @@ def z_project_dataset(
             if len(group_df) <= 1:
                 continue
 
-            # Masks belong to individual planes — after projection they no
-            # longer correspond to any image, and leaving them behind creates
-            # orphan files that rebuild into mask-only rows. Delete them with
-            # the planes (quarantine already removed broken rows' files).
-            if delete_original:
-                for _ri, grow in group_df.iterrows():
-                    for mask_col in ds.mask_colnames:
-                        mpath = grow[mask_col]
-                        if pd.isna(mpath):
-                            continue
-                        mpath = Path(mpath)
-                        try:
-                            if mpath.exists():
-                                mpath.unlink()
-                        except OSError:
-                            logger.exception(
-                                "Z-projection: failed to delete %s", mpath)
+            projected_any = False
 
             # Read every plane and channel BEFORE any projection/write. A
             # plane with a broken file is quarantined as a whole, so every
@@ -96,10 +80,13 @@ def z_project_dataset(
             # per-channel mix caused by channel processing order).
             plane_paths = []  # [{channel: Path}], one entry per surviving plane
             plane_imgs = []   # [{channel: np.ndarray}]
-            # enumerate() keeps a POSITIONAL row index: quarantine_row indexes
-            # ds.metadata.iloc[...] and must not depend on the DataFrame's
-            # index labels coinciding with positions.
-            for pos, (row_idx, row) in enumerate(group_df.iterrows()):
+            # iterrows() yields the row's ORIGINAL metadata index label, and
+            # ds.metadata always carries a contiguous RangeIndex (fresh build,
+            # reset_index after every sort/filter) — so the label IS the
+            # global position quarantine_row's iloc[...] expects. The
+            # group-local enumerate position must never be used: with more
+            # than one group it points at the wrong metadata row.
+            for row_idx, row in group_df.iterrows():
                 paths = {}
                 imgs = {}
                 broken = False
@@ -108,13 +95,13 @@ def z_project_dataset(
                         continue
                     src = Path(row[ch])
                     if not src.exists():
-                        quarantine_row(ds, pos, f"missing {src.name}")
+                        quarantine_row(ds, row_idx, f"missing {src.name}")
                         broken = True
                         break
                     try:
                         imgs[ch] = read_image(src)
                     except ImageReadError as e:
-                        quarantine_row(ds, pos, str(e))
+                        quarantine_row(ds, row_idx, str(e))
                         broken = True
                         break
                     paths[ch] = src
@@ -133,6 +120,7 @@ def z_project_dataset(
                             "in group %s, skipping", ch, group_key,
                         )
                     continue
+                projected_any = True
 
                 projected = z_project_single(imgs, method)
                 src_name = paths[0].name
@@ -154,6 +142,26 @@ def z_project_dataset(
                         if p.exists():
                             p.unlink()
                 write_image(out_path, projected)
+
+            # Masks belong to individual planes — after projection they no
+            # longer correspond to any image, and leaving them behind creates
+            # orphan files that rebuild into mask-only rows. Delete them only
+            # once the group ACTUALLY projected something: a quarantine-
+            # reduced group whose channels all fall below 2 planes keeps its
+            # planes intact (image + mask) as ordinary rows.
+            if delete_original and projected_any:
+                for _ri, grow in group_df.iterrows():
+                    for mask_col in ds.mask_colnames:
+                        mpath = grow[mask_col]
+                        if pd.isna(mpath):
+                            continue
+                        mpath = Path(mpath)
+                        try:
+                            if mpath.exists():
+                                mpath.unlink()
+                        except OSError:
+                            logger.exception(
+                                "Z-projection: failed to delete %s", mpath)
 
         sp.finish("Z-projection complete")
     return rebuild_dataset(ds)

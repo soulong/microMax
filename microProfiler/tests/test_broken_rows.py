@@ -116,3 +116,37 @@ def test_read_image_strict_raises_before_quarantine_handler(tmp_path):
     p.write_bytes(b"garbage")
     with pytest.raises(ImageReadError):
         read_image(p)
+
+
+def test_zproject_quarantine_uses_global_row_position(tmp_path):
+    """With MULTIPLE projection groups, a broken plane in a later group must
+    quarantine its OWN metadata row. The quarantine used to receive the
+    group-LOCAL enumerate position, deleting another group's files while the
+    broken file survived."""
+    for row, col in ((1, 1), (2, 2)):
+        for stack in (1, 2):
+            arr = np.full((32, 32), stack * 100, dtype=np.uint16)
+            imwrite(str(tmp_path / f"r{row:02d}c{col:02d}f01p0{stack}-ch1.tiff"), arr)
+    # Break the LAST row globally (index 3), which is position 1 WITHIN the
+    # second group.
+    _corrupt_file(tmp_path / "r02c02f01p02-ch1.tiff")
+
+    ds = ImageDataset(
+        root=tmp_path, image_pattern=IMAGE_PATTERN, channel_layout=None,
+    )
+    assert len(ds) == 4
+    out = z_project_dataset(ds, method="max", delete_original=True)
+
+    # The broken file itself is quarantined (previously it survived while
+    # site 1's files were deleted instead).
+    assert not (tmp_path / "r02c02f01p02-ch1.tiff").exists()
+    # Site 1 is untouched: its two planes are consumed by the projection.
+    assert not (tmp_path / "r01c01f01p01-ch1.tiff").exists()
+    assert not (tmp_path / "r01c01f01p02-ch1.tiff").exists()
+    projected = tmp_path / "r01c01f01p0-ch1.tiff"
+    assert projected.exists()
+    assert int(read_image(projected).max()) == 200
+    # Site 2 keeps its single surviving plane as a plain row (a one-plane
+    # group cannot be projected), so the rebuilt dataset has 2 rows.
+    assert (tmp_path / "r02c02f01p01-ch1.tiff").exists()
+    assert len(out) == 2

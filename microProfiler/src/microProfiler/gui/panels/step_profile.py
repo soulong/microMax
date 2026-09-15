@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSizePolicy,
+    QSpacerItem,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -469,6 +471,11 @@ class ImageProfileBlockWidget(QWidget):
         self._pending_settings: Optional[dict] = None
         self._image_ch_cbs: List[QCheckBox] = []
         self._threshold_spins: Dict[str, QDoubleSpinBox] = {}
+        # Expanding spacer absorbing the grid's surplus width so rows stay
+        # packed left (QGridLayout ignores stretch on empty columns); moved
+        # by _set_grid_gutter on every empty/populated rebuild. None = no
+        # spacer placed yet.
+        self._grid_gutter = None
         self._build_ui()
 
     def _build_ui(self):
@@ -488,10 +495,14 @@ class ImageProfileBlockWidget(QWidget):
         self._image_grid_layout.addWidget(self._threshold_label, 1, 0)
         self._image_ch_placeholder = QLabel("Load a dataset to configure")
         self._image_ch_placeholder.setProperty("class", "placeholder")
-        self._image_grid_layout.addWidget(self._image_ch_placeholder, 0, 1, 1, -1)
+        self._image_grid_layout.addWidget(self._image_ch_placeholder, 0, 1)
         self._threshold_placeholder = QLabel("Load a dataset to configure")
         self._threshold_placeholder.setProperty("class", "placeholder")
-        self._image_grid_layout.addWidget(self._threshold_placeholder, 1, 1, 1, -1)
+        self._image_grid_layout.addWidget(self._threshold_placeholder, 1, 1)
+        # Surplus width goes to a trailing gutter column so the hints sit
+        # right after their labels; without it Qt splits the surplus across
+        # the columns and pushes the hints toward the middle of the card.
+        self._set_grid_gutter(2)
         layout.addWidget(self._image_grid)
         if self._channels:
             self.populate_channels(self._channels)
@@ -518,6 +529,21 @@ class ImageProfileBlockWidget(QWidget):
             self._image_grid_layout.removeWidget(w)
             w.deleteLater()
         self._threshold_spins.clear()
+
+    def _set_grid_gutter(self, col):
+        """Move the grid's expanding spacer to column `col`.
+
+        The spacer absorbs all surplus card width so the content columns
+        keep their natural size (the Object Profiling rows' trailing-stretch
+        look). The previous spacer is removed first, or the empty/populated
+        transition would leave a stale gutter widening the wrong column.
+        """
+        if self._grid_gutter is not None:
+            self._image_grid_layout.removeItem(self._grid_gutter)
+            self._grid_gutter = None
+        if col >= 0:
+            self._grid_gutter = QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum)
+            self._image_grid_layout.addItem(self._grid_gutter, 0, col)
 
     def _re_add_placeholder(self, placeholder_attr, layout, row=0, col=0, rowspan=1, colspan=1):
         placeholder = QLabel("Load a dataset to configure")
@@ -559,8 +585,9 @@ class ImageProfileBlockWidget(QWidget):
         self._clear_thresholds()
 
         if not channels:
-            self._re_add_placeholder("_image_ch_placeholder", self._image_grid_layout, 0, 1, 1, -1)
-            self._re_add_placeholder("_threshold_placeholder", self._image_grid_layout, 1, 1, 1, -1)
+            self._re_add_placeholder("_image_ch_placeholder", self._image_grid_layout, 0, 1, 1, 1)
+            self._re_add_placeholder("_threshold_placeholder", self._image_grid_layout, 1, 1, 1, 1)
+            self._set_grid_gutter(2)
         else:
             if pending is not None:
                 saved_channels = {c for c in pending.get("image_channels") or []}
@@ -597,7 +624,7 @@ class ImageProfileBlockWidget(QWidget):
                 self._image_grid_layout.addWidget(th_widget, 1, col)
                 self._threshold_spins[ch] = th_widget
 
-            self._image_grid_layout.setColumnStretch(len(channels) + 1, 1)
+            self._set_grid_gutter(len(channels) + 1)
 
         if hasattr(self, "_pending_settings"):
             del self._pending_settings
@@ -636,6 +663,9 @@ class ImageProfilingStepPanel(BlockContainerPanel):
 
     step_name = "image_profile"
     _block_widget_class = ImageProfileBlockWidget
+    # The main window never calls populate_masks on this panel — channel
+    # population alone must end the deferred restore (see _uses_masks).
+    _uses_masks = False
 
     def __init__(self, state, parent=None):
         super().__init__(state, parent)
@@ -695,6 +725,17 @@ class ImageProfilingStepPanel(BlockContainerPanel):
             self._n_workers_value = int(section["n_workers"])
         if self._blocks:
             self._blocks[0].load_config_section(section)
+
+    def clear_pending_settings(self) -> None:
+        """Drop every block's stashed session settings.
+
+        Browsing a new directory must not let the PREVIOUS dataset's pending
+        channel selections/thresholds leak into the next load (the block
+        consumes _pending_settings on its next populate_channels).
+        """
+        for block in self._blocks:
+            if hasattr(block, "_pending_settings"):
+                del block._pending_settings
 
 
 class ObjectProfilingStepPanel(BlockContainerPanel):
@@ -798,9 +839,14 @@ class ObjectProfilingStepPanel(BlockContainerPanel):
             idx = block._parent_mask.findText(str(parent_name))
             if idx >= 0:
                 block._parent_mask.setCurrentIndex(idx)
-        table_name = cfg.get("output_table_name", "")
-        if table_name:
-            block._output_table.setText(str(table_name))
+        # Pin the output table ONLY for a genuine custom name: the GUI always
+        # writes output_table_name (mask-derived fallback == mask_name), so
+        # pinning on every restore would stop the field from following the
+        # Mask combo (_sync_output_table) after any session restore.
+        mask_name = str(cfg.get("mask_name") or "")
+        table_name = str(cfg.get("output_table_name") or "")
+        if table_name and table_name != mask_name:
+            block._output_table.setText(table_name)
             block._table_synced = False
         if hasattr(block, "_overwrite_db"):
             block._overwrite_db.setChecked(bool(cfg.get("overwrite_db", False)))

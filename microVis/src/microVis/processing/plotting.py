@@ -637,40 +637,65 @@ def make_line(
 
     for ax, (label, sub) in zip(axes, groups):
         grouped = _group_series(sub, "__y__", keys)
-        labels = [_group_label(k) for k, _ in grouped]
-        means = [vals.mean() for _, vals in grouped]
-        sems = [vals.std(ddof=1) / math.sqrt(len(vals)) if len(vals) > 1 else 0.0
-                for _, vals in grouped]
-        if not means:
+        if not grouped:
             ax.set_visible(False)
             continue
-        positions = np.arange(len(means))
-        group_colors = []
-        for k, _ in grouped:
-            if color_map is not None and keys and keys[-1] == color:
-                group_colors.append(color_map.get(k[-1], SINGLE_COLOR))
-            else:
-                group_colors.append(SINGLE_COLOR)
         # Raw observations as dots behind the mean line (light jitter only
         # spreads identical values; the node x stays the group position).
         rng = np.random.default_rng(0)
-        for i, ((_, vals), c) in enumerate(zip(grouped, group_colors)):
-            jitter = rng.normal(0, 0.04, len(vals))
-            ax.scatter(np.full(len(vals), i) + jitter,
-                       vals.to_numpy(dtype=float), s=4, alpha=0.3, color=c,
-                       edgecolors="none", zorder=2)
-        for i in range(len(grouped) - 1):
-            # Connect consecutive nodes; when a categorical color splits the
-            # data, each color group is its OWN line (no cross-group links).
-            if split_color and grouped[i][0][-1] != grouped[i + 1][0][-1]:
-                continue
-            ax.plot(positions[i:i + 2], means[i:i + 2],
-                    color="#555555", linewidth=1.2, zorder=3)
-        ax.errorbar(positions, means, yerr=sems, fmt="o", markersize=5,
-                    capsize=3, color="#333333", ecolor="#333333",
-                    markerfacecolor="#333333", zorder=4)
-        ax.set_xticks(positions)
-        ax.set_xticklabels(labels, fontsize=7, rotation=30, ha="right")
+
+        def _mean_sem(vals):
+            m = vals.mean()
+            e = vals.std(ddof=1) / math.sqrt(len(vals)) if len(vals) > 1 else 0.0
+            return m, e
+
+        if split_color:
+            # One connected line per color group over the shared x levels.
+            # _group_series natsorts by (x, color), so consecutive grouped
+            # entries usually SWITCH color — connecting neighbors would link
+            # different colors into one polyline. Regroup by color instead;
+            # within one color the nodes are already in x order.
+            x_levels = list(dict.fromkeys(k[0] for k, _ in grouped))
+            pos_of = {v: i for i, v in enumerate(x_levels)}
+            color_vals = list(dict.fromkeys(k[1] for k, _ in grouped))
+            for cval in color_vals:
+                c = color_map.get(cval, SINGLE_COLOR)
+                pts = [(pos_of[k[0]], vals)
+                       for k, vals in grouped if k[1] == cval]
+                xs = [p for p, _ in pts]
+                stats = [_mean_sem(vals) for _, vals in pts]
+                ms = [m for m, _ in stats]
+                es = [e for _, e in stats]
+                for p, vals in pts:
+                    jitter = rng.normal(0, 0.04, len(vals))
+                    ax.scatter(np.full(len(vals), p) + jitter,
+                               vals.to_numpy(dtype=float), s=4, alpha=0.3,
+                               color=c, edgecolors="none", zorder=2)
+                if len(xs) > 1:
+                    ax.plot(xs, ms, color=c, linewidth=1.2, zorder=3)
+                ax.errorbar(xs, ms, yerr=es, fmt="o", markersize=5,
+                            capsize=3, color=c, ecolor=c, zorder=4)
+            ax.set_xticks(range(len(x_levels)))
+            ax.set_xticklabels([str(v) for v in x_levels], fontsize=7,
+                               rotation=30, ha="right")
+        else:
+            labels = [_group_label(k) for k, _ in grouped]
+            means = [vals.mean() for _, vals in grouped]
+            sems = [_mean_sem(vals)[1] for _, vals in grouped]
+            positions = np.arange(len(means))
+            for i, (_, vals) in enumerate(grouped):
+                jitter = rng.normal(0, 0.04, len(vals))
+                ax.scatter(np.full(len(vals), i) + jitter,
+                           vals.to_numpy(dtype=float), s=4, alpha=0.3,
+                           color=SINGLE_COLOR, edgecolors="none", zorder=2)
+            if len(positions) > 1:
+                ax.plot(positions, means, color="#555555", linewidth=1.2,
+                        zorder=3)
+            ax.errorbar(positions, means, yerr=sems, fmt="o", markersize=5,
+                        capsize=3, color="#333333", ecolor="#333333",
+                        zorder=4)
+            ax.set_xticks(positions)
+            ax.set_xticklabels(labels, fontsize=7, rotation=30, ha="right")
         ax.set_ylabel(y, fontsize=8)
         if yticks is not None:
             ax.set_yticks(range(len(yticks)))

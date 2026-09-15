@@ -95,14 +95,11 @@ class PipelineWorker(QObject):
             self.finished.emit()
         except InterruptedError:
             self.finished.emit()
-        except SystemExit as e:
-            # microBase raises MicroMaxError on bad dataset state (SystemExit is caught defensively)
+        except Exception as e:
+            # microBase raises MicroMaxError subclasses on bad dataset state
             # (missing image files, invalid filter column). Without this the
             # error signal never fires and the UI stays stuck with
             # set_running(True) — the modal dialog / wait cursor never clears.
-            logger.error("Pipeline failed: %s", e)
-            self.error.emit(str(e) or "Pipeline failed")
-        except Exception as e:
             logger.error("Pipeline error: %s\n%s", e, traceback.format_exc())
             self.error.emit(str(e))
         finally:

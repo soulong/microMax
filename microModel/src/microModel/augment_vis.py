@@ -49,7 +49,7 @@ def run_augment_vis(config):
     num_samples = vis_cfg.get("num_samples", 1)
     num_views = vis_cfg.get("num_views", 8)
 
-    root = data_cfg["root"]
+    root = data_cfg["file_dir"]
     if isinstance(root, list):
         root = root[0]
 

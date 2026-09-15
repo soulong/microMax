@@ -97,7 +97,7 @@ class SegmentEntry:
     flow_threshold: float = 0.4        # cellpose flow-error threshold
     cellprob_threshold: float = 0.0    # cellpose cell-probability threshold
     edge_pixel_ratio: float = 0.4      # drop masks whose edge-pixel/perimeter ratio exceeds this ([0, 1]; 1 = off)
-    gpu_batch_size: int = 32           # images per GPU batch (<= 1 = no batching)
+    gpu_batch_size: int = 32           # images per GPU batch (1 = no batching)
     overwrite_mask: bool = False       # re-segment when a mask file already exists
 
 
@@ -313,8 +313,23 @@ def load_config(
     return _dict_to_config(config_dict)
 
 
+# Top-level keys _dict_to_config accepts: the pipeline sections plus the
+# dataset/pattern keys and the filter list.
+_VALID_TOP_LEVEL_KEYS = frozenset(SECTION_ATTRS) | {
+    "image_pattern", "mask_pattern", "image_subdir_pattern", "filter",
+}
+
+
 def _dict_to_config(d: Dict) -> PipelineConfig:
     """Build PipelineConfig from a plain dict with manual validation."""
+    unknown = set(d) - _VALID_TOP_LEVEL_KEYS
+    if unknown:
+        # Same strictness as the per-section key checks: a typo'd top-level
+        # section (e.g. `zproejct:`) must never be silently dropped — the
+        # step would just never run and nothing would hint at it.
+        raise ValueError(
+            f"Unknown top-level config keys: {sorted(unknown)}. "
+            f"Valid keys: {sorted(_VALID_TOP_LEVEL_KEYS)}")
     cfg = PipelineConfig()
     cfg.image_pattern = d.get("image_pattern")
     cfg.mask_pattern = d.get("mask_pattern")
@@ -516,6 +531,10 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
             )
             if red_obj is not None and isinstance(red_obj.reducer, str):
                 red_obj.reducer = [red_obj.reducer]
+            # Same scalar convenience for the method list (a hand-written
+            # `method: pca` must not later explode into ['p','c','a']).
+            if red_obj is not None and isinstance(red_obj.method, str):
+                red_obj.method = [red_obj.method]
             if red_obj is not None and red_obj.method:
                 # Reject typos here (not silently filter downstream), so a
                 # bad method can never make the completeness check pass
@@ -562,11 +581,34 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
     raise ValueError(f"Unknown config section: {attr!r}")
 
 
+# (dataclass -> field names) whose empty list is MEANINGFUL rather than
+# "unset": the reduction `method: []` explicitly fits nothing, while null
+# keeps the legacy default ([pca, umap]). Every other list field treats []
+# like null — e.g. zproject.method is a scalar enum, so a [] there is a
+# typo and must normalize to None (the GUI never writes it).
+_KEEP_EMPTY_LISTS = {InferenceReductionConfig: frozenset({"method"})}
+
+
+def _normalize_empty_lists(cls, section: Dict) -> Dict:
+    """Copy a section dict, DROPPING empty lists so the dataclass default
+    applies — except for this dataclass's fields in _KEEP_EMPTY_LISTS, where
+    [] survives verbatim. Dropping (not mapping to None) matters for
+    scalar-default fields like zproject.method: a hand-written
+    `method: []` there falls back to the declared projection instead of
+    leaking a list into runtime."""
+    keep = _KEEP_EMPTY_LISTS.get(cls, frozenset())
+    return {
+        k: v for k, v in section.items()
+        if not (isinstance(v, list) and not v and k not in keep)
+    }
+
+
 def _dataclass_from_section(attr: str, cls, section: Dict):
     """Instantiate a dataclass from a section dict, rejecting unknown keys.
 
-    Strict config typing: empty lists normalize to None (``[] in yml -> None``)
-    and a ``run`` flag must be a real bool.
+    Strict config typing: empty lists are dropped (``[] in yml -> default``)
+    except for the dataclass's _KEEP_EMPTY_LISTS fields, and a ``run`` flag
+    must be a real bool.
     """
     known = set(cls.__dataclass_fields__)
     unknown = set(section) - known
@@ -575,10 +617,7 @@ def _dataclass_from_section(attr: str, cls, section: Dict):
             f"Unknown keys in '{attr}' section: {sorted(unknown)}. "
             f"Valid keys: {sorted(known)}"
         )
-    coerced = {
-        k: (None if isinstance(v, list) and not v else v)
-        for k, v in section.items()
-    }
+    coerced = _normalize_empty_lists(cls, section)
     coerced = _coerce_bool_fields(attr, cls, coerced)
     if "run" in coerced:
         coerced["run"] = _coerce_bool(coerced["run"], f"{attr}.run")
@@ -588,8 +627,9 @@ def _dataclass_from_section(attr: str, cls, section: Dict):
 def _entry_from_section(attr: str, cls, entry: Dict):
     """Instantiate a block-list entry dataclass, rejecting unknown keys.
 
-    Empty lists normalize to None (``[] in yml -> None``), so optional
-    channel lists are either a real list or None — never a stale [].
+    Empty lists are dropped (``[] in yml -> default``) except for the
+    dataclass's _KEEP_EMPTY_LISTS fields, so optional channel lists are
+    either a real list or None — never a stale [].
     """
     known = set(cls.__dataclass_fields__)
     unknown = set(entry) - known
@@ -598,10 +638,7 @@ def _entry_from_section(attr: str, cls, entry: Dict):
             f"Unknown keys in '{attr}.configs' entry: {sorted(unknown)}. "
             f"Valid keys: {sorted(known)}"
         )
-    coerced = {
-        k: (None if isinstance(v, list) and not v else v)
-        for k, v in entry.items()
-    }
+    coerced = _normalize_empty_lists(cls, entry)
     return cls(**_coerce_bool_fields(f"{attr}.configs", cls, coerced))
 
 

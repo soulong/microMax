@@ -17,12 +17,13 @@ ported 1:1 from facebookresearch/dinov3 (which is built around a custom ViT
   - KoLeo loss on the student's pre-head CLS tokens of the global views.
   - Gram anchoring (optional): a regularization that pushes the Gram matrix
     of the student's patch features toward that of a frozen "gram teacher" —
-    either the EMA teacher (gram.ema_teacher) or a separate frozen backbone
-    initialized from an earlier checkpoint (gram.ckpt). Ported GramLoss with
-    normalize / remove_neg / tokens_used / img_level options; supports higher
-    resolution gram-teacher crops (gram.crops_size) with spatial resampling
-    of the teacher features to the student patch grid. With gram.rep_update
-    the gram teacher is periodically refreshed from the EMA teacher.
+    a separate backbone initialized from the resume checkpoint (the phase-1
+    model); gram.ema_teacher switches to the EMA-teacher branch. Ported
+    GramLoss with normalize / remove_neg / tokens_used / img_level options;
+    supports higher resolution gram-teacher crops (gram.crops_size) with
+    spatial resampling of the teacher features to the student patch grid.
+    With gram.rep_update the gram teacher is periodically refreshed from the
+    EMA teacher.
 
 Backbone masking (iBOT): DINOv3 block masks (random rectangular blocks,
 same generator as the official MaskingGenerator) with the linear mask-ratio
@@ -52,7 +53,6 @@ import torch
 from torch import nn
 from torch.nn import Module
 import torch.nn.functional as F
-from torch.nn.init import trunc_normal_
 
 from lightly.models.modules import MaskedVisionTransformerTIMM
 from lightly.utils.scheduler import cosine_schedule, linear_warmup_schedule
@@ -342,15 +342,19 @@ class iBOTPatchLoss(nn.Module):
         return torch.sum(t.float() * F.log_softmax(s.float() / temp, dim=-1), dim=-1)
 
     def forward_masked(self, student_patch_tokens_masked, teacher_patch_tokens_masked,
-                       masks_weight):
+                       masks_weight, n_views):
         """Masked-patch CE (teacher probs precomputed via sinkhorn_knopp_teacher).
 
         student/teacher: (n_masked, K); masks_weight: (n_masked,) from _make_masks.
+        n_views: row count of the global mask tensor — the official loss
+        normalizes by the number of mask VIEWS, not the total masked-patch
+        count (with per-view-normalized weights the latter would shrink the
+        loss by ~masked-patches-per-view).
         """
         t = teacher_patch_tokens_masked
         s = student_patch_tokens_masked
         loss = self.lossfunc(t, s, self.student_temp) * masks_weight
-        return -loss.sum() / t.shape[0]
+        return -loss.sum() / n_views
 
 
 class KoLeoLoss(nn.Module):
@@ -448,15 +452,6 @@ class DINOv3Head(nn.Module):
         self.last_layer = nn.Linear(bottleneck_dim, out_dim, bias=False)
         self.bottleneck_dim = bottleneck_dim
 
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-
-    def init_weights(self):
-        self.apply(self._init_weights)
-
     def forward(self, x):
         x = self.mlp(x)
         eps = 1e-6 if x.dtype == torch.float16 else 1e-12
@@ -482,9 +477,9 @@ class DINOv3(nn.Module):
     plus an optional frozen gram-teacher backbone for the Gram anchoring loss.
 
     Teacher is frozen (momentum-updated). Student receives patch masking on
-    global views. Gram teacher is either the EMA teacher (gram.ema_teacher)
-    or a separate frozen backbone initialized from an earlier bundle
-    (gram.ckpt) and optionally refreshed from the EMA teacher.
+    global views. Gram teacher is a separate frozen backbone initialized from
+    the resume checkpoint (the phase-1 model; gram.ema_teacher switches to
+    the EMA-teacher branch), optionally refreshed from the EMA teacher.
     """
 
     def __init__(self, vit_name="vit_small_patch16_224",
@@ -554,6 +549,9 @@ class DINOv3(nn.Module):
         self.gram_backbone = None
         self._gram_teacher_initialized = False
         self._num_gram_updates = 0
+        # Local time-axis origin of the refresh schedule (see set_gram_origin):
+        # the global_step this anchoring run started at.
+        self._gram_step_origin = 0
         self._n_gram_views = 0
         if self.gram_use_loss:
             gram_ema_teacher = bool(gram_cfg.get("ema_teacher", False))
@@ -563,25 +561,14 @@ class DINOv3(nn.Module):
             self._gram_it_first_update = int(gram_cfg.get("it_first_update", 0))
             self._gram_max_updates = gram_cfg.get("max_updates")
             self._gram_it_load_ema_teacher = int(gram_cfg.get("it_load_ema_teacher", -1))
-            self._gram_ckpt = gram_cfg.get("ckpt")
-            if self._gram_ckpt == "ignore":
-                self._gram_ckpt = None
             self._gram_teacher_resize_method = gram_cfg.get(
                 "global_teacher_resize_method", "bicubic")
             self._gram_teacher_resize_antialias = bool(
                 gram_cfg.get("global_teacher_resize_antialias", False))
             gram_crops_size = gram_cfg.get("crops_size")
 
-            if gram_ema_teacher and self._gram_ckpt is not None:
-                raise ValueError(
-                    "dinov3.gram: ema_teacher and ckpt are mutually exclusive; "
-                    "set one of them.")
-            if self._gram_ckpt is None and self._gram_it_load_ema_teacher < 0:
-                raise ValueError(
-                    "dinov3.gram: no gram.ckpt provided, so gram.it_load_ema_teacher "
-                    "must be set to a non-negative iteration.")
             if gram_ema_teacher and self._gram_rep_update:
-                raise ValueError("dinov3.gram: rep_update requires a ckpt-based "
+                raise ValueError("dinov3.gram: rep_update requires a separate "
                                  "gram teacher (ema_teacher must be false).")
             if self._gram_tokens_used not in ("all", "masked", "unmasked"):
                 raise ValueError("dinov3.gram.tokens_used must be one of "
@@ -593,7 +580,7 @@ class DINOv3(nn.Module):
             if not gram_ema_teacher:
                 if gram_crops_size is None:
                     raise ValueError(
-                        "dinov3.gram.crops_size must be set when using a ckpt-based "
+                        "dinov3.gram.crops_size must be set when using a separate "
                         "gram teacher (the augmentation_views list must end with "
                         "2 high-res gram-teacher crop views).")
                 # Frozen gram teacher backbone (same architecture + wrapper type as
@@ -604,11 +591,11 @@ class DINOv3(nn.Module):
                 self._n_gram_views = 2
             else:
                 self._n_gram_views = 0
-            logger.info("GRAM enabled: ema_teacher=%s, ckpt=%s, "
+            logger.info("GRAM enabled: ema_teacher=%s, "
                         "it_load_ema_teacher=%d, rep_update=%s (freq=%d, "
                         "first=%d, max=%s), tokens_used=%s, img_level=%s, "
                         "weight=%s, crops_size=%s",
-                        gram_ema_teacher, self._gram_ckpt,
+                        gram_ema_teacher,
                         self._gram_it_load_ema_teacher, self._gram_rep_update,
                         self._gram_update_frequency, self._gram_it_first_update,
                         self._gram_max_updates, self._gram_tokens_used,
@@ -625,7 +612,7 @@ class DINOv3(nn.Module):
         if not self.gram_use_loss or self.gram_backbone is None:
             return
         if not path or not os.path.exists(path):
-            raise MicroMaxError(f"Error: dinov3.gram.ckpt not found: {path}")
+            raise MicroMaxError(f"Error: gram anchor checkpoint not found: {path}")
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         sd = ckpt.get("state_dict")
         if not sd:
@@ -675,34 +662,35 @@ class DINOv3(nn.Module):
         """Drive the gram-teacher lifecycle at the given global step."""
         if not self.gram_use_loss or self.gram_backbone is None:
             return
-        if self._gram_it_load_ema_teacher >= 0 and global_step == self._gram_it_load_ema_teacher:
+        # The refresh schedule runs on the LOCAL time axis of the anchoring
+        # phase: local = batches since this run started (see set_gram_origin).
+        local = global_step - self._gram_step_origin
+        if (self._gram_it_load_ema_teacher >= 0
+                and local == self._gram_it_load_ema_teacher):
             self.gram_load_ema_teacher()
         if (self._gram_rep_update
-                and global_step + 1 >= self._gram_it_first_update
-                and (global_step + 1) % self._gram_update_frequency == 0
+                and local + 1 >= self._gram_it_first_update
+                and (local + 1) % self._gram_update_frequency == 0
                 and (self._gram_max_updates is None
                      or self._num_gram_updates < self._gram_max_updates)):
             self.update_gram(m=0.0)
             self._num_gram_updates += 1
 
-    def set_gram_resume_updates(self, start_iter):
-        """Restore the number of gram updates already done when resuming.
+    def set_gram_origin(self, start_step, count=0):
+        """Anchor the refresh schedule to THIS run's start (local time axis).
 
-        maybe_update_gram fires when (global_step + 1) is a positive multiple
-        of the update frequency and >= the first-update step. After completing
-        steps 0..start_iter-1 that is exactly the multiples m of frequency
-        with m >= first and m <= start_iter (floor accounting, not ceil).
+        update_frequency / it_first_update / it_load_ema_teacher / max_updates
+        all count batches of the anchoring phase itself — the resumed-from
+        checkpoint's absolute step history is irrelevant (a phase-1 without
+        gram must not pre-exhaust the max_updates budget). Call once at run
+        start; the origin and the true refresh count are persisted in the
+        bundle meta so an interrupted anchoring run resumes its schedule
+        instead of resetting it (see pretrain._resolve_gram_refresh_state).
         """
         if not self.gram_use_loss or self.gram_backbone is None:
             return
-        if start_iter > 0 and start_iter >= self._gram_it_first_update:
-            freq = self._gram_update_frequency
-            # First trigger point: the smallest POSITIVE multiple of freq that
-            # is >= first (step counting starts at global_step=0, so m=0 is
-            # never a trigger).
-            m0 = max(freq, -(-self._gram_it_first_update // freq) * freq)
-            if start_iter >= m0:
-                self._num_gram_updates = (start_iter - m0) // freq + 1
+        self._gram_step_origin = int(start_step)
+        self._num_gram_updates = int(count)
 
     def forward_teacher(self, x):
         """Teacher forward (unmasked). Returns (cls_tokens, features)."""
@@ -926,7 +914,7 @@ def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
     if n_masked > 0:
         ibot = ibot_criterion.forward_masked(
             student_global_masked_out, teacher_masked_centered,
-            masks_weight=masks_weight)
+            masks_weight=masks_weight, n_views=mask_full.shape[0])
     else:
         ibot = torch.zeros((), device=device)
 
@@ -967,12 +955,16 @@ def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
                           mask_full[:, n_prefix:])
         else:
             _diag_gram = None
+        # masked/unmasked select PATCH tokens only — slice the prefix (CLS)
+        # columns off the mask first, exactly like the _diag_gram path above
+        # (mask_full spans prefix + patches, the patch tensors do not).
+        patch_mask = mask_full[:, n_prefix:]
         if model._gram_tokens_used == "masked":
-            student_patches = student_patches[mask_full]
-            teacher_patches = teacher_patches[mask_full]
+            student_patches = student_patches[patch_mask]
+            teacher_patches = teacher_patches[patch_mask]
         elif model._gram_tokens_used == "unmasked":
-            student_patches = student_patches[~mask_full]
-            teacher_patches = teacher_patches[~mask_full]
+            student_patches = student_patches[~patch_mask]
+            teacher_patches = teacher_patches[~patch_mask]
         gram_loss = gram_criterion(student_patches, teacher_patches,
                                    img_level=model._gram_img_level)
         if model._gram_loss_weight_schedule:
@@ -1062,9 +1054,6 @@ def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
         _update_momentum_with_buffers(model.student_backbone, model.teacher_backbone, m=momentum)
         _update_momentum_with_buffers(model.student_head, model.teacher_head, m=momentum)
 
-        # Gram-teacher lifecycle (it_load_ema_teacher / rep_update).
-        model.maybe_update_gram(global_step)
-
         if model._monitoring_enabled and model._last_diag is not None:
             model._last_diag.update({
                 "lr": float(lr),
@@ -1081,6 +1070,16 @@ def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
             loss.backward()
             if freeze:
                 _zero_last_layer_grads(model)
+
+    # Gram-teacher lifecycle (it_load_ema_teacher / rep_update). global_step
+    # counts every batch (the same unit all schedules and the CSV step column
+    # use), so the lifecycle must be evaluated every batch: restricting it to
+    # optimizer steps makes an exact-multiple trigger miss every multiple that
+    # does not coincide with an accumulation boundary (grad_accum_steps=8
+    # would skip 7/8 of the refreshes). The EMA teacher copied at a refresh is
+    # the one as of the last optimizer step, so refreshing between accumulation
+    # steps is well-defined.
+    model.maybe_update_gram(global_step)
 
     components = {"dino": dino_global.item(), "ibot": ibot.item(),
                   "koleo": koleo.item()}

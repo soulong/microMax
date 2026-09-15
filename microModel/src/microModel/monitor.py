@@ -147,6 +147,32 @@ def head_collapse_metrics(diag, student_temp=0.1):
     return out
 
 
+def content_dependence_index(patch_feats, anchor=None):
+    """Mean pairwise Pearson correlation between anchor-similarity maps of
+    DIFFERENT images (dense-feature homogenization gauge).
+
+    patch_feats: (N, P, D) patch features WITHOUT prefix tokens; anchor: flat
+    patch index, default = the grid centre. ~1.0 = every image yields the
+    same similarity map (position-prior dominated, homogenized); low = the
+    maps track per-image content.
+    """
+    if patch_feats is None or len(patch_feats) < 2:
+        return None
+    Fn = patch_feats / np.maximum(
+        np.linalg.norm(patch_feats, axis=-1, keepdims=True), 1e-8)
+    if anchor is None:
+        anchor = Fn.shape[1] // 2
+    maps = np.einsum("npd,nd->np", Fn, Fn[:, anchor])      # (N, P)
+    # Drop the anchor column: its self-similarity is exactly 1 for every
+    # image and would otherwise be a shared spike inflating all correlations.
+    maps = np.delete(maps, anchor, axis=1)
+    maps = maps - maps.mean(axis=1, keepdims=True)
+    maps /= np.maximum(np.linalg.norm(maps, axis=1, keepdims=True), 1e-8)
+    corr = maps @ maps.T
+    iu = np.triu_indices(len(Fn), k=1)
+    return float(corr[iu].mean())
+
+
 @torch.no_grad()
 def gram_split_metrics(gram_criterion, student_patches, teacher_patches, mask_patch):
     """-> {gram_masked, gram_unmasked} floats (official compute_stats semantics).

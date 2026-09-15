@@ -3,6 +3,8 @@ expectations must match what the bridge actually asks microModel to write."""
 
 import sqlite3
 
+import pytest
+
 from microProfiler.cli import _is_dataset_complete
 from microProfiler.config import (
     InferenceConfig,
@@ -129,3 +131,54 @@ def test_missing_reduction_table_marks_incomplete(tmp_path):
 
     _make_infer_db(tmp_path / "infer.db", ["inference", "reduction_pacmap"])
     assert _is_dataset_complete(cfg, tmp_path) is True
+
+
+def test_config_yaml_preserves_empty_method_list():
+    """`method: []` in YAML must survive as [] (fit nothing). The section
+    coercion used to normalize it to None, silently re-enabling the pca+umap
+    default."""
+    from microProfiler.config import section_to_dataclass
+
+    section = {
+        "run": True,
+        "configs": [{
+            "model": "model.pt", "mask_name": "cell", "channels": ["ch1"],
+            "max_value": 65535.0,
+            "reduction": {"enabled": True, "method": []},
+        }],
+    }
+    cfg = section_to_dataclass("inference", section)
+    red = cfg.configs[0].reduction
+    assert red.method == []
+    assert expected_reduction_tables(cfg.configs[0]) == frozenset()
+
+
+def test_pure_preprocessing_config_is_never_complete(tmp_path):
+    """A config with no profiling/inference outputs has no notion of
+    'complete' — the dataset must always run (the applied_steps gate alone
+    protects the destructive steps)."""
+    from microProfiler.config import ResizeConfig, SegmentConfig, SegmentEntry
+
+    resize_only = PipelineConfig(resize=ResizeConfig(run=True, scale_factor=0.5))
+    assert _is_dataset_complete(resize_only, tmp_path) is False
+
+    segment_only = PipelineConfig(segment=SegmentConfig(
+        run=True, configs=[SegmentEntry(chan1=["ch1"], object_name="cell")]))
+    assert _is_dataset_complete(segment_only, tmp_path) is False
+
+
+def test_unknown_top_level_key_raises(tmp_path):
+    """A typo'd top-level section (`zproejct:`) must raise instead of being
+    silently dropped."""
+    import yaml
+
+    from microProfiler.config import load_config
+
+    cfg_file = tmp_path / "cfg.yml"
+    cfg_file.write_text(
+        "image_pattern: 'img_(?P<channel>\\d+)\\.tiff'\n"
+        "zproejct:\n"
+        "  run: true\n",
+        encoding="utf-8")
+    with pytest.raises(ValueError, match="Unknown top-level config keys"):
+        load_config(cfg_file)

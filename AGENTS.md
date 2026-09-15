@@ -127,8 +127,8 @@ Key concepts:
 
 * `db_contracts` is the single source of truth for the cross-package DB
   schema (inference/reduction/find_cluster tables, column prefixes, DR method
-  names, `directory` stored as absolute forward-slash paths) and for SQL
-  identifier quoting.
+  names, `directory` stored portable-first: CWD-relative when possible,
+  absolute fallback) and for SQL identifier quoting.
 
 * Library code never calls `sys.exit`: everything raises a `MicroMaxError`
   subclass and only the CLI/GUI boundaries decide how to report it.
@@ -227,9 +227,10 @@ The pipeline:
   in `~/.micromax` (user level — the next run defaults to them). Each
   finished block is then AUTO-MERGED with the
   profiler object table of the SAME mask (via microBase `db_merge`;
-  sources untouched) into `<dataset>/merge_<mask>.db`. Object tables are
-  bookkept in profiler.db's `_table_masks` (table -> mask) so the merges
-  group correctly even for custom `output_table_name`s.
+  sources untouched) into `<dataset>/merge_<mask>.db`. Merges match object
+  tables to masks by the table-name convention (the table must be named
+  after its mask, i.e. a custom `output_table_name` must equal the mask
+  name); written merge outputs carry a `mask` column instead.
 
 * Outputs: in-place processed TIFFs, `<stem>_cp_masks_<obj>.png` masks,
   `profiler.db` (image + per-object tables), `<dataset>/<output_db>`
@@ -368,7 +369,7 @@ Package layout (overview):
 
 * `cli/main.py` — argparse dispatch to the subcommands.
 
-* `pretrain.py` / `train.py` / `infer.py` / `deduplication.py` / `label.py` —
+* `pretrain.py` / `train.py` / `infer.py` / `deduplication.py` / `label/` —
   the five stage entries.
 
 * `backbone.py` — backbone builders (incl. DINOv3 ViT), loss, head,
@@ -386,8 +387,12 @@ Package layout (overview):
 * `reduction_vis.py` — Flask server for interactive point inspection (the
   `reduction-vis` command).
 
-* `label.py` — Flask server for interactive multi-label annotation (the
-  `label` command).
+* `label/` — subpackage for the interactive multi-label annotation web app
+  (the `label` command): `db.py` (single append-friendly SQLite project DB
+  + undo), `engines.py` (kNN / per-label ML suggesters + mislabel review),
+  `features.py` (cached classify-bundle extraction), `imaging.py`
+  (percentile PNG render + LRU), `server.py` (Flask APIs) and `ui.py`
+  (embedded single-page UI).
 
 * `augment_vis.py` — augmentation preview (the `augment-vis` command).
 
@@ -411,7 +416,11 @@ Design:
 * Preprocessing reuses microBase `augment`/`normalize`. Three dataset types:
   SSL multi-view (pretrain), single-cell (train), whole-image + mask (infer).
   Input image size is defined entirely by the augmentation steps — there is
-  no separate input-size parameter.
+  no separate input-size parameter. pretrain/train also accept
+  `data.file_list` (one or more CSVs with a `filepath` column, e.g.
+  deduplication's curated.csv) as the data source, taking precedence over
+  `data.file_dir`; train's labels then come from the CSV's `label` column only,
+  and relative paths resolve against the process CWD.
 
 * **Teacher-branch extraction:** all downstream feature consumers (infer,
   train transfer, pretrain UMAP check, attention diagnostics) extract the
@@ -430,8 +439,10 @@ Design:
   plots/reports. Two config profiles: `train_from_scratch.yml` (random or
   ImageNet init) and `train_from_pretrain.yml` (resume.ssl_model backbone
   transfer, `freeze_backbone: true` = head-only linear probe). Labels come
-  from `label_csv` (`[filepath, label]`, relative paths resolved against the
-  CSV's own directory). The loss follows the label form — no config key:
+  from the data itself, no config key: `data.file_list` mode takes each
+  CSV's own `label` column, `data.file_dir` mode takes each file's parent
+  folder name (a file directly in the root is unlabeled and dropped). The
+  loss follows the label form — no config key:
   plain single labels train FocalLoss, `;`-joined categories train
   multi-label BCELoss; `model.focal_gamma` is the focal exponent in BOTH
   losses (0 = plain CE / plain BCE). `model.label_smoothing` softens targets
@@ -445,7 +456,9 @@ Design:
   highest-probability class and its probability, and the full per-class
   vector is stored in fixed-order `prob_<class>` columns (single-label probs
   are a softmax distribution, multi-label independent per-class sigmoids).
-  Every row carries a `mask_name` column holding the BARE mask name (no
+  Every row carries a `ground_truth` column = the file's parent folder
+  name (the one label convention; a `data.label_csv` key no longer exists),
+  and a `mask_name` column holding the BARE mask name (no
   `mask_` prefix — that form is only the internal metadata column name):
   the segmented objects' mask in whole-image mode (config value, or the
   first available mask when null), and an optional config label for
@@ -458,36 +471,108 @@ Design:
   inference always uses the settings baked into the bundle at training time.
 
 * Deduplication (`deduplication.py`) prunes redundancy / picks diverse new data over
-  pre-cropped single-cell folders. Teacher-branch features (cached per folder,
+  pre-cropped single-cell folders or data.file_list CSVs (implicit roots =
+  the listed files' parent dirs; data.file_dir is ignored when file_list is
+  set; the CSV's label column is the per-cell label). Two config profiles:
+  `deduplication_prune.yml` (reference: null, sources compete) and
+  `deduplication_incremental.yml` (a previous selection_state.pkl seeds the
+  run; max_add caps the additions). Teacher-branch features (cached per folder,
   keyed by bundle + file list) are projected into a whitened-PCA +
   L2-normalized space (same convention as vis clustering) and selected by
   radius-coverage greedy: keep a cell only if it lies beyond a radius of the
-  already-kept set — sparse regions keep a floor, dense regions thin out.
+  already-kept set — sparse regions keep a floor, dense regions thin out
+  (`selection.adaptive` > 0 makes the radius density-adaptive per cell:
+  dense regions exclude with a smaller radius and keep more, sparse ones
+  with a larger radius and keep fewer).
   A previous `selection_state.pkl` seeds an incremental run, so new datasets
-  contribute only latent diversity. Outputs (manifest, curated/ hardlinks,
-  keep_label.csv, plot) never touch the source folders.
+  contribute only latent diversity. Optional group ratio control
+  (`selection.group_by`: cluster / label / source + `selection.target_ratio`)
+  power-compresses per-group keep quotas so the largest:smallest group ratio
+  lands near the target (e.g. 100:1 -> 10:1); clusters use kNN Leiden with an
+  automatic resolution sweep (coarsest partition within 95% of the best
+  modularity), quotas apply to the new candidates only in incremental runs,
+  and without target_ratio groups are reported only (manifest column,
+  per-group summary, plot colors). Outputs (manifest, curated.csv file list
+  (CWD-relative paths — the data.file_list input for pretrain/train),
+  curated/ hardlinks, keep_label.csv, plot) never touch the source folders.
 
-* Label (`label.py`) is an interactive multi-label labeling web app
-  over pre-cropped single-cell folders (a project-level single-label
-  mode makes positives mutually exclusive). An SSL or train bundle embeds all
-  cells (deduplication extraction + cache) into a whitened-PCA space where a
-  kNN suggest engine scores every label from the user's positive /
-  explicit-negative exemplars ("never labeled" is never a negative); a
-  classify bundle's per-class probabilities are a second suggestion source.
-  Queues: diverse cold-start (farthest-point), auto-label confirm,
-  per-label ranked, uncertain band, and a review queue whose leave-one-out
-  kNN consistency check ranks already-decided cells whose embedding
-  contradicts their label (suspected mislabels) for re-labeling. Cells are
-  displayed through the bundle's inference preprocessing (uniform square
-  model input, percentile normalization ignoring the zero background).
+* Label (the `label/` subpackage: `db.py` storage, `engines.py` suggesters,
+  `features.py` extraction, `imaging.py` render + cache, `server.py` Flask
+  APIs, `ui.py` embedded page) is an interactive multi-label labeling web
+  app over pre-cropped single-cell folders or data.file_list CSVs (filepath
+  column, e.g. deduplication's curated.csv — implicit roots are the listed
+  files' parent dirs, data.file_dir is ignored when file_list is set; the CSV's
+  label column is the preset). The UI is a GRID BATCH WORKTABLE:
+  every queue mode renders as one page of thumbnails (K = page size, pager
+  at the bottom), the user selects images and checks target labels, and
+  Apply + / Apply − (explicit negatives) / Remove write selected label(s)
+  to selected image(s) in ONE server action (single transaction, one
+  undoable op). Double-click a thumbnail for a zoomed overlay where labels
+  are toggled directly (chips or keys cycle undecided -> positive ->
+  explicit negative, ←/→ walk the queue, suspicious cells show the
+  contradicting evidence cell side by side).
+  Clicking a sidebar label browses its positives and makes it the only
+  checked target; the selection survives page flips so wrong cells can be
+  collected across pages and removed in one go; the sidebar's
+  selected-label box holds the auto-annotate actions and a progress bar
+  toward `auto_label.min_positives`.
+  An SSL or train bundle embeds all cells (deduplication extraction + cache)
+  into a whitened-PCA space where a kNN suggest engine scores every label
+  from the user's positive / explicit-negative exemplars ("never labeled"
+  is never a negative); a classify bundle's per-class probabilities are a
+  second suggestion source, and a per-label sklearn classifier
+  (`recommend.ml_model`, logistic regression / random forest refit lazily
+  after every write) a third — it engages only once a label has enough
+  explicit positives AND negatives and otherwise falls back to kNN.
+  Queues (four, matching the Collect -> Auto -> Manage workflow): Collect
+  (per-label ranked undecided cells: score descending by default with an
+  Uncertainty toggle for nearest-the-boundary-first active learning;
+  farthest-point spread while the label has no exemplars; a seeded Shuffle
+  reshuffles the queue when a page shows nothing like the target class),
+  Manage (ALL labeled cells — the union of
+  every label's positives — scoped to with / without the clicked label so
+  each class can be verified or completed without losing labels; ranked by
+  certainty — most uncertain first — or by the leave-one-out "suspicious"
+  consistency check that flags likely mislabels with their contradicting
+  neighbor as evidence), Unlabeled, All.
+  The pager takes a page number + Enter to jump; page flips keep the
+  selection. Auto-annotate (`auto_label` config): once a label holds >=
+  min_positives positives (default 20) every positive write runs the auto
+  pass — every undecided cell scoring >= threshold (default 0.9, model
+  probability or kNN score) becomes an AUTO positive for every eligible
+  label jointly, so threshold crossings can never be missed by batch jumps
+  (each label runs once per crossing, tracked by a `auto_fired_at` marker
+  that Remove-auto / Undo reset). Decisions carry a manual/auto `source`
+  (schema migration on open), auto-labeled cells show a blue A mark, and
+  "Remove auto" undoes a whole auto run without touching manual decisions.
+  Every user action (batch apply, single write, auto run, undo) is one
+  `op_id` in the append-only decision log, and Ctrl+Z /api/undo reverts
+  the newest op exactly (undo of the undo = redo). Cells render through
+  the bundle's inference preprocessing (uniform square model input,
+  percentile normalization ignoring the zero background) behind a small
+  render LRU; display-only contrast/gamma/size controls adjust the render.
   Labels support drag reordering and confirmed deletion; every write hits
   SQLite immediately, and re-running a save_dir resumes the project (a
-  changed model bundle logs a warning but keeps the human decisions).   `label_export.csv` (`;`-joined multi-labels) feeds train directly —
-  exportable at any time with only a subset annotated. State lives in an
-  append-friendly SQLite DB (`label.db` single-label mode, `label_multiple.db`
-  multi-label mode; label registry, current decisions, full decision log) so
-  re-annotating, adding labels or datasets never destroys prior work;
-  `label_export.csv` (`;`-joined multi-labels) feeds train directly.
+  changed model bundle logs a warning but keeps the human decisions).
+  Each mode exports its own train-ready CSV after every write
+  (`label_export.csv` multi / `label_export_single.csv` single; `;`-joined
+  multi-labels). State lives in TWO fully independent append-friendly
+  SQLite DBs — `label_multiple.db` (multi) and `label_single.db` (single),
+  switched by the top-bar Mode dropdown (Multi-label / Single-label) and
+  restored from the `label_mode.txt` pointer file. The two stores never
+  mix: separate label registries, decisions, undo history and exports;
+  single mode additionally enforces exclusivity (a new positive clears the
+  cell's other positives, keep-set semantics, one undoable op) and its
+  auto pass only annotates cells with no positive at all. Everything
+  decision-independent — the feature cache, the embedding space, the
+  suggest engines and the display pipeline — is built once and shared by
+  both modes (a switch re-registers cells into the other DB and
+  invalidates the score caches once; sub-second). Legacy projects migrate
+  on first startup: `annotations.db` -> `label_multiple.db`,
+  `annotations_single.db` -> `label_single.db`, and the v0.21 unified
+  `label.db` routes by the mode recorded in its meta (set aside as
+  `label.db.old` when the target name is taken) so re-annotating, adding
+  labels or datasets never destroys prior work.
 
 * Interactive surfaces are the two Flask viewers: reduction-vis
   (`http://127.0.0.1:5000`) for clicking through cells in the reduction
@@ -557,7 +642,9 @@ Control rules:
   names); the dataset row is `Dataset` + `Browse...` / `Load Dataset` /
   `Reset` (`Load Dataset` after `Browse...`, `Reset` right-aligned, the path
   box taking 2/3 of the free width). Reset/remove/clear actions sit
-  right-aligned with a gap from the controls before them.
+  right-aligned with a gap from the controls before them — the one
+  deliberate exception is microProfiler's Filter-panel `Clear Filter`,
+  which sits left-aligned directly after `+ Add Filter`.
 * All data-entry spin boxes hide their up/down arrows (one QSS rule in the
   shared file); users type the values directly.
 * Geometry tokens live in each package's `ui_spec.py`; the stylesheet owns

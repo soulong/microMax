@@ -1,4 +1,7 @@
-"""Diversity-preserving curation of pre-cropped single-cell folders.
+"""Diversity-preserving curation of pre-cropped single-cell folders or
+data.file_list CSVs (implicit roots = the listed files' parent dirs;
+data.file_dir is ignored when file_list is set; the CSVs' label column is the
+per-cell label).
 
 `micromodel deduplication` embeds every cell with an SSL pretrain bundle's teacher
 backbone (the same extraction path as infer) and selects a subset that
@@ -12,7 +15,8 @@ preserves latent-space coverage while removing excess redundancy:
     for Leiden clustering in vis (rows L2-normalized, so distances are in
     [0, 2]).
 
-One rule serves both use cases:
+Two config profiles serve the two use cases (deduplication_prune.yml /
+deduplication_incremental.yml):
   - prune:    reference = null, sources = the full pool -> r thins it. The
               radius is either given directly or searched (bisection) to hit
               selection.target_keep.
@@ -21,6 +25,24 @@ One rule serves both use cases:
               new latent territory (beyond r of the seeds) enter the pool;
               selection.max_add caps the additions.
 
+Optional density-adaptive radius (selection.adaptive > 0):
+  one global radius treats dense and sparse regions alike, so the densest
+  clusters collapse onto a handful of representatives. With adaptive=p the
+  per-cell radius is radius * clip((kNN distance / median)^p, 0.5, 2.0) —
+  dense regions exclude with a SMALLER radius (near-duplicates survive too,
+  finer morphological detail) while sparse regions exclude with a LARGER
+  one (they were already covered by few anchors). p = 0 (default) keeps the
+  plain uniform radius.
+
+Optional group ratios (selection.group_by + selection.target_ratio):
+  group_by clusters (Leiden, auto resolution sweep — default), label, or
+  source partitions the candidates; target_ratio then compresses the
+  largest:smallest group ratio (e.g. 100:1 -> 10:1) via power-compressed
+  per-group quotas — each group runs its own radius search against the
+  shared kept set, so global coverage survives while extreme dominance is
+  damped. Without target_ratio the groups are reported only (manifest
+  column, per-group summary, plot colors).
+
 Outputs, all under output_dir (the source folders are never touched):
   selection_state.pkl  kept cells (features + paths) — the next run's reference
   manifest.csv         per-cell keep/drop decision, distance, label
@@ -28,8 +50,11 @@ Outputs, all under output_dir (the source folders are never touched):
                        usable as a pretrain data root; rebuilt each run;
                        <root> is the path relative to the prefix shared by
                        all roots (e.g. opencell_single_cell)
-  keep_label.csv       label_csv-format kept list for train (labels known only)
-  plot_umap.png        UMAP scatter of keep/drop/seeds (deterministic)
+  keep_label.csv       file_list-format kept list for train (labels known only)
+  metrics.png          one figure: UMAP keep/drop/seeds + cluster IDs at
+                       the cluster centroids + the dropped-vs-kept outcome
+                       view + a per-source view + run quality metrics +
+                       per-cluster keep/total stats (deterministic)
   features/            per-root feature cache keyed by bundle + file list
 """
 
@@ -43,12 +68,16 @@ import datetime
 import numpy as np
 import pandas as pd
 import torch
+import igraph as ig
+import leidenalg
 from sklearn.decomposition import PCA
+from sklearn.neighbors import kneighbors_graph
 from torch.utils.data import DataLoader
 
 from microBase import CellDataset, MicroMaxError
 
 from .utils import (logger, set_seed, select_device, load_label_csv,
+                    load_file_list,
                     save_reducer, load_reducer, validate_pca,
                     resolve_max_value, add_file_logging, copy_config_file,
                     atomic_npz_save, load_npz_cache)
@@ -60,12 +89,35 @@ from .infer import _forward_pass, _validate_channel_count, _resolve_gt
 STATE_NAME = "selection_state.pkl"
 MANIFEST_NAME = "manifest.csv"
 KEEP_LABEL_NAME = "keep_label.csv"
-PLOT_NAME = "plot_umap.png"
+CURATED_CSV_NAME = "curated.csv"
+PLOT_NAME = "metrics.png"
 CURATED_DIR = "curated"
 CACHE_DIR = "features"
 
 # Candidates are scored against the kept set in chunks of this many rows.
 CHUNK = 8192
+
+# Morphological grouping (selection.group_by: cluster) — Leiden over a kNN
+# graph built exactly like reduction.py's cluster step. The resolution
+# ladder is swept; standard (gamma=1) modularity is comparable across
+# resolutions, and among partitions scoring within CLUSTER_MOD_TOL of the
+# best the COARSEST one wins — splitting a homogeneous population buys
+# almost no modularity but would defeat the per-group quotas.
+CLUSTER_K = 15
+CLUSTER_RESOLUTIONS = (0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 3.0)
+
+# Density-adaptive radius (selection.adaptive): the per-cell radius is the
+# configured radius scaled by clip((kNN dist / median)^power, LO, HI). K
+# sets the density-estimate neighborhood; LO/HI bound how far the effective
+# radius may deviate from the configured one in either direction.
+ADAPTIVE_K = 10
+ADAPTIVE_MIN = 0.5
+ADAPTIVE_MAX = 2.0
+CLUSTER_MOD_TOL = 0.95
+
+# Quota floor: with target_ratio active every group keeps at least this many
+# cells (bounded by the group size), so no morphology is ever wiped out.
+MIN_GROUP_KEEP = 2
 
 # Rows are L2-normalized, so every distance lives in [0, 2]; a radius of 2.0
 # can only ever keep the unavoidable first point of an empty kept set.
@@ -86,17 +138,17 @@ def _error(msg):
 # ----------------------------------------------------------------------------
 
 def _parse_roots(data_cfg):
-    """Normalize data.root entries into per-root dicts.
+    """Normalize data.file_dir entries into per-root dicts.
 
     Each entry is either a plain path string (every setting from the global
     data.* defaults) or a dict with a 'path' plus any of the override keys
     (max_value, channels, ...). Paths are made absolute.
     """
-    roots = data_cfg["root"]
+    roots = data_cfg["file_dir"]
     if isinstance(roots, str):
         roots = [roots]
     if not isinstance(roots, list) or not roots:
-        _error("data.root must be a non-empty list of folders (strings or "
+        _error("data.file_dir must be a non-empty list of folders (strings or "
                "dicts with 'path' + overrides)")
     out = []
     for item in roots:
@@ -105,9 +157,9 @@ def _parse_roots(data_cfg):
         elif isinstance(item, dict):
             entry = dict(item)
             if "path" not in entry:
-                _error(f"data.root dict entry needs a 'path' key: {item}")
+                _error(f"data.file_dir dict entry needs a 'path' key: {item}")
         else:
-            _error(f"data.root entries must be strings or dicts, got: {item!r}")
+            _error(f"data.file_dir entries must be strings or dicts, got: {item!r}")
         for key in _ROOT_OVERRIDE_KEYS:
             if key not in entry:
                 entry[key] = data_cfg.get(key)
@@ -209,15 +261,21 @@ def _cache_path(output_dir, entry, bundle_id, rel_paths, sample_max, seed):
     return os.path.join(output_dir, CACHE_DIR, f"{name}_{digest}.npz")
 
 
-def _extract_root_features(entry, meta, model, device, pool_fn,
+def _extract_root_features(entry, meta, model, device,
                            output_dir, bundle_id, sample_max, seed,
-                           dl_cfg):
+                           dl_cfg, only=None):
     """Full cache-aware extraction for one root.
 
     Returns (abs_paths, raw_paths, feats): normcase absolute paths + their
     raw-case originals + float32 features, rows aligned (the raw case feeds
     the label_from_dir fallback, which must show the folder's real name).
     See module docstring for the cache layout.
+
+    only: optional iterable of normcase absolute paths restricting the
+    extraction to that subset of the root (the label file-list mode points
+    whole folders' CSVs at these extractors). The subset rides into the
+    cache key, so a CSV's features are extracted and cached once no matter
+    how many times the same list comes back.
     """
     root = entry["path"]
     cell_ds = CellDataset(root, channel_layout=entry["channel_layout"],
@@ -227,6 +285,12 @@ def _extract_root_features(entry, meta, model, device, pool_fn,
     _validate_channel_count(len(cell_ds.intensity_colnames),
                             entry["channels"], meta, root)
     md = cell_ds.metadata
+    if only is not None:
+        want = set(only)
+        md = md[[os.path.normcase(os.path.abspath(p)) in want
+                 for p in md["path"]]].reset_index(drop=True)
+        if len(md) == 0:
+            _error(f"none of the file-list files exist in {root}")
 
     rel_paths = sorted(
         os.path.relpath(p, root).replace("\\", "/") for p in md["path"])
@@ -284,7 +348,7 @@ def _extract_root_features(entry, meta, model, device, pool_fn,
     logger.info("Extracting teacher features for %s (%d cells) ...",
                 root, len(indices))
     _, all_feats = _forward_pass(loader, model, device, True, False,
-                                 write_pred_class=False, pool_fn=pool_fn)
+                                 write_pred_class=False)
     feats = torch.cat(all_feats, dim=0).numpy()
 
     # Normcase absolute paths (dedup / lookups) plus their raw-case originals
@@ -374,8 +438,46 @@ def _apply_space(pca, feats):
 # Radius-coverage greedy selection
 # ----------------------------------------------------------------------------
 
-def _radius_pass(W_cand, W_seeds, radius, seed, device):
-    """One greedy pass at a fixed radius. Returns (keep_mask, min_dist).
+def _adaptive_scale(W_cand, power):
+    """Per-cell radius scale from local density (selection.adaptive).
+
+    The distance to the ADAPTIVE_K-th nearest candidate is a local density
+    probe: dense region -> small kNN distance, sparse -> large. The scale is
+    (kNN distance / median)^power, clipped to [ADAPTIVE_MIN, ADAPTIVE_MAX],
+    so a dense cell's effective radius shrinks (its near-duplicates survive
+    too) while a sparse cell's grows (its region needs fewer keeper anchors).
+    power=0 would make every scale 1.0 — the caller treats 0 as "off" and
+    never calls this. The clip bounds keep the greedy's guarantees sane:
+    nothing is forced way below half the radius (near-duplicate flood) or
+    above double (sparse floor wiped out).
+
+    Returns the dimensionless scale array (multiply by the run's radius).
+    """
+    n = W_cand.shape[0]
+    if n <= ADAPTIVE_K:
+        return np.ones(n, dtype=np.float32)
+    from sklearn.neighbors import NearestNeighbors
+    logger.info("Density probe: %d-cell kNN distances (k=%d) ...",
+                n, ADAPTIVE_K)
+    nn = NearestNeighbors(n_neighbors=ADAPTIVE_K + 1, algorithm="brute",
+                          n_jobs=-1).fit(W_cand)
+    # X=None -> query the fit data; sklearn excludes self, so column
+    # ADAPTIVE_K (0-based, after self) is the k-th neighbor distance.
+    dnn = nn.kneighbors()[0][:, -1].astype(np.float64)
+    med = float(np.median(dnn))
+    if med <= 0:
+        # Degenerate pool (mass duplicate features): keep the plain radius.
+        return np.ones(n, dtype=np.float32)
+    scale = np.clip((dnn / med) ** float(power), ADAPTIVE_MIN, ADAPTIVE_MAX)
+    logger.info("Adaptive radius scales: min %.2f / median %.2f / max %.2f "
+                "(power %.2f, k=%d, bounds %.1f-%.1f)",
+                scale.min(), np.median(scale), scale.max(), power,
+                ADAPTIVE_K, ADAPTIVE_MIN, ADAPTIVE_MAX)
+    return scale.astype(np.float32)
+
+
+def _radius_pass(W_cand, W_seeds, radius, seed, device, adaptive=None):
+    """One greedy pass. Returns (keep_mask, min_dist).
 
     Candidates are walked in a seeded-random order, chunk by chunk. Inside a
     chunk only candidates beyond the radius of the kept set S compete; they
@@ -384,6 +486,11 @@ def _radius_pass(W_cand, W_seeds, radius, seed, device):
     distances stay on the GPU/torch, the per-item checks run in numpy).
     min_dist records the distance to the kept set at decision time (for
     drops it is the chunk-start distance — informational only).
+
+    adaptive: optional per-cell radius scale (from _adaptive_scale) — the
+    effective radius of candidate j is radius * adaptive[j], so dense
+    regions can exclude with a smaller radius and sparse ones with a larger
+    one. None keeps one global radius.
     """
     n = W_cand.shape[0]
     rng = np.random.default_rng(seed)
@@ -411,9 +518,16 @@ def _radius_pass(W_cand, W_seeds, radius, seed, device):
             # Empty kept set: the first candidate always passes.
             d_base_np = np.full(C.shape[0], np.inf, dtype=np.float32)
 
-        # Only candidates beyond the radius can be kept; process them most
-        # isolated first so early accepts are the strongest representatives.
-        pass_ids = np.nonzero(d_base_np > radius)[0]
+        # Per-candidate effective radius (global radius, or scaled by the
+        # density-adaptive factor of this chunk's rows).
+        r_loc = (np.full(C.shape[0], radius, dtype=np.float32)
+                 if adaptive is None else
+                 np.asarray(radius * adaptive[idx], dtype=np.float32))
+
+        # Only candidates beyond their own radius can be kept; process them
+        # most isolated first so early accepts are the strongest
+        # representatives.
+        pass_ids = np.nonzero(d_base_np > r_loc)[0]
         settled = np.zeros(C.shape[0], dtype=bool)  # mind already recorded
         acc = None  # accepted rows of this chunk, filled below
         acc_n = 0
@@ -432,7 +546,7 @@ def _radius_pass(W_cand, W_seeds, radius, seed, device):
                     if d_acc < d:
                         d = d_acc
                 settled[j] = True
-                if d > radius:
+                if d > r_loc[j]:
                     gidx = int(idx[j])
                     keep[gidx] = True
                     mind[gidx] = d
@@ -453,19 +567,22 @@ def _radius_pass(W_cand, W_seeds, radius, seed, device):
     return keep, mind
 
 
-def _search_radius(W_cand, W_seeds, target, seed, device):
+def _search_radius(W_cand, W_seeds, target, seed, device, adaptive=None):
     """Bisection on the radius to keep ~target candidate cells.
 
     The kept count is monotonic non-increasing in the radius, so a plain
     bisection over [0, 2] converges; stops early within 1% of the target.
-    Returns (radius, keep_mask, min_dist) of the best pass.
+    Returns (radius, keep_mask, min_dist) of the best pass. The adaptive
+    per-cell scales ride along unchanged (they are dimensionless), so the
+    searched radius stays the global baseline.
     """
     tol = max(1, int(round(0.01 * target)))
     lo, hi = 0.0, MAX_DIST
     best = None  # (|count-target|, radius, keep, mind)
     for _ in range(24):
         r = 0.5 * (lo + hi)
-        keep, mind = _radius_pass(W_cand, W_seeds, r, seed, device)
+        keep, mind = _radius_pass(W_cand, W_seeds, r, seed, device,
+                                  adaptive=adaptive)
         count = int(keep.sum())
         diff = abs(count - target)
         if best is None or diff < best[0]:
@@ -483,14 +600,217 @@ def _search_radius(W_cand, W_seeds, target, seed, device):
 
 
 # ----------------------------------------------------------------------------
+# Morphological groups: Leiden clustering + per-group quotas
+# ----------------------------------------------------------------------------
+
+def _cluster_groups(W, seed, resolution=None, resolutions=CLUSTER_RESOLUTIONS):
+    """Cluster candidates into morphological groups (Leiden on a kNN graph).
+
+    Returns (labels, resolution): one 0-based group id per row plus the
+    resolution that produced them. With resolution=None the ladder is swept:
+    standard (gamma=1) modularity is comparable across resolutions, and the
+    coarsest partition scoring within CLUSTER_MOD_TOL of the best wins —
+    fine partitions score marginally higher by shaving off micro-clusters,
+    which would only add artificial groups to the quotas. A fixed resolution
+    skips the sweep. A pool that stays one community at every swept
+    resolution returns all-zeros labels with resolution None.
+    """
+    n = W.shape[0]
+    if n < 2:
+        return np.zeros(n, dtype=int), None
+    n_neighbors = min(CLUSTER_K, n - 1)
+    A = kneighbors_graph(W, n_neighbors, mode="connectivity",
+                         include_self=False)
+    A = A.maximum(A.T).tocoo()  # undirected graph, same construction as reduction
+    g = ig.Graph(n=n, edges=list(zip(A.row.tolist(), A.col.tolist())))
+    ladder = ([float(resolution)] if resolution is not None
+              else [float(r) for r in resolutions])
+    swept = []  # (modularity, resolution, n_clusters, membership)
+    for res in ladder:
+        part = leidenalg.find_partition(
+            g, leidenalg.RBConfigurationVertexPartition,
+            resolution_parameter=res, seed=seed)
+        memb = np.asarray(part.membership, dtype=int)
+        k = int(memb.max()) + 1
+        mod = float(g.modularity(memb.tolist())) if k >= 2 else -1.0
+        logger.info("  Leiden resolution %.2f -> %d clusters "
+                    "(modularity %.4f)", res, k, mod)
+        swept.append((mod, res, k, memb))
+    best_mod = max(s[0] for s in swept)
+    eligible = [s for s in swept if s[0] >= best_mod * CLUSTER_MOD_TOL]
+    best = min(eligible, key=lambda s: (s[2], s[1]))
+    return best[3], best[1]
+
+
+def _group_quotas(sizes, total, target_ratio, floor=MIN_GROUP_KEEP):
+    """Integer per-group keep quotas compressing max:min to ~target_ratio.
+
+    Power compression: quota_i is proportional to s_i**alpha with alpha
+    solved so that (s_max/s_min)**alpha == target_ratio — e.g. a 100:1 pool
+    with target_ratio 10 gives alpha 0.5 (sqrt compression), so relative
+    proportions survive but extreme dominance is damped. alpha = 1 when the
+    pool is already at/below the target ratio (plain proportional shares).
+
+    Quotas sum EXACTLY to min(total, sum(sizes)), respect a per-group floor
+    (bounded by the group size — no morphology is wiped out), and never
+    exceed a group's size. Returns (quotas, alpha).
+    """
+    s = np.asarray(sizes, dtype=np.float64)
+    k = len(s)
+    total = int(min(total, s.sum()))
+    smax, smin = float(s.max()), float(s.min())
+    alpha = 1.0
+    if target_ratio and smax > smin and target_ratio < smax / smin:
+        alpha = float(np.log(target_ratio) / np.log(smax / smin))
+    cap = s.astype(np.int64)
+    lo = np.minimum(floor, cap)
+    # Water-filling: split the budget proportionally to s**alpha among the
+    # groups not pinned at their floor/cap; pins iterate until everyone is
+    # within bounds (each iteration pins at least one group).
+    quotas = np.zeros(k, dtype=np.int64)
+    free = np.ones(k, dtype=bool)
+    for _ in range(k + 1):
+        remaining = total - int(quotas.sum())
+        if remaining <= 0 or not free.any():
+            break
+        w = s[free] ** alpha
+        q = w / w.sum() * remaining
+        fidx = np.nonzero(free)[0]
+        under = fidx[q <= lo[free]]
+        over = fidx[q >= cap[free]]
+        if under.size == 0 and over.size == 0:
+            quotas[fidx] = np.rint(q).astype(np.int64)
+            break
+        quotas[under] = lo[under]
+        quotas[over] = cap[over]
+        free[under] = False
+        free[over] = False
+    # Rounding to the exact total: the largest groups absorb the remainder
+    # (upward or downward), always within [lo, cap].
+    order = np.argsort(-(s ** alpha))
+    diff = total - int(quotas.sum())
+    i = 0
+    while diff != 0 and i < 4 * k:
+        j = int(order[i % k])
+        step = 1 if diff > 0 else -1
+        if lo[j] <= quotas[j] + step <= cap[j]:
+            quotas[j] += step
+            diff -= step
+        i += 1
+    return quotas, alpha
+
+
+def _resolve_groups(group_by, W_cand, all_labels, all_sources, name_map,
+                    seed, cluster_resolution):
+    """One group name per candidate cell (group_by == none -> None).
+
+    cluster: Leiden on the selection space (auto resolution sweep unless a
+    fixed one is given), clusters named cluster_1.. by decreasing size.
+    label: the per-cell label (label_csv / label_from_dir), unknown -> "unknown".
+    source: the root's short name.
+    """
+    if group_by == "cluster":
+        ids, used = _cluster_groups(W_cand, seed, cluster_resolution)
+        counts = np.bincount(ids)
+        rank = np.empty(len(counts), dtype=int)
+        rank[np.argsort(-counts)] = np.arange(len(counts))
+        return np.array([f"cluster_{r + 1}" for r in rank[ids]],
+                        dtype=object), used
+    if group_by == "label":
+        return np.array([l if l else "unknown" for l in all_labels],
+                        dtype=object), None
+    # group_by == "source"
+    return np.array([name_map.get(os.path.normcase(s)) or _root_dirname(s)
+                     for s in all_sources], dtype=object), None
+
+
+# ----------------------------------------------------------------------------
 # Outputs
 # ----------------------------------------------------------------------------
 
-def _write_plot(path, W_cand, keep, W_seeds, seed, radius, out_cfg):
-    """UMAP scatter of the selection outcome (drop / keep / seeds).
+def _selection_metrics(W_cand, keep, W_seeds, radius, device):
+    """Exact run-level quality numbers, measured against the FINAL kept set.
+
+    One chunked candidate x kept-union matmul (the kept union = seeds + kept
+    candidates) yields, per candidate, the distance to the nearest kept cell
+    with and without self:
+      coverage   — fraction of ALL candidates within radius/2 and radius of
+                   the kept union (kept cells count as covered by
+                   themselves). @radius is 100% by construction for a fixed
+                   radius; with selection.adaptive it can fall below — that
+                   gap is the price of the density adaptation.
+      drop dist  — dropped cells' nearest-kept distance (median / mean /
+                   p95): how much redundancy every removal had.
+      isolation  — kept cells' distance to the nearest OTHER kept cell
+                   (median / min): the spacing of the representative grid.
+    Returns the dict for the metrics panel; every field is a plain number
+    or None (nothing dropped / too few kept to space).
+    """
+    n = W_cand.shape[0]
+    kept_cand = W_cand[keep]
+    parts = ([W_seeds] if W_seeds is not None and len(W_seeds) else []) \
+        + [kept_cand]
+    K = torch.from_numpy(np.ascontiguousarray(np.vstack(parts))).to(device)
+    n_seeds = 0 if W_seeds is None else len(W_seeds)
+    C = torch.from_numpy(np.ascontiguousarray(W_cand)).to(device)
+    rank = np.full(n, -1, dtype=np.int64)   # kept candidate -> its K row
+    rank[np.nonzero(keep)[0]] = np.arange(len(kept_cand)) + n_seeds
+
+    d_with_self = np.empty(n, dtype=np.float64)     # coverage distance
+    d_without_self = np.full(n, np.nan, dtype=np.float64)  # kept isolation
+    for start in range(0, n, CHUNK):
+        idx = np.arange(start, min(start + CHUNK, n))
+        sims = C[idx] @ K.T
+        rows_kept = np.nonzero(rank[idx] >= 0)[0]
+        if rows_kept.size:
+            sims[rows_kept, rank[idx[rows_kept]]] = -np.inf  # hide self
+        d_without_self[idx] = torch.sqrt(
+            torch.clamp(2.0 - 2.0 * sims.max(dim=1).values,
+                        min=0.0)).cpu().numpy()
+        if rows_kept.size:   # restore self so coverage counts it as 0
+            sims[rows_kept, rank[idx[rows_kept]]] = 1.0
+        d_with_self[idx] = torch.sqrt(
+            torch.clamp(2.0 - 2.0 * sims.max(dim=1).values,
+                        min=0.0)).cpu().numpy()
+
+    n_kept = int(keep.sum())
+    drop = d_with_self[~keep]
+    iso = d_without_self[keep]
+    return {
+        "n_cand": n,
+        "n_kept": n_kept,
+        "n_seeds": n_seeds,
+        "cov_half": float((d_with_self <= radius / 2).mean()),
+        "cov_full": float((d_with_self <= radius).mean()),
+        "drop_med": float(np.median(drop)) if drop.size else None,
+        "drop_mean": float(drop.mean()) if drop.size else None,
+        "drop_p95": float(np.percentile(drop, 95)) if drop.size else None,
+        "iso_med": float(np.median(iso)) if n_kept else None,
+        "iso_min": float(iso.min()) if n_kept else None,
+    }
+
+
+def _write_plot(path, W_cand, keep, W_seeds, seed, radius, out_cfg,
+                group_of=None, cluster_resolution=None,
+                adaptive_power=None, source_of=None, device=None):
+    """UMAP scatter of the selection outcome — all views in ONE figure.
+
+    Five panels side by side:
+      left   — the classic scatter: gray drop, group-colored (or green)
+               keep, orange seeds, each cluster's ID at its centroid;
+      middle — the outcome alone: dropped points gray, kept points blue,
+               cluster IDs repeated at the centroids;
+      third  — the same embedding colored by dataset source (every root's
+               short name, kept and dropped alike), cluster IDs repeated;
+      fourth — run-level quality metrics (coverage, drop distances, kept
+               isolation, per-source keep rates);
+      right  — per-cluster keep/total counts plus the totals row.
 
     UMAP is fit on everything plotted — candidates and seeds share the
     selection space — with the run seed, so the picture is deterministic.
+    Cluster IDs come from group_of when groups are active (cluster_N /
+    label / source names); otherwise Leiden clusters (the same construction
+    as group_by=cluster) are computed here purely for the annotation.
     """
     if not out_cfg.get("plot", True):
         return
@@ -502,26 +822,158 @@ def _write_plot(path, W_cand, keep, W_seeds, seed, radius, out_cfg):
     X = np.vstack([W_cand, W_seeds]) if len(W_seeds) else W_cand
     logger.info("Fitting UMAP on %d points for %s ...", X.shape[0],
                 os.path.basename(path))
-    emb = umap.UMAP(n_components=2, random_state=seed).fit_transform(X)
+    emb = umap.UMAP(n_components=2, random_state=seed, n_jobs=1).fit_transform(X)
     emb_seeds = emb[len(W_cand):]
     emb_cand = emb[:len(W_cand)]
     emb_drop = emb_cand[~keep]
     emb_keep = emb_cand[keep]
 
-    fig, ax = plt.subplots(figsize=(8, 7))
+    # Per-candidate cluster names for the annotation: reuse the run's
+    # groups when active, else cluster the space here (ranked by size into
+    # cluster_1..N, same convention as _resolve_groups).
+    if group_of is not None:
+        names = group_of
+    else:
+        ids, _res = _cluster_groups(W_cand, seed, cluster_resolution)
+        counts = np.bincount(ids)
+        rank = np.empty(len(counts), dtype=int)
+        rank[np.argsort(-counts)] = np.arange(len(counts))
+        names = np.array([f"cluster_{r + 1}" for r in rank[ids]],
+                         dtype=object)
+    # Clusters ordered by size (cluster_1 = largest); centroid = mean of the
+    # member points in the 2-D embedding. The plot shows the bare number for
+    # cluster groups (cluster_3 -> "3"); label/source names pass through.
+    order = sorted(set(names.tolist()),
+                   key=lambda n: (-int((names == n).sum()), n))
+    disp = {n: n[len("cluster_"):] if n.startswith("cluster_") else n
+            for n in order}
+    centers = {n: emb_cand[names == n].mean(axis=0) for n in order}
+
+    fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(
+        1, 5, figsize=(28.5, 7),
+        gridspec_kw={"width_ratios": [1, 1, 1, 0.72, 0.72]})
+
+    def _cluster_labels(ax):
+        """Cluster ID at each centroid, white-haloed so it stays readable
+        on top of the point cloud."""
+        for n, c in centers.items():
+            ax.text(c[0], c[1], disp[n], fontsize=8, ha="center",
+                    va="center", fontweight="bold", color="black",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white",
+                              ec="none", alpha=0.75))
+
+    # ---- left: keep/drop/seeds with group coloring ------------------------
     if len(emb_drop):
-        ax.scatter(emb_drop[:, 0], emb_drop[:, 1], s=3, c="lightgray",
-                   alpha=0.4, label=f"drop ({len(emb_drop)})")
-    if len(emb_keep):
-        ax.scatter(emb_keep[:, 0], emb_keep[:, 1], s=5, c="tab:green",
-                   alpha=0.7, label=f"keep ({len(emb_keep)})")
+        ax1.scatter(emb_drop[:, 0], emb_drop[:, 1], s=3, c="lightgray",
+                    alpha=0.4, label=f"drop ({len(emb_drop)})")
+    if group_of is not None and keep.any():
+        cmap = plt.colormaps["tab20"]
+        for gi, name in enumerate(sorted(set(group_of[keep].tolist()))):
+            m = keep & (group_of == name)
+            ax1.scatter(emb_cand[m, 0], emb_cand[m, 1], s=5,
+                        color=cmap(gi % 20), alpha=0.7,
+                        label=f"{disp[name]} ({int(m.sum())})"
+                        if gi < 15 else None)
+    elif len(emb_keep):
+        ax1.scatter(emb_keep[:, 0], emb_keep[:, 1], s=5, c="tab:green",
+                    alpha=0.7, label=f"keep ({len(emb_keep)})")
     if len(emb_seeds):
-        ax.scatter(emb_seeds[:, 0], emb_seeds[:, 1], s=8, c="tab:orange",
-                   alpha=0.8, label=f"seeds ({len(emb_seeds)})")
-    ax.set_xlabel("UMAP-1")
-    ax.set_ylabel("UMAP-2")
-    ax.set_title(f"deduplication: radius={radius:.4f}")
-    ax.legend(markerscale=3)
+        ax1.scatter(emb_seeds[:, 0], emb_seeds[:, 1], s=8, c="tab:orange",
+                    alpha=0.8, label=f"seeds ({len(emb_seeds)})")
+    ax1.set_xlabel("UMAP-1")
+    ax1.set_ylabel("UMAP-2")
+    ax1.set_title(f"deduplication: radius={radius:.4f}"
+                  + (f" (adaptive ^{adaptive_power:g})"
+                     if adaptive_power else ""))
+    ax1.legend(markerscale=3)
+    _cluster_labels(ax1)
+
+    # ---- middle: outcome only — dropped gray vs kept blue -----------------
+    if len(emb_drop):
+        ax2.scatter(emb_drop[:, 0], emb_drop[:, 1], s=3, c="lightgray",
+                    alpha=0.4, label=f"dropped ({len(emb_drop)})")
+    if len(emb_keep):
+        ax2.scatter(emb_keep[:, 0], emb_keep[:, 1], s=5, c="tab:blue",
+                    alpha=0.7, label=f"kept ({len(emb_keep)})")
+    ax2.set_xlabel("UMAP-1")
+    ax2.set_title("dropped (gray) vs kept (blue)")
+    ax2.legend(markerscale=3)
+    _cluster_labels(ax2)
+
+    # ---- third: the same embedding colored by dataset source --------------
+    if source_of is not None:
+        cmap = plt.colormaps["tab20"]
+        for si, sname in enumerate(sorted(set(source_of.tolist()))):
+            m = source_of == sname
+            ax3.scatter(emb_cand[m, 0], emb_cand[m, 1], s=5,
+                        color=cmap(si % 20), alpha=0.7,
+                        label=f"{sname} ({int(m.sum())})")
+        if len(emb_seeds):
+            ax3.scatter(emb_seeds[:, 0], emb_seeds[:, 1], s=8,
+                        c="tab:orange", alpha=0.8,
+                        label=f"seeds ({len(emb_seeds)})")
+        ax3.set_xlabel("UMAP-1")
+        ax3.set_title("by dataset source")
+        ax3.legend(markerscale=3)
+    _cluster_labels(ax3)
+
+    # ---- fourth: run-level quality metrics ---------------------------------
+    ax4.axis("off")
+    ax4.set_title("metrics")
+    m = _selection_metrics(W_cand, keep, W_seeds, radius,
+                           device if device is not None
+                           else torch.device("cpu"))
+    rows_m = [
+        f"kept {m['n_kept']} / {m['n_cand']}"
+        f" ({100.0 * m['n_kept'] / max(1, m['n_cand']):.1f}%)",
+        f"seeds {m['n_seeds']}",
+        f"compression {m['n_cand'] / max(1, m['n_kept']):.1f}x",
+        f"coverage @r/2  {100.0 * m['cov_half']:5.1f}%",
+        f"coverage @r    {100.0 * m['cov_full']:5.1f}%",
+    ]
+    if m["drop_med"] is not None:
+        rows_m += ["drop->kept med/avg/p95",
+                   f"  {m['drop_med']:.3f} / {m['drop_mean']:.3f}"
+                   f" / {m['drop_p95']:.3f}"]
+    else:
+        rows_m.append("drops none")
+    if m["iso_med"] is not None:
+        rows_m += ["kept isolation med/min",
+                   f"  {m['iso_med']:.3f} / {m['iso_min']:.3f}"]
+    if source_of is not None:
+        rows_m.append("source keep%")
+        line = ""
+        for sname in sorted(set(source_of.tolist())):
+            sm = source_of == sname
+            pct = 100.0 * float((sm & keep).sum()) / max(1, int(sm.sum()))
+            item = f"{sname} {pct:.1f}"
+            if line and len(line) + 2 + len(item) > 34:
+                rows_m.append("  " + line)
+                line = item
+            else:
+                line = f"{line}  {item}" if line else item
+        if line:
+            rows_m.append("  " + line)
+    ax4.text(0.0, 1.0, "\n".join(rows_m), va="top", ha="left",
+             family="monospace", fontsize=9, transform=ax4.transAxes)
+
+    # ---- right: per-cluster keep/total stats ------------------------------
+    ax5.axis("off")
+    ax5.set_title("keep / total per cluster")
+    rows = []
+    for n in order:
+        total = int((names == n).sum())
+        kept = int(((names == n) & keep).sum())
+        rows.append(f"{disp[n]:<14}{kept:>8}/{total:<8}"
+                    f"{100.0 * kept / total if total else 0.0:5.1f}%")
+    rows.append("-" * 38)
+    rows.append(f"{'total':<14}{int(keep.sum()):>8}/{len(names):<8}"
+                f"{100.0 * float(keep.sum()) / max(1, len(names)):5.1f}%")
+    # Shrink the font when a run produced many clusters so the panel holds.
+    fs = min(10, max(5, int(400 / (len(rows) + 2))))
+    ax5.text(0.0, 1.0, "\n".join(rows), va="top", ha="left",
+             family="monospace", fontsize=fs, transform=ax5.transAxes)
+
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -581,9 +1033,33 @@ def run_deduplication(config, config_path=None):
         copy_config_file(config_path, output_dir)
 
     data_cfg = config.get("data", {})
-    if "root" not in data_cfg:
-        _error("config 'data.root' is required")
-    roots = _parse_roots(data_cfg)
+    file_list = data_cfg.get("file_list")
+    list_paths = list_labels = None
+    if file_list:
+        # File-list mode: the CSVs (filepath[, label] columns — e.g. a
+        # previous curated.csv or any custom subset) ARE the pool;
+        # data.file_dir is ignored. Implicit roots are the listed files'
+        # distinct parent directories: per-root dict overrides don't exist,
+        # the global data.* defaults hold for every file, and the CSVs'
+        # label column (when present) is the per-cell label — label_from_dir
+        # does not apply. The per-root "only" set keeps extraction on the
+        # listed subset instead of the whole folder.
+        if data_cfg.get("file_dir"):
+            logger.warning("data.file_list takes precedence: data.file_dir "
+                           "is ignored")
+        list_paths, list_labels = load_file_list(file_list)
+        pseudo = {k: v for k, v in data_cfg.items()
+                  if k not in ("file_dir", "label_csv", "file_list")}
+        pseudo["file_dir"] = [{"path": d} for d in sorted(
+            {os.path.dirname(p) for p in list_paths})]
+        roots = _parse_roots(pseudo)
+        for entry in roots:
+            entry["only"] = {os.path.normcase(p) for p in list_paths
+                             if os.path.dirname(p) == entry["path"]}
+    else:
+        if "file_dir" not in data_cfg:
+            _error("config 'data.file_dir' (or 'data.file_list') is required")
+        roots = _parse_roots(data_cfg)
     # Short per-root names for curated/ subfolders + cache files: the path
     # relative to the prefix shared by ALL roots (e.g. opencell_single_cell).
     for entry, name in zip(roots, _root_names([e["path"] for e in roots])):
@@ -600,10 +1076,42 @@ def run_deduplication(config, config_path=None):
     target_keep = sel_cfg.get("target_keep")
     max_add = sel_cfg.get("max_add")
     seed = int(sel_cfg.get("seed", 42))
+    # Optional density-adaptive radius: 0/None = off (one global radius);
+    # > 0 = the exponent that turns local kNN density into per-cell radius
+    # scales (dense region -> smaller radius -> keeps more; sparse -> larger
+    # -> keeps fewer).
+    adaptive_power = sel_cfg.get("adaptive", 0) or 0
+    try:
+        adaptive_power = float(adaptive_power)
+    except (TypeError, ValueError):
+        _error(f"selection.adaptive must be a number, got {adaptive_power!r}")
+    if adaptive_power < 0:
+        _error(f"selection.adaptive must be >= 0, got {adaptive_power}")
     space_cfg = config.get("space", {})
     dl_cfg = config.get("dataloader", {})
     out_cfg = config.get("output", {})
     sample_max = data_cfg.get("sample_max")
+
+    # Morphological grouping + optional ratio compression. Groups give the
+    # summary/plot/manifest a per-group view even without target_ratio; the
+    # ratio itself can only be controlled when groups exist.
+    group_by = str(sel_cfg.get("group_by", "cluster")).lower()
+    if group_by not in ("none", "label", "source", "cluster"):
+        _error("selection.group_by must be one of none | label | source | "
+               f"cluster, got {group_by!r}")
+    target_ratio = sel_cfg.get("target_ratio")
+    if target_ratio is not None:
+        if group_by == "none":
+            _error("selection.target_ratio needs groups to balance — set "
+                   "selection.group_by to cluster | label | source")
+        try:
+            target_ratio = float(target_ratio)
+        except (TypeError, ValueError):
+            _error(f"selection.target_ratio must be a number, got "
+                   f"{target_ratio!r}")
+        if target_ratio < 1:
+            _error(f"selection.target_ratio must be >= 1, got {target_ratio}")
+    cluster_resolution = sel_cfg.get("cluster_resolution")
 
     # ---- bundle (SSL features-only, teacher branch) -----------------------
     logger.info("Loading bundle from %s", model_path)
@@ -615,13 +1123,16 @@ def run_deduplication(config, config_path=None):
         _error("deduplication needs an SSL pretrain bundle (state_dict without "
                "num_classes); a train classifier bundle has no shared "
                "embedding space")
-    model, feat_dim, pool_fn, meta = load_ssl_backbone_from_bundle(bundle,
-                                                                   device)
+    model, feat_dim, meta = load_ssl_backbone_from_bundle(bundle, device)
     logger.info("SSL backbone loaded: feat_dim=%d", feat_dim)
+    # The readout config rides in the cache key: the same bundle yields a
+    # DIFFERENT feature space when the pooling changes, so stale caches must
+    # not be served across embed_source / mask_weighted changes.
     bundle_id = json.dumps([
         os.path.normcase(os.path.abspath(model_path)),
         os.path.getmtime(model_path),
         os.path.getsize(model_path),
+        model.source, model.mask_weighted,
     ])
 
     # ---- reference (previous run's kept set as immutable seeds) -----------
@@ -657,15 +1168,19 @@ def run_deduplication(config, config_path=None):
     all_paths, all_sources, all_labels, feats_list = [], [], [], []
     for entry in roots:
         paths, raw_paths, feats = _extract_root_features(
-            entry, meta, model, device, pool_fn, output_dir, bundle_id,
-            sample_max, seed, dl_cfg)
-        # Label per cell: label_csv map wins, else the parent folder name
-        # (label_from_dir — the RAW-case path, so the folder's real name is
-        # what shows up, not a lowercased normcase artifact), else unknown.
-        # Carried through to manifest and keep_label.csv only — labels never
-        # affect the features.
+            entry, meta, model, device, output_dir, bundle_id,
+            sample_max, seed, dl_cfg, only=entry.get("only"))
+        # Label per cell: the file-list CSVs' label column wins, then the
+        # label_csv map, else the parent folder name (label_from_dir — the
+        # RAW-case path, so the folder's real name is what shows up, not a
+        # lowercased normcase artifact), else unknown. Carried through to
+        # manifest and keep_label.csv only — labels never affect the
+        # features.
         label_map = {}
-        if entry["label_csv"]:
+        if entry.get("only") is not None:
+            label_map = {os.path.normcase(p): l for p, l in
+                         zip(list_paths, list_labels) if l}
+        elif entry["label_csv"]:
             if not os.path.exists(entry["label_csv"]):
                 _error(f"label_csv not found: {entry['label_csv']}")
             label_map = load_label_csv(entry["label_csv"])
@@ -713,12 +1228,42 @@ def run_deduplication(config, config_path=None):
                                    space_cfg.get("pca_components", 50),
                                    seed=seed)
 
+    # ---- morphological groups ---------------------------------------------
+    # One group name per candidate (or None when grouping is off). Clusters
+    # are computed on the candidates only — reference seeds keep their own
+    # decisions and never participate in quotas.
+    quota_mode = group_by != "none" and target_ratio is not None
+    if quota_mode and radius_cfg is not None:
+        _error("selection.target_ratio works with target_keep / max_add, "
+               "not with a fixed radius — drop 'radius' and let the search "
+               "hit the target")
+    group_of = None
+    cluster_res_used = None
+    if group_by != "none":
+        group_of, cluster_res_used = _resolve_groups(
+            group_by, W_cand, all_labels, all_sources, name_map, seed,
+            cluster_resolution)
+        logger.info("Groups (%s%s): %s", group_by,
+                    f", resolution {cluster_res_used}"
+                    if cluster_res_used is not None else "",
+                    ", ".join(
+                        f"{n}({int((group_of == n).sum())})"
+                        for n in sorted(set(group_of.tolist()),
+                                        key=lambda n: (-int((group_of == n)
+                                                          .sum()), n))))
+
     # ---- radius resolution + selection ------------------------------------
+    # The density-adaptive scales are computed ONCE for the pool (dimensionless,
+    # relative to the pool median) and ride along every pass unchanged.
+    adaptive = (_adaptive_scale(W_cand, adaptive_power)
+                if adaptive_power > 0 else None)
     if radius_cfg is not None:
         radius = float(radius_cfg)
-        logger.info("Selection: fixed radius %.4f", radius)
+        logger.info("Selection: fixed radius %.4f%s", radius,
+                    f" (adaptive ^{adaptive_power:g})"
+                    if adaptive is not None else "")
         keep, mind = _radius_pass(W_cand, W_seeds if n_seeds else None,
-                                  radius, seed, device)
+                                  radius, seed, device, adaptive=adaptive)
     else:
         if n_seeds > 0 and max_add is not None:
             target, what = int(max_add), f"max_add={max_add} new cells"
@@ -734,9 +1279,42 @@ def run_deduplication(config, config_path=None):
                    f"({what}); nothing to select")
         target = min(target, n_cand)
         logger.info("Selection: searching radius for %s", what)
-        radius, keep, mind = _search_radius(W_cand,
-                                            W_seeds if n_seeds else None,
-                                            target, seed, device)
+        if quota_mode:
+            # Per-group quotas: power-compressed shares of the target (the
+            # largest group walks first and sets the coverage baseline; each
+            # smaller group then keeps its own distinct cells against it).
+            names = sorted(set(group_of.tolist()),
+                           key=lambda n: (-int((group_of == n).sum()), n))
+            sizes = [int((group_of == n).sum()) for n in names]
+            quotas, alpha = _group_quotas(sizes, target, target_ratio)
+            logger.info("Per-group quotas (alpha %.3f for target ratio %s): "
+                        "%s", alpha, target_ratio,
+                        ", ".join(f"{n}={int(q)}"
+                                  for n, q in zip(names, quotas)))
+            keep = np.zeros(n_cand, dtype=bool)
+            mind = np.full(n_cand, np.inf, dtype=np.float32)
+            kept_list = [W_seeds] if n_seeds else []
+            radii = {}
+            for gi, name in enumerate(names):
+                idx = np.nonzero(group_of == name)[0]
+                r_g, keep_g, mind_g = _search_radius(
+                    W_cand[idx],
+                    np.vstack(kept_list) if kept_list else None,
+                    int(quotas[gi]), seed + gi, device,
+                    adaptive=adaptive[idx] if adaptive is not None else None)
+                keep[idx[keep_g]] = True
+                mind[idx] = mind_g
+                kept_list.append(W_cand[idx[keep_g]])
+                radii[name] = r_g
+                logger.info("  %s: radius %.4f -> %d / quota %d", name, r_g,
+                            int(keep_g.sum()), int(quotas[gi]))
+            radius = float(np.average([radii[n] for n in names],
+                                      weights=quotas))
+        else:
+            radius, keep, mind = _search_radius(W_cand,
+                                                W_seeds if n_seeds else None,
+                                                target, seed, device,
+                                                adaptive=adaptive)
     n_keep = int(keep.sum())
     logger.info("Kept %d / %d candidate cells (+ %d seeds kept as-is), "
                 "radius %.4f", n_keep, n_cand, n_seeds, radius)
@@ -745,15 +1323,23 @@ def run_deduplication(config, config_path=None):
     # state: the kept set (seeds first, then kept candidates) is the next
     # run's reference — features, paths, sources and labels travel together.
     W_keep_cand = W_cand[keep]
+    kept_idx = np.nonzero(keep)[0]
+    kept_group_list = ((["seed"] * n_seeds +
+                        [group_of[i] for i in kept_idx])
+                       if group_of is not None
+                       else [""] * (n_seeds + n_keep))
     state = {
         "bundle": os.path.abspath(model_path),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "pca": pca,
         "W": np.vstack([W_seeds, W_keep_cand]) if n_seeds
              else W_keep_cand,
-        "paths": seed_paths + [all_paths[i] for i in np.nonzero(keep)[0]],
-        "sources": seed_sources + [all_sources[i] for i in np.nonzero(keep)[0]],
-        "labels": seed_labels + [all_labels[i] for i in np.nonzero(keep)[0]],
+        "paths": seed_paths + [all_paths[i] for i in kept_idx],
+        "sources": seed_sources + [all_sources[i] for i in kept_idx],
+        "labels": seed_labels + [all_labels[i] for i in kept_idx],
+        "groups": kept_group_list,
+        "group_by": group_by,
+        "target_ratio": target_ratio,
         "radius": radius,
         "seed": seed,
         "space": {"pca_components": int(pca.n_components)},
@@ -772,6 +1358,7 @@ def run_deduplication(config, config_path=None):
             "decision": "keep" if keep[i] else "drop",
             "min_dist": float(mind[i]) if np.isfinite(mind[i]) else "",
             "label": all_labels[i] if all_labels[i] is not None else "",
+            "group": group_of[i] if group_of is not None else "",
         })
     for i in range(n_seeds):
         rows.append({
@@ -781,6 +1368,7 @@ def run_deduplication(config, config_path=None):
             "decision": "keep",
             "min_dist": "",
             "label": seed_labels[i] if seed_labels[i] is not None else "",
+            "group": "seed",
         })
     manifest = pd.DataFrame(rows).sort_values(
         ["source", "filepath"]).reset_index(drop=True)
@@ -802,6 +1390,34 @@ def run_deduplication(config, config_path=None):
             logger.info("No labels known for kept cells; %s skipped",
                         KEEP_LABEL_NAME)
 
+    # curated.csv: the kept set as a plain file list — the data.file_list
+    # input for pretrain/train, so the curated/ hardlink tree is optional.
+    # Paths are relative to the RUN DIRECTORY (os.getcwd()) with forward
+    # slashes: run train/pretrain from the same directory and the list just
+    # works. Seeds are part of the kept set and included.
+    if out_cfg.get("curated_csv", True):
+        base = os.getcwd()
+        rows = []
+        cross_drive = False
+        for fp, src, lbl in zip(
+                [all_paths[i] for i in kept_idx] + seed_paths,
+                [all_sources[i] for i in kept_idx] + seed_sources,
+                [all_labels[i] for i in kept_idx] + seed_labels):
+            try:
+                rel = os.path.relpath(fp, base)
+            except ValueError:  # different drive than the run directory
+                rel = fp
+                cross_drive = True
+            rows.append({"filepath": rel.replace("\\", "/"),
+                         "source": name_map.get(os.path.normcase(src))
+                                   or _root_dirname(src),
+                         "label": lbl if lbl else ""})
+        cc_path = os.path.join(output_dir, CURATED_CSV_NAME)
+        pd.DataFrame(rows).to_csv(cc_path, index=False)
+        logger.info("Wrote %s (%d rows, relative to %s%s)", cc_path,
+                    len(rows), base,
+                    "; some absolute (cross-drive)" if cross_drive else "")
+
     # curated/: hardlinked kept files (seeds included) as a ready-to-use
     # pretrain root.
     if out_cfg.get("link_dir", True):
@@ -811,9 +1427,17 @@ def run_deduplication(config, config_path=None):
             [all_sources[i] for i in kept_mask_idx] + seed_sources,
             name_map, output_dir)
 
-    # plot: UMAP keep/drop/seed scatter (fit on everything plotted).
+    # plot: UMAP keep/drop/seed scatter + outcome view + per-source view +
+    # per-cluster keep/total stats (one PNG; fit on everything plotted).
+    source_of = np.array(
+        [name_map.get(os.path.normcase(s)) or _root_dirname(s)
+         for s in all_sources], dtype=object)
     _write_plot(os.path.join(output_dir, PLOT_NAME),
-                W_cand, keep, W_seeds, seed, radius, out_cfg)
+                W_cand, keep, W_seeds, seed, radius, out_cfg,
+                group_of=group_of, cluster_resolution=cluster_resolution,
+                adaptive_power=adaptive_power if adaptive is not None
+                else None,
+                source_of=source_of, device=device)
 
     # Per-root summary.
     logger.info("---- deduplication summary (radius %.4f) ----", radius)
@@ -824,3 +1448,20 @@ def run_deduplication(config, config_path=None):
                     int((m["decision"] == "keep").sum()), len(m))
     logger.info("  total: %d kept + %d seeds / %d candidates",
                 n_keep, n_seeds, n_cand)
+
+    # Per-group summary: the before/after max:min ratio is what
+    # target_ratio promises — show it next to the promise.
+    if group_of is not None:
+        gnames = sorted(set(group_of.tolist()),
+                        key=lambda n: (-int((group_of == n).sum()), n))
+        kept_counts = {n: int(((group_of == n) & keep).sum())
+                       for n in gnames}
+        sizes = {n: int((group_of == n).sum()) for n in gnames}
+        logger.info("---- per-group summary (group_by=%s, "
+                    "target_ratio=%s) ----", group_by, target_ratio)
+        for n in gnames:
+            logger.info("  %s: %d kept / %d", n, kept_counts[n], sizes[n])
+        logger.info("  max:min ratio %.1f -> %.1f",
+                    max(sizes.values()) / max(min(sizes.values()), 1),
+                    max(kept_counts.values()) /
+                    max(min(kept_counts.values()), 1))

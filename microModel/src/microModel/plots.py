@@ -183,7 +183,8 @@ HEAD_LOGITS_STD_COLLAPSE_THRESHOLD = 5e-3
 
 def plot_head_track(head_std_history=None, head_entropy_history=None,
                     sts_history=None, gram_masked_history=None,
-                    gram_unmasked_history=None, save_path=None):
+                    gram_unmasked_history=None, cdi_history=None,
+                    save_path=None):
     """DINOv3 monitoring plots: head collapse signals + Gram split stats.
 
     head_std_history:   per-epoch student head-logit std (collapse if it
@@ -192,12 +193,17 @@ def plot_head_track(head_std_history=None, head_entropy_history=None,
     sts_history:        mean teacher-student CLS cosine similarity.
     gram_masked/unmasked_history: per-epoch Gram losses on masked/unmasked
         patch tokens (gram anchoring enabled).
+    cdi_history:        per-save content-dependence index (~1 = patch
+        similarity maps homogenized / input-independent).
     """
     series = [
         (head_std_history, "head logits std", "Head logits std (collapse < 5e-3)"),
         (head_entropy_history, "head entropy", "Head entropy (norm., -> 1 = collapse)"),
         (sts_history, "teacher-student sim", "Teacher-student CLS similarity"),
     ]
+    if cdi_history:
+        series.append((cdi_history, "content dependence",
+                       "Sim-map content dependence (1 = homogenized)"))
     present = [(h, lbl, ttl) for h, lbl, ttl in series if h]
     has_gram = (gram_masked_history or gram_unmasked_history)
 
@@ -320,11 +326,10 @@ def plot_attention_combined(samples, save_path, inputs=None, anchor_idx=None,
             axm.set_title("mean head", fontsize=8)
     fig.suptitle(title or f"Attention + patch similarity ({n_rows} samples)")
     fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02)
-    try:
-        fig.tight_layout()
-    except ValueError:
-        # colorbar axes are not tight_layout-compatible; fall back to subplots_adjust
-        fig.subplots_adjust(wspace=0.05, hspace=0.1)
+    # The full-grid colorbar axes are not tight_layout-compatible (matplotlib
+    # warns instead of raising on newer versions) — always use the manual
+    # adjustment; savefig's bbox_inches="tight" crops the final margins.
+    fig.subplots_adjust(wspace=0.05, hspace=0.1)
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         logger.info("Combined attention maps saved to %s", save_path)

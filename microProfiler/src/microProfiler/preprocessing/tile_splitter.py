@@ -101,8 +101,17 @@ def tile_dataset(
                     field_start, field_end = len(src.stem), len(src.stem)
 
                 tiles = tile_single(img, tile_width, tile_height)
-                if tiles:
-                    produced = True
+                if not tiles:
+                    # Zero tiles for THIS channel (image smaller than the tile
+                    # grid, or remainder only). Its source must survive — with
+                    # mixed-size channels of one site, deleting it here would
+                    # make the whole channel vanish from the dataset.
+                    logger.warning(
+                        "Tiling produced no complete tiles for %s — keeping "
+                        "its source file (choose a tile size that divides the "
+                        "image).", src.name)
+                    continue
+                produced = True
 
                 for tile_idx, tile_data in tiles:
                     # String concat: tile 1 -> "10001" + orig_field, etc.

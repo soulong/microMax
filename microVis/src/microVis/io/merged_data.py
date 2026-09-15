@@ -15,10 +15,9 @@ import logging
 
 import pandas as pd
 
-from microBase import db_merge
+from microBase import db_merge, normalize_well
 from microBase.db_merge import (  # re-exported for MainWindow
     MERGED_TABLE,
-    merge_dbs,
     write_merged_db,
 )
 
@@ -28,9 +27,14 @@ logger = logging.getLogger("microVis.merged_data")
 class MergedData:
     """The integrated per-object table built from selected DB files."""
 
-    def __init__(self, table: pd.DataFrame, paths: list[str]):
+    def __init__(self, table: pd.DataFrame, paths: list, masks=None):
         self.table = table
         self.paths = paths
+        # Distinct mask tags across the fused sources (empty when unknown —
+        # e.g. infer-only rows with NULL mask_name). A single-mask selection
+        # fuses WITHOUT the tag column, so Write to DB needs this to pass
+        # mask= and keep the written file re-loadable under its real mask.
+        self.masks = list(masks) if masks else []
 
     # ── Loading ───────────────────────────────────────────────────────────
 
@@ -38,8 +42,12 @@ class MergedData:
     def load(cls, paths) -> "MergedData":
         """Open every DB read-only and fuse their frames (per mask)."""
         paths = [str(p) for p in paths]
-        table = merge_dbs(paths)
-        return cls(table, paths)
+        frames = []
+        for p in paths:
+            frames.extend(db_merge.read_db_frames(p))
+        table = db_merge.fuse_frames(frames)
+        masks = sorted({f.mask for f in frames if f.mask})
+        return cls(table, paths, masks)
 
     # ── Access ────────────────────────────────────────────────────────────
 
@@ -78,7 +86,9 @@ def merge_metadata_into(merged: MergedData | None,
 
     Left-joins only the metadata columns missing from the table, so
     re-merging after a write never duplicates columns (same contract as
-    data_module.merge_metadata).
+    data_module.merge_metadata). The well join runs on normalized keys
+    ('A01' -> 'A1') so captured verbatim wells still meet the Excel
+    spelling; the original well columns stay verbatim.
     """
     if merged is None:
         return None
@@ -89,4 +99,10 @@ def merge_metadata_into(merged: MergedData | None,
                if c != "well" and c not in df.columns]
     if not missing:
         return df
-    return df.merge(metadata[["well"] + missing], on="well", how="left")
+    if "well" not in metadata.columns:
+        return df
+    left = df.assign(__well_key__=df["well"].map(normalize_well))
+    right = metadata[["well"] + missing].assign(
+        __well_key__=metadata["well"].map(normalize_well))
+    return left.merge(right.drop(columns=["well"]), on="__well_key__",
+                      how="left").drop(columns=["__well_key__"])

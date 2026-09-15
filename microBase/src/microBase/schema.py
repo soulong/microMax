@@ -78,6 +78,24 @@ def derive_well(row_val, col_val):
     return f"{_row_to_letter(row_val)}{col_int}"
 
 
+def normalize_well(well_val):
+    """Canonical well key: UPPERCASE row letters + strip leading zeros.
+
+    A directly-captured `well` keeps its regex text verbatim ('A01' or even
+    'a01' stays as captured), while derived wells and GUI/grid code generate
+    uppercase 'A1' — comparing or joining the two forms therefore needs this
+    normalization. Anything that is not a `<letters><digits>` well shape
+    passes through unchanged.
+    """
+    text = str(well_val)
+    i = 0
+    while i < len(text) and text[i].isalpha():
+        i += 1
+    if i == 0 or i == len(text) or not text[i:].isdigit():
+        return well_val
+    return f"{text[:i].upper()}{int(text[i:])}"
+
+
 @dataclass(frozen=True)
 class MetadataSchema:
     """Describes how regex-captured columns map to structural metadata."""

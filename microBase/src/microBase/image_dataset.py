@@ -317,12 +317,6 @@ class ImageDataset:
 
     def build_metadata(self):
         """Scan root, parse filenames with regex, build pivoted metadata DataFrame."""
-        # Any (re)build invalidates row indices — in-flight readers must not
-        # cache results keyed by the old indexing (see get_imageset), and the
-        # cache itself holds (image, mask) tuples for the old row ordering
-        # (e.g. cellpose.py rebuilds metadata after saving new masks).
-        self._metadata_generation += 1
-        self._cache.clear()
         # Group 1: collect parsed records
         # Each image record: {shared_key -> {channel: filepath, ...extra meta}}
         # Mask records similar with mask_name.
@@ -456,6 +450,15 @@ class ImageDataset:
         df = df.reset_index(drop=True)
 
         self._metadata = df
+        # Swap the table FIRST, then invalidate. Cache entries carry the
+        # generation they were built under, so a reader that sampled rows
+        # from the old table (old generation) can neither serve a hit nor
+        # complete a put once the generation advances — an old row can never
+        # survive under the new indexing. (Bumping generation BEFORE the
+        # scan, as previously, let concurrent readers capture the NEW
+        # generation while still reading the OLD table and cache it there.)
+        self._metadata_generation += 1
+        self._cache.clear()
         self._intensity_colnames = ch_cols
         self._mask_colnames = mask_cols
         self._captured_fields = captured
@@ -608,16 +611,16 @@ class ImageDataset:
         returned arrays (copy first), or the cache is corrupted for every
         subsequent reader.
         """
-        # Capture the metadata generation so a concurrent filter_metadata or
+        # Cache entries are (generation, image, masks): the generation the
+        # row was read under. A hit only counts when the entry's generation
+        # still equals the CURRENT one — a concurrent filter_metadata or
         # build_metadata (GUI thread) between this miss and the put below
-        # can't leave the read cached under a row_idx that no longer means
-        # the same site. A hit whose generation no longer matches is treated
-        # as a miss: build_metadata clears the cache, but a concurrent reader
-        # may still observe the pre-clear entry.
+        # bumps the generation, so stale entries (and reads keyed by the old
+        # row indexing) can never be served.
         generation = self._metadata_generation
         cached = self._cache.get(row_idx)
-        if cached is not None and generation == self._metadata_generation:
-            img_data, all_masks = cached
+        if cached is not None and cached[0] == self._metadata_generation:
+            _, img_data, all_masks = cached
             if masks is None:
                 return img_data, dict(all_masks)
             return img_data, {m: all_masks[m] for m in masks if m in all_masks}
@@ -646,7 +649,7 @@ class ImageDataset:
             mask_dict[mname] = _io.read_mask(mpath)
 
         if generation == self._metadata_generation:
-            self._cache.put(row_idx, (img_data, mask_dict))
+            self._cache.put(row_idx, (generation, img_data, mask_dict))
         if masks is None:
             return img_data, dict(mask_dict)
         return img_data, {m: mask_dict[m] for m in masks if m in mask_dict}

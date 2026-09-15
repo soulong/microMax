@@ -111,6 +111,40 @@ def load_label_csv(path):
     return label_map
 
 
+def load_file_list(entries):
+    """Read one or more file-list CSVs -> (absolute paths, labels|None).
+
+    `entries` is one CSV path or a list of them. Each CSV needs a
+    'filepath' column; an optional 'label' column feeds train directly
+    (pretrain ignores it) — empty/missing labels come back as None.
+
+    Relative filepath entries resolve against the PROCESS CWD — the same
+    base deduplication uses when writing curated.csv — so run train/pretrain
+    from the directory the list was generated for (this intentionally
+    differs from load_label_csv's CSV-relative convention).
+    """
+    import pandas as pd
+
+    if isinstance(entries, str):
+        entries = [entries]
+    paths, labels = [], []
+    for entry in entries:
+        if not os.path.exists(entry):
+            raise MicroMaxError(f"file list not found: {entry}")
+        df = pd.read_csv(entry)
+        if "filepath" not in df.columns:
+            raise MicroMaxError(f"file list {entry} needs a 'filepath' column")
+        for _, r in df.iterrows():
+            fp = str(r["filepath"])
+            paths.append(os.path.abspath(fp))
+            lbl = r["label"] if "label" in df.columns else None
+            labels.append(None if pd.isna(lbl) or not str(lbl).strip()
+                          else str(lbl))
+    if not paths:
+        raise MicroMaxError("file list is empty")
+    return paths, labels
+
+
 def parse_pred_prob(value):
     """Parse the infer.db `pred_prob` column into a single float.
 
@@ -185,8 +219,14 @@ def resolve_max_value(data_cfg):
 
 
 def resolve_output_paths(data_roots, output_dir):
-    """Pair each data root with an output dir. If output_dir is None, use the data root itself."""
+    """Pair each data root with an output dir. If output_dir is None, use the
+    data root itself. Roots are ABSOLUTIZED: relative roots (e.g.
+    ``data.file_dir`` entries resolved against the process CWD) must not leak
+    into the dataset scan — relative scan paths make CellDataset yield
+    relative file paths, and canonical_directory then re-joins the relative
+    root onto them, doubling the prefix in the DB ``directory`` column."""
     roots = [data_roots] if isinstance(data_roots, str) else list(data_roots)
+    roots = [os.path.abspath(r) for r in roots]
     if output_dir:
         return [(r, output_dir) for r in roots]
     return [(r, r) for r in roots]
@@ -271,10 +311,17 @@ def stratified_sample_indices(n, labels, sample_per_class, seed, uniform=False):
 
 
 def copy_config_file(config_path, target_dir):
-    """Copy config file to target_dir, falling back to manual read/write on PermissionError."""
+    """Copy config file to target_dir, falling back to manual read/write on PermissionError.
+
+    A config that already lives inside target_dir (e.g. save_dir) is its own
+    destination — copying would truncate it to empty on Windows, so the
+    same-file case is skipped.
+    """
     import shutil
     os.makedirs(target_dir, exist_ok=True)
     dst = os.path.join(target_dir, os.path.basename(config_path))
+    if os.path.exists(dst) and os.path.samefile(config_path, dst):
+        return dst
     try:
         shutil.copy2(config_path, dst)
     except PermissionError:

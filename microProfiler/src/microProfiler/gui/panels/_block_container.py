@@ -32,6 +32,13 @@ class BlockContainerPanel(BaseStepPanel):
     """
 
     _block_widget_class: Optional[Type[QWidget]] = None
+    # Whether this panel's blocks receive populate_masks. Panels that never
+    # do (Segment, Image Profiling — only object_profile/inference get mask
+    # population from the main window) must finish the deferred restore on
+    # populate_channels alone, or _maybe_finish_restore would wait forever
+    # for a mask list that never arrives and re-apply the restored config on
+    # every later repopulation, clobbering the user's current selections.
+    _uses_masks: bool = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -167,10 +174,13 @@ class BlockContainerPanel(BaseStepPanel):
         """Turn restore off once channels (and masks) carry real data.
 
         ``_masks_populated`` covers mask-less datasets: populate_masks([])
-        means there is nothing to wait for, not "still loading".
+        means there is nothing to wait for, not "still loading". Panels with
+        ``_uses_masks = False`` never get a mask population at all, so their
+        restore ends as soon as the channels are in.
         """
         if (self._restore_active and self._channels
-                and (self._last_masks or self._masks_populated)):
+                and (self._last_masks or self._masks_populated
+                     or not self._uses_masks)):
             self._restore_active = False
 
     # ── Serialization: structured list-of-dicts format (load_config_section) ──
@@ -193,7 +203,6 @@ class BlockContainerPanel(BaseStepPanel):
             self._blocks_layout.removeItem(self._add_btn_layout)
 
         last_channels = self._last_channels or self._channels
-        last_masks = self._last_masks
 
         for cfg in sections:
             if not isinstance(cfg, dict):
@@ -211,10 +220,13 @@ class BlockContainerPanel(BaseStepPanel):
 
         if self._add_btn_layout is not None:
             self._blocks_layout.addLayout(self._add_btn_layout)
-        if last_channels:
-            self.populate_channels(last_channels)
-        elif last_masks:
-            self.populate_masks(last_masks)
+        # NO pre-population with the previous dataset's channels/masks here:
+        # populate_* would fire _maybe_finish_restore on the STALE lists and
+        # switch the restore off before the new dataset ever arrives (its
+        # mask/channel configs would then never be applied). The pending
+        # configs are re-applied by _reapply_pending_configs during the real
+        # populate_channels/populate_masks after the dataset loads.
+        self._last_masks = []
         self.parameter_changed.emit()
 
     def _apply_block_config(self, block: QWidget, cfg: dict) -> None:

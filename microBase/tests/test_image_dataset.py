@@ -848,3 +848,32 @@ def test_get_imageset_no_intensity_channels_raises(tmp_path):
     assert ds.intensity_colnames == []
     with pytest.raises(ImageReadError):
         ds.get_imageset(0)
+
+
+def test_cache_entries_carry_generation(tmp_path):
+    """Cache entries are tagged with the metadata generation they were read
+    under: a stale entry is never served once the generation advanced, even
+    when it still sits in the cache (the concurrent-rebuild window)."""
+    _make_one_channel_per_file_dataset(tmp_path)
+    ds = ImageDataset(
+        root=tmp_path,
+        image_pattern=re.compile(
+            r"r(?P<row>\d+)c(?P<col>\d+)f(?P<field>\d+)p(?P<stack>\d+)-ch(?P<channel>\d+)\.tiff"
+        ),
+        channel_layout=None,
+    )
+    gen = ds._metadata_generation
+    img0, _ = ds.get_imageset(0)
+    # Simulate the concurrent-rebuild window: an entry cached under the old
+    # generation with WRONG content must not be served after the bump.
+    ds._cache.put(0, (gen, np.full((64, 64, 2), 7, dtype=np.uint16), {}))
+    ds._metadata_generation += 1  # bump WITHOUT a cache clear (old bug order)
+    img, _ = ds.get_imageset(0)
+    assert not np.array_equal(img, np.full((64, 64, 2), 7, dtype=np.uint16))
+
+    # A rebuild swaps the table first, then advances the generation and
+    # clears the cache — nothing stale survives, and the generation moved.
+    ds.get_imageset(0)
+    ds.build_metadata()
+    assert ds._metadata_generation == gen + 2
+    assert ds._cache.get(0) is None

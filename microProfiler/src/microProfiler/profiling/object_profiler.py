@@ -161,10 +161,10 @@ def _run_per_channel_regionprops(
         if not fns:
             continue
         ch_name = channel_names[ch_idx] if ch_idx < len(channel_names) else str(ch_idx)
-        expected_cols = [
-            getattr(fn, "name", None) or f"{ch_name}_{i}"
-            for i, fn in enumerate(fns)
-        ]
+        # skimage names extra-property columns from func.__name__ — the NaN
+        # fallback MUST use the same names or BatchWriter's first-flush schema
+        # locks in bogus `ch_0...` columns and the real features get dropped.
+        expected_cols = [fn.__name__ for fn in fns]
         try:
             props = regionprops_table(
                 mask, img[..., ch_idx],

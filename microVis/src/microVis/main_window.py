@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from microBase import (
+    DataError,
     SessionFile,
     DEFAULT_IMAGE_PATTERN,
     DEFAULT_MASK_PATTERN,
@@ -533,6 +534,7 @@ class MainWindow(QMainWindow):
         self._data_view.dataset_path_edit.editingFinished.connect(
             self._on_dataset_path_edited)
         self._data_view.select_db_clicked.connect(self._on_select_db_browse)
+        self._data_view.clear_db_clicked.connect(self._on_clear_db)
         self._data_view.load_dataset_clicked.connect(self._on_load_dataset_clicked)
         self._plot_view.point_picked.connect(self._on_plot_point_picked)
         self._data_view.metadata_browse_clicked.connect(self._on_metadata_browse)
@@ -566,6 +568,10 @@ class MainWindow(QMainWindow):
         self._image_controls.set_export_enabled(True)
         # Dataset-scoped selections must not leak into the next dataset.
         self._object_mask_selected = ""
+        # Reset the overlay's "Select object" combo too — populate_label_controls
+        # restores the previous text on the next load (signals blocked, so the
+        # change never propagates and the combo would disagree with the state).
+        self._image_controls.set_object_masks([])
         self._label_panel.clear_all()
         self._image_controls.clear_classes()
         self._grid_canvas.clear()
@@ -574,9 +580,11 @@ class MainWindow(QMainWindow):
         self._image_controls.set_channels({})
         # Drop the previous dataset's merged metadata — otherwise the new
         # dataset's well-grid "Color by" and overlay dropdowns would list the
-        # OLD dataset's metadata columns.
+        # OLD dataset's metadata columns. The Merge/Clear buttons follow the
+        # selection (merging into a cleared integrated table would crash).
         self._metadata_df = None
         self._metadata_merged = None
+        self._data_view.set_metadata_label(None)
         # Close old DataModule — it's no longer needed after browsing away.
         if self._dm is not None:
             self._dm.close_db()
@@ -671,16 +679,19 @@ class MainWindow(QMainWindow):
     def load_db_files(self, paths) -> None:
         """Merge any mix of profiler/infer DBs into ONE integrated table.
 
-        Every call REPLACES the previous selection (re-select with more
-        files to extend it). The last profiler-type DB is additionally
-        loaded into the DataModule so the well-grid color-by keeps its
-        existing table-level sources.
+        Every call REPLACES the previous selection wholesale: the previous
+        merged table AND the DataModule's attached DB are cleared first (an
+        infer-only re-selection must not keep the old profiler DB alive as a
+        hidden source), then the new files are merged. The last profiler-type
+        DB of the new selection is additionally loaded into the DataModule
+        so the well-grid color-by keeps its existing table-level sources.
         """
         if self._dm is None:
             return
         paths = self._split_paths(paths)
         if not paths:
             return
+        self._clear_db_state()
         logger.info("Select DB: %d file(s) — %s",
                     len(paths), ", ".join(Path(x).name for x in paths))
         try:
@@ -689,12 +700,17 @@ class MainWindow(QMainWindow):
             logger.warning("Failed to merge DBs %s: %s", paths, e)
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Invalid DB", str(e))
+            # With no integrated table there is nothing for the metadata
+            # merge to join into — a previously-selected metadata file must
+            # not keep its Merge button enabled.
+            self._data_view.set_meta_browse_enabled(False)
             return
         logger.info("Integrated table: %d rows x %d columns",
                     len(self._merged.table), len(self._merged.table.columns))
 
         self._refresh_merged_plot()
         self._data_view.set_meta_browse_enabled(True)
+        self._data_view.set_clear_db_enabled(True)
         self._update_db_status()
 
         # Well-grid / overlay machinery reads through the DataModule: keep
@@ -704,7 +720,32 @@ class MainWindow(QMainWindow):
             if not self._is_infer_db(path):
                 self._load_profiler_into_dm(path)
                 break
+        # Rebuild the column dropdowns for EVERY selection — an infer-only
+        # selection has no profiler DB to load but still contributes merge/*
+        # columns — and re-render the canvas so stale coloring from the
+        # previous selection cannot survive.
+        self._update_grid_columns()
+        self._populate_overlay_columns()
+        self._update_grid()
         self._data_view.set_write_to_db_enabled(True)
+
+    def _clear_db_state(self) -> None:
+        """Drop every loaded/merged DB source: the merged table, the plot
+        view's data, and the DataModule's attached DB + cached tables. The
+        grid/overlay column dropdowns are rebuilt from the empty state."""
+        self._reset_merged_data()
+        if self._dm is not None:
+            self._dm.clear_db()
+        self._overlay_cache = None
+        self._overlay_cache_key = None
+        self._update_grid_columns()
+        self._populate_overlay_columns()
+        self._update_grid()
+
+    def _on_clear_db(self) -> None:
+        """Explicit Clear DB(s): unload the selection and its merged table."""
+        logger.info("Clear DB: dropping the loaded/merged DB selection")
+        self._clear_db_state()
 
     @staticmethod
     def _is_infer_db(path: str) -> bool:
@@ -737,8 +778,8 @@ class MainWindow(QMainWindow):
         self._overlay_cache_key = None
         # NOTE: filters and channels are dataset-dependent — never rebuild
         # them here (that would reset the user's field/stack selections).
-        self._update_grid_columns()
-        self._populate_overlay_columns()
+        # The grid/overlay column dropdowns are rebuilt by the caller for
+        # every selection (also when no profiler DB is present at all).
         # Close persistent DB connection — cached data remains available.
         self._dm.close_db()
         logger.info("Active profiler DB: %s", path)
@@ -747,6 +788,7 @@ class MainWindow(QMainWindow):
         """Drop the merged table and the plot view's data."""
         self._merged = None
         self._data_view.set_write_to_db_enabled(False)
+        self._data_view.set_clear_db_enabled(False)
         self._data_view.set_db_status("")
         self._plot_view.clear()
 
@@ -767,8 +809,13 @@ class MainWindow(QMainWindow):
         # Defensive: the plot view must be installed in the Data page layout
         # (idempotent) — a Reset must never leave the lower half detached.
         self._data_view.set_plot_view(self._plot_view)
-        self._plot_view.set_frame(
-            merge_metadata_into(self._merged, self._metadata_merged))
+        frame = merge_metadata_into(self._merged, self._metadata_merged)
+        if frame is None:
+            # No integrated table (e.g. Clear DB(s) with metadata loaded) —
+            # set_frame(None) would crash the plot view's picker rebuild.
+            self._plot_view.clear()
+        else:
+            self._plot_view.set_frame(frame)
 
     def _merged_frame_for_dataset(self) -> pd.DataFrame:
         """Directory-scoped view of the merged table (empty df if none)."""
@@ -824,6 +871,11 @@ class MainWindow(QMainWindow):
         # Capture and clear loader state first so a failed phase 2 doesn't
         # leave dangling refs.
         p_str, image_pattern, mask_pattern, image_subdir_pattern = self._loader_pending
+        # In-flight thumbnail/mask workers of the PREVIOUS dataset must not
+        # repopulate the just-cleared caches: a same-directory reload never
+        # runs _clear_display_state, so the generation counter is untouched
+        # there — cancel (and bump the generation) explicitly.
+        self._cancel_workers()
         dialog = getattr(self, "_loader_dialog", None)
         thread = getattr(self, "_loader_thread", None)
         worker = getattr(self, "_loader_worker", None)
@@ -936,11 +988,14 @@ class MainWindow(QMainWindow):
         logger.warning("Failed to load dataset from %s — %s", p_str, msg)
         from PySide6.QtWidgets import QMessageBox
         QMessageBox.warning(self, "Dataset Load Failed", f"Could not load dataset:\n{msg}")
-        self._dataset_dir = p_str
-        self._session = SessionFile(p_str)
-        self._data_view.set_dataset_path(p_str)
-        self._data_view.set_db_buttons_enabled(False)
-        self._data_view.set_meta_browse_enabled(False)
+        # A failed SAME-directory reload must not strip the buttons from the
+        # dataset that is still displayed — only a failed NEW directory does.
+        if str(p_str) != (self._loaded_dataset_dir or ""):
+            self._dataset_dir = p_str
+            self._session = SessionFile(p_str)
+            self._data_view.set_dataset_path(p_str)
+            self._data_view.set_db_buttons_enabled(False)
+            self._data_view.set_meta_browse_enabled(False)
         self._switch_tab(0)
 
     def _on_load_dataset_clicked(self) -> None:
@@ -1243,7 +1298,8 @@ class MainWindow(QMainWindow):
             self._data_view.set_metadata_label(None)
 
     def _on_metadata_merge(self) -> None:
-        if self._metadata_df is None:
+        if self._metadata_df is None or self._merged is None:
+            # No integrated table to merge into (e.g. after Clear DB(s)).
             return
         self._metadata_merged = self._metadata_df.copy()
         self._overlay_cache = None
@@ -1256,6 +1312,8 @@ class MainWindow(QMainWindow):
         self._update_overlay_with_metadata()
 
     def _on_metadata_clear(self) -> None:
+        if self._metadata_merged is None and self._metadata_df is None:
+            return
         self._metadata_df = None
         self._metadata_merged = None
         self._overlay_cache = None
@@ -1310,7 +1368,12 @@ class MainWindow(QMainWindow):
         logger.info("Write to DB: %d rows x %d columns -> %s",
                     len(df), len(df.columns), out)
         try:
-            written_path = write_merged_db(df, out)
+            # A single-mask fused table carries no mask column — pass the
+            # mask explicitly so the written file re-loads under its real
+            # mask (the table name alone would resolve as "merged").
+            mask = (self._merged.masks[0]
+                    if len(self._merged.masks) == 1 else None)
+            written_path = write_merged_db(df, out, mask=mask)
         except Exception:
             logger.exception("Failed to write merged DB")
             from PySide6.QtWidgets import QMessageBox
@@ -2307,7 +2370,7 @@ class MainWindow(QMainWindow):
                     image_subdir_pattern=subdir_pat,
                 )
                 self._persist_channel_colors()
-        except SystemExit:
+        except DataError:
             # SessionFile.save raises DataError on YAML write failure — never let
             # it kill the app.
             logger.exception("Failed to persist session.yml")
@@ -2586,7 +2649,7 @@ class MainWindow(QMainWindow):
                     image_subdir_pattern=subdir_pat,
                 )
                 self._persist_channel_colors()
-        except SystemExit:
+        except DataError:
             # SessionFile.save raises DataError on YAML write failure — never let
             # it kill the app.
             logger.exception("Failed to persist session.yml")
@@ -2621,7 +2684,7 @@ class MainWindow(QMainWindow):
         # Get wells/fields based on mode
         annotated_keys = None  # set of row_idx for "Annotated"
         extra_filters: dict[str, list[str]] = {}
-        if object_mode == "Selected wells":
+        if object_mode == "Current displayed":
             # Wells exist but none selected → warn, never export the whole
             # plate (matches the viewer's "wells exist but none selected →
             # show nothing" rule; "All" mode is the explicit whole-plate path).
@@ -2636,15 +2699,15 @@ class MainWindow(QMainWindow):
             fields = list(ic.get_selected_fields())
             stacks = list(ic.get_selected_stacks())
             timepoints = list(ic.get_selected_timepoints())
-            # Extra-col filters only apply to "Selected wells" — "Selected
-            # wells (all objects)" exports all images in the wells by user
+            # Extra-col filters only apply to "Current displayed" —
+            # "Selected wells" exports all images in the wells by user
             # intent, "All" exports everything, "Annotated" is scoped to
             # annotated images.
             for col, widget in ic.get_extra_widgets().items():
                 selected = widget.get_selected()
                 if selected:
                     extra_filters[col] = selected
-        elif object_mode == "Selected wells (all objects)":
+        elif object_mode == "Selected wells":
             # Selected wells only — the Image Filters (fields/stacks/
             # timepoints/extra cols) are intentionally ignored. Empty
             # wells/fields/stacks/timepoints means "no filter" in the worker.
@@ -2868,13 +2931,19 @@ class MainWindow(QMainWindow):
         ic.sort_by_row.setChecked(False)
         ic.sort_by_row.blockSignals(False)
         for w in (getattr(ic, "_export_dir_input", None),
-                  getattr(ic, "_export_well_subdir", None),
                   getattr(ic, "_label_table_name", None),
                   getattr(ic, "_class_input", None)):
             if w is not None:
                 w.blockSignals(True)
                 w.clear()
                 w.blockSignals(False)
+        # The well-subdir switch is a fixed-items QComboBox: clear() would
+        # empty it forever (the switch then silently reads False until the
+        # app restarts) — restore its default selection instead.
+        if getattr(ic, "_export_well_subdir", None) is not None:
+            ic._export_well_subdir.blockSignals(True)
+            ic._export_well_subdir.setCurrentIndex(1)
+            ic._export_well_subdir.blockSignals(False)
         max_obj = getattr(ic, "_export_max_obj", None)
         if max_obj is not None:
             max_obj.blockSignals(True)

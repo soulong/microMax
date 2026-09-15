@@ -18,19 +18,76 @@ from microBase import MicroMaxError
 from . import __version__
 from .utils import (logger, set_seed, select_device, copy_config_file,
                     add_file_logging, atomic_torch_save, merge_locked_normalize,
-                    resolve_channels, resolve_max_value, build_cell_datasets)
-from .dataset import SSLMultiViewDataset, subsample
+                    resolve_channels, resolve_max_value, build_cell_datasets,
+                    load_file_list)
+from .dataset import SSLMultiViewDataset, FileListCellDataset, subsample
 from .models import build_ssl_model, get_train_step, get_criterion
+from .backbone import (pool_embedding, num_prefix_tokens,
+                       validate_embed_source)
 from .monitor import (MetricsTracker, head_collapse_metrics, gram_split_metrics,
                       compute_patch_similarity_maps, compute_cls_attention_maps,
-                      maps_to_grid, resize_map)
+                      maps_to_grid, resize_map, content_dependence_index)
+
+# Images used for the content-dependence index inside each UMAP check.
+CDI_IMAGES = 60
+
+
+def _is_self_resume(resume_path, output_dir):
+    """True when resume.ssl_model lives inside this run's output_dir — an
+    interrupted continuation of the SAME run (vs a new phase over another
+    run's bundle)."""
+    if not resume_path:
+        return False
+    out = os.path.normcase(os.path.abspath(output_dir))
+    return os.path.normcase(os.path.abspath(resume_path)).startswith(out)
+
+
+def _align_history(hist, start_epoch):
+    """Front-pad a monitor history with None so that index i == epoch i.
+
+    Histories that only start mid-run (gram stats, CDI — enabled in some
+    phases but not others) would otherwise be plotted at the far left of
+    head_track.pdf, sharing an 'Epoch' axis they don't belong to.
+    """
+    return [None] * max(0, start_epoch - len(hist)) + list(hist)
+
+
+def _append_at(hist, epoch, value):
+    """Place value at 1-based index epoch, front-padding None gaps (sparse
+    per-save metrics like CDI keep their true epoch positions)."""
+    while len(hist) < epoch - 1:
+        hist.append(None)
+    if len(hist) == epoch - 1:
+        hist.append(value)
+    else:
+        hist[epoch - 1] = value
+
+
+def _resolve_gram_refresh_state(bundle_meta, output_dir, resume_path, start_step):
+    """-> (origin, count) for the gram refresh schedule of this anchoring run.
+
+    Self-resume — the resume bundle lives inside this run's output_dir, i.e.
+    an interrupted continuation of the SAME anchoring phase — restores the
+    persisted origin + true refresh count, so the schedule and its
+    max_updates budget are not reset by the interruption. Any other resume
+    (a NEW anchoring phase over a phase-1/other bundle) starts a fresh local
+    schedule at the resume step: the earlier history contains no gram
+    refreshes and must not pre-exhaust max_updates.
+    """
+    if not _is_self_resume(resume_path, output_dir):
+        return int(start_step), 0
+    saved = (bundle_meta or {}).get("gram_refresh")
+    if saved:
+        return int(saved.get("origin", start_step)), int(saved.get("count", 0))
+    return int(start_step), 0
 
 
 def _save_bundle(output_dir, epoch, model, opt, loss_history, config, meta, method,
-                 component_histories=None, monitor_histories=None, final=False):
+                 component_histories=None, monitor_histories=None, final=False,
+                 scaler=None):
     """Save a complete SSL bundle: full model state (backbone + heads +
     momentum nets + training-time heads), meta, config, optimizer state,
-    epoch, loss history.
+    GradScaler state, epoch, loss history.
 
     Every saved .pt is a complete bundle — usable for exact resume, train
     transfer, and feature extraction. final=True writes model.pt (final
@@ -46,11 +103,21 @@ def _save_bundle(output_dir, epoch, model, opt, loss_history, config, meta, meth
     # meta["ssl_method"] is the single method key (no top-level "method").
     meta = dict(meta)
     meta.setdefault("ssl_method", method)
+    # Persist the gram refresh schedule state (local origin + true refresh
+    # count) so an interrupted anchoring run resumes its schedule instead of
+    # resetting it (see _resolve_gram_refresh_state).
+    if (method == "dinov3" and getattr(model, "gram_use_loss", False)
+            and getattr(model, "gram_backbone", None) is not None):
+        meta["gram_refresh"] = {"origin": int(model._gram_step_origin),
+                                "count": int(model._num_gram_updates)}
     bundle = {
         "state_dict": model.state_dict(),
         "meta": meta,
         "config": config,
         "optimizer_state_dict": opt.state_dict(),
+        # AMP scale: without it a resumed run restarts at 65536 and skips a
+        # few steps until the scale re-converges.
+        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
         "epoch": epoch,
         # Bundle key naming mirrors the train bundles (meta["ssl_method"]
         # identifies the method; no separate top-level "method").
@@ -64,9 +131,19 @@ def _save_bundle(output_dir, epoch, model, opt, loss_history, config, meta, meth
     logger.info("SSL bundle saved to %s (epoch %d)", path, epoch)
 
 
-def _run_umap_check(model, method, loader, device, epoch, seed, save_path):
+def _run_umap_check(model, method, loader, device, epoch, seed, save_path,
+                    embed_source="patch", mask_weighted=False):
     """Extract backbone features of the fixed UMAP-check subset (deterministic
-    augmentation_infer pipeline) and save a fresh UMAP scatter PDF.
+    augmentation_infer pipeline), save a fresh UMAP scatter PDF, and return
+    the content-dependence index (CDI) of the first CDI_IMAGES images' patch
+    features — the dense-feature homogenization gauge (~1.0 = similarity maps
+    input-independent; low = maps track content). Returns None when fewer
+    than 2 images are available.
+
+    Features come from the teacher (EMA) branch — official DINO-family
+    evaluation uses the teacher backbone — pooled per the run's
+    monitoring.embed_source. The umap loader yields masks only when
+    mask_weighted is set (single deterministic view per image).
 
     Auxiliary monitoring aid: failures are caught by the caller (logged and
     skipped) so a plotting hiccup never aborts training.
@@ -78,17 +155,33 @@ def _run_umap_check(model, method, loader, device, epoch, seed, save_path):
 
     model.eval()
     feats = []
+    cdi_patches = []
+    n_prefix = None
     with torch.no_grad():
         for batch in loader:
-            x = batch[0].to(device)
-            # Teacher (EMA) branch — official DINO-family evaluation uses
-            # the teacher backbone, which is a Polyak average of the
-            # student and yields the better features.
-            f = model.teacher_backbone.encode(x)[:, 0]
+            # Without return_mask the batch is [view_batch]; with it, the item
+            # is (views, masks) -> batch = [[view_batch], [mask_batch]].
+            views = batch[0]
+            x = (views[0] if isinstance(views, list) else views).to(device)
+            # teacher_backbone.encode returns the FULL token grid (CLS +
+            # registers + patches); pool it per the run's embed_source.
+            tokens = model.teacher_backbone.encode(x)
+            if n_prefix is None:
+                n_prefix = num_prefix_tokens(model.teacher_backbone)
+            if len(cdi_patches) < CDI_IMAGES:
+                cdi_patches.append(
+                    tokens[:, n_prefix:].detach().float().cpu())
+            patch_mask = None
+            if mask_weighted:
+                m = batch[-1]
+                patch_mask = (m[0] if isinstance(m, list) else m).to(device)
+            f = pool_embedding(tokens, n_prefix, embed_source, patch_mask)
             feats.append(f.cpu().numpy())
     X = np.concatenate(feats, axis=0)
 
-    reducer = umap.UMAP(random_state=seed)
+    # n_jobs=1 is required by the fixed random_state (reproducible embedding);
+    # passing it explicitly silences umap's override warning.
+    reducer = umap.UMAP(random_state=seed, n_jobs=1)
     emb = reducer.fit_transform(X)
 
     # epoch 0 = the pre-training baseline snapshot (before epoch 1 runs).
@@ -102,6 +195,21 @@ def _run_umap_check(model, method, loader, device, epoch, seed, save_path):
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info("UMAP check saved to %s (%s, %d images)", save_path, stage, len(X))
+
+    # Dense-feature homogenization gauge over the first CDI_IMAGES images
+    # (anchor = grid centre patch). Returned to the caller for the
+    # monitor_histories curve; None when the subset is too small.
+    if not cdi_patches:
+        return None
+    patches = torch.cat(cdi_patches, dim=0)[:CDI_IMAGES].numpy()
+    if len(patches) < 2:
+        return None
+    grid = int(round((patches.shape[1]) ** 0.5))
+    cdi = content_dependence_index(
+        patches, anchor=(grid // 2) * grid + grid // 2)
+    logger.info("Content-dependence index: %.3f (~1.0 = similarity maps "
+                "homogenized; low = content-tracking)", cdi)
+    return cdi
 
 
 def _run_attention_summary_check(model, loader, device, save_path, n_samples,
@@ -125,7 +233,10 @@ def _run_attention_summary_check(model, loader, device, save_path, n_samples,
     grid = None
     with torch.no_grad():
         for batch in loader:
-            x = batch[0].to(device)
+            # The umap loader yields a view LIST per sample (single view here)
+            # — collated to [view_batch]; unwrapped either way.
+            views = batch[0]
+            x = (views[0] if isinstance(views, list) else views).to(device)
             need = n_samples - len(samples)
             for i in range(min(need, len(x))):
                 x1 = x[i:i + 1]
@@ -168,11 +279,17 @@ def _run_attention_summary_check(model, loader, device, save_path, n_samples,
 def _load_checkpoint_state(model, ckpt, method=None):
     """Restore model state from a bundle (full model state_dict).
 
-    For DINOv3 phase-2 gram runs, the fresh model carries a frozen gram
-    teacher (gram_backbone, plus optionally gram_teacher/gram_ema buffers)
-    that a phase-1 bundle (trained without gram) does not have — such bundles
-    are loaded non-strictly, keeping every gram-* key at its
-    gram.ckpt-initialized value instead of failing on a mismatch.
+    For DINOv3 gram runs the bundle and the freshly built model may disagree
+    on the gram modules ONLY — such bundles load non-strictly, in either
+    direction:
+    - bundle has no gram state (phase-1 bundle into a phase-2 model): every
+      missing key is a gram module, which keeps the value it was initialized
+      with from the resume checkpoint (the gram anchor).
+    - bundle has gram state but the current config disabled gram: those
+      bundle keys are unexpected (the model never built the modules) and are
+      simply dropped.
+    Any other missing/unexpected key is real schema drift and must fail
+    loudly via the strict load below.
     """
     if "state_dict" not in ckpt:
         raise MicroMaxError("Error: bundle has no 'state_dict' key (unsupported pre-0.2.1 "
@@ -190,15 +307,13 @@ def _load_checkpoint_state(model, ckpt, method=None):
         model_keys = set(model.state_dict())
         bundle_keys = set(state)
         missing = model_keys - bundle_keys
+        unexpected = bundle_keys - model_keys
         gram_prefixes = ("gram_backbone.", "gram_teacher.")
-        if missing and all(k.startswith(gram_prefixes) for k in missing):
-            # Bundle predates the gram teacher: every schema-diff key belongs
-            # to the gram modules, so they stay at the values loaded from
-            # gram.ckpt. Anything else missing is real schema drift and must
-            # fail loudly.
+        if (missing and all(k.startswith(gram_prefixes) for k in missing)) or \
+                (unexpected and all(k.startswith(gram_prefixes) for k in unexpected)):
             logger.info(
-                "Bundle has no gram-* state (%d gram keys kept from "
-                "dinov3.gram.ckpt); loading non-strictly", len(missing))
+                "Bundle/model gram schema diff (%d missing / %d unexpected "
+                "keys); loading non-strictly", len(missing), len(unexpected))
             model.load_state_dict(state, strict=False)
             return
     model.load_state_dict(state)
@@ -342,6 +457,10 @@ def _resolve_monitoring_cfg(user_cfg):
         "attention_maps": True,
         "gram_split_stats": True,
         "head_logits_track": True,
+        # UMAP-check embedding readout (teacher branch) + binary background
+        # drop in the patch mean. Training itself is unaffected.
+        "embed_source": "patch",
+        "mask_weighted": True,
     }
     for k, v in (user_cfg or {}).items():
         if v is not None:
@@ -400,36 +519,56 @@ def _prepare_pretrain_data(config):
     fixed_reference = norm_cfg.get("fixed_reference", False)
     max_value = resolve_max_value(data_cfg)
 
-    root = data_cfg["root"]
-    roots = [root] if isinstance(root, str) else list(root)
+    root = data_cfg.get("file_dir")
+    # file_dir may be null (all entries commented out) — legal in file_list
+    # mode, where the CSVs are the pool and file_dir is ignored.
+    roots = [root] if isinstance(root, str) else list(root or [])
     channels = data_cfg.get("channels")
     channel_layout = data_cfg.get("channel_layout", "CHW")
     image_pattern = data_cfg.get("image_pattern")
 
-    datasets = build_cell_datasets(roots, channel_layout, image_pattern)
-    all_pairs = []
-    root_of_pair = []
+    file_list = data_cfg.get("file_list")
+    if not file_list and not roots:
+        raise MicroMaxError("Error: data.file_list and data.file_dir are both "
+              "empty; set one of them (a data source is required)")
     resolved_per_root = {}
-    for r, cell_ds in datasets:
+    if file_list:
+        # File-list mode: the CSVs ARE the pool — data.file_dir is ignored.
+        # Labels (if a column exists) are meaningless for SSL and skipped.
+        if root:
+            logger.warning("data.file_list takes precedence: data.file_dir "
+                           "is ignored")
+        paths, _labels = load_file_list(file_list)
+        cell_ds = FileListCellDataset(paths, channel_layout)
         n_avail = len(cell_ds.intensity_colnames)
-        resolved_per_root[r] = resolve_channels(channels, n_avail, r)
-        recs = _build_records(cell_ds)
-        all_pairs.extend(recs)
-        root_of_pair.extend([r] * len(recs))
+        resolved_channels = resolve_channels(channels, n_avail, "file_list")
+        all_pairs = [(cell_ds, i) for i in range(len(paths))]
+        root_of_pair = ["file_list"] * len(all_pairs)
+        logger.info("File list: %d cells from %s", len(paths), file_list)
+    else:
+        datasets = build_cell_datasets(roots, channel_layout, image_pattern)
+        all_pairs = []
+        root_of_pair = []
+        for r, cell_ds in datasets:
+            n_avail = len(cell_ds.intensity_colnames)
+            resolved_per_root[r] = resolve_channels(channels, n_avail, r)
+            recs = _build_records(cell_ds)
+            all_pairs.extend(recs)
+            root_of_pair.extend([r] * len(recs))
 
-    if not all_pairs:
-        raise MicroMaxError(f"Error: no records found in {roots}")
+        if not all_pairs:
+            raise MicroMaxError(f"Error: no records found in {roots}")
 
-    # All roots must resolve to the same channel set — one bundle carries a
-    # single `channels` meta, so a heterogeneous resolution would silently
-    # train on the wrong channels for some roots (last-root-wins bug).
-    unique_resolved = {tuple(v) for v in resolved_per_root.values()}
-    if len(unique_resolved) > 1:
-        raise MicroMaxError(f"Error: data roots resolve to different channel sets: "
-            f"{ {r: v for r, v in resolved_per_root.items()} }. "
-            f"Give every root the same channel count or set data.channels "
-            f"explicitly.")
-    resolved_channels = list(next(iter(unique_resolved))) if unique_resolved else channels
+        # All roots must resolve to the same channel set — one bundle carries a
+        # single `channels` meta, so a heterogeneous resolution would silently
+        # train on the wrong channels for some roots (last-root-wins bug).
+        unique_resolved = {tuple(v) for v in resolved_per_root.values()}
+        if len(unique_resolved) > 1:
+            raise MicroMaxError(f"Error: data roots resolve to different channel sets: "
+                f"{ {r: v for r, v in resolved_per_root.items()} }. "
+                f"Give every root the same channel count or set data.channels "
+                f"explicitly.")
+        resolved_channels = list(next(iter(unique_resolved))) if unique_resolved else channels
 
     # Subsample
     sample_max = data_cfg.get("sample_max")
@@ -505,6 +644,15 @@ def run_pretrain(config, config_path=None):
                     monitoring_cfg["tensorboard"], monitoring_cfg["csv"],
                     monitoring_cfg["log_every_steps"],
                     monitoring_cfg["patch_similarity_samples"])
+    # UMAP-check embedding readout (teacher branch): monitoring.embed_source
+    # + monitoring.mask_weighted. Training itself is unaffected — the SSL
+    # losses use CLS and patch tokens directly.
+    embed_source = validate_embed_source(monitoring_cfg["embed_source"])
+    umap_mask_weighted = bool(monitoring_cfg["mask_weighted"]) \
+        and embed_source != "cls"
+    if monitoring_cfg["enabled"]:
+        logger.info("UMAP-check embedding: source=%s mask_weighted=%s",
+                    embed_source, umap_mask_weighted)
 
     # Validate views count
     if method == "dinov3":
@@ -539,8 +687,8 @@ def run_pretrain(config, config_path=None):
     (all_pairs, resolved_channels, channel_layout, image_pattern,
      max_value, normalize_method, with_masking, clip_low, clip_high,
      fixed_reference, augmentation_infer) = _prepare_pretrain_data(config)
-    cfg_root = config["data"]["root"]
-    data_roots = [cfg_root] if isinstance(cfg_root, str) else list(cfg_root)
+    cfg_root = config["data"].get("file_dir")
+    data_roots = [cfg_root] if isinstance(cfg_root, str) else list(cfg_root or [])
 
     logger.info("Found %d records, channels=%s", len(all_pairs), resolved_channels)
     logger.info("SSL method: %s, views: %d", method, len(aug_views_cfg))
@@ -600,24 +748,29 @@ def run_pretrain(config, config_path=None):
     # monitoring block through on a copy, so `monitoring.enabled: false` also
     # stops the model from building per-step diag tensors. method_cfg itself
     # stays clean (it is what gets saved into the bundle config).
+    # The dinov3 gram anchor IS the phase-1 model the run resumes from — always
+    # resume.ssl_model, there is no separate gram.ckpt to configure (or forget).
+    # gram.it_load_ema_teacher (optional) can still overwrite the anchor with
+    # the EMA teacher at a chosen global step.
+    gram_anchor = None
+    if method == "dinov3":
+        gram_cfg = method_cfg.get("gram") or {}
+        if gram_cfg.get("use_loss", False) and not gram_cfg.get("ema_teacher", False):
+            gram_anchor = (config.get("resume") or {}).get("ssl_model")
+            if not gram_anchor:
+                raise MicroMaxError("Error: dinov3.gram.use_loss is on but resume.ssl_model is "
+                      "not set; the gram anchor is the phase-1 model the run resumes from")
     model = build_ssl_model(
         method, backbone_cfg, {**method_cfg, "monitoring": monitoring_cfg},
         device)
 
-    # DINOv3 gram anchoring phase 2: initialize the frozen gram teacher from
-    # gram.ckpt (an earlier SSL bundle, typically the phase-1 model.pt). When
-    # no ckpt is given, the gram teacher is initialized later from the EMA
-    # teacher at gram.it_load_ema_teacher.
-    if method == "dinov3":
-        gram_cfg = method_cfg.get("gram", {}) or {}
-        if gram_cfg.get("use_loss", False) and not gram_cfg.get("ema_teacher", False):
-            gram_ckpt = gram_cfg.get("ckpt")
-            gram_ckpt = None if gram_ckpt == "ignore" else gram_ckpt
-            if gram_ckpt:
-                model.load_gram_from_bundle(gram_ckpt)
+    # DINOv3 gram anchoring: initialize the frozen gram teacher from the
+    # resume checkpoint (the phase-1 model).
+    if gram_anchor:
+        model.load_gram_from_bundle(gram_anchor)
 
     # Bundle meta — needed by every saved bundle (infer/train consumers).
-    feat_dim = model.student_backbone.vit.num_features
+    # No feat_dim: consumers rebuild the backbone and read num_features live.
     meta = {
         "ssl_method": method,
         "backbone": backbone_cfg["name"],
@@ -625,7 +778,6 @@ def run_pretrain(config, config_path=None):
         "channels": resolved_channels,
         "channel_layout": channel_layout,
         "max_value": max_value,
-        "feat_dim": feat_dim,
         "augmentation_infer": augmentation_infer,
         "normalize_method": normalize_method,
         "normalize_with_masking": with_masking,
@@ -732,10 +884,17 @@ def run_pretrain(config, config_path=None):
                 epochs = start_epoch + epochs
             if "optimizer_state_dict" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if scaler is not None and checkpoint.get("scaler_state_dict") is not None:
+                scaler.load_state_dict(checkpoint["scaler_state_dict"])
             loss_history = checkpoint.get("train_loss_history", [])
             component_histories = dict(checkpoint.get("component_histories", {}))
             for k, v in (checkpoint.get("monitor_histories") or {}).items():
-                monitor_histories[k] = list(v)
+                monitor_histories[k] = _align_history(v, start_epoch)
+            if not _is_self_resume((config.get("resume") or {}).get("ssl_model"),
+                                   output_dir):
+                # New anchoring phase over another run's bundle: its CDI
+                # points belong to the previous phase's own head_track.pdf.
+                monitor_histories["content_dependence"] = []
         else:
             # Transfer: domain-transfer / pretrained-weight init. The run
             # restarts from epoch 1 with fresh schedules and a fresh optimizer
@@ -753,9 +912,23 @@ def run_pretrain(config, config_path=None):
     total_steps = max(1, epochs * len(loader))
     global_step = start_epoch * len(loader)
     if method == "dinov3" and resume_type == "continue":
-        # Restore the number of gram-teacher refreshes already done so the
-        # rep_update schedule continues seamlessly (official behavior).
-        model.set_gram_resume_updates(global_step)
+        # Gram refresh schedule on the LOCAL time axis of this anchoring run:
+        # a self-resume (bundle inside this output_dir) restores origin +
+        # true refresh count; any other resume starts a fresh schedule here
+        # (the earlier history has no gram refreshes to account for).
+        origin, count = _resolve_gram_refresh_state(
+            checkpoint.get("meta"), output_dir,
+            (config.get("resume") or {}).get("ssl_model"), global_step)
+        model.set_gram_origin(origin, count)
+        if count:
+            logger.info("Gram refresh schedule resumed: origin=%d, %d update(s) done",
+                        origin, count)
+        elif model._gram_max_updates <= 0:
+            logger.info("Gram refresh disabled (max_updates=0): anchor frozen "
+                        "at the resume model for the whole run")
+        else:
+            logger.info("Gram refresh schedule starts fresh at local step 0 "
+                        "(first update after %d batches)", model._gram_update_frequency)
     if resume_type == "transfer":
         # Transfer: short warmup (default 1 epoch) — pretrained weights only
         # need a brief warmup for the fresh optimizer to estimate gradient
@@ -798,7 +971,8 @@ def run_pretrain(config, config_path=None):
                     augmentation_specs=[augmentation_infer],
                     normalize_method=normalize_method, clip_low=clip_low,
                     clip_high=clip_high, with_masking=with_masking,
-                    fixed_reference=fixed_reference, max_value=max_value)
+                    fixed_reference=fixed_reference, max_value=max_value,
+                    return_mask=umap_mask_weighted)
                 for cell_ds, indices in by_cell.values()
             ]
             umap_check_loader = DataLoader(
@@ -816,7 +990,9 @@ def run_pretrain(config, config_path=None):
     if umap_check_loader is not None and (checkpoint is None or resume_type != "continue"):
         try:
             _run_umap_check(model, method, umap_check_loader, device, 0, seed,
-                            os.path.join(output_dir, "umap_check_baseline.pdf"))
+                            os.path.join(output_dir, "umap_check_baseline.pdf"),
+                            embed_source=embed_source,
+                            mask_weighted=umap_mask_weighted)
         except Exception as e:
             logger.error("UMAP check failed on baseline: %s", e)
 
@@ -934,11 +1110,20 @@ def run_pretrain(config, config_path=None):
             _save_bundle(output_dir, epoch + 1, model, optimizer, loss_history,
                          config, meta, method,
                          component_histories=component_histories,
-                         monitor_histories=monitor_histories)
+                         monitor_histories=monitor_histories, scaler=scaler)
             if umap_check_loader is not None:
                 try:
-                    _run_umap_check(model, method, umap_check_loader, device, epoch + 1, seed,
-                                    os.path.join(output_dir, f"umap_check_epoch_{epoch + 1}.pdf"))
+                    cdi = _run_umap_check(
+                        model, method, umap_check_loader, device, epoch + 1, seed,
+                        os.path.join(output_dir, f"umap_check_epoch_{epoch + 1}.pdf"),
+                        embed_source=embed_source,
+                        mask_weighted=umap_mask_weighted)
+                    if cdi is not None:
+                        # Place at the ABSOLUTE epoch (front-padding gaps) so
+                        # sparse CDI points keep their true positions on the
+                        # shared head_track epoch axis.
+                        _append_at(monitor_histories.setdefault(
+                            "content_dependence", []), epoch + 1, cdi)
                     last_umap_epoch = epoch + 1
                 except Exception as e:
                     logger.error("UMAP check failed at epoch %d: %s", epoch + 1, e)
@@ -955,11 +1140,17 @@ def run_pretrain(config, config_path=None):
     _save_bundle(output_dir, last_epoch, model, optimizer, loss_history,
                  config, meta, method, final=True,
                  component_histories=component_histories,
-                 monitor_histories=monitor_histories)
+                 monitor_histories=monitor_histories, scaler=scaler)
     if umap_check_loader is not None and last_umap_epoch != last_epoch:
         try:
-            _run_umap_check(model, method, umap_check_loader, device, last_epoch, seed,
-                            os.path.join(output_dir, f"umap_check_epoch_{last_epoch}.pdf"))
+            cdi = _run_umap_check(
+                model, method, umap_check_loader, device, last_epoch, seed,
+                os.path.join(output_dir, f"umap_check_epoch_{last_epoch}.pdf"),
+                embed_source=embed_source,
+                mask_weighted=umap_mask_weighted)
+            if cdi is not None:
+                _append_at(monitor_histories.setdefault(
+                    "content_dependence", []), last_epoch, cdi)
         except Exception as e:
             logger.error("UMAP check failed at final epoch %d: %s", last_epoch, e)
     if last_umap_epoch != last_epoch:
@@ -996,6 +1187,7 @@ def _run_diag_plots(model, method, loader, device, output_dir, epoch,
             monitor_histories.get("teacher_student_sim", []),
             monitor_histories.get("gram_masked", []),
             monitor_histories.get("gram_unmasked", []),
+            cdi_history=monitor_histories.get("content_dependence"),
             save_path=os.path.join(output_dir, "head_track.pdf"))
     except Exception as e:
         logger.error("Head-track plot failed at epoch %d: %s", epoch, e)
