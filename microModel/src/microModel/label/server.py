@@ -20,31 +20,45 @@ Model assistance (optional but recommended):
   cells are embedded with the same extraction path as infer/deduplication
   (bundle-meta normalization, teacher backbone for SSL bundles), projected
   into a whitened-PCA + L2-normalized space and cached per root. On top of
-  that space the engines provide kNN scores, a classify head's per-class
-  probabilities and a per-label trained classifier (see engines.py).
+  that space SuggestEngine scores every cell for one label as
 
-Queue modes driven by the scores (see /api/queue) — four, matching the
-Collect -> Auto -> Manage workflow:
-  label_top  "Collect": for the selected label, undecided cells ranked by
-             score (farthest-point spread while the label has no exemplars
-             at all); a seeded Shuffle reshuffles the queue
-  label_all  "Manage": ALL labeled cells — union / with / without the
-             selected label — most uncertain first, plus a "suspicious"
-             ranking that surfaces likely mislabels (review_items)
-  unlabeled  cells without any annotation yet (stable order)
-  all        everything (with source filter)
+      score = top-k mean similarity to the label's POSITIVE exemplars
+              − neg_weight × top-k mean similarity to its EXPLICIT NEGATIVES
 
-Auto-annotate (auto_label config): once a label holds >= min_positives
-positives, every positive write runs the auto pass — every undecided cell
-scoring >= threshold becomes an AUTO positive, jointly over all eligible
-labels so nothing is missed. Each label runs ONCE per crossing (tracked
-by labels.auto_fired_at), so "Remove auto" sticks; it resets the marker
-and a later write can re-run the pass.
+  (undecided is never a negative). That single transparent score drives the
+  Collect queue order AND the grid badge; writing positives or negatives
+  bumps the cached scores, so the ranking always reflects the current
+  exemplars. A classify bundle additionally offers its own class
+  probabilities as a second suggestion source. When a label holds enough
+  explicit exemplars on BOTH sides, the UI's Refresh-model button
+  (POST /api/refresh_model) fits a per-label logistic scorer over them —
+  negatives then define a real decision boundary instead of only nudging a
+  similarity — and that P(positive) becomes the label's primary score
+  everywhere. The fit is MANUAL by design: new writes mark the models
+  stale (button status) but keep scoring until the user refreshes again.
+
+ONE unified queue (see /api/queue), fully determined by
+image source × label × scope radio × sort radio — optionally narrowed to
+one Leiden cluster (cluster-assisted bulk labeling, see label/cluster.py)
+and/or the classify bundle's argmax prediction:
+  undecided  cells without a decision for the label, ranked by the
+             label's primary score; seeded Shuffle reshuffles and
+             sort=unc ranks the smallest pos/neg margin first (active
+             learning); farthest-point spread while the label has no
+             positives at all (needs a model)
+  with       the label's positives — certainty ranking, or sort=review's
+             leave-one-out "suspicious" ranking (review_items)
+  without    labeled cells missing the label (candidates)
+  neg        the label's explicit negatives (certainty = positive-
+             likeness, so descending surfaces likely mislabels first)
+  union      every cell carrying any label
+Decided scopes are pure DB reads and work without a model.
 
 Every write is grouped into one op in the annotation log; /api/undo
 reverts the newest op exactly (see db.py).
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -55,7 +69,7 @@ import torch
 from flask import Flask, Response, jsonify, request
 
 from microBase import (CellDataset, MicroMaxError, apply, build_pipeline,
-                       read_tiff_channels)
+                       canonical_directory, read_tiff_channels)
 
 from ..deduplication import (_build_space, _error, _extract_root_features,
                              _parse_roots, _resolve_max_value_entry,
@@ -65,9 +79,11 @@ from ..utils import (add_file_logging, copy_config_file, load_file_list,
                      set_seed)
 from ..backbone import load_model_from_bundle, load_ssl_backbone_from_bundle
 from ..infer import _resolve_gt
+from .cluster import build_or_load
 from .db import (STATE_NEG, STATE_POS, AnnotationDB, DB_NAME,
                  DB_NAME_SINGLE, migrate_project_db)
-from .engines import MLModelEngine, SuggestEngine, _diverse_order, review_items
+from .engines import (MIN_FIT_NEG, MIN_FIT_POS, SuggestEngine,
+                      _diverse_order, fit_label_model, review_items)
 from .features import _extract_root_features_cls
 from .imaging import RENDER_VERSION, RenderCache, _render_png
 from .ui import HTML_PAGE
@@ -148,29 +164,29 @@ class LabelServer:
         rec = config.get("recommend", {})
         self.knn_k = int(rec.get("knn_k", 1))
         self.neg_weight = float(rec.get("neg_weight", 0.5))
-        self.auto_threshold = float(rec.get("auto_threshold", 0.75))
         self.diverse_size = int(rec.get("diverse_size", 48))
         self.page_size = int(rec.get("page_size", 100))
-        # Model-based (active learning) suggester over the same space; a
-        # label engages only once it has enough explicit pos AND neg.
-        self.ml_model = str(rec.get("ml_model", "logistic")).lower()
-        if self.ml_model not in ("none", "logistic", "random_forest"):
-            _error("recommend.ml_model must be one of "
-                   "none | logistic | random_forest, "
-                   f"got {self.ml_model!r}")
-        self.ml_min_pos = int(rec.get("ml_min_pos", 5))
-        self.ml_min_neg = int(rec.get("ml_min_neg", 3))
-        # Auto-annotate: once a label holds >= min_positives positives, every
-        # positive write runs the auto pass — undecided cells scoring >=
-        # threshold become AUTO positives (the closed-world workflow labels
-        # broadly, then prunes by uncertainty in the Manage view).
-        auto_cfg = config.get("auto_label", {})
-        self.auto_min_positives = int(auto_cfg.get("min_positives", 20))
-        self.auto_apply_threshold = float(auto_cfg.get("threshold", 0.9))
         self.seed = int(config.get("seed", 42))
         self.pca_components = int(
             config.get("space", {}).get("pca_components", 50))
         self.dl_cfg = config.get("dataloader", {})
+
+        # Cluster-assisted bulk labeling: `cluster.target` asks the resolution
+        # search for ~N Leiden clusters over the shared space; `cluster.res`
+        # clusters once at an explicit resolution instead. Both null (or the
+        # section missing) keeps the feature off — behavior identical to a
+        # config without the section.
+        clu = config.get("cluster") or {}
+        self.cluster_target = clu.get("target")
+        self.cluster_res = clu.get("res")
+        if self.cluster_target is not None:
+            self.cluster_target = int(self.cluster_target)
+        if self.cluster_res is not None:
+            self.cluster_res = float(self.cluster_res)
+        if self.cluster_res is not None and self.cluster_target is not None:
+            logging.getLogger(__name__).info(
+                "cluster.res is set: the explicit resolution overrides "
+                "cluster.target (%s)", self.cluster_target)
 
         # ---- runtime state (filled by start()) ----------------------------
         # Labeling mode: 'multi' (default) = a cell may hold any number of
@@ -186,19 +202,39 @@ class LabelServer:
         self.db = None
         self.session_id = None
         self.cells = []            # full DB cell table, ordered by cell_id
-        self.cell_by_fp = {}       # normcase filepath -> cell dict
+        self.cell_by_fp = {}       # portable identity -> cell dict
         self.cid_cell = {}         # cell_id -> cell dict
         self.cid_row = {}          # cell_id -> W row (cells with features)
         self.row_cid = {}          # W row -> cell_id (reverse)
-        self._row_fp = {}          # W row -> normcase filepath (mode-independent)
+        self._row_fp = {}          # W row -> portable identity (mode-independent)
         self._registration_rows = []   # config rows, replayed on mode switch
         self.engine = None         # SuggestEngine, or None (no model)
-        self.ml_engine = None      # MLModelEngine, or None (ml_model: none)
+        # Per-label logistic refits (the manual Refresh-model button):
+        # label_id -> fitted sklearn model over the shared space. New writes
+        # mark them stale (button status) but they keep scoring until the
+        # next refresh; a mode switch drops them entirely (the other mode's
+        # decisions live in a different DB — its labels need their own fit).
+        self.label_models = {}
+        self._model_scores = {}    # label_id -> full-W P(positive) array
+        self._model_stale = False
         self.aug_infer = None      # bundle inference pipeline (square display)
         self.diverse_cids = []     # cold-start cell_ids (model only)
         self.prob_matrix = None    # (n_feature_rows, n_classes), classify only
         self.class_names = []
         self.class_index = {}      # class name -> prob column
+        # Classify-bundle per-row argmax: W row -> predicted class index and
+        # its probability (the /api/queue pred_label filter and the prob
+        # sort read these instead of scanning prob_matrix per request).
+        self._pred_argmax = None       # int array over W rows
+        self._pred_maxprob = None      # float32 array over W rows
+        # Cluster-assisted bulk labeling (built once with the features,
+        # decision-independent, shared by both modes). cluster_memb is the
+        # 0-based partition over W rows; ids/medoids are 1-based for the API.
+        self.bundle_id = None
+        self.cluster_memb = None
+        self.cluster_ids = []          # 1-based, ascending
+        self.cluster_medoid = {}       # 1-based cluster id -> W row
+        self.cluster_res_used = None
         self.root_entries = {}     # normcase source -> config entry
         self.labels_cache = []     # refreshed on label changes
         self.render_cache = RenderCache()
@@ -223,15 +259,16 @@ class LabelServer:
         self.app.route("/api/labels_from_model",
                        methods=["POST"])(self._api_labels_from_model)
         self.app.route("/api/queue")(self._api_queue)
+        self.app.route("/api/clusters")(self._api_clusters)
         self.app.route("/api/annotate",
                        methods=["POST"])(self._api_annotate)
         self.app.route("/api/annotate_batch",
                        methods=["POST"])(self._api_annotate_batch)
-        self.app.route("/api/auto_apply",
-                       methods=["POST"])(self._api_auto_apply)
-        self.app.route("/api/auto_clear",
-                       methods=["POST"])(self._api_auto_clear)
+        self.app.route("/api/annotate_cluster",
+                       methods=["POST"])(self._api_annotate_cluster)
         self.app.route("/api/undo", methods=["POST"])(self._api_undo)
+        self.app.route("/api/refresh_model",
+                       methods=["POST"])(self._api_refresh_model)
         self.app.route("/api/image")(self._api_image)
         self.app.route("/api/export", methods=["POST"])(self._api_export)
 
@@ -274,20 +311,27 @@ class LabelServer:
                      os.path.basename(self._db_path(self.label_mode)))
         model_path = self.config.get("model")
         if model_path:
-            norm_model = os.path.normcase(os.path.abspath(model_path))
+            # Stored PORTABLE (same convention as the cell paths) so the
+            # project stays valid when the working tree moves.
+            model_portable = canonical_directory(os.path.abspath(model_path))
             prev_model = self.db.get_meta("model")
-            if prev_model and prev_model != norm_model:
+            if prev_model and prev_model != model_portable:
                 log.warning("Model bundle changed since the previous "
                             "session (%s -> %s); existing annotations "
                             "are kept, but suggestions are now computed "
                             "in the NEW embedding space", prev_model,
-                            norm_model)
-            self.db.set_meta("model", norm_model)
+                            model_portable)
+            self.db.set_meta("model", model_portable)
 
         # ---- index roots, register cells ---------------------------------
+        # Every stored path is PORTABLE (canonical_directory: CWD-relative
+        # forward-slash when under the CWD, absolute fallback) — the label
+        # project survives moving the working tree and the dataset together,
+        # and label_export.csv is a CWD-relative file list like curated.csv.
         new_rows = []
         for entry in self.roots:
             root = entry["path"]
+            root_portable = canonical_directory(root)
             cell_ds = CellDataset(root,
                                   channel_layout=entry["channel_layout"],
                                   image_pattern=entry["image_pattern"])
@@ -318,11 +362,13 @@ class LabelServer:
                     label_map = load_label_csv(entry["label_csv"])
             for p in md["path"]:
                 raw = os.path.abspath(p)
-                fp = os.path.normcase(raw)
+                raw_portable = canonical_directory(raw)
+                fp = os.path.normcase(raw_portable)
+                # label_map / _resolve_gt work on absolute normcase keys.
                 preset = _resolve_gt(
-                    label_map, self.preset_from_dir, fp,
+                    label_map, self.preset_from_dir, os.path.normcase(raw),
                     os.path.dirname(raw).replace("\\", "/"))
-                new_rows.append((fp, raw, root, preset))
+                new_rows.append((fp, raw_portable, root_portable, preset))
             log.info("Root %s: %d cells", root, len(md))
 
         # Overlapping roots would give one file two identities.
@@ -448,6 +494,11 @@ class LabelServer:
         self.db = AnnotationDB(self._db_path(mode))
         self.db.set_meta("label_mode", mode)
         self.session_id = self.db.new_session()
+        # The refit models were trained on the OTHER mode's decisions —
+        # drop them instead of leaking scores across projects.
+        self.label_models.clear()
+        self._model_scores.clear()
+        self._model_stale = False
         self._bump_engines()
         self._rebuild_cell_maps()
         self._refresh_labels()
@@ -525,6 +576,13 @@ class LabelServer:
         else:
             _error("bundle has no 'state_dict' key (unsupported bundle)")
 
+        # Final cache identity (SSL bundles extend it with the readout) —
+        # also the space identity the cluster cache keys on.
+        self.bundle_id = bundle_id
+        self.prob_matrix = None
+        self._pred_argmax = None
+        self._pred_maxprob = None
+
         # Display preprocessing: the same geometric pipeline the model sees
         # at inference (resize/pad to the square model input — small cells
         # upscale, large ones downscale), applied before the percentile
@@ -538,10 +596,10 @@ class LabelServer:
         if len(set(flat_paths)) != len(flat_paths):
             _error("feature paths contain duplicates — overlapping roots?")
 
-        # Row -> filepath table: decision-independent and SHARED by both
-        # modes (each mode's DB re-derives its own cell_id maps from it in
-        # _rebuild_cell_maps). Cells whose root is not in this run's config
-        # simply have no row (no suggestions for them).
+        # Row -> portable-identity table: decision-independent and SHARED by
+        # both modes (each mode's DB re-derives its own cell_id maps from it
+        # in _rebuild_cell_maps). Cells whose root is not in this run's
+        # config simply have no row (no suggestions for them).
         self._row_fp = {}
         w_rows, prob_rows = [], []
         for flat_row, fp in enumerate(flat_paths):
@@ -560,8 +618,6 @@ class LabelServer:
 
         _, W = _build_space(W_sub, self.pca_components, seed=self.seed)
         self.engine = SuggestEngine(W, self.knn_k, self.neg_weight)
-        self.ml_engine = None if self.ml_model == "none" else MLModelEngine(
-            W, self.ml_model, self.ml_min_pos, self.ml_min_neg, self.seed)
         self.diverse_cids = [self.row_cid[r]
                              for r in _diverse_order(W, self.diverse_size,
                                                      self.seed)
@@ -569,6 +625,11 @@ class LabelServer:
         if is_cls:
             self.prob_matrix = np.ascontiguousarray(
                 np.vstack([np.asarray(p, np.float32) for p in prob_rows]))
+            # Per-row argmax prediction: the pred_label queue filter and the
+            # confidence (sort=prob) ranking read these flat arrays.
+            self._pred_argmax = np.argmax(self.prob_matrix, axis=1)
+            self._pred_maxprob = self.prob_matrix[
+                np.arange(len(self._pred_argmax)), self._pred_argmax]
 
         # The extractor is no longer needed — display and scoring are
         # numpy/DB only. The cell_id maps for the current mode derive from
@@ -579,6 +640,40 @@ class LabelServer:
         self._rebuild_cell_maps()
         log.info("Suggest engine ready: %d cells in space, k=%d, "
                  "neg_weight=%.2f", W.shape[0], self.knn_k, self.neg_weight)
+        self._build_clusters()
+
+    def _build_clusters(self):
+        """Leiden clusters over the shared space (once, decision-independent).
+
+        Configured via cluster.target / cluster.res; the assignment only
+        depends on the embedding (bundle identity + cell list + PCA width),
+        so it is cached to <save_dir>/features/ and survives mode switches.
+        Without a model there is no space to cluster — the feature logs a
+        hint and stays off.
+        """
+        log = logging.getLogger(__name__)
+        if self.cluster_target is None and self.cluster_res is None:
+            return
+        if self.engine is None:
+            log.warning("cluster configured but no model — clustering off")
+            return
+        row_paths = [self._row_fp[r] for r in range(len(self._row_fp))]
+        key = {"bundle": self.bundle_id,
+               "cells": hashlib.md5(
+                   json.dumps(row_paths).encode("utf-8")).hexdigest(),
+               "pca": self.pca_components}
+        memb, ids, meds, used = build_or_load(
+            self.engine.W, row_paths, self.save_dir, key,
+            self.cluster_target, self.cluster_res, self.seed)
+        # 1-based display ids in the API/UI (0 would read as "no cluster").
+        self.cluster_memb = memb
+        self.cluster_ids = [int(i) + 1 for i in ids]
+        self.cluster_medoid = {int(i) + 1: int(m) for i, m in zip(ids, meds)}
+        self.cluster_res_used = used
+        log.info("Clusters ready: %d clusters over %d cells (resolution "
+                 "%.3f%s)", len(self.cluster_ids), len(memb), used,
+                 f", target {self.cluster_target}"
+                 if self.cluster_target is not None else "")
 
     # ------------------------------------------------------------------
     # Label cache (refreshed on every label change)
@@ -591,93 +686,70 @@ class LabelServer:
         """Invalidate the affected label's cached scores after a write."""
         if self.engine is not None:
             self.engine.bump(label_id)
-        if self.ml_engine is not None:
-            self.ml_engine.bump(label_id)
 
     def _bump_engines(self):
         """Invalidate every suggestion cache (label deletion, undo, ...)."""
         if self.engine is not None:
             self.engine.bump()
-        if self.ml_engine is not None:
-            self.ml_engine.bump()
 
-    def _label_scores(self, label_id, pos_rows, neg_rows):
-        """Confidence array over ALL cells for one label (None: no data).
+    def _mark_models_stale(self):
+        """A write landed: refit models no longer match the decisions.
 
-        The trained model's probability when the label engaged, else the
-        kNN positive-similarity score. With explicit negatives the kNN
-        variant keeps the veto — a cell closer to a negative than to any
-        positive scores -1 and never auto-applies.
+        They keep scoring (they are still the best available ranking) until
+        the user clicks Refresh model again — the fit is deliberately
+        manual, the staleness is only a status hint.
         """
-        if not pos_rows:
+        self._model_stale = True
+
+    def _model_proba(self, label_id):
+        """P(positive) over ALL W rows from the label's fitted logistic.
+
+        Full-array predictions are cached per label: the model only changes
+        on an explicit refresh, so the Collect queue and every badge read
+        the same array between refreshes. None when the label has no refit
+        (it then runs on the kNN exemplar score).
+        """
+        model = self.label_models.get(label_id)
+        if model is None or self.engine is None:
             return None
-        if self.ml_engine is not None:
-            probs = self.ml_engine.probs(label_id, pos_rows, neg_rows)
-            if probs is not None:
-                return probs
-        pos_part, neg_part = self.engine.parts(label_id, pos_rows, neg_rows)
-        if neg_rows:
-            return np.where(pos_part > neg_part, pos_part, -1.0)
-        return pos_part
+        if label_id not in self._model_scores:
+            self._model_scores[label_id] = model.predict_proba(
+                self.engine.W)[:, 1].astype(np.float32)
+        return self._model_scores[label_id]
 
-    def _maybe_auto_apply_all(self, force_label=None):
-        """Run the auto-annotate pass for every eligible label.
+    def _api_refresh_model(self):
+        """Fit a per-label logistic scorer for every eligible label.
 
-        Eligible = n_pos >= auto_label.min_positives. A forced run (the UI
-        button, ``force_label`` set) reruns one label regardless of its
-        fired marker; the regular post-write pass runs a label only ONCE
-        per crossing (labels.auto_fired_at) so Remove-auto sticks. Every
-        still-undecided cell scoring >= auto_label.threshold becomes an
-        AUTO positive — jointly over all eligible labels, so a cell gets
-        every label it deserves and nothing is missed. Returns the
-        {label_name: applied_count} map.
+        Eligible = at least MIN_FIT_POS positives AND MIN_FIT_NEG explicit
+        negatives (a logistic needs both classes to mean anything); labels
+        below the bar keep the kNN score and are reported as skipped. A
+        fresh fit replaces the previous model and clears the stale flag.
+        Pure CPU and sub-second per label.
         """
-        log = logging.getLogger(__name__)
         if self.engine is None:
-            return {}
-        states = self.db.cell_states()
-        label_rows = self._label_rows(states)
-        # Single mode is mutually exclusive: auto-annotating a cell that
-        # already holds ANOTHER label's positive would break exclusivity
-        # (the old design did exactly that) — restrict candidates to cells
-        # with no positive at all. cell_states keys are (cell_id, label_id).
-        pos_holders = {cid for (cid, _lid), s in states.items()
-                       if s == STATE_POS} \
-            if self.label_mode == "single" else set()
-        applied = {}
-        # ONE op for the whole pass: "the auto run" is a single undoable
-        # step no matter how many labels it annotated.
-        op_id = self.db.next_op_id() if self.labels_cache else 0
+            return jsonify({"error": "refresh model needs a model bundle"}), 400
+        log = logging.getLogger(__name__)
+        label_rows = self._label_rows(self.db.cell_states())
+        fitted, skipped = [], []
         for lb in self.labels_cache:
             lid = lb["label_id"]
-            if lb["n_pos"] < self.auto_min_positives:
-                continue
-            if force_label is not None:
-                if lid != force_label:
-                    continue
-            elif lb.get("auto_fired"):
-                continue
-            scores = self._label_scores(lid, *label_rows.get(lid, ([], [])))
-            if scores is None:
-                continue
-            candidates = [
-                cid for cid in self.row_cid.values()
-                if (cid, lid) not in states
-                and cid not in pos_holders
-                and float(scores[self.cid_row[cid]]) >=
-                self.auto_apply_threshold]
-            n = self.db.auto_apply(lid, candidates, self.session_id, op_id)
-            self.db.mark_auto_fired(lid)
-            if n:
-                applied[lb["name"]] = n
-                self._bump_label(lid)
-                log.info("Auto-apply '%s': %d cells (threshold %.2f, %d "
-                         "positives)", lb["name"], n,
-                         self.auto_apply_threshold, lb["n_pos"])
-        if applied:
-            self._refresh_labels()
-            self._auto_export()
-        return applied
+            pos_rows, neg_rows = label_rows.get(lid, ([], []))
+            model = fit_label_model(self.engine.W, pos_rows, neg_rows,
+                                    self.seed)
+            self._model_scores.pop(lid, None)   # recompute on the next read
+            if model is None:
+                self.label_models.pop(lid, None)
+                skipped.append(lb["name"])
+            else:
+                self.label_models[lid] = model
+                fitted.append(lb["name"])
+        self._model_stale = False
+        if fitted or skipped:
+            log.info("Refresh model: fitted %s; skipped %s (< %d positives "
+                     "or < %d negatives)", fitted or "none", skipped,
+                     MIN_FIT_POS, MIN_FIT_NEG)
+        return jsonify({"ok": True, "fitted": fitted, "skipped": skipped,
+                        "min_pos": MIN_FIT_POS, "min_neg": MIN_FIT_NEG})
 
     def _label_ids(self):
         return [lb["label_id"] for lb in self.labels_cache]
@@ -704,8 +776,39 @@ class LabelServer:
                 [self.cid_row[c] for c in d[0] if c in self.cid_row])
         return out
 
-    def _cell_payload(self, cell, states, label_rows, thr):
-        """One cell for the UI: identity + current labels + suggestions."""
+    def _score_parts(self, lid, label_rows):
+        """(pos_part, neg_part) arrays for one label, or None without positives."""
+        pos_rows, neg_rows = label_rows.get(lid, ([], []))
+        if not pos_rows:
+            return None
+        return self.engine.parts(lid, pos_rows, neg_rows)
+
+    def _score_at(self, lid, row, label_rows):
+        """The label's primary score for one W row, or None.
+
+        A refreshed (logistic) label scores by its model's P(positive);
+        everything else by the transparent exemplar score
+        pos_part − neg_weight × neg_part. Either way this is the exact
+        number the Collect queue sorts by, so badges and order always agree.
+        """
+        proba = self._model_proba(lid)
+        if proba is not None:
+            return float(proba[row])
+        parts = self._score_parts(lid, label_rows)
+        if parts is None:
+            return None
+        pos_part, neg_part = parts
+        return float(pos_part[row]) - self.neg_weight * float(neg_part[row])
+
+    def _cell_payload(self, cell, states, label_rows):
+        """One cell for the UI: identity + current labels + suggestion scores.
+
+        Suggestions carry the same transparent score the Collect queue ranks
+        by, for every label that has at least one positive exemplar and is
+        not decided on this cell yet. A classify bundle's own class
+        probabilities merge in as a second source. Exact negatives lower a
+        label's score, so they change the badges and the order too.
+        """
         cid = cell["cell_id"]
         labels = {}
         for lid in self._label_ids():
@@ -713,29 +816,23 @@ class LabelServer:
             if st is not None:
                 labels[str(lid)] = st
         suggest = []
-        if self.engine is not None:
-            row = self.cid_row.get(cid)
-            if row is not None:
-                for lb in self.labels_cache:
-                    lid = lb["label_id"]
-                    if (cid, lid) in states:
-                        continue  # already decided — no suggestion needed
-                    pos_rows, neg_rows = label_rows.get(lid, ([], []))
-                    if not pos_rows:
-                        continue
-                    pos_part, neg_part = self.engine.parts(
-                        lid, pos_rows, neg_rows)
-                    p = float(pos_part[row])
-                    if p >= thr and p > float(neg_part[row]):
-                        suggest.append({"label_id": lid, "score": round(p, 4),
-                                        "src": "knn"})
-            if self.prob_matrix is not None and row is not None:
+        row = self.cid_row.get(cid) if self.engine is not None else None
+        if row is not None:
+            for lb in self.labels_cache:
+                lid = lb["label_id"]
+                if (cid, lid) in states:
+                    continue  # already decided — no suggestion needed
+                score = self._score_at(lid, row, label_rows)
+                if score is None or score <= 0:
+                    continue
+                suggest.append({"label_id": lid, "score": round(score, 4)})
+            if self.prob_matrix is not None:
                 # Second source: the classify head's own probability for a
                 # label sharing a class name.
                 pvec = self.prob_matrix[row]
                 for ci, name in enumerate(self.class_names):
                     p = float(pvec[ci])
-                    if p < thr:
+                    if p < 0.5:
                         continue
                     lid = next((lb["label_id"] for lb in self.labels_cache
                                 if lb["name"] == name), None)
@@ -745,45 +842,29 @@ class LabelServer:
                                      if s["label_id"] == lid), None)
                     if existing is not None:
                         if p > existing["score"]:
-                            existing.update({"score": round(p, 4),
-                                             "src": "model"})
+                            existing.update({"score": round(p, 4)})
                     else:
                         suggest.append({"label_id": lid,
-                                        "score": round(p, 4), "src": "model"})
-            if self.ml_engine is not None and row is not None:
-                # Third source: the per-label trained model's probability
-                # (only labels past the pos/neg count gates return scores).
-                for lb in self.labels_cache:
-                    lid = lb["label_id"]
-                    if (cid, lid) in states:
-                        continue  # already decided — no suggestion needed
-                    pos_rows, neg_rows = label_rows.get(lid, ([], []))
-                    probs = self.ml_engine.probs(lid, pos_rows, neg_rows)
-                    if probs is None:
-                        continue
-                    p = float(probs[row])
-                    if p < 0.5:
-                        continue
-                    existing = next((s for s in suggest
-                                     if s["label_id"] == lid), None)
-                    if existing is not None:
-                        if p > existing["score"]:
-                            existing.update({"score": round(p, 4),
-                                             "src": "aml"})
-                    else:
-                        suggest.append({"label_id": lid,
-                                        "score": round(p, 4), "src": "aml"})
+                                        "score": round(p, 4)})
         suggest.sort(key=lambda s: -s["score"])
         if self.label_mode == "single":
             # Mutually exclusive classes: suggest only the single best
             # candidate — a cell can end up with at most one positive.
             suggest = suggest[:1]
+        # The classify bundle's own argmax prediction (queue filter value +
+        # tooltip info); None with an SSL bundle or without features.
+        pred = None
+        if row is not None and self._pred_argmax is not None:
+            ci = int(self._pred_argmax[row])
+            pred = {"class": (self.class_names[ci]
+                              if ci < len(self.class_names) else str(ci)),
+                    "prob": round(float(self.prob_matrix[row, ci]), 4)}
         return {"filepath": cell["filepath"], "raw_path": cell["raw_path"],
                 "filename": os.path.basename(cell["raw_path"]),
                 "source": cell["source"],
                 "source_name": self.source_names.get(cell["source"],
                                                      cell["source"]),
-                "preset": cell["preset"],
+                "preset": cell["preset"], "pred": pred,
                 "labels": labels, "suggest": suggest}
 
     # ------------------------------------------------------------------
@@ -803,13 +884,19 @@ class LabelServer:
             "labeled": st["labeled"],
             "undecided": st["undecided"],
             "has_model": self.engine is not None,
-            "ml_model": self.ml_model,
+            "models_fitted": len(self.label_models),
+            "models_stale": self._model_stale,
+            "fit_min_pos": MIN_FIT_POS,
+            "fit_min_neg": MIN_FIT_NEG,
             "class_names": self.class_names,
-            "threshold": self.auto_threshold,
-            "auto_min_positives": self.auto_min_positives,
-            "auto_threshold": self.auto_apply_threshold,
+            "knn_k": self.knn_k,
+            "neg_weight": self.neg_weight,
             "page_size": self.page_size,
             "label_mode": self.label_mode,
+            "cluster": {"enabled": self.cluster_memb is not None,
+                        "n": len(self.cluster_ids),
+                        "res": self.cluster_res_used,
+                        "target": self.cluster_target},
         })
 
     def _api_add_label(self):
@@ -828,6 +915,9 @@ class LabelServer:
         removed = self.db.delete_label(lid)
         self._refresh_labels()
         self._bump_label(lid)
+        # A deleted label cannot keep a model fitted on its decisions.
+        self.label_models.pop(lid, None)
+        self._model_scores.pop(lid, None)
         logging.getLogger(__name__).info(
             "Label %s deleted (%d decision rows removed)", lid, removed)
         self._auto_export()
@@ -860,83 +950,240 @@ class LabelServer:
         self._refresh_labels()
         return jsonify({"created": created})
 
+    def _api_clusters(self):
+        """Cluster cards for the sidebar's Clusters tab, largest first.
+
+        Per card:
+          size      — the FULL cluster size (decision/source independent).
+          undecided — with a label_id: members without a decision for that
+                      label (whole cluster) — the per-cluster progress badge.
+          in_view   — how many members the CURRENT queue context (source ∩
+                      scope ∩ label, the exact member logic /api/queue
+                      uses) would show. When the source/scope filters hide
+                      parts of a cluster, the card says so instead of
+                      promising cells clicking it will not show.
+        The medoid identifies the card (its thumbnail).
+        """
+        if self.cluster_memb is None:
+            return jsonify({"error": "clustering is off (set cluster.target "
+                                     "or cluster.res in the config)"}), 400
+        label_id = request.args.get("label_id", type=int)
+        source = request.args.get("source") or None
+        scope = request.args.get("scope", "undecided")
+        if scope not in ("undecided", "with", "without", "neg", "union"):
+            scope = "undecided"
+        lids = self._label_ids()
+        have_label = label_id is not None and label_id in lids
+        states = self.db.cell_states()
+        out = []
+        for cid in self.cluster_ids:
+            rows = np.flatnonzero(self.cluster_memb == cid - 1)
+            med_cell = self.cid_cell.get(self.row_cid.get(
+                self.cluster_medoid[cid]))
+            item = {"id": cid, "size": int(len(rows)),
+                    "medoid_filepath":
+                        med_cell["filepath"] if med_cell else None,
+                    "medoid_raw_path":
+                        med_cell["raw_path"] if med_cell else None}
+            n_view = n_und = 0
+            for r in rows:
+                cid_ = self.row_cid.get(int(r))
+                if cid_ is None:
+                    continue
+                if have_label:
+                    if (cid_, label_id) not in states:
+                        n_und += 1
+                    if not self._in_scope(states, cid_, scope, label_id,
+                                          lids):
+                        continue
+                if source and self.cid_cell[cid_]["source"] != source:
+                    continue
+                n_view += 1
+            if have_label:
+                item["undecided"] = n_und
+            item["in_view"] = n_view
+            out.append(item)
+        out.sort(key=lambda it: -it["size"])
+        return jsonify({"clusters": out, "res": self.cluster_res_used})
+
+    def _in_scope(self, states, cid, scope, label_id, lids):
+        """Is cell_id a member of the given queue scope?
+
+        The ONE membership definition shared by the queue and the
+        whole-cluster write — an annotate_cluster request can never touch a
+        cell the cluster queue is not currently showing.
+        """
+        st = states.get((cid, label_id))
+        if scope == "undecided":
+            return st is None
+        if scope == "with":
+            return st == STATE_POS
+        if scope == "without":
+            return (st != STATE_POS
+                    and any(states.get((cid, l)) == STATE_POS for l in lids))
+        if scope == "neg":
+            return st == STATE_NEG
+        return any(states.get((cid, l)) == STATE_POS for l in lids)   # union
+
     def _api_queue(self):
+        """ONE unified queue per (source, label, scope, cluster, prediction).
+
+        The client picks an image source (or all), a label in the sidebar
+        and a scope radio; the queue is that intersection with the chosen
+        ranking:
+          undecided — cells without a decision for this label, ranked by
+                      the label's primary score (model P after a
+                      Refresh-model click, else exemplar similarity minus
+                      the explicit-negative penalty); farthest-point
+                      spread while the label has no positives yet;
+                      sort=unc ranks the smallest pos/neg margin first
+                      (active learning), shuffle reshuffles. Needs a model
+                      (the scope is defined by the scores).
+          with      — the label's positives; ranked by certainty (best
+                      positive-likeness) or, with sort=review, by the
+                      leave-one-out mislabel check.
+          without   — labeled cells missing this label (candidates).
+          neg       — the label's EXPLICIT negatives; certainty = how
+                      positive-like, so descending surfaces the likely
+                      wrongly-marked ones first (review / un-do them).
+          union     — every cell carrying ANY label.
+        Two orthogonal filters narrow every scope:
+          cluster=?     — only members of this Leiden cluster (1-based id
+                          from /api/clusters; the cluster-assisted bulk
+                          pass — see label/cluster.py).
+          pred_label=?  — classify bundle only: only cells whose argmax
+                          prediction is this class name.
+        And two cross-cutting rankings override the per-scope order:
+          sort=medoid   — similarity to the cluster's medoid, most typical
+                          member first (needs the cluster filter).
+          sort=prob     — classify bundle only: P(pred_label class) first,
+                          or each cell's argmax confidence when no class is
+                          picked; the sorted-by value rides in `score`.
+        Certainty is the best available positive-likeness (model P /
+        classify head / kNN similarity — max merge). The decided scopes
+        are pure DB reads and work without a model.
+        """
         a = request.args
-        mode = a.get("mode", "unlabeled")
         label_id = a.get("label_id", type=int)
         source = a.get("source") or None
         offset = max(0, a.get("offset", 0, type=int) or 0)
         limit = min(500, max(1, a.get("limit", 200, type=int) or 200))
-        thr = float(a.get("threshold", self.auto_threshold))
-        # Manage scopes: with (the label's positives), without (labeled
-        # cells missing the label), union (every cell with >= 1 positive).
-        scope = a.get("scope", "with")
+        scope = a.get("scope", "undecided")
+        if scope not in ("undecided", "with", "without", "neg", "union"):
+            scope = "undecided"
+        sort = a.get("sort", "desc")
+        if sort not in ("desc", "unc", "review", "medoid", "prob"):
+            sort = "desc"
         # Seeded reshuffle (client Shuffle button): > 0 permutes the queue
         # deterministically so a fresh random sample reaches the page.
         shuffle = a.get("shuffle", 0, type=int) or 0
+        # Cluster filter (1-based display id as served by /api/clusters) and
+        # the classify bundle's prediction filter (class name or empty).
+        cluster_id = a.get("cluster", type=int)
+        pred_label = a.get("pred_label") or None
+
+        if label_id is None or label_id not in self._label_ids():
+            return jsonify({"error": "queue needs a known label_id"}), 400
+        if sort == "medoid" and cluster_id is None:
+            return jsonify({"error": "sort=medoid needs a cluster filter"}), 400
+        if sort == "prob" and self.prob_matrix is None:
+            return jsonify({"error": "sort=prob needs a classify "
+                                     "bundle"}), 400
 
         states = self.db.cell_states()
-        touched = {cid for (cid, _lid) in states}  # cells with any decision
         label_rows = self._label_rows(states) \
             if self.engine is not None else {}
-        labels_list = self.labels_cache
-
         cells = [c for c in self.cells
                  if source is None or c["source"] == source]
-        cert_by_cid = {}    # label_all mode: cell_id -> label certainty
-        susp_by_cid = {}    # label_all mode: cell_id -> review evidence
-        auto_set = None     # label_all mode: cell_ids auto-annotated
+        if cluster_id is not None:
+            if (self.cluster_memb is None
+                    or cluster_id not in self.cluster_medoid):
+                return jsonify({"error":
+                                f"unknown cluster: {cluster_id}"}), 400
+            # Cluster members are feature rows; a cell without features
+            # belongs to no cluster and drops out here.
+            wanted = {int(r)
+                      for r in np.flatnonzero(
+                          self.cluster_memb == cluster_id - 1)}
+            cells = [c for c in cells
+                     if self.cid_row.get(c["cell_id"]) in wanted]
+        if pred_label is not None and self.prob_matrix is not None:
+            ci = self.class_index.get(pred_label, -1)
+            if ci < 0:
+                return jsonify({"error":
+                                f"unknown pred_label: {pred_label}"}), 400
+            keep = []
+            for c in cells:
+                row = self.cid_row.get(c["cell_id"])
+                if row is not None and int(self._pred_argmax[row]) == ci:
+                    keep.append(c)
+            cells = keep
+        cert_by_cid = {}    # decided scopes: cell_id -> label certainty
+        susp_by_cid = {}    # with scope, sort=review: review evidence
 
-        # ---- candidate selection per mode --------------------------------
-        if mode == "all":
-            picked = cells
-
-        elif mode == "unlabeled":
-            picked = [c for c in cells if c["cell_id"] not in touched]
-
-        elif mode == "label_all":
-            # Manage view over DECIDED cells (works without a model — pure
-            # DB read). scope picks the membership:
-            #   with    — cells positive for the selected label (verify it);
-            #   without — labeled cells that do NOT carry the selected
-            #             label (candidates missing it);
-            #   union   — every cell carrying ANY label (the whole pool a
-            #             user should re-check, nothing drops out).
-            # A selected label rides along in every scope so each cell can
-            # carry its certainty for it: the best score any suggestion
-            # source assigns (trained model / classify head / kNN
-            # nearest-exemplar — max-merge, same rule as suggestions).
-            # Lower = the label is less certain on that cell, i.e. an
-            # auto-annotation worth re-checking. sort=review replaces the
-            # ranking with the leave-one-out consistency check (the most
-            # suspicious decisions first, evidence attached).
-            if scope not in ("with", "without", "union"):
-                scope = "with"
-            known = label_id in self._label_ids()
-            if scope != "union" and (label_id is None or not known):
-                return jsonify({"error": f"{mode} scope {scope!r} needs a "
-                                         f"known label_id"}), 400
-            lids = self._label_ids()
-
-            def _has_any_pos(c):
-                cid = c["cell_id"]
-                return any(states.get((cid, l)) == STATE_POS for l in lids)
-
-            if scope == "with":
-                picked = [c for c in cells
-                          if states.get((c["cell_id"], label_id)) == STATE_POS]
-            elif scope == "without":
-                picked = [c for c in cells if _has_any_pos(c)
-                          and states.get((c["cell_id"], label_id)) != STATE_POS]
+        # ---- member selection + ranking per scope ------------------------
+        if scope == "undecided":
+            if self.engine is None:
+                return jsonify({"error": "the undecided queue needs a "
+                                         "model"}), 400
+            pos_rows, neg_rows = label_rows.get(label_id, ([], []))
+            if not pos_rows and cluster_id is None:
+                # Cold start (label has no positives yet): the farthest-
+                # point spread over the whole space seeds the first picks.
+                # Only for the UNFILTERED queue — inside a cluster this
+                # dataset-wide sprinkle would usually miss the cluster
+                # entirely; there every undecided member is a candidate and
+                # the medoid order provides the spread instead.
+                by_id = {c["cell_id"]: c for c in cells}
+                picked = [by_id[cid] for cid in self.diverse_cids
+                          if cid in by_id and (cid, label_id) not in states]
+            elif not pos_rows:
+                picked = sorted(
+                    (c for c in cells
+                     if (c["cell_id"], label_id) not in states),
+                    key=lambda c: c["cell_id"])
             else:
-                picked = [c for c in cells if _has_any_pos(c)]
-            auto_set = self.db.auto_cells(label_id) \
-                if (known and scope == "with") else None
-            if auto_set and a.get("auto_only") == "1":
-                picked = [c for c in picked if c["cell_id"] in auto_set]
+                proba = self._model_proba(label_id)
+                pos_part, neg_part = (None, None) if proba is not None \
+                    else self.engine.parts(label_id, pos_rows, neg_rows)
+                scored = []
+                for c in cells:
+                    if (c["cell_id"], label_id) in states:
+                        continue
+                    row = self.cid_row.get(c["cell_id"])
+                    if row is None:
+                        continue
+                    if proba is not None:
+                        # Refit model: uncertainty = closeness to the 0.5
+                        # decision boundary (the margin sort=unc ranks by).
+                        s = float(proba[row])
+                        margin = abs(s - 0.5)
+                    else:
+                        # One transparent score everywhere: exemplar
+                        # similarity minus the explicit-negative penalty.
+                        # Negatives PUSH cells down instead of merely
+                        # vetoing them.
+                        p = float(pos_part[row])
+                        n = float(neg_part[row])
+                        s = p - self.neg_weight * n
+                        margin = abs(p - n)
+                    scored.append((c, s, margin))
+                if sort == "unc":
+                    # Active learning: smallest margin first — the most
+                    # informative cells once the confident head of the
+                    # queue is exhausted.
+                    scored.sort(key=lambda t: t[2])
+                else:
+                    scored.sort(key=lambda t: -t[1])
+                picked = [c for c, _s, _m in scored]
+        else:
+            lids = self._label_ids()
+            picked = [c for c in cells
+                      if self._in_scope(states, c["cell_id"], scope,
+                                        label_id, lids)]
 
-            review_mode = (a.get("sort") == "review" and known
-                           and scope == "with" and self.engine is not None)
+            review_mode = (sort == "review" and scope == "with"
+                           and self.engine is not None)
             if review_mode:
                 # Likely mislabels first: the leave-one-out check over this
                 # label's decided positives vs its explicit negatives.
@@ -950,76 +1197,43 @@ class LabelServer:
                 picked.sort(key=lambda c: order[c["cell_id"]][0])
                 for c in picked:
                     susp_by_cid[c["cell_id"]] = order[c["cell_id"]][1]
-            elif self.engine is not None and label_id is not None:
+            elif self.engine is not None:
                 self._compute_certainties(picked, label_id, label_rows,
                                           cert_by_cid)
-                reverse = a.get("sort", "desc") != "asc"
                 # Stable two-pass sort: cell_id ascending as the base order,
-                # then certainty — ties keep their registration order in
-                # BOTH directions (a reverse=True tuple sort would flip
-                # ties too).
+                # then certainty — descending by default, sort=unc flips to
+                # the least certain first; ties keep their registration
+                # order in BOTH directions (a reverse=True tuple sort would
+                # flip ties too).
                 picked.sort(key=lambda c: c["cell_id"])
                 picked.sort(key=lambda c: cert_by_cid.get(c["cell_id"], -1.0),
-                            reverse=reverse)
+                            reverse=(sort != "unc"))
 
-        elif mode == "label_top":
-            # Collect view: undecided cells ranked for the selected label —
-            # the fastest way to reach the auto-annotate threshold. Without
-            # any exemplar yet (cold start) the queue falls back to the
-            # farthest-point spread, so the very first batch still covers
-            # the whole space.
-            if self.engine is None:
-                return jsonify({"error": f"{mode} queue needs a model"}), 400
-            if not label_id or label_id not in self._label_ids():
-                return jsonify({"error": f"{mode} queue needs a known "
-                                         f"label_id"}), 400
-            pos_rows, neg_rows = label_rows.get(label_id, ([], []))
-            if not pos_rows and not neg_rows:
-                by_id = {c["cell_id"]: c for c in cells}
-                picked = [by_id[cid] for cid in self.diverse_cids
-                          if cid in by_id and (cid, label_id) not in states]
+        # ---- cross-cutting rankings (cluster medoid / class probability) -
+        score_override = {}   # cell_id -> the exact value this queue sorted by
+        if sort in ("medoid", "prob"):
+            rows, keep = [], []
+            for c in picked:
+                row = self.cid_row.get(c["cell_id"])
+                if row is not None:
+                    rows.append(row)
+                    keep.append(c)
+            if sort == "medoid":
+                vals = np.asarray(
+                    self.engine.W[rows] @ self.engine.W[
+                        self.cluster_medoid[cluster_id]])
             else:
-                pos_part, neg_part = self.engine.parts(label_id, pos_rows,
-                                                       neg_rows)
-                # When the trained model engages for this label it replaces
-                # the kNN ranking outright.
-                ml_probs = None
-                if self.ml_engine is not None:
-                    ml_probs = self.ml_engine.probs(label_id, pos_rows,
-                                                    neg_rows)
-                scored = []
-                for c in cells:
-                    if (c["cell_id"], label_id) in states:
-                        continue
-                    row = self.cid_row.get(c["cell_id"])
-                    if row is None:
-                        continue
-                    if ml_probs is not None:
-                        scored.append((c, float(ml_probs[row])))
-                        continue
-                    p = float(pos_part[row])
-                    if p <= float(neg_part[row]):
-                        # Explicit negatives veto this cell (same rule as
-                        # the suggestion path) — never queue a vetoed cell.
-                        continue
-                    scored.append((c, p))
-                # Two rankings: score descending (default — the fastest
-                # harvest) or active-learning uncertainty, i.e. the cells
-                # nearest the decision center (0.5 for the trained model,
-                # else the kNN threshold) first — the most informative picks
-                # when the confident head of the queue is exhausted or all
-                # one morphology.
-                center = 0.5 if ml_probs is not None else thr
-                if a.get("sort", "desc") == "unc":
-                    scored.sort(key=lambda t: abs(t[1] - center))
-                else:
-                    scored.sort(key=lambda t: -t[1])
-                picked = [c for c, _ in scored]
-
-        else:
-            return jsonify({"error": f"unknown queue mode: {mode}"}), 400
-
-        if shuffle and len(picked) > 1:
+                # P(class): the picked pred_label class, else each cell's
+                # own argmax confidence.
+                ci = self.class_index.get(pred_label, -1) \
+                    if pred_label else -1
+                vals = (self.prob_matrix[np.asarray(rows), ci] if ci >= 0
+                        else self._pred_maxprob[np.asarray(rows)])
+            order = np.argsort(-vals, kind="stable")
+            picked = [keep[i] for i in order]
+            for c, v in zip(picked, vals[order]):
+                score_override[c["cell_id"]] = float(v)
+        elif shuffle and len(picked) > 1:
             # Seeded reshuffle of the queue (client Shuffle button): a new
             # random sample reaches the page while the same seed keeps the
             # pages stable while flipping.
@@ -1030,7 +1244,17 @@ class LabelServer:
         page = picked[offset:offset + limit]
         payload = []
         for c in page:
-            pl = self._cell_payload(c, states, label_rows, thr)
+            pl = self._cell_payload(c, states, label_rows)
+            if c["cell_id"] in score_override:
+                # The exact value this queue sorted by (medoid similarity /
+                # class probability) — the grid badge.
+                pl["score"] = round(score_override[c["cell_id"]], 4)
+            elif scope == "undecided":
+                # The exact score this queue sorted by — the grid badge.
+                row = self.cid_row.get(c["cell_id"])
+                score = self._score_at(label_id, row, label_rows) \
+                    if row is not None else None
+                pl["score"] = None if score is None else round(score, 4)
             if c["cell_id"] in cert_by_cid:
                 pl["cert"] = round(cert_by_cid[c["cell_id"]], 4)
             if c["cell_id"] in susp_by_cid:
@@ -1040,11 +1264,9 @@ class LabelServer:
                               "ev_sim": it["ev_sim"],
                               "ev_file": ev["raw_path"] if ev else None,
                               "ev_state": it["state"]}
-            if auto_set is not None:
-                pl["auto"] = c["cell_id"] in auto_set
             payload.append(pl)
         return jsonify({"cells": payload, "total": total,
-                        "offset": offset, "mode": mode})
+                        "offset": offset, "scope": scope})
 
     def _compute_certainties(self, picked, label_id, label_rows, out):
         """Best certainty per picked cell for one label (vectorized).
@@ -1085,17 +1307,18 @@ class LabelServer:
             knn_cert = sims.astype(np.float32)
 
         cert = knn_cert
-        if self.ml_engine is not None:
-            ml_probs = self.ml_engine.probs(
-                label_id, pos_rows, neg_rows)
-            if ml_probs is not None:
-                ml = ml_probs[rows]
-                cert = ml if cert is None else np.maximum(cert, ml)
         if self.prob_matrix is not None:
             ci = self.class_index.get(self._label_name(label_id), -1)
             if ci >= 0:
                 head = self.prob_matrix[rows, ci]
                 cert = head if cert is None else np.maximum(cert, head)
+        # A refreshed logistic scorer is the sharpest certainty available —
+        # it is the only source that has actually seen the explicit
+        # negatives.
+        proba = self._model_proba(label_id)
+        if proba is not None:
+            p_arr = proba[np.asarray(rows, dtype=np.int64)]
+            cert = p_arr if cert is None else np.maximum(cert, p_arr)
         if cert is None:
             return
         for c, v in zip((c for c in picked if c["cell_id"] in self.cid_row),
@@ -1118,16 +1341,68 @@ class LabelServer:
         return self._annotate_core(data.get("filepaths", []),
                                    lids or [], data.get("state"))
 
+    def _api_annotate_cluster(self):
+        """Whole-cluster write: cluster ∩ current scope members × targets.
+
+        The UI sends the cluster queue's exact context (label_id + scope +
+        source), and the members are expanded server-side through the SAME
+        `_in_scope` membership the queue uses — so the N shown above the
+        grid (queue total) is exactly the number of cells this request
+        writes. The write goes through _annotate_core: one transaction,
+        one undoable op (Ctrl+Z reverts the whole cluster), engine bumps
+        and the auto export included.
+        """
+        data = request.get_json(force=True)
+        try:
+            cluster_id = int(data.get("cluster_id"))
+        except (TypeError, ValueError):
+            return jsonify({"error":
+                            f"bad cluster_id: {data.get('cluster_id')!r}"}), 400
+        if (self.cluster_memb is None
+                or cluster_id not in self.cluster_medoid):
+            return jsonify({"error": f"unknown cluster: {cluster_id}"}), 400
+        scope = data.get("scope", "undecided")
+        if scope not in ("undecided", "with", "without", "neg", "union"):
+            scope = "undecided"
+        lids_all = self._label_ids()
+        label_id = data.get("label_id")
+        try:
+            label_id = int(label_id) if label_id is not None else None
+        except (TypeError, ValueError):
+            return jsonify({"error": f"bad label_id: {label_id!r}"}), 400
+        if label_id is None or label_id not in lids_all:
+            return jsonify({"error": "annotate_cluster needs a known "
+                                     "label_id (the queue's label)"}), 400
+        source = data.get("source") or None
+
+        states = self.db.cell_states()
+        cids = []
+        for row in np.flatnonzero(self.cluster_memb == cluster_id - 1):
+            cid = self.row_cid.get(int(row))
+            if cid is None:
+                continue
+            if source and self.cid_cell[cid]["source"] != source:
+                continue
+            if self._in_scope(states, cid, scope, label_id, lids_all):
+                cids.append(cid)
+        if not cids:
+            return jsonify({"error": "the cluster has no members in this "
+                                     "scope"}), 400
+        filepaths = [self.cid_cell[cid]["filepath"] for cid in cids]
+        lids = data.get("label_ids") or []
+        logging.getLogger(__name__).info(
+            "Cluster write: cluster %d, %d member(s) in scope %s",
+            cluster_id, len(cids), scope)
+        return self._annotate_core(filepaths, lids, data.get("state"))
+
     def _annotate_core(self, filepaths, label_ids, state):
         """Shared write path for cells × labels (ONE undoable op).
 
         state: 1 = positive, 0 = explicit negative, "clear"/None = remove
-        the decision. The whole batch is one transaction; the engines'
-        score caches are invalidated ONLY for the written labels; the
-        auto-annotate pass runs afterwards for every eligible label so a
-        threshold crossing can never be skipped (the old equality check
-        missed batch jumps like 19 -> 22 positives). The export CSV is
-        rewritten exactly once per request.
+        the decision. The whole batch is one transaction; the engine's
+        score cache is invalidated for the written labels so the next queue
+        request ranks with the new exemplars; the export CSV is rewritten
+        exactly once per request.
         """
         log = logging.getLogger(__name__)
         if not isinstance(filepaths, list) or not filepaths:
@@ -1183,76 +1458,28 @@ class LabelServer:
                 self._bump_label(lid)
         for lid in lids:
             self._bump_label(lid)
+        self._mark_models_stale()
         # Refresh the label cache so per-label pos/neg counts served by
         # /api/state reflect the write immediately.
         self._refresh_labels()
-        # Auto-annotate runs after every positive write: any label that has
-        # crossed its positive threshold and not yet fired annotates its
-        # confident undecided cells (the written labels, or another one that
-        # became eligible through this write's state change).
-        auto_applied = {}
-        if db_state == STATE_POS:
-            auto_applied = self._maybe_auto_apply_all()
         self._auto_export()
         st = self.db.stats()
         names = ", ".join(self._label_name(l) for l in lids)
-        log.info("Annotate [%s] state=%s on %d cells (op %d)%s",
-                 names, db_state, len(cids), op_id,
-                 f" auto={auto_applied}" if auto_applied else "")
-        return jsonify({"ok": True, "n": n, "labeled": st["labeled"],
-                        "auto_applied": sum(auto_applied.values()),
-                        "auto_labels": auto_applied}), 200
-
-    def _api_auto_apply(self):
-        """Auto-annotate one label (label_id given, forced rerun) or every
-        eligible label that has not fired yet. Idempotent: decided cells
-        skip."""
-        data = request.get_json(force=True, silent=True) or {}
-        force = None
-        if data.get("label_id") is not None:
-            try:
-                force = int(data["label_id"])
-            except (TypeError, ValueError):
-                return jsonify({"error": "bad label_id"}), 400
-            if force not in self._label_ids():
-                return jsonify({"error": f"unknown label_id: {force}"}), 400
-        applied = self._maybe_auto_apply_all(force_label=force)
-        st = self.db.stats()
-        return jsonify({"ok": True, "applied": applied,
-                        "labeled": st["labeled"]})
-
-    def _api_auto_clear(self):
-        """Remove every AUTO decision of one label (two-step confirm in UI)."""
-        data = request.get_json(force=True, silent=True) or {}
-        try:
-            lid = int(data.get("label_id"))
-        except (TypeError, ValueError):
-            return jsonify({"error": "bad label_id"}), 400
-        if lid not in self._label_ids():
-            return jsonify({"error": f"unknown label_id: {lid}"}), 400
-        removed = self.db.clear_auto(lid, self.session_id,
-                                     self.db.next_op_id())
-        self._bump_label(lid)
-        self._refresh_labels()
-        self._auto_export()
-        logging.getLogger(__name__).info(
-            "Auto-clear '%s': %d auto decisions removed",
-            self._label_name(lid), removed)
-        st = self.db.stats()
-        return jsonify({"ok": True, "removed": removed,
-                        "labeled": st["labeled"]})
+        log.info("Annotate [%s] state=%s on %d cells (op %d)",
+                 names, db_state, len(cids), op_id)
+        return jsonify({"ok": True, "n": n, "labeled": st["labeled"]}), 200
 
     def _api_undo(self):
         """Revert the newest user action of this session (one op from the
-        log). Works for batch applies, single writes and auto runs;
-        repeated undos keep walking back through earlier actions. Returns
-        what was reverted.
+        log). Works for batch applies and single writes; repeated undos
+        keep walking back through earlier actions. Returns what was reverted.
         """
         result = self.db.undo_last_op(self.session_id)
         if result is None:
             return jsonify({"ok": True, "undone": False, "n": 0,
                             "message": "nothing to undo"})
         self._bump_engines()
+        self._mark_models_stale()
         self._refresh_labels()
         self._auto_export()
         st = self.db.stats()
@@ -1283,16 +1510,19 @@ class LabelServer:
             v = a.get(name, type=float)
             return default if v is None else v
 
+        # The DB stores portable paths; reading/getmtime need the absolute
+        # form (relative entries resolve against the CWD they were stored in).
+        raw_path = os.path.abspath(cell["raw_path"])
         lo, hi, gamma = _fparam("lo", 0.1), _fparam("hi", 99.9), \
             _fparam("gamma", 1.0)
-        key = (cell["raw_path"], os.path.getmtime(cell["raw_path"]),
+        key = (raw_path, os.path.getmtime(raw_path),
                tuple(settings["channels"]), settings["channel_layout"],
                float(settings["max_value"]), max_px, float(lo), float(hi),
                float(gamma), self.aug_infer is not None, RENDER_VERSION)
         png = self.render_cache.get(key)
         if png is None:
             try:
-                img = read_tiff_channels(cell["raw_path"], settings["channels"],
+                img = read_tiff_channels(raw_path, settings["channels"],
                                          channel_layout=settings["channel_layout"])
                 if img.ndim == 2:
                     img = img[:, :, None]
@@ -1315,7 +1545,7 @@ class LabelServer:
                 # Includes the microBase MicroMaxError subclasses (missing
                 # files) — keep the server alive.
                 logging.getLogger(__name__).exception(
-                    "image render failed: %s", cell["raw_path"])
+                    "image render failed: %s", raw_path)
                 return jsonify({"error": str(e)}), 500
             self.render_cache.put(key, png)
         return Response(png, mimetype="image/png")

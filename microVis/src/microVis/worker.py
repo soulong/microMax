@@ -392,6 +392,91 @@ def crop_object_rgb(
     return np.ascontiguousarray(rgb)
 
 
+def crop_cell_rgb_normalized(
+    img_data: np.ndarray,
+    mask: np.ndarray,
+    label: int,
+    channel_names: list[str],
+    ch_config: dict,
+    low_pct: float,
+    high_pct: float,
+    gamma: float,
+    target_size: int = 96,
+    padding: int = 4,
+) -> np.ndarray | None:
+    """Crop one masked object and render it SELF-normalized (Data-page popup).
+
+    Deliberately a separate code path from crop_object_rgb (annotation
+    crops) so the two display pipelines can evolve independently. Instead
+    of the Image page's absolute per-channel vmin/vmax, EACH channel is
+    scaled by percentiles of THIS cell's own nonzero pixels (the masked-out
+    background is exactly 0, so band > 0 selects the object only) and then
+    gamma-shaped — the rendering is independent of absolute staining
+    intensity, which keeps texture differences visible across cells.
+    Channel enable state and colors still come from `ch_config` (the Image
+    page), so a multi-channel cell keeps its usual colors. Returns None
+    when the label is absent from the mask.
+    """
+    from microVis.processing.compositing import composite_image
+
+    ys, xs = np.where(mask == label)
+    if len(ys) == 0:
+        return None
+
+    # Object bounding box + padding (same geometry as crop_object_rgb).
+    h, w = mask.shape
+    y_min = max(0, int(ys.min()) - padding)
+    y_max = min(h, int(ys.max()) + padding + 1)
+    x_min = max(0, int(xs.min()) - padding)
+    x_max = min(w, int(xs.max()) + padding + 1)
+
+    crop_img = img_data[y_min:y_max, x_min:x_max, :].astype(np.float64)
+    obj = mask[y_min:y_max, x_min:x_max] == label
+    # Zero out everything outside this object — the crop's background then
+    # IS 0 and is excluded from the percentile population below.
+    crop_img *= obj[:, :, None]
+
+    # Per-channel self (per-cell) quantile normalization + gamma.
+    enhanced = np.zeros_like(crop_img)
+    for ch_idx, ch_name in enumerate(channel_names):
+        if ch_idx >= crop_img.shape[2]:
+            break
+        if not ch_config.get(ch_name, {}).get("enabled", True):
+            continue  # disabled channel stays black
+        band = crop_img[:, :, ch_idx]
+        vals = band[band > 0]
+        if vals.size == 0:
+            continue
+        lo, hi = np.percentile(vals, [low_pct, high_pct])
+        if hi <= lo:
+            # Degenerate (constant) population: the whole signal IS the
+            # range — every signal pixel lands at the top, exactly where
+            # the maximum lands in the non-degenerate case.
+            scaled = (band > 0).astype(np.float64)
+        else:
+            scaled = np.clip((band - lo) / (hi - lo), 0.0, 1.0)
+        enhanced[:, :, ch_idx] = scaled ** float(gamma)
+
+    # Composite with the Image page's channel colors (the display range is
+    # already 0..1, so the pass-through vmin/vmax never re-scale).
+    comp_config = {ch: {**c, "vmin": 0, "vmax": 1} for ch, c in ch_config.items()}
+    rgb = composite_image(enhanced, channel_names, comp_config, None, None)
+
+    # Shrink to the popup size when the crop is larger.
+    ch_n, cw = rgb.shape[:2]
+    if ch_n > target_size or cw > target_size:
+        from skimage.transform import resize as sk_resize
+        scale = target_size / max(ch_n, cw)
+        rgb = sk_resize(
+            rgb,
+            (int(ch_n * scale), int(cw * scale), 3),
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(np.uint8)
+
+    return np.ascontiguousarray(rgb)
+
+
 class CropWorker(QRunnable):
     """Background worker that crops and masks a single object from an image."""
 

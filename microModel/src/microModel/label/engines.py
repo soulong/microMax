@@ -1,29 +1,34 @@
 """Suggestion engines for the label app.
 
 All engines score cells in ONE shared embedding space W (whitened-PCA +
-L2-normalized feature rows — the deduplication/vis convention). Three
-complementary sources feed the UI badges and the queue rankings:
+L2-normalized feature rows — the deduplication/vis convention):
 
-  SuggestEngine  per-label nearest-exemplar kNN score (positive similarity
-                 minus explicit-negative similarity — PU: undecided is not
-                 a negative)
-  MLModelEngine  a per-label sklearn classifier fitted on that label's
-                 explicit positives vs explicit negatives (active learning
-                 once a label has enough of BOTH)
-  review_items   leave-one-out consistency check over DECIDED cells —
-                 flags decided cells whose embedding contradicts their own
-                 decision (likely mislabels)
+  SuggestEngine    per-label nearest-exemplar kNN score (positive
+                   similarity minus explicit-negative similarity — PU:
+                   undecided is not a negative)
+  fit_label_model  per-label logistic refit over the explicit exemplars
+                   (the manual Refresh-model action) — negatives shape a
+                   real decision boundary instead of only nudging a
+                   similarity ranking
+  review_items     leave-one-out consistency check over DECIDED cells —
+                   flags decided cells whose embedding contradicts their own
+                   decision (likely mislabels)
 
-Score arrays are cached per label and invalidated selectively: writing to
-label A must not throw away label B's cached scores on a 40k-cell project,
-so bump() takes an optional label id (None = invalidate everything).
+Score arrays are cached per label keyed by the decision counts and the
+engine version; bump() invalidates them after every write, so the ranking
+always reflects the current exemplars.
 """
 
 import threading
 
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+
+# A per-label logistic refit needs BOTH sides in reasonable numbers — below
+# that the label keeps the kNN score (sklearn cannot say anything sensible
+# from one or two exemplars of a class).
+MIN_FIT_POS = 4
+MIN_FIT_NEG = 4
 
 
 def _diverse_order(W, m, seed):
@@ -58,8 +63,9 @@ class SuggestEngine:
     MEAN would dilute the one truly similar exemplar (measured: top-4 mean
     ~0.01 while the nearest same-type neighbor sits at ~0.8), so the max is
     the right primary signal and larger k only smooths once many exemplars
-    accumulate. A suggestion fires when pos_part >= threshold AND
-    pos_part > neg_part (negatives act as a veto and a ranking term).
+    accumulate. Explicit negatives PUSH every similar cell down the ranking
+    (the score is what the UI shows and what the Collect queue sorts by);
+    cells without a decision are never treated as negatives.
 
     Score arrays are cached per label keyed by the decision counts and
     invalidated — for ONE label or wholesale — by bump().
@@ -115,82 +121,35 @@ class SuggestEngine:
             k = min(self.knn_k, len(neg_rows))
             sims = self.W @ self.W[neg_rows].T
             neg_part = self._topk_mean(sims, k)
+        result = (pos_part, neg_part)
         with self._lock:
             self._cache[label_id] = (self.version,
                                      (len(pos_rows), len(neg_rows)),
-                                     (pos_part, neg_part))
-        return pos_part, neg_part
+                                     result)
+        return result
 
 
-class MLModelEngine:
-    """Per-label discriminative model over the embedding space.
+def fit_label_model(W, pos_rows, neg_rows, seed):
+    """Fit one label's logistic scorer over its explicit exemplars, or None.
 
-    Where SuggestEngine ranks by similarity to exemplars, this engine fits a
-    small sklearn classifier on a label's explicit positives (state 1) vs
-    explicit negatives (state 0) — logistic regression by default, random
-    forest as the non-linear alternative — and scores EVERY cell with
-    predict_proba. A trained boundary separates lookalike-but-negative
-    regions that pure nearest-exemplar similarity still scores high.
-
-    A label only engages once it has at least min_pos positives AND min_neg
-    negatives (below that a two-class fit would be noise — the kNN engine
-    keeps serving those labels). Like SuggestEngine, score arrays are cached
-    per label keyed by the decision counts and invalidated by bump(); the
-    refit costs well under a second on the 50-d space, so models are never
-    persisted to disk.
+    The discriminative complement to the kNN score: a per-label logistic
+    regression in the SAME whitened space — positives are class 1, explicit
+    negatives class 0, undecided cells never enter training (the same PU
+    principle as the kNN score). Fitting is MANUAL (the UI's Refresh-model
+    button): negatives then define a decision boundary instead of only
+    pulling a similarity down, which is what makes Apply − / shift+click
+    negatives really bite. class_weight='balanced' keeps a small negative
+    set from being drowned by many positives. Returns None when either side
+    holds fewer than MIN_FIT exemplars — the caller keeps the kNN score.
     """
-
-    def __init__(self, W, kind, min_pos, min_neg, seed=42):
-        self.W = W
-        self.kind = kind              # "logistic" | "random_forest"
-        self.min_pos = int(min_pos)
-        self.min_neg = int(min_neg)
-        self.seed = int(seed)
-        self.version = 0
-        self._cache = {}   # label_id -> (version, (npos, nneg), probs|None)
-        self._lock = threading.Lock()
-
-    def bump(self, label_id=None):
-        """Invalidate cached probabilities (one label, or all when None)."""
-        with self._lock:
-            self.version += 1
-            if label_id is None:
-                self._cache.clear()
-            else:
-                self._cache.pop(label_id, None)
-
-    def _fit(self, pos_rows, neg_rows):
-        """Fit the configured classifier on explicit pos vs neg rows."""
-        X = np.vstack([self.W[pos_rows], self.W[neg_rows]])
-        y = np.r_[np.ones(len(pos_rows)), np.zeros(len(neg_rows))].astype(np.int64)
-        if self.kind == "random_forest":
-            # n_jobs=1: the server is a threaded Flask app; process pools
-            # per request are not worth it on <= a few thousand rows.
-            clf = RandomForestClassifier(
-                n_estimators=300, min_samples_leaf=2,
-                class_weight="balanced", random_state=self.seed, n_jobs=1)
-        else:
-            clf = LogisticRegression(max_iter=1000, class_weight="balanced",
-                                     random_state=self.seed)
-        clf.fit(X, y)
-        return clf
-
-    def probs(self, label_id, pos_rows, neg_rows):
-        """P(positive) over ALL cells, or None while below the gates."""
-        with self._lock:
-            hit = self._cache.get(label_id)
-            if hit is not None and hit[0] == self.version and \
-                    hit[1] == (len(pos_rows), len(neg_rows)):
-                return hit[2]
-
-        out = None
-        if len(pos_rows) >= self.min_pos and len(neg_rows) >= self.min_neg:
-            out = self._fit(pos_rows, neg_rows) \
-                     .predict_proba(self.W)[:, 1].astype(np.float32)
-        with self._lock:
-            self._cache[label_id] = (self.version,
-                                     (len(pos_rows), len(neg_rows)), out)
-        return out
+    if len(pos_rows) < MIN_FIT_POS or len(neg_rows) < MIN_FIT_NEG:
+        return None
+    X = np.vstack([W[pos_rows], W[neg_rows]])
+    y = np.concatenate([np.ones(len(pos_rows)), np.zeros(len(neg_rows))])
+    model = LogisticRegression(class_weight="balanced", max_iter=1000,
+                               random_state=seed)
+    model.fit(X, y)
+    return model
 
 
 def review_items(W, row_cid, pos_rows, neg_rows):
@@ -199,8 +158,8 @@ def review_items(W, row_cid, pos_rows, neg_rows):
     The active-learning complement to the uncertainty ranking: instead of
     picking new informative cells, flag already-labeled cells whose
     embedding contradicts their own decision (likely mislabels — slips of
-    the hand, or auto annotations accepted when the label had too few
-    exemplars to be trustworthy). A positive is suspicious when its nearest
+    the hand, or a label annotated before it had trustworthy exemplars).
+    A positive is suspicious when its nearest
     OTHER positive (self excluded — the self-similarity of 1.0 would
     otherwise mask everything) is FARTHER than its nearest explicit
     negative; symmetrically for negatives (a suspicious negative is a

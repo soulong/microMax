@@ -22,10 +22,16 @@ class NoScrollDoubleSpinBox(QDoubleSpinBox):
 
 
 class NoScrollComboBox(QComboBox):
-    """QComboBox that ignores scroll-wheel."""
+    """QComboBox that ignores scroll-wheel while its own popup is CLOSED.
+
+    Wheel inside an OPEN popup must still scroll the option list, so this
+    override only swallows wheels delivered while the popup is shut (the
+    app-wide wheel redirect skips open popups as well, see app._WheelBlocker).
+    """
 
     def event(self, event):
-        if event.type() == QEvent.Type.Wheel:
+        if (event.type() == QEvent.Type.Wheel
+                and not self.view().isVisible()):
             event.ignore()
             self.clearFocus()
             return True

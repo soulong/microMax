@@ -5,61 +5,70 @@
 #
 #    - 开始前在网页左侧定义若干标签（可拖动排序、可二次确认删除；标注点击即存，重复运行自动继续）；
 #    - 每个细胞可以打任意多个标签；网页 = 统一的网格批量工作台：点选多张图像 + 勾选目标标签 → Apply + / Apply − / Remove 一次批量写入（单事务、
-#      一步可撤销）；双击缩略图放大——放大视图里可以直接点标签 chip（或按 1-9）给当前细胞打标，←/→ 在队列里逐个走，底部翻页，K = 每页张数；
-#    - 三步工作流（多标签 closed-world 训练里"漏标 = 假负例"代价最高，所以广标之后靠不确定度修剪）：
-#        * Collect —— 点左侧标签，未标注细胞按分数降序铺开（绿徽标 = 建议分；该标签还没有正例时退化为最远点冷启动铺开），选中 Apply + 快速攒到
-#          auto_label.min_positives 个正例；Uncertain ↑ 切换成"最接近决策边界优先"的主动学习排序，Shuffle 换一批；
-#        * Auto —— 某标签正例数达到 min_positives 后（每次正向写入都会检查，批量跨越也不会漏），对每个已就绪标签打分，分数 ≥ threshold 的未标注
-#          细胞批量标为 auto 正例（蓝 A 标记；对所有就绪标签联合执行，一个细胞该有几个标签就同时拿到几个，不会漏）。每个标签只自动跑一次
-#          （Remove auto 复位，下次写入可重跑）；侧栏有进度条提示还差几个正例；
-#        * Manage —— 点左侧标签浏览已标细胞：scope = with（该标签正例）/ without（缺这个标签的）/ union（全部已标），排序 Certainty ↑（最不确
-#          定优先，修剪错误 auto 标注）或 Suspicious ⚠（leave-one-out 一致性检查找疑似错标，放大后并排显示矛盾证据细胞）；Remove 错误标注、
-#          勾目标标签 Apply + 补标；Apply − 写"明确反例"——它们驱动 ML 推荐器，易混标签务必标一些；
-#        * 模型推荐 —— recommend.ml_model 开启后，显式正负例都够多的标签训练小分类器（逻辑回归 / 随机森林）给全部细胞打分，作为建议来源
-#          （徽标 A）并接管 Collect 排序；不够的标签回退 kNN。
+#      一步可撤销）；Shift+点击缩略图 = 对勾选标签记一个"即时负例"；双击缩略图放大——放大视图里可以直接点标签 chip（或按 1-9）给当前细胞打标，
+#      ←/→ 在队列里逐个走，底部翻页，K = 每页张数；凡是有标注的细胞，右下角都显示它的标签圆点；
+#    - 一个标签一个队列（没有队列模式切换）：顶栏选数据源，左侧点标签，顶栏 Scope 单选决定队列成员——
+#        To label（待标：该标签未决定的细胞按推荐分数降序铺开，绿徽标 = 分数；还没有正例时退化为最远点冷启动铺开）；
+#        Positive（该标签正例）/ Missing（缺该标签的已标细胞）/ Negatives（该标签全部明确反例——复查每个 Shift+点击 / Apply − 决定：
+#        Best ↓ 把最像正例、最可能误标的反例排最前，选中 Remove 撤销或 Apply + 翻正）/ All labeled（全部已标）。
+#      Sort 单选决定排序：Best ↓（分数最高/最像正例优先）、Uncertain ↑（正负边界最模糊优先的主动学习排序，已标 scope = 最不像正例优先）、
+#      Suspicious ⚠（leave-one-out 一致性检查找疑似错标，仅 Positive scope，放大后并排显示矛盾证据细胞）；Shuffle 给待标队列换一批。
 #
 #  推荐原理（与 vis 聚类 / deduplication 同一特征约定）：bundle 提特征（SSL bundle 用 teacher 分支；train 分类 bundle 用其特征输出，并额外用分类头
 #  概率作第二推荐来源）→ whitened-PCA + L2 归一 → 余弦相似度。每个标签 score(x) = 与正例的 top-k 平均相似度 − neg_weight × 与"明确反例"的 top-k 平均
-#  相似度。没标过 ≠ 反例（PU 原则），只有显式拒绝才算反例。
+#  相似度。没标过 ≠ 反例（PU 原则），只有显式拒绝才算反例；待标队列排序、缩略图徽标、已标 scope 的 certainty 全部都用这一个透明分数。
+#  Refresh model 按钮（顶栏，手动）：某个标签的正例和明确反例都攒够（各 ≥4）后点一下，为它拟合一个逻辑回归打分器——反例从此参与划定真正的决策边界，
+#  比只拉动相似度强得多；刷新后该标签的分数/徽标变成模型 P(positive)。刻意做成手动：每次写入只把模型标记为"过期"（按钮旁状态提示），分数继续可用，
+#  直到你再点一次刷新。
 #
-#  顶栏有 Contrast / Gamma 滑杆（只改显示的分位窗与 gamma，不碰特征）和 Undo（Ctrl+Z，撤销最近一次操作——批量应用/单次写入/自动标注各自是一步，
-#  再按一次 = 重做），小特征或亮度看不清时先调显示再标注。
+#  簇-批量标注（左栏 Clusters tab，配置下方 cluster 段后出现）：全部细胞在同一嵌入空间上按目标簇数自动做 Leiden 细聚类（默认 ~100 簇，每簇显示其
+#  medoid 最典型细胞缩略图 + 大小 + 当前标签的未决数）。点一个簇 = 队列收窄到该簇 ∩ 当前 Scope，Medoid ↓ 排序让最典型的成员排最前（第一页就能看出
+#  这个簇是什么）；确认后"Cluster Apply + / − / Remove"把勾选的目标标签写给整簇 ∩ 当前 Scope——一次服务端动作 = 一个事务 = 一步可撤销（默认
+#  To label scope 只填未决定成员，不碰你已做的显式正/负例）。数万细胞 ≈ 一百次整簇决定；之后用 Uncertain ↑ / Suspicious ⚠ 做簇边界处的细粒度清理。
+#  SSL 预训练 bundle（如 dinov3）即可用全部簇功能；train 训练的分类 bundle 额外有"Predicted 下拉 + Prob ↓ 排序"：按模型 argmax 预测类别筛选细胞、
+#  按该类概率降序复查（All 时按各细胞自身的最高置信度排），配合"从模型类别建标签"形成预测验证/纠错的快速闭环。聚类结果缓存于 features/，特征或
+#  bundle 一变自动重算；与标注决定完全无关，两种标注模式共享。
+#
+#  顶栏有 Contrast / Gamma 滑杆（只改显示的分位窗与 gamma，不碰特征）和 Undo（Ctrl+Z，撤销最近一次操作——批量应用/单次写入各自是一步，
+#  再按一次 = 继续往前撤销），小特征或亮度看不清时先调显示再标注。
 #
 #  产出（全部写入 save_dir，源数据一个字节不动；重复运行/换数据集/加标签都安全）：双模式各自一个独立工程库——multi = label_multiple.db，single = label_single.db
 #  （顶栏 Mode 下拉切换，指针文件 label_mode.txt 记住上次模式；两库完全独立、互不可见，撤销也不跨库；旧工程库首次启动自动改名迁移——annotations.db →
 #  label_multiple.db、annotations_single.db → label_single.db、v0.21 统一的 label.db 按其记录的模式归位，目标名被占用时加 .old 后缀搁置，标注原样保留）。
 #  特征缓存 / 推荐引擎 / 显示管线与标注决定无关，两模式共享（切换亚秒完成；打分永远只来自当前模式自己的库）。每次点击立即落盘；再次运行自动加载已有标注继续
 #  （模型 bundle 换了会警告，但人工标注仍有效）。导出按模式分文件：multi → label_export.csv，single → label_export_single.csv（filepath,label，
-#  多标签用 ";" 连接），直接喂 micromodel train。
-#    features/  每 root 特征缓存（deduplication 同款布局：key = bundle 路径+ mtime+size、文件清单、channels 等；新数据/新 bundle 自动失效）
+#  多标签用 ";" 连接），直接喂 micromodel train；filepath 为可移植路径（相对进程 CWD、正斜杠，跨盘退回绝对——与 curated.csv 同一约定）。
+#    features/  每 root 特征缓存（deduplication 同款布局：key = bundle 路径+ mtime+size、文件清单、channels 等；新数据/新 bundle 自动失效）+ 簇划分缓存
+#               （clusters_*.npz，key 覆盖 bundle 身份 + 细胞清单 + PCA 维数）
 #    micromodel.log  运行日志
 #
 #  网页显示与模型输入一致：细胞图先走 bundle 的 augmentation_infer 预处理（统一正方形模型输入尺寸，小的放大、大的缩小），再做忽略 0 值背景的分位数
 #  归一——你看到的就是模型看到的几何。
 # =====================================================================================
 
-#  标注工程目录：label.db / 导出 / 特征缓存都放在这里。同一个目录反复打开就是同一个标注工程（细胞按绝对路径识别，旧标注原样保留）。
+#  标注工程目录：label.db / 导出 / 特征缓存都放在这里。同一个目录反复打开就是同一个标注工程（细胞按可移植路径识别：相对进程 CWD、正斜杠，跨盘退回绝对——与 curated.csv 同一约定，旧标注原样保留）。
 save_dir: sc_dataset/label
 
 #  模型 bundle（可选但强烈推荐）：
 #    - SSL 预训练 bundle（无 num_classes）→ teacher 特征 + kNN 推荐；
 #    - train 分类 bundle（有 num_classes）→ 同样提特征 + 额外用分类头概率做第二推荐来源，且可一键"从模型类别建标签"；
 #    - null = 纯手动模式（无推荐，浏览/筛选/手动打标功能完整）。换 bundle = 换嵌入空间，特征缓存自动失效重建（旧标注不受影响）。
-model: 2026-09-14_dinov3_phase2/model_220.pt
+# model: 2026-09-14_dinov3_phase2/model_220.pt
+model: 2026-09-15_train_puncta/model.pt
 
 data:
   #  file_list: 数据清单 CSV（deduplication 的 curated.csv、本工具的 label_export.csv，或任意 [filepath(,label)] 清单；写成列表，单个数据源也用单元素列表）。配
   #  置后清单就是全部细胞，data.file_dir 被忽略（日志警告）：隐式 root = 清单文件所在的各个父目录，全局 data.* 默认对全部文件生效，CSV 自带 label 列仅作为预设标签展
   #  示。filepath 相对路径按进程 CWD 解析——与 curated.csv 的生成约定一致，从 deduplication 的运行目录启动即可。与 file_dir 二选一。
-  file_list: #null
-    - sc_dataset/deduplication/curated.csv
+  file_list: null
+    #- sc_dataset/deduplication/curated.csv
   #  file_dir: 每个元素是一个"预裁剪单细胞文件夹"（递归枚举 .tif/.tiff，一个文件一个细胞，背景为 0）。字符串 = 全部继承 data.* 全局默认；字典 = {path: ..., 加任意
   #  data.* 键做 per-folder 覆盖}（例如 8-bit 数据集用 max_value: 255 混跑）。后续新增数据集 = 往这里追加路径后重新运行，旧标注/旧标签自动保留。两个条目不能有重
   #  叠文件（硬报错）；配 model 时 channels 解析后必须等于 bundle 的 in_chans（与 infer 相同的硬校验）。file_list 配置时本键被忽略。
   file_dir:
-    # - sc_dataset/deduplication/curated/NCOA2_293T_63x_epi
-    # - sc_dataset/deduplication/curated/opencell_single_cell
-    # - sc_dataset/deduplication/curated/p53
+    - sc_dataset/deduplication/curated/NCOA2_293T_63x_epi
+    - sc_dataset/deduplication/curated/opencell_single_cell
+    - sc_dataset/deduplication/curated/p53
   # 从文件名提取元数据的正则；null = 不提取。对标注本身无影响，只进入缓存 key。
   image_pattern: null
   #  通道排布：CHW = 通道是 TIFF 的多个 page；HWC = 通道在最后一维；null = 每个文件本身就是单张 2D 图（当前数据全是这种）。未来多通道数据改这里即可，网页会多通
@@ -78,37 +87,24 @@ data:
 recommend:
   #  打分取与该标签已标样本的前 k 个最相似值的平均。k=1（默认）= 纯最近邻检索：正例少而分散时这是唯一不被稀释的信号（实测 top-4 均值 ~0.01 而最近同类型邻居 ~0.8
   #  ）；标注多了以后可调到 3~10 平滑噪声。
-  knn_k: 1
+  knn_k: 10
   #  反例惩罚权重：score = 正例侧打分 − neg_weight × 反例侧打分。0.5 = 反例贡献一半负分；0 = 完全忽略反例（不推荐）。
   neg_weight: 0.5
-  #  建议阈值：与最近正例的相似度 ≥ 此值且压过反例时才推荐。0.75 附近表示"与已标正例几乎是同一种形态"；调低 = 推得多（快但要多纠错），调高 =推得少而准。网页顶栏
-  #  可随时改（对之后加载的队列生效）。
-  auto_threshold: 0.75
-  #  冷启动批量：Collect 视图在标签还没有任何正例时的回退铺开数量（特征空间最远点贪心）。建议每个预期标签 10~20 个；标完这批即可触发自动标注。
+  #  冷启动批量：Collect 视图在标签还没有任何正例时的回退铺开数量（特征空间最远点贪心）。建议每个预期标签 10~20 个。
   diverse_size: 80
   #  每页张数（网格一批浏览/标注的数量，网页顶栏 K 可临时改，改动只存在浏览器本地）。
   page_size: 100
-  #  模型推荐（主动学习）：某标签的显式正例与显式负例都够数时，在该标签的正 / 负例嵌入上训练一个小分类器，用 predict_proba 给全部细胞打分——学到的是决策边界而非纯
-  #  样本相似度，易混形态的误推会明显减少。打分作为第三建议来源（chip 徽标 A），并接管 Collect 视图里该标签的排序；不够数的标签自动回退 kNN。
-  #    logistic  逻辑回归（小样本最稳，默认）random_forest 随机森林（非线性边界，样本多时更优）
-  #    none  关闭（只用 kNN + 分类头）每次标注后懒重训（秒级），不落盘——特征缓存让重训近乎免费。
-  ml_model: logistic
-  #  模型推荐的参与门槛：显式正例 ≥ ml_min_pos 且显式负例 ≥ ml_min_neg 才为该标签训练模型。负例不参与训练导出，但在这里很重要——没有负例就没有模型推荐；易混标签
-  #  对建议各标几个负例。
-  ml_min_pos: 5
-  ml_min_neg: 3
-
-#  自动标注（Collect → Auto → Manage 工作流的核心）：某标签正例数达到 min_positives 后，每次正向写入都会对每个就绪标签打分（ML 概率，未触发模型时用
-#  kNN 正例相似度 + 反例否决），把分数 ≥ threshold 的未标注细胞批量标为 auto 正例（蓝 A 标记）——批量跨越阈值也不会漏。每个标签只自动跑一次（按
-#  auto_fired 标记去重；Remove auto 或 Undo 复位后可再次触发）。多标签 closed-world 训练里"漏标 = 假负例"，广标之后在 Manage 视图按 Certainty ↑ /
-#  Suspicious 修剪错误的 auto 标注即可；侧栏的 Auto-apply now 按钮可随时强制重跑。
-auto_label:
-  min_positives: 20
-  threshold: 0.9
 
 space:
   #  推荐空间的 whitened-PCA 维数（对所有已提特征拟合，行再 L2 归一）。自动被样本数和特征维数封顶；与 deduplication/vis 聚类同一约定，50d 通常够。
   pca_components: 50
+
+cluster:
+  #  簇-批量标注（左栏 Clusters tab）：把全部细胞在同一嵌入空间上自动聚成 ~N 个细簇，逐簇看 medoid 代表细胞后整簇写标签（一次一步可撤销）。
+  #  target = 目标簇数：自动搜索 Leiden 分辨率逼近该簇数（结果缓存在 save_dir/features/，特征或 bundle 变了自动重算）。
+  target: 100
+  #  显式分辨率（可选）：设置后跳过搜索，直接用这一档 Leiden 分辨率聚一次（覆盖 target）。
+  res: null
 
 dataloader:
   batch_size: 128                      # 特征提取的前向批大小

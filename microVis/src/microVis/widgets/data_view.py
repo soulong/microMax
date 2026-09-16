@@ -152,12 +152,16 @@ class DataView(QWidget):
         self._btn_select_db.ensurePolished()
         self._btn_select_db.setFixedWidth(
             self._btn_select_db.sizeHint().width() * 2)
-        self._btn_select_db.setEnabled(False)
+        # Always available: the merge + plot chain works with or without a
+        # loaded dataset (only the click-to-cell popup needs the images).
+        self._btn_select_db.setEnabled(True)
         self._btn_select_db.setToolTip(
-            "Pick one or more profiler.db and/or infer.db files of THIS "
-            "dataset (multi-select). Their object tables are merged into a "
+            "Pick one or more profiler.db and/or infer.db files "
+            "(multi-select). Their object tables are merged into a "
             "single integrated table so measurements and predictions can be "
-            "cross-plotted. You can also drop files on this button.")
+            "cross-plotted — with or without a loaded dataset (without one, "
+            "the click-to-cell popup stays silent). "
+            "You can also drop files on this button.")
         self._btn_select_db.clicked.connect(self.select_db_clicked)
         btn_row.addWidget(self._btn_select_db)
 
@@ -296,7 +300,12 @@ class DataView(QWidget):
         self._db_status_label.setText(text)
 
     def set_db_buttons_enabled(self, enabled: bool) -> None:
-        self._btn_select_db.setEnabled(enabled)
+        """Legacy dataset-transition hook — a no-op now.
+
+        Select DB(s) is always available (it works without a dataset too);
+        Clear DB(s) has its own `set_clear_db_enabled` gated on an actual
+        selection. Kept so existing callers don't break.
+        """
 
     def get_merge_db_name(self) -> str:
         """Output DB file name for Write to DB (defaults to merge.db)."""
@@ -335,7 +344,7 @@ class DataView(QWidget):
         self._pattern_subdir_edit.clear()
         self._btn_load_dataset.setEnabled(False)
         self._btn_reset.setEnabled(False)
-        self._btn_select_db.setEnabled(False)
+        # Select DB(s) stays enabled: it works without a dataset too.
         self._btn_meta_browse.setEnabled(False)
         self._btn_merge.setEnabled(False)
         self._btn_meta_clear.setEnabled(False)

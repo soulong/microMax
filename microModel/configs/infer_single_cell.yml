@@ -9,9 +9,9 @@
 
 mode: single_cell
 
-model: 2026-09-14_dinov3_phase2/model_220.pt      # train bundle (model.pt) or SSL bundle (model.pt)
+model: 2026-09-15_train_puncta/model.pt      # train bundle (model.pt) or SSL bundle (model.pt)
 
-output_dir: 2026-09-14_dinov3_phase2/infer_sc                  # shared DB dir for all file_dir entries; null = per-dataset
+output_dir: 2026-09-15_train_puncta/infer_sc                  # shared DB dir for all file_dir entries; null = per-dataset
 
 data:
   file_dir:

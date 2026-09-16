@@ -9,7 +9,7 @@
 
 mode: whole_image
 
-model: 2026-09-14_dinov3_phase2/model_220.pt         # train bundle (model.pt) or SSL bundle (model.pt)
+model: 2026-09-15_train_puncta/model.pt         # train bundle (model.pt) or SSL bundle (model.pt)
 
 output_dir: null           # shared DB dir for all file_dir entries; null = per-dataset
 
@@ -59,9 +59,9 @@ reduction:
   # reduction_pacmap: null              # path to a pre-fitted reduction_pacmap.pkl; null = fit new
   # reduction_localmap: null            # path to a pre-fitted reduction_localmap.pkl; null = fit new
   # cluster: null                       # path to a baseline cluster.pkl; null = fit new (and save cluster.pkl)
-  reduction_pca: D:/Model/2026-09-14_dinov3_phase2/infer_sc/reduction_pca.pkl          # e.g. reuse the baseline reducers
-  reduction_umap: D:/Model/2026-09-14_dinov3_phase2/infer_sc/reduction_umap.pkl
-  reduction_pacmap: D:/Model/2026-09-14_dinov3_phase2/infer_sc/reduction_pacmap.pkl
-  reduction_localmap: D:/Model/2026-09-14_dinov3_phase2/infer_sc/reduction_localmap.pkl
-  cluster: D:/Model/2026-09-14_dinov3_phase2/infer_sc/cluster.pkl                # e.g. predict the baseline clusters
+  reduction_pca: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_pca.pkl          # e.g. reuse the baseline reducers
+  reduction_umap: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_umap.pkl
+  reduction_pacmap: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_pacmap.pkl
+  reduction_localmap: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_localmap.pkl
+  cluster: D:/Model/2026-09-15_train_puncta/infer_sc/cluster.pkl                # e.g. predict the baseline clusters
 

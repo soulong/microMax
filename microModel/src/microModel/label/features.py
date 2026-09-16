@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from microBase import CellDataset
+from microBase import CellDataset, canonical_directory
 
 from ..dataset import SingleCellDataset
 from ..deduplication import _cache_path, _error
@@ -37,6 +37,11 @@ def _extract_root_features_cls(entry, meta, model, device, output_dir,
     model(x)'s second output, per-class probabilities from the first
     (sigmoid for multi-label bundles, softmax otherwise). `only` restricts
     the extraction to a subset of the root (the label file-list mode).
+
+    Returns (paths, raw_paths, feats, probs): paths are PORTABLE
+    (CWD-relative forward-slash under the CWD, absolute fallback — the
+    canonical_directory convention the label DB itself stores), paths is
+    the normcase identity, raw_paths keeps the real case.
     """
     root = entry["path"]
     cell_ds = CellDataset(root, channel_layout=entry["channel_layout"],
@@ -108,8 +113,8 @@ def _extract_root_features_cls(entry, meta, model, device, output_dir,
     else:
         probs = torch.softmax(logits, dim=1).numpy()
 
-    raw_paths = [os.path.abspath(md.iloc[int(i)]["path"]) for i in
-                 range(len(md))]
+    raw_paths = [canonical_directory(
+        os.path.abspath(md.iloc[int(i)]["path"])) for i in range(len(md))]
     paths = [os.path.normcase(p) for p in raw_paths]
 
     os.makedirs(os.path.dirname(cpath), exist_ok=True)

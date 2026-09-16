@@ -83,7 +83,7 @@ QGroupBox {
     border: none;
     border-radius: 8px;
     margin-top: 8px;
-    padding: 8px 12px 12px 12px;
+    padding: 8px 8px 12px 8px;
     padding-top: 16px;
     font-weight: bold;
 }
@@ -341,6 +341,20 @@ QCheckBox::indicator:hover {
 QCheckBox::indicator:checked:hover {
     border-color: #6a9aaa;
     background-color: rgba(90, 138, 154, 0.3);
+}
+
+/* Facet list (Data page): item checkboxes need a clearly visible frame. */
+QListWidget::indicator {
+    width: 14px;
+    height: 14px;
+    border: 2px solid #888888;
+    border-radius: 4px;
+    background-color: #1e1e2e;
+}
+
+QListWidget::indicator:checked {
+    border-color: #5a8a9a;
+    background-color: rgba(90, 138, 154, 0.4);
 }
 
 /* ── Labels ─────────────────────────────────────────────────────────────── */

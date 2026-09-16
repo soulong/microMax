@@ -585,6 +585,8 @@ class WholeImageCellDataset(Dataset):
         if self.return_mask:
             tensor, mask = cell_out
             return tensor, int(label), stem, bbox, mask
+        # return_mask=False: _cell_to_tensor hands back the bare tensor.
+        tensor = cell_out
         return tensor, int(label), stem, bbox
 
     def row_channel_filenames(self, row_idx):

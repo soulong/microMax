@@ -114,13 +114,15 @@ def is_numeric_sql_type(decl) -> bool:
 
 
 def canonical_directory(path) -> str:
-    """The DB ``directory`` value, PORTABLE-first.
+    """The DB path-value form, PORTABLE-first.
 
     Stored relative to the process CWD (forward slashes) whenever the path
     lives under it — moving the dataset and the working directory together
     onto another computer/drive keeps every DB valid. Paths outside the CWD
-    (e.g. another drive) fall back to absolute forward-slash. Reading is the
-    inverse: :func:`resolve_directory`.
+    (e.g. another drive) fall back to absolute forward-slash. Every
+    path-like DB column uses this exact convention: infer.db `directory`
+    AND `mask_filename` (whose bare filename is the stored value's last
+    segment). Reading is the inverse: :func:`resolve_directory`.
     """
     p = os.path.abspath(str(path))
     try:

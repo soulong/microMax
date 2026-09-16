@@ -14,8 +14,8 @@ Image loading:
     via config.
   - whole_image: filename is a JSON array of channel TIFF filenames;
     load each channel from {directory}/{channel_filename}, load mask from
-    {directory}/{mask_filename} (full path stored in DB), then crop using
-    label.
+    the resolved mask_filename (stored PORTABLE-first like `directory` —
+    resolve_directory CWD-first then dataset root), then crop using label.
 """
 
 import os
@@ -418,7 +418,8 @@ class VisInteractiveServer:
         """Load all channel TIFFs + mask, then crop the cell by label.
 
         filename_json: JSON array of channel TIFF filenames (in channel order).
-        mask_filename: mask full filepath (stored in DB).
+        mask_filename: portable mask path (same canonical_directory contract
+        as `directory`; legacy absolute values pass through).
         Returns cropped img_HWC.
         """
         ch_filenames = json.loads(filename_json)
@@ -433,10 +434,11 @@ class VisInteractiveServer:
             arrays.append(read_image(ch_path))
         img_hwc = np.stack(arrays, axis=-1)  # (H, W, C)
 
-        # Load mask — mask_filename is a full filepath stored in DB
+        # Load mask — mask_filename is stored PORTABLE-first (canonical_
+        # directory, like `directory`) and resolved the same way.
         if not mask_filename:
             raise ValueError("Missing mask_filename in DB for whole-image mode")
-        mask = read_mask(mask_filename)
+        mask = read_mask(resolve_directory(mask_filename, root))
 
         # Crop the cell using label (mask object ID). crop_cell raises
         # DataError when the label has zero pixels in the mask; validate

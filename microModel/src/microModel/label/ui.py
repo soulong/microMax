@@ -2,25 +2,38 @@
 
 Layout (light theme, same approach as reduction_vis):
 
-  top bar      queue + source + live stats + Undo / display controls
-  left         Labels box (click = Collect queue, drag = reorder) +
-               a Selected-label box with the auto-annotate actions +
-               help/shortcuts in a collapsible box
+  top bar      brand + image source + live stats + Size/K + Refresh model
+               / Undo on row 1; display controls (Contrast/Gamma/Reset),
+               the classify prediction filter, then the scope and sort
+               radio groups + Shuffle on row 2
+  left         tabbed: Labels (click = load the label's queue, drag =
+               reorder) + a Selected-label box with the live counts |
+               Clusters (cluster-assisted bulk labeling: one card per
+               Leiden cluster over the shared space, medoid thumbnail,
+               click = the cluster's queue) + the target chips + help /
+               shortcuts in a collapsible box
   toolbar      target-label chips + Apply + / Apply − / Remove / selection
-               tools + a context row (Collect sort & Shuffle / Manage scope
-               & sort & Auto-only)
-  grid         one page of thumbnails; click = select, double-click = zoom
+               tools; inside a cluster an extra bar writes the checked
+               labels to the whole cluster ∩ scope in one undoable step
+  grid         one page of thumbnails; click = select, shift+click =
+               instant negative, double-click = zoom; each thumbnail
+               carries its score/certainty badge and every annotated cell
+               shows its label dots bottom-right
   zoom         full-size view where labels are TOGGLED DIRECTLY (chips or
                keys 1-9 cycle undecided -> positive -> explicit negative),
-               ←/→ walk the current queue, and suspicious cells show the
+               ←/→ walk the queue, and suspicious cells show the
                contradicting evidence cell side by side
 
-Workflow (Collect -> Auto -> Manage): pick a label, harvest positives in
-Collect, the auto pass annotates confident undecided cells once the label
-crosses its positive threshold, Manage verifies everything (uncertain
-first / suspicious first) and takes explicit negatives for the ML
-recommender. Everything writes through to label.db immediately; Ctrl+Z
-undoes the last action; label_export.csv is re-written after every write.
+ONE unified queue (no queue-mode switch): pick an image source, click a
+label, and the scope radio decides the members — undecided (to label,
+ranked by the exemplar/model score), positive, missing, negatives, or all
+labeled — while the sort radio picks the ranking (best first / uncertain
+first / suspicious mislabel check). Batch-select and Apply + / Apply − /
+Remove work in every scope; shift+click records an instant negative; the
+Refresh-model button fits a per-label logistic scorer on the current
+positives + negatives (manual — new writes mark it stale until you refresh
+again). Every write goes through to the DB immediately; Ctrl+Z undoes the
+last action; label_export.csv is re-written after every write.
 """
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -37,9 +50,9 @@ body { font-family:"Segoe UI",system-ui,sans-serif; background:var(--bg); height
 #topbar .brand { font-weight:700; margin-right:4px; }
 #topbar select, #topbar input { font-size:12px; padding:1px 3px; }
 #topbar label { font-size:12px; white-space:nowrap; color:#555; }
-#mode { max-width:200px; } #source { max-width:150px; }
-#stats { color:#555; font-size:12px; white-space:nowrap; }
+#source { max-width:150px; }#stats { color:#555; font-size:12px; white-space:nowrap; }
 #stats b { color:#222; }
+#refit-status { color:#555; font-size:12px; white-space:nowrap; }
 button { font-size:13px; padding:3px 10px; border:1px solid #bbb; background:#fff; border-radius:4px; cursor:pointer; }
 button:hover { background:#eee; }
 button.primary { background:var(--acc); color:#fff; border-color:var(--acc); }
@@ -62,11 +75,6 @@ button:disabled { opacity:.45; cursor:default; }
 .lbl-row .del.armed { display:inline-block; background:#c33; color:#fff; font-size:11px; font-weight:600; padding:1px 6px; }
 #sel-box .name { font-weight:600; display:flex; align-items:center; gap:6px; margin-bottom:4px; }
 #sel-box .counts { color:#666; font-size:12px; margin-bottom:4px; }
-.bar { height:8px; background:#eee; border-radius:4px; overflow:hidden; margin:4px 0; }
-.bar i { display:block; height:100%; background:var(--warn); }
-.bar i.full { background:var(--ok); }
-#sel-box .autoline { font-size:11px; color:#777; margin-bottom:6px; }
-#sel-box .btns { display:flex; gap:6px; flex-wrap:wrap; }
 #help { font-size:11px; color:#555; line-height:1.7; }
 #help summary { cursor:pointer; font-size:12px; font-weight:600; color:#444; }
 #help b { color:#333; }
@@ -80,8 +88,32 @@ button:disabled { opacity:.45; cursor:default; }
 .tgt.on { border-color:var(--c); background:var(--c); color:#fff; font-weight:600; }
 .tgt.on .dot { background:#fff !important; }
 #sel-count { font-size:12px; color:#666; }
-#qtools { display:none; align-items:center; gap:6px; flex-wrap:wrap; font-size:12px; color:#555; }
-#qtools select { font-size:12px; padding:1px 3px; }
+/* Scope / sort radio groups (top bar row 2, after the display Reset). */
+.radios { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+.radios label { display:inline-flex; align-items:center; gap:3px; font-size:12px; color:#555; white-space:nowrap; cursor:pointer; }
+.radios label:hover { color:#222; }
+.radios input { accent-color:var(--acc); margin:0; cursor:pointer; }
+.radios input:disabled { cursor:default; opacity:.4; }
+#pred-wrap select { max-width:140px; }
+/* Sidebar tabs: Labels | Clusters. */
+.tabs { display:flex; gap:4px; }
+.tab { flex:1; font-size:12px; padding:4px 0; background:#f0f0f2; border:1px solid var(--line); border-radius:4px; cursor:pointer; }
+.tab:hover { background:#e8e8f0; }
+.tab.on { background:var(--acc); color:#fff; border-color:var(--acc); font-weight:600; }
+/* Cluster cards (Clusters tab): medoid thumbnail + id + size + per-label
+   undecided count. */
+.clu-card { display:flex; align-items:center; gap:8px; padding:4px; border:1px solid var(--line); border-radius:4px; cursor:pointer; margin-bottom:4px; }
+.clu-card:hover { background:#f0f0f2; }
+.clu-card.active { outline:2px solid var(--acc); }
+.clu-card img { width:52px; height:52px; object-fit:contain; background:#fff; border-radius:3px; flex-shrink:0; }
+.clu-info { display:flex; flex-direction:column; font-size:12px; gap:1px; min-width:0; }
+.clu-info .clu-size { color:#666; }
+.clu-info .clu-und { color:var(--warn); font-weight:600; }
+.clu-info .clu-view { color:#888; }
+.clu-info .clu-view.zero { color:#c22; font-weight:600; }
+/* Whole-cluster action bar above the grid (visible inside a cluster). */
+#cluster-bar { display:none; align-items:center; gap:6px; padding:5px 10px; background:#eef2fd; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+#clu-title { font-size:12px; color:#333; }
 #grid { flex:1; overflow:auto; padding:10px; display:flex; flex-wrap:wrap; gap:8px; align-content:flex-start; }
 #grid .cellbox { background:#fff; border:2px solid var(--line); border-radius:4px; padding:4px; cursor:pointer; position:relative; flex-shrink:0; }
 /* Selected: 3px accent ring + light fill + a check badge in the free
@@ -95,7 +127,6 @@ button:disabled { opacity:.45; cursor:default; }
   background:var(--acc); color:#fff; border-radius:50%;
   font-size:12px; font-weight:700;
 }
-#grid .cellbox .automark { position:absolute; bottom:2px; left:26px; font-size:8px; font-weight:700; color:#4a90d9; }
 #grid .cellbox img { object-fit:contain; background:#fff; display:block; }
 #grid .cellbox .sugb { position:absolute; top:2px; left:4px; font-size:9px; background:rgba(6,140,60,.85); color:#fff; padding:0 4px; border-radius:3px; }
 #grid .cellbox .cert { position:absolute; top:2px; right:4px; font-size:9px; background:rgba(224,120,0,.85); color:#fff; padding:0 4px; border-radius:3px; }
@@ -137,12 +168,6 @@ button:disabled { opacity:.45; cursor:default; }
 <div id="topbar">
   <div class="trow">
     <span class="brand">🔬 micromodel label</span>
-    <select id="mode">
-      <option value="label_top" title="Collect: undecided cells ranked for the label selected on the left — Score ↓ = confident positives first (cold start = farthest-point spread), Uncertain ↑ = nearest the decision boundary first (active learning). Reach the positive threshold — then the Auto pass fires. Shuffle reshuffles the queue when a page shows nothing like your target.">Collect (selected label)</option>
-      <option value="label_all" title="Manage: ALL labeled cells (union of every label). Click a label on the left, then pick the scope — union / with the label / without the label — to verify each class fast without losing labels.">Manage (labeled cells)</option>
-      <option value="unlabeled" title="Every cell without any annotation yet (stable order).">Unlabeled</option>
-      <option value="all" title="Every cell (filterable by source).">All</option>
-    </select>
     <select id="source"><option value="">All sources</option></select>
     <label title="Two fully independent projects share this directory: Multi-label = a cell may hold any number of positives. Single-label = mutually exclusive classes (a new positive clears the cell's other positives, and only the best suggestion is shown). Switching swaps the whole store — labels and decisions of the other mode are untouched, exports are separate files.">
       Mode
@@ -153,16 +178,17 @@ button:disabled { opacity:.45; cursor:default; }
     </label>
     <span id="stats"></span>
     <span style="flex:1"></span>
-    <button id="btn-undo" title="Undo the last action (Ctrl+Z): a batch apply, a single write, an auto run — each is one revertible step. Keep pressing to undo further back.">Undo</button>
-  </div>
-  <div class="trow">
-    <label title="Thumbnail display size (px). 96-512.">Size
-      <input id="cell-px" type="number" min="96" max="512" step="8" style="width:56px">
+    <label title="Thumbnail display size (px). 48-512. Display only — the model always sees its own square input.">Size
+      <input id="cell-px" type="number" min="48" max="512" step="8" style="width:56px">
     </label>
     <label title="Page size: images per page (the batch you review at once). 1-200.">K
       <input id="nb-k" type="number" min="1" max="200" style="width:56px">
     </label>
-    <span class="sep"></span>
+    <button id="btn-refit" title="Refit a per-label logistic scorer from the current positives + explicit negatives of every label that has enough of both. A refit label's score becomes its model probability — negatives then shape a real decision boundary instead of only nudging a similarity. Manual by design: new writes make the models stale (status below) until you click again.">Refresh model</button>
+    <span id="refit-status"></span>
+    <button id="btn-undo" title="Undo the last action (Ctrl+Z): a batch apply or a single write — each is one revertible step. Keep pressing to undo further back.">Undo</button>
+  </div>
+  <div class="trow">
     <label title="Display contrast: symmetrically narrows the per-channel percentile window (0.1/99.9 at 0 → 10/90 at 100). Display only — features are unaffected.">Contrast
       <input id="disp-con" type="range" min="0" max="100" step="1" style="width:64px;vertical-align:middle">
     </label>
@@ -171,15 +197,37 @@ button:disabled { opacity:.45; cursor:default; }
     </label>
     <button id="disp-reset" title="Reset contrast and gamma to the default render">Reset</button>
     <span class="sep"></span>
-    <label title="Suggestion threshold (0-1): a label is suggested when the cell's nearest positive exemplar is at least this similar and beats the nearest explicit negative. Lower = more suggestions, higher = fewer but safer. Applies to queues loaded afterwards.">Suggest thr
-      <input id="thr" type="number" step="0.05" min="0" max="1" style="width:58px">
+    <label id="pred-wrap" title="Classify bundle only: keep only cells whose argmax prediction is this class. 'Prob ↓' (sort) ranks by this class's probability — or by each cell's argmax confidence while All is picked." style="display:none">Predicted
+      <select id="pred-sel"><option value="">All</option></select>
     </label>
+    <span class="sep" id="pred-sep" style="display:none"></span>
+    <span class="radios" id="scope-radios">
+      <label title="Cells WITHOUT a decision for the selected label, ranked by the label's score (model P or exemplar score) — the main labeling queue. Needs a model."><input type="radio" name="scope" value="undecided">To label</label>
+      <label title="Cells positive for the selected label — verify them (Certainty or the Suspicious mislabel check)."><input type="radio" name="scope" value="with">Positive</label>
+      <label title="Labeled cells MISSING the selected label — completion candidates."><input type="radio" name="scope" value="without">Missing</label>
+      <label title="The selected label's EXPLICIT negatives — review them: Certainty ↓ puts the most positive-like, likely mislabeled ones first; select and Remove to undo."><input type="radio" name="scope" value="neg">Negatives</label>
+      <label title="Every cell carrying ANY label — the whole pool to re-check."><input type="radio" name="scope" value="union">All labeled</label>
+    </span>
+    <span class="sep"></span>
+    <span class="radios" id="sort-radios">
+      <label title="undecided: highest score first. decided scopes: most positive-like (certain) first."><input type="radio" name="sort" value="desc">Best ↓</label>
+      <label title="undecided: smallest pos/neg margin first (active learning). decided scopes: least positive-like first."><input type="radio" name="sort" value="unc">Uncertain ↑</label>
+      <label title="Positive scope only: the leave-one-out mislabel check, most suspicious first (zoom shows the contradicting cell)."><input type="radio" name="sort" value="review">Suspicious ⚠</label>
+      <label id="sort-medoid-wrap" title="Cluster view: most similar to the cluster's medoid first — the most typical members lead, so the first page tells you what the cluster is." style="display:none"><input type="radio" name="sort" value="medoid">Medoid ↓</label>
+      <label id="sort-prob-wrap" title="Classify bundle: highest P(class) first — the class picked in the Predicted dropdown, or each cell's argmax confidence while All is picked." style="display:none"><input type="radio" name="sort" value="prob">Prob ↓</label>
+    </span>
+    <button id="qt-shuffle" title="Reshuffle the To-label queue with a new random order — use when the first page shows nothing like your target class. Same seed keeps pages stable while flipping.">Shuffle</button>
   </div>
 </div>
 <div id="main">
   <div id="sidebar">
+    <div class="tabs">
+      <button id="tab-labels" class="tab on" title="Per-label queues">Labels</button>
+      <button id="tab-clusters" class="tab" title="Cluster-assisted bulk labeling: Leiden clusters over the shared embedding space (config cluster.target). Review a cluster's medoid, then write target labels to the whole cluster in ONE undoable step." style="display:none">Clusters</button>
+    </div>
+    <div id="side-labels" style="display:flex;flex-direction:column;gap:10px">
     <div class="side-box">
-      <h3>Labels — click = Collect queue</h3>
+      <h3>Labels — click = its queue</h3>
       <div id="labels"></div>
       <div style="display:flex;gap:4px;margin-top:6px">
         <input id="new-label" placeholder="New label name" style="flex:1;font-size:13px;padding:3px 6px">
@@ -190,30 +238,62 @@ button:disabled { opacity:.45; cursor:default; }
     <div class="side-box" id="sel-box" style="display:none">
       <div class="name"><span class="dot" id="sel-dot" style="width:12px;height:12px;border-radius:3px;display:inline-block"></span><span id="sel-name"></span></div>
       <div class="counts" id="sel-counts"></div>
-      <div class="bar"><i id="sel-bar" style="width:0%"></i></div>
-      <div class="autoline" id="sel-autoline"></div>
-      <div class="btns">
-        <button id="btn-auto-apply" title="Run the auto-annotate pass for this label now: every undecided cell scoring >= the auto threshold becomes an AUTO positive (blue A). Runs automatically once per label anyway when it crosses the positive threshold.">Auto-apply now</button>
-        <button id="btn-auto-clear" title="Remove every AUTO annotation of this label (undo an auto run). Manual annotations are untouched; the next write may re-run the pass.">Remove auto</button>
+    </div>
+    </div>
+    <div id="side-clusters" style="display:none;flex-direction:column;gap:10px">
+      <div class="side-box">
+        <h3>Targets — check what Apply writes</h3>
+        <div id="clu-targets" class="targets-strip"></div>
+      </div>
+      <div class="side-box">
+        <h3>Clusters — click = its queue <span id="clu-meta" style="float:right;color:#888;text-transform:none;letter-spacing:0;font-weight:400"></span></h3>
+        <div id="cluster-list"></div>
       </div>
     </div>
     <div class="side-box">
       <details id="help">
         <summary>Workflow &amp; shortcuts</summary>
-        <b>1. Collect</b> — click a label on the left; the queue ranks
-        undecided cells for it. Select images, <b>Apply +</b> (A) until the
-        label reaches the auto threshold. Score ↓ = confident first;
-        Uncertain ↑ = informative first; Shuffle = new random order.
-        <b>2. Auto</b> — at the threshold the auto pass marks every
-        confident undecided cell for every eligible label (blue A), so
-        nothing is missed.
-        <b>3. Manage</b> — all labeled cells. Scope: with / without the
-        selected label / union. Sort by Certainty ↑ (least certain first)
-        or Suspicious ⚠ (likely mislabels, with the contradicting cell as
-        evidence). Remove wrong ones; <b>Apply −</b> (Shift+A) records
-        explicit negatives — they power the ML recommender.
+        <b>One queue per label</b> — pick an image source on top, click a
+        label on the left, and the top-bar radios decide what the queue
+        shows. <b>Scope</b>: To label = cells without a decision for this
+        label, ranked by the <b>exemplar score</b> (similarity to the
+        positives minus the negative penalty) — the main labeling queue;
+        Positive / Missing / Negatives / All labeled = the already-decided
+        cells for verification. <b>Sort</b>: Best ↓ = highest score (or
+        most positive-like) first; Uncertain ↑ = smallest pos/neg margin
+        (or least certain) first; Suspicious ⚠ = the leave-one-out
+        mislabel check on the Positive scope (zoom shows the contradicting
+        cell). Shuffle = new random To-label order. Select the confident
+        ones, <b>Apply +</b> (A); <b>Apply −</b> (Shift+A) records
+        explicit negatives for lookalikes that are NOT the label — or
+        shift+click a thumbnail for an instant negative. Negatives push
+        every similar cell down the To-label ranking, and every annotated
+        cell shows its label dots bottom-right. The queue refreshes after
+        every write, so the order follows your latest decisions.
+        <b>Refresh model</b> (top bar) = refit a per-label logistic scorer
+        on the current positives + negatives of every label that has
+        enough of both — a refit label's score/badge becomes its model
+        probability, where negatives define a real decision boundary. New
+        writes mark it stale; click again to catch up.
+        <b>Clusters tab</b> (left, with cluster.target configured) =
+        cluster-assisted bulk labeling: the whole dataset is pre-split into
+        fine-grained Leiden clusters over the embedding space, largest
+        first, each card showing its medoid (most typical cell). Click a
+        card to narrow the queue to that cluster — Medoid ↓ sorts the most
+        typical members first so page one tells you what the cluster is —
+        then use <b>Cluster Apply + / − / Remove</b> to write the checked
+        target labels to the whole cluster ∩ current scope in ONE undoable
+        step (the default To-label scope fills only undecided members).
+        ←/→ prev/next cluster; the orange number on each card is how many
+        members still lack the selected label.
+        <b>Predicted</b> (top bar, classify bundle only) = keep only cells
+        whose argmax prediction is the picked class; <b>Prob ↓</b> ranks by
+        that class's probability (each cell's argmax confidence while All
+        is picked) — the fast loop for verifying/correcting model
+        predictions, e.g. after "Create labels from model classes".
         <b>Shortcuts</b><br>
-        click = select · double-click = zoom · 1-9 = toggle target labels<br>
+        click = select · shift+click = instant negative · double-click =
+        zoom · 1-9 = toggle target labels<br>
         A = Apply + · Shift+A = Apply − · R = Remove · Ctrl+Z = Undo
         (keep pressing to undo further)<br>
         In zoom: 1-9/Shift+1-9 label the zoomed cell, ←/→ walk the queue,
@@ -229,7 +309,7 @@ button:disabled { opacity:.45; cursor:default; }
         fully independent projects sharing one directory — switching swaps
         the whole store, nothing mixes
         <div id="legend">
-          <span style="color:var(--ok)">■</span> green: suggestion score (top-left)
+          <span style="color:var(--ok)">■</span> green: recommendation score
           · <span style="color:var(--warn)">■</span> orange: certainty
           · <span style="color:#c22">■</span> red: suspicion (mislabel risk)
         </div>
@@ -240,16 +320,26 @@ button:disabled { opacity:.45; cursor:default; }
     <div id="banner"></div>
     <div id="toolbar">
       <div class="trow2">
-        <span id="targets"></span>
+        <span id="targets" class="targets-strip"></span>
         <span style="flex:1"></span>
         <span id="sel-count"></span>
         <button id="btn-apply-pos" class="primary" title="Set every CHECKED target label as POSITIVE on every selected image (A)">Apply +</button>
-        <button id="btn-apply-neg" class="neg" title="Set every CHECKED target label as an EXPLICIT NEGATIVE on every selected image (Shift+A). Explicit negatives power the ML recommender — label a few per confusable label.">Apply −</button>
+        <button id="btn-apply-neg" class="neg" title="Set every CHECKED target label as an EXPLICIT NEGATIVE on every selected image (Shift+A). Negatives push lookalikes down the ranking and are the training data for the Refresh-model scorer. Shift+click a single thumbnail for the same write on one cell.">Apply −</button>
         <button id="btn-remove" title="CLEAR the checked target labels' decisions on the selected images (R). In the Manage view this drops them from the label.">Remove</button>
         <button id="btn-sel-all">Select all</button>
         <button id="btn-sel-none">Clear</button>
       </div>
-      <div id="qtools"></div>
+    </div>
+    <div id="cluster-bar">
+      <button id="clu-exit" title="Leave the cluster view — back to the whole dataset">✕ Exit</button>
+      <span id="clu-title"></span>
+      <span style="flex:1"></span>
+      <button id="clu-prev" title="Previous cluster (largest-first order)">← Prev</button>
+      <button id="clu-next" title="Next cluster">Next →</button>
+      <span class="sep"></span>
+      <button id="clu-pos" class="primary" title="Apply every CHECKED target label as POSITIVE to the whole cluster ∩ current scope — ONE undoable step. The default To-label scope fills only the undecided members; your explicit positives/negatives are kept.">Cluster Apply +</button>
+      <button id="clu-neg" class="neg" title="Apply every CHECKED target label as an EXPLICIT NEGATIVE to the whole cluster ∩ current scope — one undoable step.">Cluster Apply −</button>
+      <button id="clu-clear" title="CLEAR the checked target labels' decisions on the whole cluster ∩ current scope — one undoable step.">Cluster Remove</button>
     </div>
     <div id="grid"></div>
     <div id="pager"></div>
@@ -269,11 +359,13 @@ button:disabled { opacity:.45; cursor:default; }
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
-const S = { labels:[], labelById:{}, mode:'unlabeled', labelFilter:null, source:'',
-            scope:'union', manageSort:'asc', uncSort:false,
-            thr:0.75, nbK:100, page:0,
+const S = { labels:[], labelById:{}, labelFilter:null, source:'',
+            scope:'undecided', sort:'desc', shuffle:0,
+            cluster:null, clusters:[], clusterRes:null, clusterEnabled:false,
+            predLabel:'', sideTab:'labels',
+            nbK:100, page:0,
             cellPx:(()=>{ const v = parseInt(localStorage.getItem('label_cellsize'));
-              return (v >= 96 && v <= 512) ? v : 100; })(),
+              return (v >= 48 && v <= 512) ? v : 100; })(),
             queue:[], queueTotal:0,
             sel:new Set(), targets:new Set(),
             disp:(()=>{ const d = { lo:0.1, hi:99.9, gamma:1.0 };
@@ -281,10 +373,9 @@ const S = { labels:[], labelById:{}, mode:'unlabeled', labelFilter:null, source:
               return d; })(),
             dragId:null, zoomIdx:-1,
             hasModel:false, classNames:[], total:0, labeled:0, undecided:0,
+            modelsFitted:0, modelsStale:false,
             labelMode:'multi' };
 const esc = s => (s ?? '').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-// auto_label.min_positives from the server (set by refreshStats).
-let AUTO_MIN = 20;
 function toast(m) { const t=$('#toast'); t.textContent=m; t.style.display='block'; clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none',2600); }
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -308,11 +399,9 @@ async function refreshStats() {
   S.labels = j.labels; S.hasModel = j.has_model; S.classNames = j.class_names;
   // The config value is only the default — a user-chosen K (stored locally)
   // wins until cleared.
-  S.thr = j.threshold; S.nbK = parseInt(localStorage.getItem('label_nbk')) || j.page_size;
+  S.nbK = parseInt(localStorage.getItem('label_nbk')) || j.page_size;
   S.total = j.total; S.labeled = j.labeled; S.undecided = j.undecided;
-  AUTO_MIN = j.auto_min_positives || 20;
   S.labelById = {}; S.labels.forEach((l,i)=>{ l.idx = i+1; S.labelById[l.label_id] = l; });
-  $('#thr').value = S.thr;
   $('#nb-k').value = S.nbK;
   $('#stats').innerHTML = `<b>${S.labeled}</b> / ${S.total} labeled` +
     ` · <b>${S.undecided}</b> undecided`;
@@ -321,11 +410,37 @@ async function refreshStats() {
   src.innerHTML = '<option value="">All sources</option>' +
     j.sources.map(s=>`<option value="${esc(s.path)}">${esc(s.name)}</option>`).join('');
   src.value = keep;
-  if (!S.hasModel) ['label_top'].forEach(v=>{
-    const o=$('#mode').querySelector(`option[value=${v}]`); if(o){o.disabled=true;}
-  });
+  // Reflect the queue controls (and disable the model-dependent options
+  // without a model: the score-defined To-label queue, the Suspicious
+  // check). Without a model the undecided scope falls back to Positive.
+  syncQueueControls();
   S.labelMode = j.label_mode || 'multi';
   $('#label-mode').value = S.labelMode;
+  // Refresh-model status: how many labels currently score with a fitted
+  // logistic model, and whether writes have happened since the last fit.
+  S.modelsFitted = j.models_fitted || 0;
+  S.modelsStale = !!j.models_stale;
+  $('#btn-refit').disabled = !S.hasModel;
+  $('#refit-status').textContent = !S.hasModel ? ''
+    : (S.modelsFitted ? `${S.modelsFitted} refit` : 'kNN')
+      + (S.modelsStale ? ' · stale' : '');
+  // ---- clusters tab + classify prediction filter ------------------------
+  S.clusterEnabled = !!(j.cluster && j.cluster.enabled);
+  S.clusterRes = (j.cluster && j.cluster.res) != null ? j.cluster.res : null;
+  $('#tab-clusters').style.display = S.clusterEnabled ? '' : 'none';
+  if (!S.clusterEnabled && S.sideTab === 'clusters') setSideTab('labels');
+  if (!S.classNames.includes(S.predLabel)) S.predLabel = '';
+  const pw = $('#pred-wrap'), psep = $('#pred-sep');
+  pw.style.display = S.classNames.length ? '' : 'none';
+  psep.style.display = S.classNames.length ? '' : 'none';
+  if (S.classNames.length) {
+    const ps = $('#pred-sel');
+    ps.innerHTML = '<option value="">All</option>' +
+      S.classNames.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
+    ps.value = S.predLabel;
+  }
+  if (S.clusterEnabled) await loadClusters();
+  syncQueueControls();   // medoid/prob sort visibility depends on the above
   renderLabels(); renderSelBox(); renderTargets();
 }
 function renderLabels() {
@@ -339,25 +454,16 @@ function renderLabels() {
   document.querySelectorAll('.lbl-row').forEach(el => {
     const lid = +el.dataset.lid;
     el.onclick = () => {
-      // Manage keeps the clicked label as its REFERENCE (the with/without
-      // scopes need one) — never toggles off; other queues toggle as
-      // before.
-      if (S.mode === 'label_all') S.labelFilter = lid;
-      else S.labelFilter = (S.labelFilter === lid) ? null : lid;
-      // The clicked label becomes the ONLY checked target — switching
-      // labels switches the Apply target with it (more chips can still be
-      // checked by hand for a multi-label batch).
-      if (S.labelFilter != null) S.targets = new Set([lid]);
+      // The sidebar promises "click = load its queue": picking a label
+      // selects it as the queue's label and the only checked target
+      // (more chips can still be checked by hand for a multi-label
+      // batch).
+      S.labelFilter = lid;
+      S.targets = new Set([lid]);
       S.shuffle = 0;   // a new label restarts from the queue's own ranking
       renderLabels(); renderSelBox(); renderTargets();
-      // Label-consuming queues just reload; any OTHER mode switches to the
-      // Manage view (union scope) of all labeled cells.
-      if (['label_top','label_all'].includes(S.mode)) {
-        loadQueue(0);
-      } else if (S.labelFilter) {
-        S.mode = 'label_all'; $('#mode').value = 'label_all';
-        updateModeTip(); loadQueue(0);
-      }
+      if (S.clusterEnabled) loadClusters();   // per-card counts follow the label
+      loadQueue(0);
     };
     // ---- drag to reorder ------------------------------------------------
     el.ondragstart = (ev) => { S.dragId = lid; el.classList.add('dragging');
@@ -402,11 +508,9 @@ async function deleteLabel(lid) {
   S.queue.forEach(c => delete c.labels[lid]);
   toast(`Label "${name}" deleted (with all of its decisions)`);
   await refreshStats();
-  if (['label_top','label_all'].includes(S.mode)) loadQueue();
-  else render();
+  loadQueue();   // re-rank with the label gone (prompts if it WAS selected)
 }
-// The selected-label box: counts, auto progress and the auto actions —
-// every label-scoped control lives in ONE place.
+// The selected-label box: the clicked label's live decision counts.
 function renderSelBox() {
   const box = $('#sel-box');
   const l = S.labelFilter != null ? S.labelById[S.labelFilter] : null;
@@ -415,81 +519,29 @@ function renderSelBox() {
   $('#sel-dot').style.background = l.color;
   $('#sel-name').textContent = l.name;
   $('#sel-counts').textContent = `+${l.n_pos} positives · −${l.n_neg} negatives`;
-  const pct = Math.max(0, Math.min(100, l.n_pos / Math.max(1, AUTO_MIN) * 100));
-  const bar = $('#sel-bar');
-  bar.style.width = pct + '%';
-  bar.className = l.n_pos >= AUTO_MIN ? 'full' : '';
-  $('#sel-autoline').textContent = l.n_pos >= AUTO_MIN
-    ? (l.auto_fired ? `auto pass: done (${AUTO_MIN}+ positives) — Remove auto resets it`
-                    : `auto pass: ready — fires on the next positive write (${AUTO_MIN}+ positives)`)
-    : `auto pass at ${AUTO_MIN} positives — Collect ${(AUTO_MIN - l.n_pos)} more`;
 }
 
 // ---- queue -----------------------------------------------------------------
+// ONE queue per (source, label): the scope radio picks the members, the
+// sort radio picks the ranking (see /api/queue).
 function queueParams(extra) {
-  const p = new URLSearchParams({ mode: S.mode, threshold: S.thr, ...extra });
+  if (!S.labelFilter) return null;
+  const p = new URLSearchParams({ label_id: S.labelFilter,
+                                  scope: S.scope, sort: S.sort, ...extra });
   if (S.source) p.set('source', S.source);
-  if (S.mode === 'label_all') {
-    // Manage: union needs no label; with/without do. A chosen label rides
-    // along in every scope so certainty badges have a reference.
-    if (S.scope !== 'union' && !S.labelFilter) return null;
-    p.set('scope', S.scope);
-    if (S.labelFilter) p.set('label_id', S.labelFilter);
-    p.set('sort', S.manageSort);
-    if ($('#auto-only') && $('#auto-only').checked) p.set('auto_only', '1');
-  } else if (['label_top'].includes(S.mode)) {
-    if (!S.labelFilter) return null;
-    p.set('label_id', S.labelFilter);
-    if (S.uncSort) p.set('sort', 'unc');
-  }
-  if (S.shuffle && S.mode === 'label_top') p.set('shuffle', S.shuffle);
+  if (S.cluster != null) p.set('cluster', S.cluster);
+  if (S.predLabel) p.set('pred_label', S.predLabel);
+  if (S.shuffle && S.scope === 'undecided') p.set('shuffle', S.shuffle);
   return p;
 }
 // Every mode pages by K — one uniform batch workflow (select images ×
 // target labels → Apply).
 const pageSize = () => Math.max(1, S.nbK);
-function renderQTools() {
-  const q = $('#qtools');
-  if (S.mode === 'label_top') {
-    q.style.display = 'flex';
-    q.innerHTML =
-      `<button id="qt-unc">${S.uncSort ? 'Uncertain ↑' : 'Score ↓'}</button>` +
-      `<button id="qt-shuffle" title="Reshuffle the queue with a new random order — use when the first page shows nothing like your target class. Same seed keeps pages stable while flipping.">Shuffle</button>` +
-      `<span class="dim">for the selected label's undecided cells</span>`;
-    $('#qt-unc').onclick = () => { S.uncSort = !S.uncSort; renderQTools(); loadQueue(0); };
-    $('#qt-shuffle').onclick = () => { S.shuffle += 1; loadQueue(0); };
-  } else if (S.mode === 'label_all') {
-    q.style.display = 'flex';
-    q.innerHTML =
-      `<span>Scope</span>` +
-      `<select id="qt-scope" title="union = every labeled cell; with = cells carrying the selected label; without = labeled cells missing it.">
-         <option value="union">All labeled (union)</option>
-         <option value="with">With selected label</option>
-         <option value="without">Without selected label</option>
-       </select>` +
-      `<span>Sort</span>` +
-      `<select id="qt-sort" title="Certainty ↑ = least certain first (re-check auto labels); Certainty ↓ = most certain first; Suspicious = likely mislabels with evidence.">
-         <option value="asc">Certainty ↑ (uncertain first)</option>
-         <option value="desc">Certainty ↓ (certain first)</option>
-         <option value="review">Suspicious ⚠ (likely mislabels)</option>
-       </select>` +
-      `<label title="Show only cells AUTO-annotated for the selected label (blue A mark)."><input id="auto-only" type="checkbox"> Auto only</label>`;
-    $('#qt-scope').value = S.scope;
-    $('#qt-sort').value = S.manageSort;
-    $('#qt-scope').onchange = () => { S.scope = $('#qt-scope').value; loadQueue(0); };
-    $('#qt-sort').onchange = () => { S.manageSort = $('#qt-sort').value; loadQueue(0); };
-    const ao = $('#auto-only');
-    if (ao) ao.onchange = () => loadQueue(0);
-  } else {
-    q.style.display = 'none'; q.innerHTML = '';
-  }
-}
 async function loadQueue(page, keepSel) {
   if (page !== undefined) S.page = page;
   const ps = pageSize();
   const p = queueParams({ limit: ps, offset: S.page * ps });
   if (!p) { toast('Select a label on the left first'); return; }
-  renderQTools();
   const j = await api('/api/queue?' + p);
   // The queue may have shrunk (removals) — land on the last valid page.
   if (!j.cells.length && S.page > 0 && j.total > 0) {
@@ -503,6 +555,7 @@ async function loadQueue(page, keepSel) {
   // user can no longer see.
   if (!keepSel) S.sel.clear();
   render(); renderPager();
+  renderClusterBar();   // the bar's "N in view" tracks the queue total
   // The banner tracks EVERY load — a stale empty-queue message must
   // disappear once the queue has cells again.
   showBanner(S.queue.length ? null : queueEmptyText());
@@ -547,18 +600,17 @@ function renderPager() {
   jump.onchange = doJump;
 }
 function queueEmptyText() {
-  if (S.mode==='label_top') return 'No undecided cells left for this label.';
-  if (S.mode==='label_all') {
-    if (S.manageSort === 'review')
-      return S.scope === 'with'
-        ? 'No suspicious decisions — every decided cell is consistent with its label.'
-        : 'Suspicious ranking needs the "With selected label" scope.';
-    if (S.scope === 'union') return 'No cell carries any label yet — the union appears here as you annotate.';
-    if (S.scope === 'without') return 'Every labeled cell already carries this label.';
-    return 'No cell carries this label yet — positive decisions appear here as you make them.';
+  if (S.cluster != null) {
+    const src = S.source
+      ? ` — the Source filter ("${($('#source').selectedOptions[0] || {}).textContent || S.source}") may be hiding this cluster's cells`
+      : '';
+    return `Cluster #${S.cluster} has no cells in the current scope${src} — switch the scope radio or Source, or exit the cluster.`;
   }
-  if (S.mode==='unlabeled') return 'No unlabeled cells left.';
-  return 'Queue is empty';
+  if (S.scope==='undecided') return 'No undecided cells left for this label.';
+  if (S.scope==='with') return 'No cell carries this label yet — positive decisions appear here as you make them.';
+  if (S.scope==='without') return 'Every labeled cell already carries this label.';
+  if (S.scope==='neg') return 'No explicit negatives for this label yet — mark some with Apply − or shift+click.';
+  return 'No cell carries any label yet — the union appears here as you annotate.';
 }
 function showBanner(html) {
   const b = $('#banner');
@@ -574,37 +626,49 @@ function renderSelCount() {
 function renderTargets() {
   // Target labels: everything Apply + / Apply − / Remove writes. Toggled
   // here or with keys 1-9 (sidebar numbering); clicking a sidebar label
-  // makes it the ONLY checked one.
-  $('#targets').innerHTML = S.labels.map(l =>
+  // makes it the ONLY checked one. Rendered twice — the toolbar above the
+  // grid AND the Clusters tab's Targets box share one definition.
+  const html = S.labels.map(l =>
     `<span class="tgt ${S.targets.has(l.label_id)?'on':''}" style="--c:${l.color}" data-lid="${l.label_id}"` +
     ` title="Checked = Apply + / Apply − / Remove write this label${l.idx<=9?' (toggle with key '+l.idx+')':''}">` +
     `<span class="dot" style="background:${l.color}"></span>${esc(l.name)}</span>`).join('')
     || '<span style="color:#999;font-size:12px">no labels yet — add one on the left</span>';
-  document.querySelectorAll('#targets .tgt').forEach(el => el.onclick = () => {
-    const lid = +el.dataset.lid;
-    S.targets.has(lid) ? S.targets.delete(lid) : S.targets.add(lid);
-    el.classList.toggle('on');
+  document.querySelectorAll('.targets-strip').forEach(el => {
+    el.innerHTML = html;
+    el.querySelectorAll('.tgt').forEach(t => t.onclick = () => {
+      const lid = +t.dataset.lid;
+      S.targets.has(lid) ? S.targets.delete(lid) : S.targets.add(lid);
+      t.classList.toggle('on');
+    });
   });
 }
 function renderGrid() {
   $('#grid').innerHTML = S.queue.map((c,i) => {
     const dots = S.labels.filter(l => c.labels[l.label_id] !== undefined)
       .map(l => `<span class="dot ${c.labels[l.label_id]===0?'neg':''}" style="background:${l.color}"></span>`).join('');
+    // The green badge is the recommendation score: in Collect it is the
+    // exact score the queue sorted by (c.score); elsewhere the best
+    // suggestion of any label.
+    const score = (c.score != null) ? c.score
+                : ((c.suggest||[]).length ? c.suggest[0].score : null);
     const tip = esc(c.filename) + ' · ' + esc(c.source_name) +
       (c.preset ? ' · preset: ' + esc(c.preset) : '') +
-      (c.auto ? ' ⚠ auto-annotated — verify in Manage view' : '') +
+      (c.pred ? ' · pred: ' + esc(c.pred.class) + ' (' + c.pred.prob.toFixed(2) + ')' : '') +
+      (score != null ? ' · score: ' + score.toFixed(2) : '') +
       (c.susp ? ' ⚠ suspicious — see evidence in zoom' : '');
     return `<div class="cellbox ${S.sel.has(c.filepath)?'sel':''}" data-i="${i}" title="${tip}">` +
       `<img loading="lazy" src="${imgURL(c.filepath,S.cellPx)}" style="width:${S.cellPx}px;height:${S.cellPx}px">` +
-      ((c.suggest||[]).length ? `<span class="sugb">${c.suggest[0].score.toFixed(2)}${({model:' M',aml:' A'})[c.suggest[0].src]||' K'}</span>` : '') +
+      (score != null ? `<span class="sugb">${score.toFixed(2)}</span>` : '') +
       (c.susp ? `<span class="susb">⚠${c.susp.susp.toFixed(2)}</span>` :
         (c.cert != null ? `<span class="cert">${c.cert.toFixed(2)}</span>` : '')) +
-      (c.auto ? '<span class="automark">A</span>' : '') +
       `<div class="dots">${dots}</div></div>`;
   }).join('');
   document.querySelectorAll('#grid .cellbox').forEach(el => {
     const c = S.queue[+el.dataset.i];
-    el.onclick = () => {
+    el.onclick = (e) => {
+      // Shift+click = instant explicit negative for the checked targets on
+      // this one cell — the per-cell fast path next to select + Apply −.
+      if (e.shiftKey) { applyNegOne(c); return; }
       S.sel.has(c.filepath) ? S.sel.delete(c.filepath) : S.sel.add(c.filepath);
       el.classList.toggle('sel');
       renderSelCount();
@@ -631,9 +695,11 @@ function renderZoom() {
   $('#zoom-img').onclick = (e) => { e.stopPropagation(); closeZoom(); };
   const bits = [`<b>${esc(c.filename)}</b>`, `<span class="dim">${esc(c.source_name)}</span>`];
   if (c.preset) bits.push(`<span class="dim">preset: ${esc(c.preset)}</span>`);
-  if ((c.suggest||[]).length) bits.push(`<span class="zg">sug ${c.suggest[0].score.toFixed(2)}</span>`);
+  if (c.pred) bits.push(`<span class="zo">pred: ${esc(c.pred.class)} ${c.pred.prob.toFixed(2)}</span>`);
+  const zscore = (c.score != null) ? c.score
+               : ((c.suggest||[]).length ? c.suggest[0].score : null);
+  if (zscore != null) bits.push(`<span class="zg">score ${zscore.toFixed(2)}</span>`);
   if (c.cert != null) bits.push(`<span class="zo">cert ${c.cert.toFixed(2)}</span>`);
-  if (c.auto) bits.push('<span class="zo">auto</span>');
   if (c.susp) bits.push(`<span class="zr">⚠ suspicious: own ${c.susp.own_sim.toFixed(2)} vs ${c.susp.ev_state===0?'neg':'pos'} ${c.susp.ev_sim.toFixed(2)}</span>`);
   const cur = S.labels.filter(l => c.labels[l.label_id] !== undefined)
     .map(l => `<span class="dot ${c.labels[l.label_id]===0?'neg':''}" style="background:${l.color};width:9px;height:9px;border-radius:50%;display:inline-block"></span>`).join(' ');
@@ -660,12 +726,16 @@ function renderZoom() {
 async function zoomSet(lid, state) {
   const c = S.queue[S.zoomIdx];
   if (!c) return;
-  const j = await api('/api/annotate', { method:'POST',
+  await api('/api/annotate', { method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ filepath: c.filepath, label_id: lid, state }) });
   if (state === 'clear') delete c.labels[lid]; else c.labels[lid] = state;
-  if (j.auto_applied) toast(`auto-annotated ${j.auto_applied} more — see Manage`);
-  renderZoom(); renderGrid(); refreshStats();
+  // Every write re-ranks: reload the queue with the new exemplars and show
+  // whatever cell now sits at this slot (the just-labeled cell usually
+  // leaves the Collect queue — label and the next one slides in).
+  await refreshStats();
+  await loadQueue(S.page, true);
+  renderZoom();
 }
 function zoomCycle(lid) {
   const c = S.queue[S.zoomIdx];
@@ -683,11 +753,9 @@ async function applyTargets(state) {
   if (!S.sel.size) { toast('Select some images first (click thumbnails)'); return; }
   if (!S.targets.size) { toast('Check at least one target label above the grid'); return; }
   const n = S.sel.size, lids = [...S.targets];
-  const j = await api('/api/annotate_batch', { method:'POST',
+  await api('/api/annotate_batch', { method:'POST',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ filepaths:[...S.sel], label_id: lids[0], state,
-                           extra_label_ids: lids.slice(1) }) });
-  let autoN = j.auto_applied || 0;
+    body: JSON.stringify({ filepaths:[...S.sel], label_ids: lids, state }) });
   S.queue.forEach(c => {
     if (!S.sel.has(c.filepath)) return;
     for (const lid of lids) {
@@ -695,8 +763,7 @@ async function applyTargets(state) {
     }
   });
   toast(`${state === 1 ? 'Applied +' : state === 0 ? 'Applied −' : 'Removed'} ` +
-        `${lids.length} label(s) on ${n} cells` +
-        (autoN ? ` — auto-annotated ${autoN} more` : ''));
+        `${lids.length} label(s) on ${n} cells`);
   S.sel.clear();
   await refreshStats();
   loadQueue(S.page);   // memberships changed — recompute the page
@@ -704,6 +771,124 @@ async function applyTargets(state) {
 $('#btn-apply-pos').onclick = () => applyTargets(1);
 $('#btn-apply-neg').onclick = () => applyTargets(0);
 $('#btn-remove').onclick = () => applyTargets('clear');
+// Shift+click on one thumbnail: the same write as Apply − but for a single
+// cell and without touching the selection. The write re-ranks, so the
+// queue reloads and the (now decided) cell is replaced by its successor.
+async function applyNegOne(c) {
+  if (!S.targets.size) { toast('Check a target label first'); return; }
+  const lids = [...S.targets];
+  await api('/api/annotate_batch', { method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ filepaths:[c.filepath], label_ids: lids,
+                           state: 0 }) });
+  for (const lid of lids) c.labels[lid] = 0;
+  toast(`Applied − ${lids.length} label(s)`);
+  await refreshStats();
+  loadQueue(S.page, true);
+}
+// ---- cluster-assisted bulk labeling ----------------------------------------
+// The Clusters tab lists the Leiden clusters over the shared embedding space
+// (largest first), each card showing its medoid — the cluster's most typical
+// cell. Click a card: the queue narrows to that cluster (composed with the
+// scope radios), the Medoid ↓ sort leads with the most typical members, and
+// the bar above the grid writes the checked target labels to the WHOLE
+// cluster ∩ scope in one undoable step — ~one decision per cluster instead
+// of one per cell.
+async function loadClusters() {
+  // Counts follow the CURRENT queue context (label + scope + source) so a
+  // card never promises cells the filters hide.
+  const q = new URLSearchParams();
+  if (S.labelFilter != null) { q.set('label_id', S.labelFilter); q.set('scope', S.scope); }
+  if (S.source) q.set('source', S.source);
+  const j = await api('/api/clusters' + (q.toString() ? '?' + q.toString() : ''));
+  S.clusters = j.clusters; S.clusterRes = j.res;
+  renderClusters();
+}
+function renderClusters() {
+  $('#clu-meta').textContent =
+    `${S.clusters.length} · res ${S.clusterRes != null ? S.clusterRes.toFixed(2) : '?'}`;
+  $('#cluster-list').innerHTML = S.clusters.map(c =>
+    `<div class="clu-card ${S.cluster===c.id?'active':''}" data-cid="${c.id}">` +
+    (c.medoid_filepath ? `<img loading="lazy" src="${imgURL(c.medoid_filepath,64)}">` : '') +
+    `<div class="clu-info"><b>#${c.id}</b>` +
+    `<span class="clu-size">${c.size} cells</span>` +
+    (c.undecided != null ? `<span class="clu-und">${c.undecided} to label</span>` : '') +
+    (c.in_view != null && c.in_view !== c.size
+      ? `<span class="clu-view${c.in_view === 0 ? ' zero' : ''}">${c.in_view} in view</span>` : '') +
+    `</div></div>`).join('') || '<div style="color:#999">No clusters.</div>';
+  document.querySelectorAll('.clu-card').forEach(el =>
+    el.onclick = () => selectCluster(+el.dataset.cid));
+}
+function selectCluster(cid) {
+  S.cluster = (S.cluster === cid) ? null : cid;
+  // Entering a cluster leads with its most typical members (Medoid ↓);
+  // leaving falls back to the plain Best order.
+  S.sort = (S.cluster != null) ? 'medoid' : 'desc';
+  S.shuffle = 0;
+  renderClusters(); syncQueueControls();
+  loadQueue(0);   // clears the selection (a context change) and re-renders the bar
+}
+function clusterNeighbor(dir) {
+  // Prev/next walk the same largest-first order the cards render in.
+  const i = S.clusters.findIndex(c => c.id === S.cluster);
+  const j = i + dir;
+  return (i >= 0 && j >= 0 && j < S.clusters.length) ? S.clusters[j].id : null;
+}
+function renderClusterBar() {
+  const bar = $('#cluster-bar');
+  if (S.cluster == null) { bar.style.display = 'none'; return; }
+  bar.style.display = 'flex';
+  const cur = S.clusters.find(c => c.id === S.cluster);
+  $('#clu-title').innerHTML =
+    `Cluster <b>#${S.cluster}</b> · <b>${S.queueTotal}</b> in view` +
+    (S.scope === 'undecided' ? ' (undecided)' : '') +
+    (cur && cur.size !== S.queueTotal ? ` · ${cur.size} in cluster` : '');
+  $('#clu-prev').disabled = clusterNeighbor(-1) == null;
+  $('#clu-next').disabled = clusterNeighbor(1) == null;
+}
+$('#clu-exit').onclick = () => selectCluster(null);
+$('#clu-prev').onclick = () => { const p = clusterNeighbor(-1); if (p != null) selectCluster(p); };
+$('#clu-next').onclick = () => { const n = clusterNeighbor(1); if (n != null) selectCluster(n); };
+async function applyCluster(state) {
+  if (S.cluster == null) return;
+  if (S.labelFilter == null) { toast('Click a label first (it defines the queue scope)'); return; }
+  if (!S.targets.size) { toast('Check at least one target label first'); return; }
+  await api('/api/annotate_cluster', { method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ cluster_id: S.cluster, label_ids: [...S.targets],
+                           state, label_id: S.labelFilter, scope: S.scope,
+                           source: S.source || null }) });
+  toast(`${state === 1 ? 'Applied +' : state === 0 ? 'Applied −' : 'Removed'} ` +
+        `${S.targets.size} label(s) on cluster #${S.cluster} (${S.scope}) — Ctrl+Z reverts the whole cluster`);
+  await refreshStats();
+  loadQueue(S.page);
+}
+$('#clu-pos').onclick = () => applyCluster(1);
+$('#clu-neg').onclick = () => applyCluster(0);
+$('#clu-clear').onclick = () => applyCluster('clear');
+
+// ---- sidebar tabs -----------------------------------------------------------
+function setSideTab(t) {
+  S.sideTab = t;
+  $('#tab-labels').classList.toggle('on', t === 'labels');
+  $('#tab-clusters').classList.toggle('on', t === 'clusters');
+  $('#side-labels').style.display = t === 'labels' ? 'flex' : 'none';
+  $('#side-clusters').style.display = t === 'clusters' ? 'flex' : 'none';
+}
+$('#tab-labels').onclick = () => setSideTab('labels');
+$('#tab-clusters').onclick = () => setSideTab('clusters');
+
+$('#btn-refit').onclick = async () => {
+  const j = await api('/api/refresh_model', { method:'POST' });
+  const bits = [];
+  if (j.fitted.length) bits.push(`refit ${j.fitted.length} label(s)`);
+  if (j.skipped.length)
+    bits.push(`skipped ${j.skipped.length} (need ≥${j.min_pos} positives ` +
+              `and ≥${j.min_neg} negatives)`);
+  toast(bits.join(' · ') || 'Nothing to refit yet');
+  await refreshStats();
+  loadQueue(S.page);   // re-rank with the new scorers
+};
 $('#btn-sel-all').onclick = () => { S.queue.forEach(c => S.sel.add(c.filepath)); renderGrid(); renderSelCount(); };
 $('#btn-sel-none').onclick = () => { S.sel.clear(); renderGrid(); renderSelCount(); };
 $('#btn-undo').onclick = doUndo;
@@ -714,36 +899,6 @@ async function doUndo() {
   await refreshStats();
   loadQueue(S.page);
 }
-$('#btn-auto-apply').onclick = async () => {
-  if (!S.labelFilter) { toast('Select a label on the left first'); return; }
-  const j = await api('/api/auto_apply', { method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ label_id: S.labelFilter }) });
-  const parts = Object.entries(j.applied || {}).map(([n, c]) => `${n} ×${c}`);
-  toast(parts.length
-    ? `Auto-applied: ${parts.join(', ')} — review them in Manage (Suspicious / Certainty ↑)`
-    : 'Nothing to auto-apply (more positives needed, or no confident cells)');
-  await refreshStats();
-  loadQueue(0);
-};
-let _autoClearArmed = false;
-$('#btn-auto-clear').onclick = async () => {
-  if (!S.labelFilter) { toast('Select a label on the left first'); return; }
-  const b = $('#btn-auto-clear');
-  if (!b.dataset.armed) {
-    // Two-step confirm: a stray click must not wipe a whole auto-run.
-    b.dataset.armed = '1'; b.textContent = 'Confirm';
-    setTimeout(() => { if (b.isConnected) { b.dataset.armed = ''; b.textContent = 'Remove auto'; } }, 3000);
-    return;
-  }
-  b.dataset.armed = ''; b.textContent = 'Remove auto';
-  const j = await api('/api/auto_clear', { method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ label_id: S.labelFilter }) });
-  toast(`Removed ${j.removed} auto annotations of the label`);
-  await refreshStats();
-  loadQueue(0);
-};
 $('#nb-k').onchange = () => {
   const v = parseInt($('#nb-k').value);
   if (v >= 1 && v <= 200) {
@@ -755,7 +910,7 @@ $('#nb-k').onchange = () => {
 $('#cell-px').value = S.cellPx;
 $('#cell-px').onchange = () => {
   const v = parseInt($('#cell-px').value);
-  if (v >= 96 && v <= 512) {
+  if (v >= 48 && v <= 512) {
     S.cellPx = v;
     localStorage.setItem('label_cellsize', String(v));
     render();
@@ -774,15 +929,6 @@ $('#btn-model-labels').onclick = async () => {
   const j = await api('/api/labels_from_model', { method:'POST' });
   await refreshStats(); toast(`Created ${j.created.length} labels`);
 };
-function updateModeTip() {
-  const o = $('#mode').selectedOptions[0];
-  $('#mode').title = o ? o.title : '';
-}
-$('#mode').onchange = () => {
-  S.mode = $('#mode').value;
-  S.shuffle = 0;   // a mode switch restarts every queue from its own order
-  updateModeTip(); refreshStats().then(() => loadQueue(0));
-};
 function setBusy(on) {
   document.querySelector('#busy').style.display = on ? 'flex' : 'none';
 }
@@ -798,6 +944,7 @@ $('#label-mode').onchange = async () => {
     // drop every piece of state tied to the previous store and reload.
     S.labelMode = mode;
     S.labelFilter = null;
+    S.cluster = null;   // cluster cards reload with the new DB's counts
     S.targets.clear(); S.sel.clear();
     toast(mode === 'single'
       ? 'Switched to the single-label project (independent label_single.db)'
@@ -809,11 +956,56 @@ $('#label-mode').onchange = async () => {
     setBusy(false);
   }
 };
-$('#source').onchange = () => { S.source = $('#source').value; loadQueue(); };
-$('#thr').onchange = () => {
-  S.thr = parseFloat($('#thr').value) || S.thr;
-  loadQueue(S.page);   // suggestions/certainties apply immediately
+$('#source').onchange = () => {
+  S.source = $('#source').value;
+  if (S.clusterEnabled) loadClusters();   // per-card in-view counts follow
+  loadQueue();
 };
+// Classify-bundle prediction filter: '' = all classes. A queue-context
+// change, so the selection is dropped (loadQueue without keepSel).
+$('#pred-sel').onchange = () => {
+  S.predLabel = $('#pred-sel').value;
+  loadQueue(0);
+};
+
+// ---- scope / sort radios + Shuffle (top bar row 2) -------------------------
+// Reflect S.scope/S.sort in the radio groups; options that need the model
+// (the score-defined To-label queue, the Suspicious check) are enabled
+// only with one — without a model the undecided scope falls back to
+// Positive.
+function syncQueueControls() {
+  if (!S.hasModel && S.scope === 'undecided') S.scope = 'with';
+  document.querySelectorAll('#scope-radios input').forEach(r => {
+    r.checked = r.value === S.scope;
+    r.disabled = !S.hasModel && r.value === 'undecided';
+  });
+  // The cross-cutting sorts appear only where they mean anything:
+  // Medoid ↓ inside a cluster, Prob ↓ with a classify bundle.
+  $('#sort-medoid-wrap').style.display =
+    (S.clusterEnabled && S.cluster != null) ? '' : 'none';
+  $('#sort-prob-wrap').style.display = S.classNames.length ? '' : 'none';
+  document.querySelectorAll('#sort-radios input').forEach(r => {
+    r.checked = r.value === S.sort;
+    r.disabled = (!S.hasModel && r.value === 'review')
+              || (r.value === 'medoid' && !(S.clusterEnabled && S.cluster != null))
+              || (r.value === 'prob' && !S.classNames.length);
+  });
+  $('#qt-shuffle').style.display = S.scope === 'undecided' ? '' : 'none';
+}
+document.querySelectorAll('#scope-radios input').forEach(r => r.onchange = () => {
+  if (!r.checked) return;
+  S.scope = r.value;
+  S.shuffle = 0;   // a scope switch restarts the queue's own order
+  syncQueueControls();
+  if (S.clusterEnabled) loadClusters();   // per-card in-view counts follow
+  loadQueue(0);
+});
+document.querySelectorAll('#sort-radios input').forEach(r => r.onchange = () => {
+  if (!r.checked) return;
+  S.sort = r.value;
+  loadQueue(0);
+});
+$('#qt-shuffle').onclick = () => { S.shuffle += 1; loadQueue(0); };
 
 // ---- display adjustment (render-only: percentile window + gamma) -----------
 let _dispTimer = null;
@@ -892,17 +1084,11 @@ $('#nb-k').addEventListener('input', () => debouncedApply(() => {
 }));
 $('#cell-px').addEventListener('input', () => debouncedApply(() => {
   const v = parseInt($('#cell-px').value);
-  if (v >= 96 && v <= 512) { S.cellPx = v; localStorage.setItem('label_cellsize', String(v)); render(); }
-}));
-$('#thr').addEventListener('input', () => debouncedApply(() => {
-  const v = parseFloat($('#thr').value);
-  if (v >= 0 && v <= 1) { S.thr = v; loadQueue(S.page); }
+  if (v >= 48 && v <= 512) { S.cellPx = v; localStorage.setItem('label_cellsize', String(v)); render(); }
 }));
 
-// The select's DOM default is its first option — sync it with the actual
-// startup mode so the control never shows a state the app is not in.
-$('#mode').value = S.mode;
-updateModeTip();
+// Startup: refreshStats wires the queue controls and loads the queue
+// (with no label selected yet it just prompts for one).
 refreshStats().then(() => loadQueue(0));
 </script>
 </body>

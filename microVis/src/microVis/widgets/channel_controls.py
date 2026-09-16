@@ -70,12 +70,15 @@ class ChannelControls(QWidget):
         top.addStretch()
         root.addLayout(top)
 
-        # Row 2: vmin / vmax
+        # Row 2: vmin / vmax — fixed-width labels, no indent: this row must
+        # align with the Low/High row of the Channel Setting group (same
+        # label column, same stretching spin boxes).
         bottom = QHBoxLayout()
         bottom.setSpacing(4)
-        bottom.setContentsMargins(20, 0, 0, 0)
 
-        bottom.addWidget(QLabel("vmin"))
+        lbl_vmin = QLabel("vmin")
+        lbl_vmin.setFixedWidth(32)
+        bottom.addWidget(lbl_vmin)
         self._vmin = NoScrollDoubleSpinBox()
         self._vmin.setRange(0, self._max_value)
         # Decimals >= 1 so auto-range percentiles (e.g. 1234.7) round-trip
@@ -93,7 +96,9 @@ class ChannelControls(QWidget):
         self._vmin.setContextMenuPolicy(Qt.NoContextMenu)
         bottom.addWidget(self._vmin, stretch=1)
 
-        bottom.addWidget(QLabel("vmax"))
+        lbl_vmax = QLabel("vmax")
+        lbl_vmax.setFixedWidth(32)
+        bottom.addWidget(lbl_vmax)
         self._vmax = NoScrollDoubleSpinBox()
         self._vmax.setRange(0, self._max_value)
         if self._integer:

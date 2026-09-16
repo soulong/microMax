@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import sys
 import logging
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -32,6 +33,16 @@ from microProfiler.io import (
 from microProfiler.progress_collector import NullProgressCollector, ProgressCollector
 
 logger = logging.getLogger(__name__)
+
+# cellpose builds its flow sparse tensor without invariant checks; newer
+# torch versions print a UserWarning about that on every segmentation run.
+# The tensor construction is entirely cellpose's business and the warning
+# is pure noise here — silence exactly that message, nothing else.
+warnings.filterwarnings(
+    "ignore",
+    message="Sparse invariant checks are implicitly disabled",
+    category=UserWarning,
+)
 
 
 def merge_channels(

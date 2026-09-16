@@ -12,7 +12,11 @@ nearest tagged point within a small radius wins (overlapping points
 included); clicking empty space hides the popup. The crop itself is
 resolved by MainWindow (it owns the dataset) and pushed back through
 :meth:`show_cell_image` / :meth:`hide_cell_image` — the view only owns the
-floating near-cursor popup.
+floating near-cursor popup. With "Normalize cell image" checked the popup
+renders the cell normalized to ITSELF (per-channel Low/High percentiles
+over the cell's own nonzero pixels + gamma), independent of the Image
+page's absolute brightness; unchecked it falls back to the Image page's
+rendering. Channel colors follow the Image page either way.
 """
 
 from __future__ import annotations
@@ -36,7 +40,6 @@ from PySide6.QtWidgets import (
     QCompleter,
     QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -53,20 +56,28 @@ from PySide6.QtWidgets import (
 
 from microVis._settings import CMAP_OPTIONS, DEFAULT_CMAP, QUALITATIVE_PALETTES
 from microVis.processing import plotting as P
-from microVis.widgets._event_filter import NoScrollComboBox
-from microVis.widgets.ui_spec import COMPACT_LINE_EDIT_STYLE, centered_row
+from microVis.widgets._event_filter import (
+    NoScrollComboBox,
+    NoScrollDoubleSpinBox,
+    NoScrollSlider,
+)
+from microVis.widgets.ui_spec import (
+    BTN_MINI_WIDTH,
+    COMPACT_LINE_EDIT_STYLE,
+    CONTROLS_WIDTH,
+    centered_row,
+    controls_pane_style,
+    small_button,
+)
 
-_NONE = "(none)"
 _CHART_SCATTER = "scatter"
-_CHART_LINE = "line"
+_CHART_LINE = "smooth line"
 _CHART_BOXPLOT = "boxplot"
 _CHART_BARPLOT = "barplot"
 _CHART_ORDER = [_CHART_SCATTER, _CHART_LINE, _CHART_BOXPLOT, _CHART_BARPLOT]
 
-# Width of the Data page control column. Matches the Image page's control
-# boxes (the splitter pane minus the 6px pane margins minus the vertical
-# scrollbar) so both pages present the same left column.
-_CONTROLS_WIDTH = 260
+# Width of the Data page control column: the ONE control-column width shared
+# by every page's left rail (see ui_spec.CONTROLS_WIDTH).
 
 
 def _make_picker_combo() -> NoScrollComboBox:
@@ -79,15 +90,36 @@ def _make_picker_combo() -> NoScrollComboBox:
     return combo
 
 
-def _fill_combo(combo: QComboBox, items, keep=None) -> None:
+def _fill_combo(combo: QComboBox, items, keep="") -> None:
     """Replace a combo's items, preserving `keep` (default: current text)."""
-    prev = combo.currentText() if keep is None else keep
+    prev = combo.currentText() if keep == "" else keep
     combo.blockSignals(True)
     combo.clear()
     combo.addItems(items)
     combo.blockSignals(False)
     if prev in items:
         combo.setCurrentText(prev)
+
+
+def _form_row(label_text: str, content, width: int = 64,
+              top_align: bool = False):
+    """A `label + content` row with a FIXED-width label (no colon) — the
+    well-grid control bar's row pattern. The label column never grows with
+    the longest caption, so no single row can force the column wider.
+    `top_align` pins the label to the content's first line (multi-line
+    content such as the facet filter+list)."""
+    row = QHBoxLayout()
+    row.setSpacing(4)
+    lbl = QLabel(label_text)
+    lbl.setFixedWidth(width)
+    if top_align:
+        lbl.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+    row.addWidget(lbl)
+    if isinstance(content, QWidget):
+        row.addWidget(content, 1)
+    else:
+        row.addLayout(content, 1)
+    return row
 
 
 def _mpl_to_qt_xy(canvas_height: int, dpr: float,
@@ -130,6 +162,9 @@ class DataPlotView(QWidget):
     # The plot cannot resolve the cell image itself — MainWindow owns the
     # dataset and answers via show_cell_image/hide_cell_image.
     point_picked = Signal(dict, QPoint)
+    # The cell-popup render controls (Normalize / Low / High / gamma)
+    # changed: MainWindow re-renders the visible popup live.
+    cell_render_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -151,26 +186,31 @@ class DataPlotView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        # ── Left column: controls (scrollable so small windows never clip) ──
+        # ── Left column: controls (scrollable so tiny windows never clip) ──
         controls = QWidget()
-        # Titleless rounded box around the whole plotting-control column.
+        # Titleless rounded box around the whole plotting-control column,
+        # with the SAME compact input style as the well-grid control bar
+        # (20–24px inputs, 9pt labels) so its density matches too.
         controls.setProperty("class", "panel-box")
+        controls.setStyleSheet(controls_pane_style())
         controls_layout = QVBoxLayout(controls)
         # Slim inner rail: the control column is kept as narrow as the Image
         # page's pane, so the form must fit without dead padding.
-        controls_layout.setContentsMargins(8, 8, 8, 10)
-        controls_layout.setSpacing(6)
+        controls_layout.setContentsMargins(8, 8, 8, 8)
+        controls_layout.setSpacing(4)
 
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignLeft)
-
+        # Every row uses the well-grid bar's pattern: a FIXED-width label
+        # (no colon) + a stretching field. The label column therefore never
+        # grows with the longest caption — that growth is what previously
+        # forced rows like Low/High past the column's width.
         self._chart_combo = QComboBox()
         self._chart_combo.addItems(_CHART_ORDER)
         self._chart_combo.currentTextChanged.connect(self._on_chart_changed)
-        form.addRow("Chart:", self._chart_combo)
+        controls_layout.addLayout(_form_row("Chart", self._chart_combo))
 
         # Filter sits directly below Chart (the plot-wide data selector).
         filter_row = QHBoxLayout()
+        filter_row.setSpacing(4)
         self._filter_edit = QLineEdit()
         self._filter_edit.setStyleSheet(COMPACT_LINE_EDIT_STYLE)
         self._filter_edit.setPlaceholderText("area > 200 & pred_prob > 0.8")
@@ -183,35 +223,34 @@ class DataPlotView(QWidget):
             "Leave empty for no filter.")
         self._filter_edit.returnPressed.connect(self._on_plot)
         filter_row.addWidget(self._filter_edit, 1)
-        # Gap between the expression box and its clear button.
-        filter_row.addSpacing(8)
-        self._filter_clear_btn = QPushButton("Clear")
+        self._filter_clear_btn = small_button("Clear", width=44,
+                                              mini_style=True)
         self._filter_clear_btn.setToolTip("Clear the filter expression")
         self._filter_clear_btn.clicked.connect(self._filter_edit.clear)
         filter_row.addWidget(self._filter_clear_btn)
-        form.addRow("Filter:", filter_row)
+        controls_layout.addLayout(_form_row("Filter", filter_row))
 
         self._x_combo = _make_picker_combo()
         self._x_combo.setToolTip(
             "Any merged column. Categorical levels are placed on their level "
             "index with the level names as axis ticks.")
-        form.addRow("X:", self._x_combo)
+        controls_layout.addLayout(_form_row("X", self._x_combo))
 
         self._y_combo = _make_picker_combo()
         self._y_combo.setToolTip(
             "Any merged column. Categorical levels are placed on their level "
             "index with the level names as axis ticks.")
-        form.addRow("Y:", self._y_combo)
+        controls_layout.addLayout(_form_row("Y", self._y_combo))
 
         self._color_combo = _make_picker_combo()
         self._color_combo.currentTextChanged.connect(self._on_color_changed)
-        form.addRow("Color by:", self._color_combo)
+        controls_layout.addLayout(_form_row("Color by", self._color_combo))
 
         self._size_combo = _make_picker_combo()
-        form.addRow("Size by:", self._size_combo)
+        controls_layout.addLayout(_form_row("Size by", self._size_combo))
 
         self._facet_list = QListWidget()
-        self._facet_list.setMaximumHeight(90)
+        self._facet_list.setMaximumHeight(72)
         # No selection highlight: a selected row's fill hides whether its
         # checkbox is ticked; only the checkbox itself changes state.
         self._facet_list.setSelectionMode(QAbstractItemView.NoSelection)
@@ -228,50 +267,125 @@ class DataPlotView(QWidget):
         self._facet_filter.textChanged.connect(self._apply_facet_filter)
         facet_box.addWidget(self._facet_filter)
         facet_box.addWidget(self._facet_list)
-        form.addRow("Facet by:", facet_box)
+        controls_layout.addLayout(_form_row("Facet by", facet_box,
+                                            top_align=True))
 
         facet_cols_row = QHBoxLayout()
         self._facet_cols = QSpinBox()
         self._facet_cols.setRange(1, 8)
         self._facet_cols.setValue(3)
         self._facet_cols.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        facet_cols_row.addWidget(QLabel("grid columns:"))
+        self._facet_cols.setFixedWidth(44)
+        facet_cols_row.addWidget(QLabel("Cols"))
         facet_cols_row.addWidget(self._facet_cols)
         facet_cols_row.addStretch()
-        form.addRow("", facet_cols_row)
+        # One-click uncheck of every facet variable (right-aligned clear
+        # action; the checked set can be long and tedious to clear by hand).
+        self._facet_clear_btn = QPushButton("Clear")
+        self._facet_clear_btn.setToolTip("Uncheck all facet variables")
+        self._facet_clear_btn.clicked.connect(self._clear_facets)
+        facet_cols_row.addWidget(self._facet_clear_btn)
+        # Indent under the facet field (past the fixed label column).
+        facet_cols_row.setContentsMargins(68, 0, 0, 0)
+        controls_layout.addLayout(facet_cols_row)
 
-        colors_row = QHBoxLayout()
         self._colors_combo = QComboBox()
-        colors_row.addWidget(self._colors_combo, 1)
-        form.addRow("Colors:", colors_row)
+        controls_layout.addLayout(_form_row("Colors", self._colors_combo))
 
-        cap_row = QHBoxLayout()
         self._cap_spin = QSpinBox()
         self._cap_spin.setRange(0, 100_000_000)
         self._cap_spin.setValue(20000)
         self._cap_spin.setSingleStep(5000)
-        self._cap_spin.setSuffix("  (0 = all)")
         self._cap_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        cap_row.addWidget(self._cap_spin, 1)
-        form.addRow("Scatter cap:", cap_row)
+        self._cap_spin.setToolTip("Max scatter points drawn (0 = all rows)")
+        controls_layout.addLayout(_form_row("Cap", self._cap_spin))
 
         # Scatter point size sits right below the cap (they shape the same
         # scatter rendering).
-        scatter_size_row = QHBoxLayout()
         self._scatter_size = QDoubleSpinBox()
         self._scatter_size.setRange(1.0, 200.0)
         self._scatter_size.setValue(20.0)
         self._scatter_size.setSuffix(" pt")
         self._scatter_size.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        scatter_size_row.addWidget(self._scatter_size)
-        scatter_size_row.addStretch()
-        form.addRow("Scatter size:", scatter_size_row)
+        controls_layout.addLayout(_form_row("Point size", self._scatter_size))
 
-        self._show_points = QCheckBox("Show points on boxplot")
+        # Show points / Normalize / Low-High / Gamma are LEFT-aligned loose
+        # rows (no input-column alignment): their controls carry fixed widths,
+        # so no row can force the column wider.
+        self._show_points = QCheckBox("Show points")
         self._show_points.setChecked(True)
-        form.addRow("", self._show_points)
+        self._show_points.setToolTip(
+            "Show the raw observations: on boxplots and on the smooth-line "
+            "chart (the fitted mean curve is always drawn).")
+        controls_layout.addWidget(self._show_points)
 
-        controls_layout.addLayout(form)
+        # ── Cell popup rendering ──
+        # Checked: the clicked cell is normalized to ITSELF — per channel
+        # the Low/High percentiles come from the cell's own nonzero pixels
+        # (0 background ignored) and gamma shapes the result, so the popup
+        # compares TEXTURE regardless of absolute intensity. Unchecked: the
+        # popup renders like the Image page (absolute vmin/vmax etc.).
+        # Channel colors follow the Image page either way.
+        self._cell_show = QCheckBox("Normalize cell image")
+        self._cell_show.setChecked(True)
+        self._cell_show.setToolTip(
+            "Checked: the clicked cell is normalized to ITSELF — each "
+            "channel is scaled by the Low/High percentiles of the cell's "
+            "own nonzero pixels (0 background ignored), then gamma-shaped, "
+            "independent of the Image page's absolute brightness.\n"
+            "Unchecked: the popup renders like the Image page. Channel "
+            "colors follow the Image page either way.")
+        self._cell_show.toggled.connect(self._on_cell_render_changed)
+        controls_layout.addWidget(self._cell_show)
+
+        lowhigh_row = QHBoxLayout()
+        lowhigh_row.setSpacing(4)
+        self._cell_low_label = QLabel("Low")
+        lowhigh_row.addWidget(self._cell_low_label)
+        self._cell_low = NoScrollDoubleSpinBox()
+        self._cell_low.setRange(0.0, 100.0)
+        self._cell_low.setValue(0.1)
+        self._cell_low.setDecimals(2)
+        self._cell_low.setFixedWidth(48)
+        self._cell_low.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        # Tighter padding than the app stylesheet's input default so the
+        # label-to-number gap stays small.
+        self._cell_low.setStyleSheet("padding: 2px 4px;")
+        self._cell_low.valueChanged.connect(self._on_cell_render_changed)
+        lowhigh_row.addWidget(self._cell_low)
+        self._cell_high_label = QLabel("High")
+        lowhigh_row.addWidget(self._cell_high_label)
+        self._cell_high = NoScrollDoubleSpinBox()
+        self._cell_high.setRange(0.0, 100.0)
+        self._cell_high.setValue(99.9)
+        self._cell_high.setDecimals(2)
+        self._cell_high.setFixedWidth(48)
+        self._cell_high.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self._cell_high.setStyleSheet("padding: 2px 4px;")
+        self._cell_high.valueChanged.connect(self._on_cell_render_changed)
+        lowhigh_row.addWidget(self._cell_high)
+        controls_layout.addLayout(lowhigh_row)
+
+        gamma_row = QHBoxLayout()
+        gamma_row.setSpacing(6)
+        self._cell_gamma_title = QLabel("Gamma")
+        gamma_row.addWidget(self._cell_gamma_title)
+        self._cell_gamma = NoScrollSlider(Qt.Horizontal)
+        self._cell_gamma.setRange(10, 300)
+        self._cell_gamma.setSingleStep(10)
+        self._cell_gamma.setPageStep(10)
+        self._cell_gamma.setValue(100)
+        self._cell_gamma.setFixedWidth(136)
+        self._cell_gamma.setToolTip(
+            "Gamma exponent shaping the clicked cell's display")
+        self._cell_gamma_label = QLabel("1.00")
+        self._cell_gamma_label.setProperty("class", "muted")
+        self._cell_gamma.valueChanged.connect(
+            lambda v: self._cell_gamma_label.setText(f"{v / 100:.2f}"))
+        self._cell_gamma.valueChanged.connect(self._on_cell_render_changed)
+        gamma_row.addWidget(self._cell_gamma)
+        gamma_row.addWidget(self._cell_gamma_label)
+        controls_layout.addLayout(gamma_row)
 
         # Row-count / status info line.
         self._info_label = QLabel("")
@@ -297,7 +411,7 @@ class DataPlotView(QWidget):
         controls_scroll.setFrameShape(QFrame.NoFrame)
         controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         controls_scroll.setWidget(controls)
-        controls_scroll.setFixedWidth(_CONTROLS_WIDTH)
+        controls_scroll.setFixedWidth(CONTROLS_WIDTH)
         layout.addWidget(controls_scroll)
 
         # ── Right column: interactive plot canvas ──
@@ -316,10 +430,15 @@ class DataPlotView(QWidget):
         names = [c for c in df.columns]
         numeric = [c for c in names
                    if pd.api.types.is_numeric_dtype(df[c])]
-        _fill_combo(self._x_combo, names)
-        _fill_combo(self._y_combo, names)
-        _fill_combo(self._color_combo, [_NONE] + names, keep=None)
-        _fill_combo(self._size_combo, [_NONE] + numeric, keep=None)
+        # X/Y/Color/Size start EMPTY (index -1, no "(none)" pseudo-item):
+        # the empty editable box invites typing to filter-find a column,
+        # and an unset picker simply plots nothing. Colors/palette keep
+        # their own selection — that picker is not a column chooser.
+        for combo, items in (
+                (self._x_combo, names), (self._y_combo, names),
+                (self._color_combo, names), (self._size_combo, numeric)):
+            _fill_combo(combo, items)
+            combo.setCurrentIndex(-1)
 
         checked = set(self._facet_selected())
         self._facet_list.clear()
@@ -369,19 +488,26 @@ class DataPlotView(QWidget):
         self._scatter_size.setValue(20.0)
         self._cap_spin.setValue(20000)
         self._show_points.setChecked(True)
+        # Cell popup rendering back to its construction defaults (the
+        # value changes emit cell_render_changed — harmless, the popup is
+        # already hidden at this point).
+        self._cell_show.setChecked(True)
+        self._cell_low.setValue(0.1)
+        self._cell_high.setValue(99.9)
+        self._cell_gamma.setValue(100)
 
     # ── Control behavior ──────────────────────────────────────────────────
 
     def _selected(self, combo: QComboBox) -> str | None:
-        text = combo.currentText()
-        return None if not text or text == _NONE else text
+        return combo.currentText().strip() or None
 
     def _on_chart_changed(self, chart: str) -> None:
         is_scatter = chart == _CHART_SCATTER
         self._size_combo.setEnabled(is_scatter)
         self._scatter_size.setEnabled(True)
         self._cap_spin.setEnabled(is_scatter)
-        self._show_points.setEnabled(chart == _CHART_BOXPLOT)
+        # Raw-point visibility applies to boxplots and the smooth line.
+        self._show_points.setEnabled(chart in (_CHART_BOXPLOT, _CHART_LINE))
         self._x_combo.setToolTip(
             "X is required for scatter and line (the connected axis); "
             "optional grouping for box/bar."
@@ -391,7 +517,7 @@ class DataPlotView(QWidget):
     def _on_color_changed(self, color: str) -> None:
         """Switch the Colors combo between palettes and colormaps."""
         continuous = False
-        if (color and color != _NONE and self._df is not None
+        if (color and self._df is not None
                 and color in self._df.columns):
             continuous = pd.api.types.is_numeric_dtype(self._df[color])
         prev = self._colors_combo.currentText()
@@ -421,6 +547,50 @@ class DataPlotView(QWidget):
         for i in range(self._facet_list.count()):
             item = self._facet_list.item(i)
             item.setHidden(bool(needle) and needle not in item.text().lower())
+
+    def _clear_facets(self) -> None:
+        """Uncheck every facet variable in one click.
+
+        Like a manual uncheck, this takes effect on the next Plot.
+        """
+        for i in range(self._facet_list.count()):
+            item = self._facet_list.item(i)
+            if item.checkState() != Qt.Unchecked:
+                item.setCheckState(Qt.Unchecked)
+
+    # ── Cell popup rendering controls ─────────────────────────────────────
+
+    def _on_cell_render_changed(self, *_):
+        """Normalize/Low/High/gamma moved: re-gate the controls and emit."""
+        on = self._cell_show.isChecked()
+        for w in (self._cell_low_label, self._cell_low,
+                  self._cell_high_label, self._cell_high,
+                  self._cell_gamma_title, self._cell_gamma,
+                  self._cell_gamma_label):
+            w.setEnabled(on)
+        self.cell_render_changed.emit()
+
+    def cell_render_params(self) -> dict:
+        """Popup render parameters as one dict.
+
+        `normalize` selects the self-normalized crop (worker.
+        crop_cell_rgb_normalized) vs the Image-page rendering;
+        `low`/`high` are percentiles (percent), `gamma` the exponent —
+        both only used when `normalize` is true.
+        """
+        return {
+            "normalize": self._cell_show.isChecked(),
+            "low": self._cell_low.value(),
+            "high": self._cell_high.value(),
+            "gamma": self._cell_gamma.value() / 100.0,
+        }
+
+    def cell_popup_visible(self) -> bool:
+        """True while the single-cell popup is on screen."""
+        try:
+            return self._popup.isVisible()
+        except RuntimeError:
+            return False
 
     # ── Plot ──────────────────────────────────────────────────────────────
 
@@ -479,8 +649,10 @@ class DataPlotView(QWidget):
                 self.info(f"Scatter: {len(sub):,} rows.{filtered}")
         elif chart == _CHART_LINE:
             fig = P.make_line(df, y=y, x=x, color=color, facet_cols=facets,
-                              palette=palette, ncols=ncols)
-            self.info(f"Line (mean ± SEM): {len(df):,} rows.{filtered}")
+                              palette=palette, ncols=ncols,
+                              show_points=self._show_points.isChecked())
+            self.info(
+                f"Smooth line (mean fit ± SEM): {len(df):,} rows.{filtered}")
         elif chart == _CHART_BOXPLOT:
             fig = P.make_boxplot(df, y=y, x=x, color=color, facet_cols=facets,
                                  palette=palette,
@@ -532,7 +704,8 @@ class DataPlotView(QWidget):
             return
         chart = self._chart_combo.currentText()
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Plot as PDF", f"merged_{chart}.pdf", "PDF (*.pdf)")
+            self, "Export Plot as PDF",
+            f"merged_{chart.replace(' ', '_')}.pdf", "PDF (*.pdf)")
         if not path:
             return
         if not path.lower().endswith(".pdf"):
@@ -600,15 +773,37 @@ class DataPlotView(QWidget):
         except (TypeError, RuntimeError):
             return False
 
+    def _is_cell_render_widget(self, widget) -> bool:
+        """True when `widget` is one of the cell-render controls (or a
+        child of one, e.g. a spin box's internal line edit).
+
+        Interacting with these controls must KEEP the popup alive — they
+        exist to re-shape the currently shown cell. Everything else still
+        dismisses it. The app-wide event filter also delivers non-widget
+        watchers (e.g. a QWindow), which are never part of the widget tree.
+        """
+        if not isinstance(widget, QWidget):
+            return False
+        try:
+            return any(
+                widget is w or w.isAncestorOf(widget)
+                for w in (self._cell_show, self._cell_low, self._cell_high,
+                          self._cell_gamma, self._cell_gamma_label)
+            )
+        except RuntimeError:
+            return False
+
     def eventFilter(self, watched, event):
         """Hide the cell popup on any interaction outside the canvas.
 
         Clicks on buttons, other panels, the nav bar, wheel/focus changes
         all dismiss it; events inside the canvas are left to the matplotlib
-        click handler (which re-shows or hides the popup itself). Losing the
-        application/window focus (user switched to another app) dismisses it
-        too — it is a top-level tooltip window that would otherwise stay on
-        screen over the other application.
+        click handler (which re-shows or hides the popup itself), and the
+        cell-render controls are exempt so Low/High/gamma can be tuned
+        against the currently shown cell. Losing the application/window
+        focus (user switched to another app) dismisses it too — it is a
+        top-level tooltip window that would otherwise stay on screen over
+        the other application.
         """
         try:
             popup_visible = self._popup.isVisible()
@@ -619,7 +814,8 @@ class DataPlotView(QWidget):
         if popup_visible and etype in (
                 QEvent.MouseButtonPress, QEvent.Wheel,
                 QEvent.KeyPress, QEvent.FocusIn):
-            if not self._is_canvas_widget(watched):
+            if (not self._is_canvas_widget(watched)
+                    and not self._is_cell_render_widget(watched)):
                 self._hide_cell_image()
         elif popup_visible and etype in (
                 QEvent.ApplicationDeactivate, QEvent.WindowDeactivate):

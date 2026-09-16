@@ -558,10 +558,13 @@ def _run_whole_image(data_dir, image_pattern, mask_pattern, meta,
         filename_json = json.dumps(ch_filenames)
         mask_fname = ds.row_mask_filename(row_idx)
         if mask_fname:
-            # Mask path is consumed directly (reduction_vis/reduction contact
-            # sheets) — anchor it now so a relative data.file_dir cannot make it
-            # CWD-dependent later.
-            mask_fname = os.path.abspath(mask_fname).replace("\\", "/")
+            # PORTABLE-first, the SAME canonical_directory contract as the
+            # `directory` column: CWD-relative forward slashes when possible,
+            # absolute fallback. Masks may live in a different subtree than
+            # the images (the `directory` column belongs to the image), so
+            # the stored value keeps its path — the bare filename is its
+            # last segment, and consumers re-join it via resolve_directory.
+            mask_fname = canonical_directory(mask_fname)
         source_path = ds.row_source_path(row_idx)
         file_dir = (
             canonical_directory(os.path.dirname(source_path))

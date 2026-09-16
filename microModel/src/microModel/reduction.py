@@ -186,21 +186,34 @@ def _res_tag(res):
     return f"{float(res):g}"
 
 
-def _leiden_partition(W, resolution, seed):
+def _knn_graph(W, n_neighbors=LEIDEN_N_NEIGHBORS):
+    """Undirected unweighted kNN graph over W (union of directed edges).
+
+    Each point connects to its `n_neighbors` nearest neighbors; an edge is
+    kept when EITHER side lists the other. Shared by the reduction and label
+    clustering paths so both partition exactly the same graph.
+    """
+    n_neighbors = min(n_neighbors, W.shape[0] - 1)
+    A = kneighbors_graph(W, n_neighbors, mode="connectivity", include_self=False)
+    A = A.maximum(A.T).tocoo()  # undirected graph: keep an edge from either side
+    return ig.Graph(n=W.shape[0], edges=list(zip(A.row.tolist(), A.col.tolist())))
+
+
+def _leiden_partition(W, resolution, seed, graph=None):
     """Leiden communities over a kNN graph of W (one 0-based label per row).
 
     Each point is connected to its LEIDEN_N_NEIGHBORS nearest neighbors; the
     union of the directed kNN edges forms an undirected unweighted graph.
     Leiden's RBConfiguration model puts `resolution` in the modularity term:
     higher resolutions yield more, tighter clusters, and the cluster count
-    emerges from the data instead of being configured.
+    emerges from the data instead of being configured. `graph` accepts a
+    pre-built graph (see _knn_graph) so callers sweeping many resolutions
+    build the kNN graph only once.
     """
-    n_neighbors = min(LEIDEN_N_NEIGHBORS, W.shape[0] - 1)
-    A = kneighbors_graph(W, n_neighbors, mode="connectivity", include_self=False)
-    A = A.maximum(A.T).tocoo()  # undirected graph: keep an edge from either side
-    g = ig.Graph(n=W.shape[0], edges=list(zip(A.row.tolist(), A.col.tolist())))
+    if graph is None:
+        graph = _knn_graph(W)
     part = leidenalg.find_partition(
-        g, leidenalg.RBConfigurationVertexPartition,
+        graph, leidenalg.RBConfigurationVertexPartition,
         resolution_parameter=float(resolution), seed=seed)
     return np.asarray(part.membership, dtype=int)
 
@@ -425,7 +438,12 @@ def _load_cell_image(d, mode, view):
             ch_files = json.loads(d["filename"])
             arrays = [read_image(os.path.join(directory, f)) for f in ch_files]
             img = np.stack(arrays, axis=-1)
-            mask_m = read_mask(d.get("mask_filename") or "")
+            # mask_filename follows the same canonical_directory contract as
+            # `directory` (CWD-relative portable path, legacy absolute values
+            # pass through) — resolve it the same way.
+            mask_value = d.get("mask_filename") or ""
+            mask_m = (read_mask(resolve_directory(mask_value, d.get("_root", "")))
+                      if mask_value else None)
             label = int(d.get("label") or 0)
             if label not in get_labels(mask_m):
                 return None

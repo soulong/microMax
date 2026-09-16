@@ -15,7 +15,7 @@ mode: single_cell
 
 method: classification               # classification | segmentation | ...
 
-output_dir: 2026-09-13_train_puncta
+output_dir: 2026-09-15_train_puncta
 
 data:
   #  file_list: 数据清单 CSV 列表（deduplication 的 curated.csv，或任意 [filepath(,label)] 清单；统一写成列表——单个数据源也用单元素列表，多个 CSV 的并集就是数据

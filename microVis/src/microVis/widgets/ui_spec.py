@@ -22,9 +22,10 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QScrollArea, QWi
 WINDOW_DEFAULT_SIZE = (1500, 1000)   # first start, before a saved size exists
 WINDOW_MIN_SIZE = (1200, 800)        # panes never squeeze below this
 
-# ── Left control panes (WellGridControls / ImageControls) ────────────────────
-CONTROLS_MIN_WIDTH = 260      # splitter never shrinks a pane below this
-CONTROLS_MAX_WIDTH = 320      # splitter never grows a pane beyond this
+# ── Left control panes (WellGridControls / ImageControls / Data plot) ────────
+# ONE fixed width for every left control column in the app (Image sidebar,
+# well-grid bar, Data-page plot column) so the pages present identical rails.
+CONTROLS_WIDTH = 232
 CONTROLS_MARGIN = 6           # inner padding of a control pane
 CONTROLS_SPACING = 4          # vertical gap between the group boxes
 
@@ -46,10 +47,11 @@ COMPACT_LINE_EDIT_STYLE = (
     "font-size: 9pt;"
 )
 COMPACT_INPUT_STYLE = f"""
-QComboBox, QDoubleSpinBox, QSpinBox, QSlider {{
+QComboBox, QDoubleSpinBox, QSpinBox, QSlider, QCheckBox, QLineEdit {{
     min-height: {CONTROL_MIN_H}px;
     max-height: {CONTROL_MAX_H}px;
     min-width: 0;
+    font-size: 9pt;
 }}
 QLabel {{
     font-size: 9pt;
@@ -72,14 +74,19 @@ BTN_MINI_HEIGHT = 20
 BTN_MINI_STYLE = "font-size: 8pt; padding: 1px 4px;"
 
 # ── Horizontal checkbox strips (filter multi-select, class checkboxes) ───────
-CHECK_STRIP_MAX_H = 24
+# Height budget: ~14px checkbox content + ~12px horizontal scrollbar (when
+# visible) + frame — anything less clips the checkboxes vertically and the
+# strip stops feeling horizontally scrollable. FIXED height: a plain maximum
+# gets squeezed by the parent layout back into clipping territory.
+CHECK_STRIP_MAX_H = 28
 SMALL_CHECKBOX_STYLE = (
-    "QCheckBox { font-size: 8pt; spacing: 2px; } "
-    "QCheckBox::indicator { width: 12px; height: 12px; }"
+    "QCheckBox { font-size: 7pt; spacing: 1px; min-height: 0; "
+    "max-height: 16px; } "
+    "QCheckBox::indicator { width: 10px; height: 10px; }"
 )
 
 # ── Splitters of the Image page ──────────────────────────────────────────────
-H_SPLITTER_SIZES = (280, 600)         # controls | canvas (both horizontal splitters)
+H_SPLITTER_SIZES = (CONTROLS_WIDTH, 600)   # controls | canvas (horizontal)
 V_SPLITTER_SIZES = (220, 780, 0)      # well grid | image view | label panel (hidden)
 LABEL_CLASS_RATIOS = (0.25, 0.50, 0.25)   # when the label panel first appears
 NO_LABEL_RATIOS = (0.30, 0.70, 0.0)       # after the last label class is removed
@@ -138,6 +145,6 @@ def check_strip() -> QScrollArea:
     strip.setWidgetResizable(True)
     strip.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
     strip.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-    strip.setMaximumHeight(CHECK_STRIP_MAX_H)
+    strip.setFixedHeight(CHECK_STRIP_MAX_H)
     strip.setStyleSheet("QScrollArea { border: none; background: transparent; }")
     return strip

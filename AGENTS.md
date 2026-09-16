@@ -127,8 +127,10 @@ Key concepts:
 
 * `db_contracts` is the single source of truth for the cross-package DB
   schema (inference/reduction/find_cluster tables, column prefixes, DR method
-  names, `directory` stored portable-first: CWD-relative when possible,
-  absolute fallback) and for SQL identifier quoting.
+  names, every path-like column stored portable-first: CWD-relative when
+  possible, absolute fallback — `directory` always, and infer.db's
+  `mask_filename` likewise; `filename` holds bare file names and full paths
+  are re-joined via `resolve_directory`) and for SQL identifier quoting.
 
 * Library code never calls `sys.exit`: everything raises a `MicroMaxError`
   subclass and only the CLI/GUI boundaries decide how to report it.
@@ -323,7 +325,12 @@ Data flow:
   The DB **Select DB** button accepts any number of profiler.db AND infer.db
   files of
   that dataset (a single selection is used as-is); the fused sources are
-  shown next to the button as `a.db + b.db (+ metadata) -> merge`. Their
+  shown next to the button as `a.db + b.db (+ metadata) -> merge`. The
+  selection works WITHOUT a loaded dataset too — the merge, the plot and
+  the Excel-metadata merge are dataset-independent; only the point-click
+  cell popup (needs images) and the well-grid color-by merge/* entries
+  (needs the DataModule) wait for a dataset, and Write to DB then asks for
+  a save location instead of writing next to the dataset. Their
   object rows are
   fused into ONE integrated table per mask (microBase `db_merge`: outer
   merge on the identity columns — well, label, directory, ... — so
@@ -331,16 +338,28 @@ Data flow:
   row per object; colliding columns are prefixed `<db-stem>/`; different
   masks stack with a `mask` tag; infer rows without mask info join the
   profiler's mask, logged as a hint). One plot area renders that table:
-  scatter / line
-  mean±SEM / boxplot / barplot mean±SEM with X/Y/color/size/facets and
-  palette; X/Y accept every merged column, categoricals plotted on level
-  ticks. Every picker combo is editable — type to filter long column lists.
+  scatter / smooth
+  line (scipy-default spline fit; categorical x → per-group means ± SEM on
+  shared level positions, continuous x → a numeric-axis fit of the raw y
+  per categorical color; the Show points toggle also gates its raw dots) /
+  boxplot / barplot mean±SEM with
+  X/Y/color/size/facets and palette; X/Y accept every merged column,
+  categoricals plotted on level ticks. Facet panels SHARE both axes and place categories/groups at their
+  GLOBAL level positions (a category missing from one panel still occupies
+  its slot there), so panels compare like with like. Every picker combo is editable — type to filter long column lists.
   A free-form pandas-expression filter (directly below Chart) is applied
   before plotting. Plot
   controls sit in a left column with the interactive canvas on the right;
   hover shows a point's values and LEFT-CLICKING a scatter point shows the
   corresponding cropped single cell in a near-cursor popup (nearest point
-  wins on overlap; clicking empty space hides it). All plots export vector
+  wins on overlap; clicking empty space hides it). With "Normalize cell
+  image" checked (the checkbox block under Show points on boxplot) the
+  popup renders each channel normalized to the CELL itself (per-channel
+  Low/High percentiles over the cell's own nonzero pixels + gamma; tuning
+  the controls keeps the popup open and re-renders live) for texture
+  compares independent of absolute intensity; unchecked it falls back to
+  the Image page's rendering. Channel colors follow the Image page either
+  way. All plots export vector
   PDFs with editable text. PyGwalker is not used.
 
 * Excel plate metadata (**Select Metadata**) is merged by `well`
@@ -389,8 +408,10 @@ Package layout (overview):
 
 * `label/` — subpackage for the interactive multi-label annotation web app
   (the `label` command): `db.py` (single append-friendly SQLite project DB
-  + undo), `engines.py` (kNN / per-label ML suggesters + mislabel review),
-  `features.py` (cached classify-bundle extraction), `imaging.py`
+  + undo), `engines.py` (exemplar-kNN suggester + mislabel review),
+  `features.py` (cached classify-bundle extraction), `cluster.py`
+  (Leiden cluster assignment + medoids over the shared space),
+  `imaging.py`
   (percentile PNG render + LRU), `server.py` (Flask APIs) and `ui.py`
   (embedded single-page UI).
 
@@ -464,7 +485,14 @@ Design:
   first available mask when null), and an optional config label for
   single-cell mode (null yml -> NULL). This column is the per-mask
   grouping key for the downstream merges; a NULL joins the profiler DB's
-  mask with a log hint. Probability-descending ordering is a display
+  mask with a log hint. Whole-image rows' `mask_filename` follows the same
+  portable-first convention as `directory` (canonical_directory:
+  CWD-relative when possible, absolute fallback — the bare filename is its
+  last segment), so consumers resolve it with `resolve_directory` exactly
+  like `directory`; legacy absolute values pass through. Intensity
+  `filename` is always bare names (single-cell: the bare TIFF name;
+  whole-image: a JSON array of bare channel names). Probability-descending
+  ordering is a display
   concern of reduction-vis, never baked into the DB.
 
 * Bundles carry their meta (channels, normalization, augmentation);
@@ -497,57 +525,75 @@ Design:
   curated/ hardlinks, keep_label.csv, plot) never touch the source folders.
 
 * Label (the `label/` subpackage: `db.py` storage, `engines.py` suggesters,
-  `features.py` extraction, `imaging.py` render + cache, `server.py` Flask
+  `features.py` extraction, `cluster.py` Leiden clustering over the shared
+  space, `imaging.py` render + cache, `server.py` Flask
   APIs, `ui.py` embedded page) is an interactive multi-label labeling web
   app over pre-cropped single-cell folders or data.file_list CSVs (filepath
   column, e.g. deduplication's curated.csv — implicit roots are the listed
   files' parent dirs, data.file_dir is ignored when file_list is set; the CSV's
-  label column is the preset). The UI is a GRID BATCH WORKTABLE:
-  every queue mode renders as one page of thumbnails (K = page size, pager
+  label column is the preset). The UI is a GRID BATCH WORKTABLE over ONE
+  unified queue — no queue-mode switch: pick an image source, click a
+  sidebar label, and the top-bar scope radio picks the members
+  (undecided = cells without a decision for the label, ranked by the
+  label's score — the main labeling queue; with / without / neg / union =
+  the already-decided cells for verification). Every scope renders as one
+  page of thumbnails (K = page size, pager
   at the bottom), the user selects images and checks target labels, and
   Apply + / Apply − (explicit negatives) / Remove write selected label(s)
   to selected image(s) in ONE server action (single transaction, one
-  undoable op). Double-click a thumbnail for a zoomed overlay where labels
+  undoable op); shift+clicking a thumbnail records an instant explicit
+  negative for the checked targets; annotated cells always show their
+  label dots bottom-right. A sort radio picks the ranking (best first /
+  uncertain first / the leave-one-out "suspicious" mislabel check, which
+  needs a model and the Positive scope), plus a Shuffle for the undecided
+  queue. Double-click a thumbnail for a zoomed
+  overlay where labels
   are toggled directly (chips or keys cycle undecided -> positive ->
   explicit negative, ←/→ walk the queue, suspicious cells show the
   contradicting evidence cell side by side).
-  Clicking a sidebar label browses its positives and makes it the only
+  Clicking a sidebar label loads its queue and makes it the only
   checked target; the selection survives page flips so wrong cells can be
-  collected across pages and removed in one go; the sidebar's
-  selected-label box holds the auto-annotate actions and a progress bar
-  toward `auto_label.min_positives`.
+  collected across pages and removed in one go.
   An SSL or train bundle embeds all cells (deduplication extraction + cache)
   into a whitened-PCA space where a kNN suggest engine scores every label
   from the user's positive / explicit-negative exemplars ("never labeled"
-  is never a negative); a classify bundle's per-class probabilities are a
-  second suggestion source, and a per-label sklearn classifier
-  (`recommend.ml_model`, logistic regression / random forest refit lazily
-  after every write) a third — it engages only once a label has enough
-  explicit positives AND negatives and otherwise falls back to kNN.
-  Queues (four, matching the Collect -> Auto -> Manage workflow): Collect
-  (per-label ranked undecided cells: score descending by default with an
-  Uncertainty toggle for nearest-the-boundary-first active learning;
-  farthest-point spread while the label has no exemplars; a seeded Shuffle
-  reshuffles the queue when a page shows nothing like the target class),
-  Manage (ALL labeled cells — the union of
-  every label's positives — scoped to with / without the clicked label so
-  each class can be verified or completed without losing labels; ranked by
-  certainty — most uncertain first — or by the leave-one-out "suspicious"
-  consistency check that flags likely mislabels with their contradicting
-  neighbor as evidence), Unlabeled, All.
+  is never a negative): score = top-k mean similarity to the positives
+  minus `recommend.neg_weight` × top-k mean similarity to the explicit
+  negatives. That ONE transparent score drives the Collect order, the
+  thumbnail badge and the decided scopes' certainty, and every write
+  invalidates
+  the cached scores so the ranking follows the latest exemplars. A
+  classify bundle's per-class probabilities are a second suggestion
+  source. The top-bar Refresh-model button (manual by design) fits a
+  per-label logistic scorer for every label holding at least four
+  positives AND four explicit negatives — a refreshed label's score
+  everywhere becomes that model's P(positive), so negatives define a real
+  decision boundary instead of only nudging a similarity; new writes mark
+  the models stale (status next to the button) but they keep scoring
+  until the user refreshes again, and a mode switch drops them.
+  Cluster-assisted bulk labeling (the sidebar's Clusters tab, configured
+  by `cluster.target` = a target cluster count, or an explicit
+  `cluster.res`): `cluster.py` partitions the shared L2-normalized space
+  with the SAME Leiden/kNN-graph clustering as the reduction command
+  (resolution ladder + bisection lands nearest the target count), computes
+  each cluster's medoid (most typical member) and caches the assignment to
+  `features/clusters_*.npz` keyed on bundle identity + cell list + PCA
+  width — decision-independent, shared by both modes. Clicking a cluster
+  card narrows the queue to that cluster (orthogonal to source/scope, with
+  a Medoid ↓ sort = similarity to the medoid first), and Cluster Apply + /
+  − / Remove writes the checked targets to the whole cluster ∩ current
+  scope through the SAME `_in_scope` membership the queue uses — one
+  transaction, one undoable op — so tens of thousands of cells cost ~one
+  decision per cluster, then Uncertain/Suspicious sorts clean up cluster
+  boundaries per cell. A classify bundle additionally feeds the queue's
+  Predicted dropdown (keep cells whose argmax prediction is the picked
+  class) and the Prob ↓ sort (P(class) first — argmax confidence while
+  All), the fast verify loop after "Create labels from model classes".
   The pager takes a page number + Enter to jump; page flips keep the
-  selection. Auto-annotate (`auto_label` config): once a label holds >=
-  min_positives positives (default 20) every positive write runs the auto
-  pass — every undecided cell scoring >= threshold (default 0.9, model
-  probability or kNN score) becomes an AUTO positive for every eligible
-  label jointly, so threshold crossings can never be missed by batch jumps
-  (each label runs once per crossing, tracked by a `auto_fired_at` marker
-  that Remove-auto / Undo reset). Decisions carry a manual/auto `source`
-  (schema migration on open), auto-labeled cells show a blue A mark, and
-  "Remove auto" undoes a whole auto run without touching manual decisions.
-  Every user action (batch apply, single write, auto run, undo) is one
+  selection.
+  Every user action (batch apply, single write, undo) is one
   `op_id` in the append-only decision log, and Ctrl+Z /api/undo reverts
-  the newest op exactly (undo of the undo = redo). Cells render through
+  the newest op exactly (repeated undos walk backward, never redo). Cells render through
   the bundle's inference preprocessing (uniform square model input,
   percentile normalization ignoring the zero background) behind a small
   render LRU; display-only contrast/gamma/size controls adjust the render.
@@ -556,16 +602,18 @@ Design:
   changed model bundle logs a warning but keeps the human decisions).
   Each mode exports its own train-ready CSV after every write
   (`label_export.csv` multi / `label_export_single.csv` single; `;`-joined
-  multi-labels). State lives in TWO fully independent append-friendly
+  multi-labels). Every path the label project stores (cells, sources, model
+  meta, feature caches, exports) is PORTABLE — CWD-relative forward-slash
+  like `curated.csv`, absolute only outside the CWD. State lives in TWO
+  fully independent append-friendly
   SQLite DBs — `label_multiple.db` (multi) and `label_single.db` (single),
   switched by the top-bar Mode dropdown (Multi-label / Single-label) and
   restored from the `label_mode.txt` pointer file. The two stores never
   mix: separate label registries, decisions, undo history and exports;
   single mode additionally enforces exclusivity (a new positive clears the
-  cell's other positives, keep-set semantics, one undoable op) and its
-  auto pass only annotates cells with no positive at all. Everything
-  decision-independent — the feature cache, the embedding space, the
-  suggest engines and the display pipeline — is built once and shared by
+  cell's other positives, keep-set semantics, one undoable op). Everything
+  decision-independent — the feature cache, the embedding space,
+  the suggest engine and the display pipeline — is built once and shared by
   both modes (a switch re-registers cells into the other DB and
   invalidates the score caches once; sub-second). Legacy projects migrate
   on first startup: `annotations.db` -> `label_multiple.db`,

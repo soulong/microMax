@@ -15,24 +15,25 @@ Tables
 meta            project-level key/values (model bundle the decisions were
                 made with, for consistency checks)
 labels          label registry with a user-controlled display order (drag
-                in the UI) and the auto-annotate bookkeeping
-                (``auto_fired_at``); deletion is explicit and UI-confirmed
-                and removes the label's decisions — the append-only log
-                keeps the history
+                in the UI); deletion is explicit and UI-confirmed and
+                removes the label's decisions — the append-only log keeps
+                the history
 sessions        one row per server start (the session_id stamped on writes)
 sources         per-source-root display settings (channels/layout/
                 max_value) as they were when the root was last configured —
                 legacy cells stay displayable even when their root leaves
                 the config
-cells           one row per known cell (normcase absolute filepath is the
-                identity); registered on every startup, never removed, so
+cells           one row per known cell (the PORTABLE CWD-relative path —
+                forward slashes, absolute fallback outside the CWD — is the
+                identity; same convention as deduplication's curated.csv);
+                registered on every startup, never removed, so
                 cells from roots that dropped out of the config stay
                 annotated and exportable
 cell_labels     CURRENT decision per (cell, label): state 1 = positive,
                 0 = explicit negative; re-annotating upserts this row
 annotation_log  append-only history of every decision (including the
                 cleared state NULL). ``op_id`` groups the rows of ONE user
-                action (a batch apply, an auto run, an undo) so undo can
+                action (a batch apply, a single write, an undo) so undo can
                 revert exactly the last action.
 
 Projects created before the dual-mode naming stored their decisions in
@@ -51,6 +52,8 @@ from contextlib import closing
 
 import pandas as pd
 
+from microBase import canonical_directory
+
 logger = logging.getLogger(__name__)
 
 DB_NAME = "label_multiple.db"           # the MULTI-label project database
@@ -67,7 +70,9 @@ UNIFIED_DB = "label.db"                      # v0.21 unified name (routed)
 STATE_POS = 1
 STATE_NEG = 0
 
-# Auto-assigned label colors (cycled in registration order).
+# Auto-assigned label colors: a new label takes the first palette color NO
+# existing label uses (distinct for the first 14 labels no matter what was
+# deleted or corrupted before); once the palette is exhausted it cycles.
 PALETTE = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
            "#008080", "#f032e6", "#9a6324", "#469990", "#800000",
            "#000075", "#808000", "#e6c229", "#a9a9a9"]
@@ -153,8 +158,7 @@ class AnnotationDB:
                 name          TEXT NOT NULL UNIQUE,
                 color         TEXT NOT NULL,
                 sort_order    INTEGER NOT NULL DEFAULT 0,
-                created_at    TEXT NOT NULL,
-                auto_fired_at TEXT);
+                created_at    TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS sessions(
                 session_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 started_at TEXT NOT NULL);
@@ -177,7 +181,6 @@ class AnnotationDB:
                 state      INTEGER NOT NULL,
                 updated_at TEXT NOT NULL,
                 session_id INTEGER,
-                source     TEXT NOT NULL DEFAULT 'manual',
                 PRIMARY KEY (cell_id, label_id));
             CREATE TABLE IF NOT EXISTS annotation_log(
                 log_id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,33 +189,58 @@ class AnnotationDB:
                 op_id      INTEGER NOT NULL DEFAULT 0,
                 cell_id    INTEGER NOT NULL,
                 label_id   INTEGER NOT NULL,
-                state      INTEGER,
-                source     TEXT NOT NULL DEFAULT 'manual');
+                state      INTEGER);
             CREATE TABLE IF NOT EXISTS undone_ops(
                 op_id     INTEGER PRIMARY KEY,
                 undone_at TEXT NOT NULL);
             """)
             # Migrations for projects created before a column existed — an
             # existing annotation project must keep working untouched.
+            # (Pre-op_id projects get 0 for every historical row; undo
+            # simply cannot address those ops, the decisions still load.)
             for table, column, ddl in (
-                    ("cell_labels", "source",
-                     "ALTER TABLE cell_labels ADD COLUMN source "
-                     "TEXT NOT NULL DEFAULT 'manual'"),
-                    ("annotation_log", "source",
-                     "ALTER TABLE annotation_log ADD COLUMN source "
-                     "TEXT NOT NULL DEFAULT 'manual'"),
                     ("annotation_log", "op_id",
                      "ALTER TABLE annotation_log ADD COLUMN op_id "
-                     "INTEGER NOT NULL DEFAULT 0"),
-                    ("labels", "auto_fired_at",
-                     "ALTER TABLE labels ADD COLUMN auto_fired_at TEXT")):
+                     "INTEGER NOT NULL DEFAULT 0"),):
                 cols = {r[1] for r in conn.execute(
                     f"PRAGMA table_info({table})").fetchall()}
                 if column not in cols:
                     conn.execute(ddl)
+        # Older builds could write the same palette color to several
+        # labels — self-heal on every open so the sidebar stays readable.
+        self._repair_duplicate_colors()
 
     def _connect(self):
         return sqlite3.connect(self.path)
+
+    def _repair_duplicate_colors(self):
+        """Reassign duplicated label colors to unused palette entries.
+
+        Labels are walked in creation order: the first label carrying a
+        color keeps it, every later duplicate gets the first palette color
+        nobody uses (palette exhausted -> left as is). A no-op when the
+        colors are already distinct.
+        """
+        with closing(self._connect()) as conn, conn:
+            rows = conn.execute(
+                "SELECT label_id, color FROM labels ORDER BY label_id"
+            ).fetchall()
+            used, updates = set(), []
+            for label_id, color in rows:
+                if color not in used:
+                    used.add(color)
+                    continue
+                fresh = next((c for c in PALETTE if c not in used), None)
+                if fresh is None:            # palette exhausted — keep it
+                    used.add(color)
+                    continue
+                updates.append((fresh, label_id))
+                used.add(fresh)
+            if updates:
+                conn.executemany(
+                    "UPDATE labels SET color = ? WHERE label_id = ?", updates)
+                logger.warning("Reassigned %d duplicate label color(s) to "
+                               "unused palette colors", len(updates))
 
     def new_session(self):
         with closing(self._connect()) as conn, conn:
@@ -234,8 +262,14 @@ class AnnotationDB:
             if row is not None:
                 return {"label_id": row[0], "name": row[1],
                         "color": row[2], "created": False}
-            n = conn.execute("SELECT COUNT(*) FROM labels").fetchone()[0]
-            color = color or PALETTE[n % len(PALETTE)]
+            if color is None:
+                # First palette color no existing label uses — count-based
+                # cycling only kicks in once the whole palette is taken.
+                taken = {r[0] for r in
+                         conn.execute("SELECT color FROM labels").fetchall()}
+                n = len(taken)
+                color = next((c for c in PALETTE if c not in taken), None) \
+                    or PALETTE[n % len(PALETTE)]
             sort_order = conn.execute(
                 "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM labels"
             ).fetchone()[0]
@@ -267,18 +301,6 @@ class AnnotationDB:
                     "UPDATE labels SET sort_order = ? WHERE label_id = ?",
                     (i + 1, int(lid)))
 
-    def mark_auto_fired(self, label_id):
-        """Record that the auto-annotate pass ran for this label.
-
-        The pass runs once per label until Remove-auto resets the marker —
-        that is what makes "Remove auto" stick instead of being re-applied
-        by the next manual write.
-        """
-        with closing(self._connect()) as conn, conn:
-            conn.execute(
-                "UPDATE labels SET auto_fired_at = ? WHERE label_id = ?",
-                (_now(), int(label_id)))
-
     def get_meta(self, key):
         with closing(self._connect()) as conn, conn:
             row = conn.execute("SELECT value FROM meta WHERE key = ?",
@@ -291,30 +313,32 @@ class AnnotationDB:
                          (key, str(value)))
 
     def list_labels(self):
-        """All labels in display order, with pos/neg counts + auto state."""
+        """All labels in display order, with positive/negative counts."""
         with closing(self._connect()) as conn, conn:
             rows = conn.execute("""
                 SELECT l.label_id, l.name, l.color,
                        COALESCE(SUM(cl.state = 1), 0),
-                       COALESCE(SUM(cl.state = 0), 0),
-                       l.auto_fired_at IS NOT NULL
+                       COALESCE(SUM(cl.state = 0), 0)
                 FROM labels l
                 LEFT JOIN cell_labels cl ON cl.label_id = l.label_id
                 GROUP BY l.label_id
                 ORDER BY l.sort_order, l.label_id""").fetchall()
         return [{"label_id": r[0], "name": r[1], "color": r[2],
-                 "n_pos": int(r[3]), "n_neg": int(r[4]),
-                 "auto_fired": bool(r[5])} for r in rows]
+                 "n_pos": int(r[3]), "n_neg": int(r[4])} for r in rows]
 
     # -- cells / sources ----------------------------------------------------
 
     def upsert_source(self, source, channels, channel_layout, max_value,
                       n_channels):
-        """Record the display settings of a configured root."""
+        """Record the display settings of a configured root.
+
+        The root is stored PORTABLE (CWD-relative forward-slash when it
+        lives under the CWD — the same form cells.source carries).
+        """
         with closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT OR REPLACE INTO sources VALUES (?,?,?,?,?)",
-                (os.path.normcase(source), json.dumps(channels),
+                (canonical_directory(source), json.dumps(channels),
                  channel_layout, float(max_value), int(n_channels)))
 
     def source_settings(self, source):
@@ -322,7 +346,8 @@ class AnnotationDB:
         with closing(self._connect()) as conn, conn:
             row = conn.execute(
                 "SELECT channels, channel_layout, max_value FROM sources "
-                "WHERE source = ?", (os.path.normcase(source),)).fetchone()
+                "WHERE source = ?",
+                (canonical_directory(source),)).fetchone()
         if row is None:
             return None
         return {"channels": json.loads(row[0]), "channel_layout": row[1],
@@ -331,9 +356,10 @@ class AnnotationDB:
     def register_cells(self, rows):
         """Insert new cells (INSERT OR IGNORE) and refresh preset labels.
 
-        rows: iterable of (normcase filepath, raw path, source, preset).
-        Returns the full cell table ordered by cell_id — including cells
-        from earlier sessions whose roots are no longer in the config.
+        rows: iterable of (portable identity path, portable raw path,
+        portable source, preset). Returns the full cell table ordered by
+        cell_id — including cells from earlier sessions whose roots are no
+        longer in the config.
         """
         ts = _now()
         with closing(self._connect()) as conn, conn:
@@ -362,15 +388,6 @@ class AnnotationDB:
                 "SELECT cell_id, label_id, state FROM cell_labels").fetchall()
         return {(r[0], r[1]): int(r[2]) for r in rows}
 
-    def auto_cells(self, label_id):
-        """Cell ids currently auto-annotated positive for one label."""
-        with closing(self._connect()) as conn, conn:
-            rows = conn.execute(
-                "SELECT cell_id FROM cell_labels WHERE label_id = ? AND "
-                "state = 1 AND source = 'auto'",
-                (label_id,)).fetchall()
-        return {r[0] for r in rows}
-
     def next_op_id(self):
         """A fresh monotonically increasing op id (one per user action)."""
         with closing(self._connect()) as conn, conn:
@@ -378,8 +395,7 @@ class AnnotationDB:
                 "SELECT COALESCE(MAX(op_id), 0) + 1 FROM annotation_log"
             ).fetchone()[0])
 
-    def _write_one(self, conn, cell_id, label_id, state, ts, session_id,
-                   source):
+    def _write_one(self, conn, cell_id, label_id, state, ts, session_id):
         """Upsert/clear ONE current decision (inside an open transaction)."""
         if state is None:
             conn.execute(
@@ -388,28 +404,24 @@ class AnnotationDB:
         else:
             conn.execute(
                 "INSERT INTO cell_labels(cell_id, label_id, state, "
-                "updated_at, session_id, source) VALUES (?,?,?,?,?,?) "
+                "updated_at, session_id) VALUES (?,?,?,?,?) "
                 "ON CONFLICT(cell_id, label_id) DO UPDATE SET "
                 "state = excluded.state, "
                 "updated_at = excluded.updated_at, "
-                "session_id = excluded.session_id, "
-                "source = excluded.source",
-                (cell_id, label_id, int(state), ts, session_id, source))
+                "session_id = excluded.session_id",
+                (cell_id, label_id, int(state), ts, session_id))
 
-    def set_label(self, cell_id, label_id, state, session_id, op_id=0,
-                  source="manual"):
+    def set_label(self, cell_id, label_id, state, session_id, op_id=0):
         """Upsert one decision; state None clears it. Always logged."""
         ts = _now()
         with closing(self._connect()) as conn, conn:
-            self._write_one(conn, cell_id, label_id, state, ts, session_id,
-                            source)
+            self._write_one(conn, cell_id, label_id, state, ts, session_id)
             conn.execute(
                 "INSERT INTO annotation_log(ts, session_id, op_id, cell_id, "
-                "label_id, state, source) VALUES (?,?,?,?,?,?,?)",
-                (ts, session_id, op_id, cell_id, label_id, state, source))
+                "label_id, state) VALUES (?,?,?,?,?,?)",
+                (ts, session_id, op_id, cell_id, label_id, state))
 
-    def apply_batch(self, cell_ids, label_ids, state, session_id, op_id,
-                    source="manual"):
+    def apply_batch(self, cell_ids, label_ids, state, session_id, op_id):
         """Write ONE decision to MANY cells × MANY labels in ONE transaction.
 
         All-or-nothing: a partially applied batch can never exist, so the
@@ -426,62 +438,13 @@ class AnnotationDB:
         with closing(self._connect()) as conn, conn:
             for lid in label_ids:
                 for cid in cell_ids:
-                    self._write_one(conn, cid, lid, state, ts, session_id,
-                                    source)
+                    self._write_one(conn, cid, lid, state, ts, session_id)
                 conn.executemany(
                     "INSERT INTO annotation_log(ts, session_id, op_id, "
-                    "cell_id, label_id, state, source) VALUES (?,?,?,?,?,?,?)",
-                    [(ts, session_id, op_id, cid, lid, state, source)
+                    "cell_id, label_id, state) VALUES (?,?,?,?,?,?)",
+                    [(ts, session_id, op_id, cid, lid, state)
                      for cid in cell_ids])
         return len(cell_ids) * len(label_ids)
-
-    def auto_apply(self, label_id, cell_ids, session_id, op_id=0):
-        """Bulk-insert AUTO positive decisions (undecided cells only).
-
-        The WHERE-style ON CONFLICT DO NOTHING guard makes it idempotent
-        even if the caller's snapshot is stale. Every write lands in the
-        log with source='auto'. Returns the number of decisions written.
-        """
-        ts = _now()
-        rows = [(int(cid), int(label_id), STATE_POS, ts, session_id, "auto")
-                for cid in cell_ids]
-        with closing(self._connect()) as conn, conn:
-            cur = conn.executemany(
-                "INSERT INTO cell_labels(cell_id, label_id, state, "
-                "updated_at, session_id, source) VALUES (?,?,?,?,?,?) "
-                "ON CONFLICT(cell_id, label_id) DO NOTHING",
-                rows)
-            applied = cur.rowcount
-            conn.executemany(
-                "INSERT INTO annotation_log(ts, session_id, op_id, cell_id, "
-                "label_id, state, source) VALUES (?,?,?,?,?,?, 'auto')",
-                [(ts, session_id, op_id, int(cid), int(label_id), STATE_POS)
-                 for cid in cell_ids])
-        return applied
-
-    def clear_auto(self, label_id, session_id, op_id=0):
-        """Remove every AUTO decision of one label (undo an auto-apply run).
-
-        Each removal is logged with state NULL, and the label's fired
-        marker resets so a later write can run the auto pass again.
-        Returns rows removed.
-        """
-        ts = _now()
-        with closing(self._connect()) as conn, conn:
-            ids = [r[0] for r in conn.execute(
-                "SELECT cell_id FROM cell_labels WHERE label_id = ? AND "
-                "source = 'auto'", (label_id,)).fetchall()]
-            conn.execute(
-                "DELETE FROM cell_labels WHERE label_id = ? AND "
-                "source = 'auto'", (label_id,))
-            conn.executemany(
-                "INSERT INTO annotation_log(ts, session_id, op_id, cell_id, "
-                "label_id, state, source) VALUES (?,?,?,?,?,NULL,'auto-clear')",
-                [(ts, session_id, op_id, cid, label_id) for cid in ids])
-            conn.execute(
-                "UPDATE labels SET auto_fired_at = NULL WHERE label_id = ?",
-                (int(label_id),))
-        return len(ids)
 
     def clear_other_positives(self, cell_ids, keep_label_ids, session_id,
                               op_id):
@@ -513,8 +476,8 @@ class AnnotationDB:
                         "label_id = ?", (int(cid), lid))
                     conn.execute(
                         "INSERT INTO annotation_log(ts, session_id, op_id, "
-                        "cell_id, label_id, state, source) "
-                        "VALUES (?,?,?,?,?,NULL,'exclusive')",
+                        "cell_id, label_id, state) "
+                        "VALUES (?,?,?,?,?,NULL)",
                         (ts, session_id, op_id, int(cid), lid))
                     removed.append((int(cid), lid))
         return removed
@@ -525,41 +488,36 @@ class AnnotationDB:
         The previous state of every (cell, label) touched by the op is the
         state of its latest log row BEFORE the op (None = undecided), so
         the restore is exact no matter how many passes touched the cell in
-        between. Reverted ops are recorded in ``undone_ops`` and pure-undo
-        ops are never targets, so repeated undos walk BACKWARD through the
-        real actions (op3, op2, op1, then nothing) — each exactly once.
-        Undoing an auto run also resets that label's fired marker, so auto
-        can run again later.
+        between. The reverted op AND the undo op it creates are both
+        recorded in ``undone_ops``, so repeated undos walk BACKWARD through
+        the real actions (op3, op2, op1, then nothing) — each exactly once,
+        never re-doing an undo.
 
         Returns {"op_id", "n", "labels"} or None when nothing is undoable.
         """
         ts = _now()
         with closing(self._connect()) as conn, conn:
-            ops = conn.execute(
-                "SELECT l.op_id, MIN(l.source), MAX(l.source) "
-                "FROM annotation_log l "
-                "WHERE l.session_id = ? AND l.op_id > 0 AND l.op_id NOT IN "
+            op = conn.execute(
+                "SELECT op_id FROM annotation_log "
+                "WHERE session_id = ? AND op_id > 0 AND op_id NOT IN "
                 "(SELECT op_id FROM undone_ops) "
-                "GROUP BY l.op_id ORDER BY l.op_id DESC",
-                (session_id,)).fetchall()
-            # Skip ops that consist purely of 'undo' rows: they are the
-            # result of previous undos, not user actions.
-            op = next((r[0] for r in ops
-                       if not (r[1] == "undo" and r[2] == "undo")), None)
+                "GROUP BY op_id ORDER BY op_id DESC LIMIT 1",
+                (session_id,)).fetchone()
             if op is None:
                 return None
+            op = op[0]
             op_min = conn.execute(
                 "SELECT MIN(log_id) FROM annotation_log WHERE op_id = ?",
                 (op,)).fetchone()[0]
             rows = conn.execute(
-                "SELECT cell_id, label_id, source FROM annotation_log "
+                "SELECT cell_id, label_id FROM annotation_log "
                 "WHERE op_id = ? GROUP BY cell_id, label_id",
                 (op,)).fetchall()
             new_op = int(conn.execute(
                 "SELECT COALESCE(MAX(op_id), 0) + 1 FROM annotation_log"
             ).fetchone()[0])
-            touched, auto_touched = set(), set()
-            for cell_id, label_id, source in rows:
+            touched = set()
+            for cell_id, label_id in rows:
                 prev = conn.execute(
                     "SELECT state FROM annotation_log "
                     "WHERE cell_id = ? AND label_id = ? AND log_id < ? "
@@ -567,20 +525,16 @@ class AnnotationDB:
                     (cell_id, label_id, op_min)).fetchone()
                 prev_state = prev[0] if prev else None
                 self._write_one(conn, cell_id, label_id, prev_state, ts,
-                                session_id, "undo")
+                                session_id)
                 conn.execute(
                     "INSERT INTO annotation_log(ts, session_id, op_id, "
-                    "cell_id, label_id, state, source) "
-                    "VALUES (?,?,?,?,?,?,'undo')",
+                    "cell_id, label_id, state) VALUES (?,?,?,?,?,?)",
                     (ts, session_id, new_op, cell_id, label_id, prev_state))
                 touched.add(label_id)
-                if source == "auto":
-                    auto_touched.add(label_id)
-            for lid in auto_touched:
-                conn.execute(
-                    "UPDATE labels SET auto_fired_at = NULL "
-                    "WHERE label_id = ?", (lid,))
-            conn.execute("INSERT INTO undone_ops VALUES (?,?)", (op, ts))
+            # Both the reverted action and the undo are spent: the undo op
+            # must never be picked as the next target (that would redo).
+            conn.executemany("INSERT INTO undone_ops VALUES (?,?)",
+                             [(op, ts), (new_op, ts)])
             return {"op_id": op, "n": len(rows),
                     "labels": sorted(touched)}
 

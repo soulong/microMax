@@ -25,9 +25,8 @@ from microVis.widgets.ui_spec import (
     BTN_MINI_WIDTH,
     BTN_WIDE_WIDTH,
     CONTROLS_MARGIN,
-    CONTROLS_MAX_WIDTH,
-    CONTROLS_MIN_WIDTH,
     CONTROLS_SPACING,
+    CONTROLS_WIDTH,
     COMPACT_LINE_EDIT_STYLE,
     SMALL_CHECKBOX_STYLE,
     centered_row,
@@ -53,7 +52,11 @@ class _MultiSelectCombo(QWidget):
         # Label + buttons row
         header = QHBoxLayout()
         header.setSpacing(4)
-        header.addWidget(QLabel(label))
+        # One size smaller than the pane's 9pt content scale: the filter
+        # strips are auxiliary UI.
+        header_lbl = QLabel(label)
+        header_lbl.setStyleSheet("font-size: 8pt;")
+        header.addWidget(header_lbl)
 
         sel_all = small_button("All", width=42, mini_style=True)
         sel_all.clicked.connect(lambda: self.set_all_checked(True))
@@ -129,8 +132,8 @@ class ImageControls(QScrollArea):
         super().__init__(parent)
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setMinimumWidth(CONTROLS_MIN_WIDTH)
-        self.setMaximumWidth(CONTROLS_MAX_WIDTH)
+        # The ONE control-column width shared by every page's left rail.
+        self.setFixedWidth(CONTROLS_WIDTH)
 
         container = QWidget()
         container.setStyleSheet(controls_pane_style())
@@ -161,11 +164,12 @@ class ImageControls(QScrollArea):
         ch_layout.addLayout(self._ch_container)
         self._channel_widgets: dict[str, ChannelControls] = {}
 
-        # Low / High
+        # Low / High — same fixed label width as the per-channel vmin/vmax
+        # row above, so both rows' texts and input boxes align vertically.
         lowhigh_row = QHBoxLayout()
         lowhigh_row.setSpacing(4)
         lbl_lo = QLabel("Low")
-        lbl_lo.setFixedWidth(28)
+        lbl_lo.setFixedWidth(32)
         lowhigh_row.addWidget(lbl_lo)
         self._auto_low = NoScrollDoubleSpinBox()
         self._auto_low.setRange(0.0, 100.0)
@@ -174,7 +178,7 @@ class ImageControls(QScrollArea):
         self._auto_low.setButtonSymbols(QDoubleSpinBox.NoButtons)
         lowhigh_row.addWidget(self._auto_low, stretch=1)
         lbl_hi = QLabel("High")
-        lbl_hi.setFixedWidth(28)
+        lbl_hi.setFixedWidth(32)
         lowhigh_row.addWidget(lbl_hi)
         self._auto_high = NoScrollDoubleSpinBox()
         self._auto_high.setRange(0.0, 100.0)
@@ -406,6 +410,14 @@ class ImageControls(QScrollArea):
             _lay = _grp.layout()
             _m = _lay.contentsMargins()
             _lay.setContentsMargins(_m.left(), _m.top(), _m.right(), 0)
+
+        # Long item captions ("histogram_equalization", "Current displayed")
+        # must not dictate the pane's minimum width — closed combos elide
+        # instead, or the 232px rail clips their drop-down arrows off.
+        for combo in self.findChildren(QComboBox):
+            combo.setSizeAdjustPolicy(
+                QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(6)
 
         self._layout.addStretch()
         self.setWidget(container)

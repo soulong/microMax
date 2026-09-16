@@ -99,7 +99,7 @@ def main():
     p_cur.set_defaults(func=cmd_deduplication)
 
     p_ann = sub.add_parser("label",
-                           help="Interactive multi-label annotation web server (Flask) with feature-similarity assisted suggestions: SSL/train bundle -> kNN/ML label recommendation, auto-annotate pass, Collect/Manage queues, per-action undo -> label_multiple.db / label_single.db + per-mode label_export(_single).csv")
+                           help="Interactive multi-label annotation web server (Flask) with exemplar-similarity recommendation scores: SSL/train bundle -> kNN (+ classify head) ranking in Collect, explicit negatives push lookalikes down, Collect/Manage queues, per-action undo -> label_multiple.db / label_single.db + per-mode label_export(_single).csv")
     p_ann.add_argument("--config", required=True, help="Path to label YAML config")
     p_ann.add_argument("--port", type=int, default=5000, help="Server port (default 5000)")
     p_ann.add_argument("--no-browser", action="store_true",

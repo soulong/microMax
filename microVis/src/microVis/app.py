@@ -33,6 +33,14 @@ class _WheelBlocker(QObject):
             if target is None:
                 return False
 
+            # ── Open popup: the wheel belongs to the popup's option list ─────
+            # Combo/completer option lists are popup windows; while one is
+            # open the wheel must scroll THAT list, never be redirected to
+            # the page scrolling behind it.
+            popup = QApplication.activePopupWidget()
+            if popup is not None and popup.isAncestorOf(target):
+                return False
+
             # ── Walk parent chain ────────────────────────────────────────────
             has_spin_or_combo = False
             found_scroll: QScrollArea | None = None

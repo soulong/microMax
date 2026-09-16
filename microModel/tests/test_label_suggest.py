@@ -1,21 +1,21 @@
 """Unit tests for the label app's suggestion/render primitives.
 
-Covers MLModelEngine (the active-learning per-label classifier over the
-embedding space) and the display-parameter handling of _render_png. No
-Flask server or model bundle is needed — both are pure numpy/sklearn.
+Covers SuggestEngine (per-label exemplar scoring: positives raise a cell's
+score, explicit negatives PUSH their lookalikes down), the Refresh-model
+logistic fit (fit_label_model) and the display-parameter handling of
+_render_png. No Flask server or model bundle is needed — all pure
+numpy/sklearn.
 """
 
 import numpy as np
-import pytest
 
-from microModel.label import MLModelEngine, _render_png
+from microModel.label import SuggestEngine, _render_png
 
 
 def _clustered_space(n_per_side=8, seed=0):
     """L2-normalized space with two well-separated cell clusters.
 
-    Rows 0..n-1 sit around +e1, rows n..2n-1 around -e1 — a labeled
-    positive/negative split the models must reproduce.
+    Rows 0..n-1 sit around +e1, rows n..2n-1 around -e1.
     """
     rng = np.random.default_rng(seed)
     W = rng.normal(scale=0.1, size=(2 * n_per_side, 16)).astype(np.float32)
@@ -24,43 +24,67 @@ def _clustered_space(n_per_side=8, seed=0):
     return W / np.linalg.norm(W, axis=1, keepdims=True)
 
 
-def test_ml_engine_gates_on_counts():
-    """Below min_pos or min_neg the engine refuses to score (kNN fallback)."""
-    W = _clustered_space()
-    eng = MLModelEngine(W, "logistic", min_pos=5, min_neg=3)
-    pos, neg = list(range(6)), list(range(8, 10))
-    assert eng.probs(1, pos, neg) is None          # 2 negatives: too few
-    assert eng.probs(1, pos, list(range(8, 13))) is not None
-    assert eng.probs(1, list(range(4)), list(range(8, 13))) is None  # 4 pos
-
-
-def test_ml_engine_separates_clusters():
-    """Fitted probabilities must be high on the positive cluster and low on
-    the negative one — a real decision boundary, not exemplar similarity.
-    Random-forest probabilities on 16 training rows stay soft (~0.8), so
-    the assertion only requires a clean margin, not calibration."""
+def test_knn_score_ranks_the_positive_cluster_first():
+    """Cells near the positives score above cells near the negatives."""
     W = _clustered_space()
     n = 8
-    for kind in ("logistic", "random_forest"):
-        eng = MLModelEngine(W, kind, min_pos=5, min_neg=3, seed=42)
-        probs = eng.probs(1, list(range(n)), list(range(n, 2 * n)))
-        assert probs is not None
-        assert (probs[:n] > 0.6).all()
-        assert (probs[n:] < 0.4).all()
+    eng = SuggestEngine(W, knn_k=1, neg_weight=0.5)
+    pos_part, neg_part = eng.parts(1, [0, 1], [n])
+    score = pos_part - 0.5 * neg_part
+    assert (score[:n] > score[n:]).all()
+    # k=1 means nearest exemplar: the top positive row keeps its own peak.
+    assert pos_part[0] >= pos_part[2:].max()
 
 
-def test_ml_engine_cache_invalidated_by_bump_and_counts():
-    """Cached arrays survive identical repeat calls; bump() or a changed
-    decision count must re-fit (observed through object identity)."""
+def test_explicit_negatives_push_lookalikes_down():
+    """An explicit negative is not just a veto — it depresses the score of
+    the cells it resembles, so the ranking itself changes."""
     W = _clustered_space()
-    eng = MLModelEngine(W, "logistic", min_pos=5, min_neg=3, seed=1)
-    pos, neg = list(range(6)), list(range(8, 14))
-    first = eng.probs(1, pos, neg)
-    assert eng.probs(1, pos, neg) is first          # cache hit
-    eng.bump()
-    assert eng.probs(1, pos, neg) is not first      # invalidated
-    grown = eng.probs(1, pos + [7], neg)
-    assert grown is not None and grown is not first  # count key changed
+    n = 8
+    # A negative that is an almost exact copy of positive-cluster row 2.
+    dup = W[2] + 0.001
+    dup = (dup / np.linalg.norm(dup)).astype(np.float32)
+    W2 = np.vstack([W, dup])
+    neg_row = len(W2) - 1
+    eng = SuggestEngine(W2, knn_k=1, neg_weight=2.0)
+    pos_part, neg_part = eng.parts(1, [0], [neg_row])
+    score = pos_part - 2.0 * neg_part
+    others = [i for i in range(n) if i != 2]
+    assert score[2] < score[others].min()   # the lookalike sank below the rest
+
+
+def test_score_cache_bumps_on_write():
+    """Cached arrays survive identical repeat calls; bump() (called after
+    every write by the server) forces a recompute."""
+    W = _clustered_space()
+    eng = SuggestEngine(W, knn_k=1, neg_weight=0.5)
+    first = eng.parts(1, [0], [])
+    assert eng.parts(1, [0], []) is first            # cache hit
+    eng.bump(1)
+    assert eng.parts(1, [0], []) is not first        # invalidated
+    grown = eng.parts(1, [0, 1], [])
+    assert grown is not first                        # exemplar count changed
+
+
+def test_fit_label_model_learns_the_boundary():
+    """The Refresh-model logistic fit separates the two exemplar clusters
+    (its P(positive) is what a refreshed label scores by); a label with
+    too few exemplars on either side gets NO model — None — and keeps the
+    kNN score."""
+    from microModel.label import MIN_FIT_NEG, MIN_FIT_POS, fit_label_model
+    W = _clustered_space()
+    n = 8
+    # Below the minimum on either side: refuse to fit.
+    assert fit_label_model(W, [0, 1], list(range(n, n + MIN_FIT_NEG)),
+                           seed=0) is None
+    assert fit_label_model(W, list(range(MIN_FIT_POS)), [], seed=0) is None
+    # Enough of both: P(positive) separates the clusters outright
+    # (regularized probabilities are calibrated, not saturated — the
+    # property that matters is clean separation around the 0.5 boundary).
+    model = fit_label_model(W, list(range(n)), list(range(n, 2 * n)), seed=0)
+    proba = model.predict_proba(W)[:, 1]
+    assert proba[:n].min() > 0.5 > proba[n:].max()
+    assert proba[:n].min() > proba[n:].max()
 
 
 def test_render_png_window_and_gamma():

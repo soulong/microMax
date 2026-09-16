@@ -66,7 +66,13 @@ from microVis.widgets.ui_spec import (
 from microVis.user_defaults import get_user_defaults, update_user_defaults
 from microVis.widgets.well_grid_canvas import WellGridCanvas
 from microVis.widgets.well_grid_controls import WellGridControls
-from microVis.worker import CropWorker, ImageWorker, ImageWorkerConfig, crop_object_rgb
+from microVis.worker import (
+    CropWorker,
+    ImageWorker,
+    ImageWorkerConfig,
+    crop_cell_rgb_normalized,
+    crop_object_rgb,
+)
 
 logger = get_logger("microVis.main_window")
 
@@ -247,6 +253,9 @@ class MainWindow(QMainWindow):
         self._last_state: dict = {}  # for change detection
         self._overlay_cache: tuple | None = None
         self._overlay_cache_key: str | None = None
+        # Last clicked Data-plot row (merged-table values) — kept so the
+        # cell-popup render controls can re-render the visible popup live.
+        self._plot_last_row: dict | None = None
 
         # Full-res zoom cache
         self._thread_pool = QThreadPool.globalInstance()
@@ -537,6 +546,7 @@ class MainWindow(QMainWindow):
         self._data_view.clear_db_clicked.connect(self._on_clear_db)
         self._data_view.load_dataset_clicked.connect(self._on_load_dataset_clicked)
         self._plot_view.point_picked.connect(self._on_plot_point_picked)
+        self._plot_view.cell_render_changed.connect(self._on_plot_cell_render_changed)
         self._data_view.metadata_browse_clicked.connect(self._on_metadata_browse)
         self._data_view.metadata_merge_clicked.connect(self._on_metadata_merge)
         self._data_view.metadata_clear_clicked.connect(self._on_metadata_clear)
@@ -666,10 +676,12 @@ class MainWindow(QMainWindow):
         return out
 
     def _on_select_db_browse(self) -> None:
-        """Open a file dialog for profiler.db and/or infer.db files."""
+        """Open a file dialog for profiler.db and/or infer.db files.
+
+        Works with or without a loaded dataset — the merge + plot chain is
+        dataset-independent (see load_db_files).
+        """
         from PySide6.QtWidgets import QFileDialog
-        if self._dm is None:
-            return
         start_dir = self._dataset_dir or ""
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Select DB(s)", start_dir, "SQLite DB (*.db)")
@@ -679,15 +691,18 @@ class MainWindow(QMainWindow):
     def load_db_files(self, paths) -> None:
         """Merge any mix of profiler/infer DBs into ONE integrated table.
 
-        Every call REPLACES the previous selection wholesale: the previous
-        merged table AND the DataModule's attached DB are cleared first (an
-        infer-only re-selection must not keep the old profiler DB alive as a
-        hidden source), then the new files are merged. The last profiler-type
-        DB of the new selection is additionally loaded into the DataModule
-        so the well-grid color-by keeps its existing table-level sources.
+        Works without a loaded dataset: the merge (MergedData.load) and the
+        Data-page plot chain only need the DB files, so DB-only browsing is
+        valid — the point-click cell popup stays silent (no images to crop)
+        and the well-grid color-by merge/* entries appear once a dataset is
+        loaded. Every call REPLACES the previous selection wholesale: the
+        previous merged table AND the DataModule's attached DB are cleared
+        first (an infer-only re-selection must not keep the old profiler DB
+        alive as a hidden source), then the new files are merged. The last
+        profiler-type DB of the new selection is additionally loaded into
+        the DataModule so the well-grid color-by keeps its existing
+        table-level sources.
         """
-        if self._dm is None:
-            return
         paths = self._split_paths(paths)
         if not paths:
             return
@@ -1237,8 +1252,10 @@ class MainWindow(QMainWindow):
         ic.overlay_col.clear()
         ic.overlay_col.addItem("None")
         # The integrated ``merge/*`` table replaces the raw profiler tables
-        # as soon as DBs are selected (see _update_grid_columns).
-        if self._merged is None:
+        # as soon as DBs are selected (see _update_grid_columns). The raw
+        # profiler tables need a dataset — a DB-only selection (no dataset
+        # loaded) skips straight to the merge/* entries.
+        if self._merged is None and self._dm is not None:
             tables = self._dm.get_profiling_tables()
             for tname in tables:
                 cols = self._dm.get_profiling_columns(tname)
@@ -1364,7 +1381,18 @@ class MainWindow(QMainWindow):
             logger.info("Write to DB: no DBs are merged")
             return
         df = merge_metadata_into(self._merged, self._metadata_merged)
-        out = str(Path(self._dataset_dir) / self._data_view.get_merge_db_name())
+        # Next to the dataset when one is loaded; otherwise ask for a
+        # location — a DB-only session (no dataset) must still be able to
+        # persist the integrated table.
+        if self._dataset_dir:
+            out = str(Path(self._dataset_dir) / self._data_view.get_merge_db_name())
+        else:
+            from PySide6.QtWidgets import QFileDialog
+            out, _ = QFileDialog.getSaveFileName(
+                self, "Write Merged DB", self._data_view.get_merge_db_name(),
+                "SQLite DB (*.db)")
+            if not out:
+                return
         logger.info("Write to DB: %d rows x %d columns -> %s",
                     len(df), len(df.columns), out)
         try:
@@ -2523,6 +2551,7 @@ class MainWindow(QMainWindow):
         the GUI looking dead).
         """
         try:
+            self._plot_last_row = dict(row)
             pixmap = self._resolve_point_cell(row)
         except Exception:
             logger.warning("Plot click: cell resolution failed",
@@ -2533,6 +2562,25 @@ class MainWindow(QMainWindow):
             return
         self._plot_view.show_cell_image(pixmap)
 
+    def _on_plot_cell_render_changed(self) -> None:
+        """Cell-popup render controls moved: re-render the visible popup.
+
+        The Data-plot keeps its popup open while the Normalize/Low/High/
+        gamma controls are used (they are exempt from the popup auto-dismiss),
+        so tuning them reshapes the shown cell in place — no re-click needed.
+        """
+        if self._plot_last_row is None or not self._plot_view.cell_popup_visible():
+            return
+        try:
+            pixmap = self._resolve_point_cell(self._plot_last_row)
+        except Exception:
+            logger.warning("Plot popup: cell re-render failed", exc_info=True)
+            pixmap = None
+        if pixmap is None:
+            self._plot_view.hide_cell_image()
+        else:
+            self._plot_view.show_cell_image(pixmap)
+
     def _resolve_point_cell(self, row: dict):
         """Crop the single cell for a clicked merged-table row.
 
@@ -2540,10 +2588,17 @@ class MainWindow(QMainWindow):
         (directory match first, then well + field/stack/timepoint) and
         cropped from the selected object mask (fallback: first mask — this
         is a read-only viewer, not annotation, so a substitute mask only
-        changes the outline shown, never written anywhere).
+        changes the outline shown, never written anywhere). With the Data
+        page's "Normalize cell image" checked the crop is rendered
+        SELF-normalized (crop_cell_rgb_normalized): per-channel percentiles
+        of the cell's own nonzero pixels + gamma, independent of the Image
+        page's absolute brightness; unchecked it renders like the Image
+        page (crop_object_rgb). Channel colors and enable state always
+        come from the Image page.
         """
         if self._dm is None:
             return None
+        norm = self._plot_view.cell_render_params()
         label = row.get("label")
         if label is None:
             return None
@@ -2615,12 +2670,19 @@ class MainWindow(QMainWindow):
             return None
 
         ch_config = self._image_controls.get_channel_config()
-        rgb = crop_object_rgb(
-            img_data, mask, int(label), list(ch_config.keys()), ch_config,
-            DTYPE_MAX.get(str(self._dm.img_dtype), 65535.0),
-            self._contrast_method, self._contrast_gamma, self._invert,
-            target_size=96, padding=4,
-        )
+        if norm["normalize"]:
+            rgb = crop_cell_rgb_normalized(
+                img_data, mask, int(label), list(ch_config.keys()), ch_config,
+                norm["low"], norm["high"], norm["gamma"],
+                target_size=96, padding=4,
+            )
+        else:
+            rgb = crop_object_rgb(
+                img_data, mask, int(label), list(ch_config.keys()), ch_config,
+                DTYPE_MAX.get(str(self._dm.img_dtype), 65535.0),
+                self._contrast_method, self._contrast_gamma, self._invert,
+                target_size=96, padding=4,
+            )
         if rgb is None:
             return None
 

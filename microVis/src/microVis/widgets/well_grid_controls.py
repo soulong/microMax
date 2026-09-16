@@ -14,9 +14,8 @@ from PySide6.QtWidgets import (
 from microVis.widgets._event_filter import NoScrollComboBox
 from microVis.widgets.ui_spec import (
     CONTROLS_MARGIN,
-    CONTROLS_MAX_WIDTH,
-    CONTROLS_MIN_WIDTH,
     CONTROLS_SPACING,
+    CONTROLS_WIDTH,
     controls_pane_style,
     form_row,
     small_button,
@@ -34,8 +33,8 @@ class WellGridControls(QScrollArea):
         super().__init__(parent)
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setMinimumWidth(CONTROLS_MIN_WIDTH)
-        self.setMaximumWidth(CONTROLS_MAX_WIDTH)
+        # The ONE control-column width shared by every page's left rail.
+        self.setFixedWidth(CONTROLS_WIDTH)
 
         container = QWidget()
         outer = QVBoxLayout(container)
@@ -50,7 +49,7 @@ class WellGridControls(QScrollArea):
         box.setProperty("class", "panel-box")
         box.setStyleSheet(controls_pane_style())
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(CONTROLS_SPACING)
 
         # Format
@@ -71,13 +70,14 @@ class WellGridControls(QScrollArea):
         layout.addLayout(form_row("Agg", self._agg))
 
         # Select All / Clear stay left; Block Image sits after Clear at the
-        # right edge of the box. Widths follow the captions (no stretching).
-        self._select_all_btn = small_button("Select All")
+        # right edge of the box. Mini style (8pt, tight padding) — the three
+        # captions together must fit the 232px rail without clipping.
+        self._select_all_btn = small_button("Select All", mini_style=True)
         self._select_all_btn.clicked.connect(self.select_all_clicked)
-        self._clear_btn = small_button("Clear")
+        self._clear_btn = small_button("Clear", mini_style=True)
         self._clear_btn.clicked.connect(self.clear_clicked)
         self._image_blocked = False
-        self._image_block_btn = small_button("Block Image")
+        self._image_block_btn = small_button("Block Image", mini_style=True)
         self._image_block_btn.setToolTip(
             "Block image loading and display.\n"
             "Already shown images stay visible."

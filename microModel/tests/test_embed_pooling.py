@@ -148,11 +148,61 @@ def test_extractor_conv_branch_global_mean_pool():
         def __call__(self, x):
             return torch.arange(2 * 6 * 2 * 2, dtype=torch.float32).reshape(2, 6, 2, 2)
 
-    ex = EmbedExtractor(_Conv(), source="cls")   # source ignored on conv
+    ex = EmbedExtractor(_Conv())                 # conv only supports source="patch"
+    assert ex.vit is False
     assert ex.feat_dim == 6
     out = ex(torch.zeros(2, 3, 8, 8))
     assert out.shape == (2, 6)
     assert torch.allclose(out, torch.arange(48, dtype=torch.float32).reshape(2, 6, 2, 2).mean(dim=(2, 3)))
+
+
+def test_conv_forward_features_stubs_route_to_conv_pool():
+    """timm ConvNeXt-style backbones ALSO define forward_features (returning
+    a (B, C, H, W) feature map, not a token grid) — they must route to the
+    conv spatial-mean pool, never the token path that needs
+    num_prefix_tokens. cls sources are a hard config error there."""
+
+    class _ConvLike:
+        num_features = 3
+
+        def forward_features(self, x):
+            b = x.shape[0]
+            return torch.arange(b * 3 * 2 * 2,
+                                dtype=torch.float32).reshape(b, 3, 2, 2)
+
+        def __call__(self, x):
+            return self.forward_features(x).mean(dim=(2, 3))
+
+    conv = _ConvLike()
+    ex = EmbedExtractor(conv)                    # default source="patch"
+    assert ex.vit is False and ex.feat_dim == 3
+    out = ex(torch.zeros(2, 1, 16, 16))
+    assert out.shape == (2, 3)
+    assert torch.allclose(
+        out, conv.forward_features(torch.zeros(2, 1, 16, 16)).mean(dim=(2, 3)))
+    with pytest.raises(MicroMaxError):
+        EmbedExtractor(conv, source="cls")
+    with pytest.raises(MicroMaxError):
+        EmbedExtractor(conv, source="cls_patch")
+
+
+def test_real_convnext_tiny_end_to_end():
+    """Regression for the train crash: a REAL timm convnext_tiny (which
+    exposes forward_features) must pool to (B, 768) without ever touching
+    num_prefix_tokens — and match the backbone's own pooled forward."""
+    timm = pytest.importorskip("timm")
+    net = timm.create_model("convnext_tiny", pretrained=False,
+                            in_chans=1, num_classes=0)
+    net.eval()
+    ex = EmbedExtractor(net)
+    assert ex.vit is False and ex.feat_dim == net.num_features == 768
+    x = torch.rand(2, 1, 64, 64)
+    with torch.no_grad():
+        out = ex(x)
+        expected = net(x)
+    assert out.shape == (2, 768)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, expected, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +268,68 @@ def test_ssl_multiview_default_and_mask_paths():
     m0 = masks[0]                       # numpy uint8 HxW (collate -> tensor)
     assert m0.shape == (32, 32)
     assert not m0[:4, :].any() and m0[4:, :].all()
+
+
+# ---------------------------------------------------------------------------
+# WholeImageCellDataset return_mask paths (the whole-image infer loader)
+# ---------------------------------------------------------------------------
+
+def test_whole_image_default_and_mask_paths(tmp_path):
+    """Both __getitem__ layouts must come back intact: the 4-tuple
+    (tensor, label, stem, bbox) when return_mask is off — regression for the
+    UnboundLocalError that crashed every whole-image inference without mask
+    pooling — and the 5-tuple (+ uint8 foreground mask) when it is on."""
+    import numpy as np
+    import pandas as pd
+    import tifffile
+    from torch.utils.data import DataLoader
+
+    from microModel.dataset import WholeImageCellDataset
+
+    # Real labeled mask on disk (labels 1 and 2, equal-size bboxes so the
+    # default collate can stack the crops — the real path gets uniform sizes
+    # from the bundle's baked resize augmentation).
+    mask = np.zeros((24, 24), dtype=np.uint16)
+    mask[2:10, 2:10] = 1
+    mask[12:20, 12:20] = 2
+    mask_path = tmp_path / "field_cp_masks_cell.tif"
+    tifffile.imwrite(mask_path, mask)
+
+    class _Images:
+        metadata = pd.DataFrame({"well": ["A1"], "mask_cell": [str(mask_path)]})
+
+        @staticmethod
+        def get_cropped_cell(row_idx, label, mask_name, padding=4):
+            # Zero-background crop (everything outside the cell stays 0) so
+            # the return_mask path derives a real foreground mask.
+            crop = np.zeros((24, 24, 1), dtype=np.float32)
+            crop[mask == label] = 1000.0
+            ys, xs = np.where(mask == label)
+            y0, x0 = int(ys.min()), int(xs.min())
+            h, w = int(ys.max()) - y0 + 1, int(xs.max()) - x0 + 1
+            return (crop[y0:y0 + h, x0:x0 + w], None,
+                    (x0, y0, w, h))
+
+    kwargs = dict(channels=[1], normalize_method="per_channel",
+                  clip_low=0.05, clip_high=99.95, with_masking=False,
+                  fixed_reference=False, max_value=65535)
+
+    ds = WholeImageCellDataset(_Images(), "mask_cell", **kwargs)
+    assert len(ds) == 2
+    tensor, label, stem, bbox = ds[0]
+    assert tensor.shape == (1, 8, 8) and tensor.dtype == torch.float32
+    assert isinstance(label, int) and label == 1
+    assert isinstance(stem, str) and stem
+    assert len(bbox) == 4
+    tb, lb, sb, bb = next(iter(DataLoader(ds, batch_size=2)))
+    assert tb.shape == (2, 1, 8, 8) and lb.tolist() == [1, 2]
+
+    ds_m = WholeImageCellDataset(_Images(), "mask_cell", return_mask=True,
+                                 **kwargs)
+    tensor, label, stem, bbox, m = ds_m[0]
+    assert m.shape == (8, 8) and m.dtype == np.uint8 and m.all()
+    tb, lb, sb, bb, mb = next(iter(DataLoader(ds_m, batch_size=2)))
+    assert mb.shape == (2, 8, 8)
 
 
 def test_umap_check_accepts_both_loader_layouts(tmp_path):

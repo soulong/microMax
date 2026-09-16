@@ -74,7 +74,7 @@ from sklearn.decomposition import PCA
 from sklearn.neighbors import kneighbors_graph
 from torch.utils.data import DataLoader
 
-from microBase import CellDataset, MicroMaxError
+from microBase import CellDataset, MicroMaxError, canonical_directory
 
 from .utils import (logger, set_seed, select_device, load_label_csv,
                     load_file_list,
@@ -266,9 +266,15 @@ def _extract_root_features(entry, meta, model, device,
                            dl_cfg, only=None):
     """Full cache-aware extraction for one root.
 
-    Returns (abs_paths, raw_paths, feats): normcase absolute paths + their
-    raw-case originals + float32 features, rows aligned (the raw case feeds
-    the label_from_dir fallback, which must show the folder's real name).
+    Returns (paths, raw_paths, feats): PORTABLE paths + their raw-case
+    originals + float32 features, rows aligned. A portable path is
+    CWD-relative with forward slashes when the file lives under the process
+    CWD, and an absolute forward-slash path otherwise (the canonical_directory
+    convention shared with curated.csv / infer.db) — the cache thus survives
+    moving the working tree and the dataset together. ``paths`` is the
+    normcase identity, ``raw_paths`` keeps the real case (it feeds the
+    label_from_dir fallback, which must show the folder's real name).
+    Consumers that touch the filesystem resolve with os.path.abspath.
     See module docstring for the cache layout.
 
     only: optional iterable of normcase absolute paths restricting the
@@ -351,10 +357,11 @@ def _extract_root_features(entry, meta, model, device,
                                  write_pred_class=False)
     feats = torch.cat(all_feats, dim=0).numpy()
 
-    # Normcase absolute paths (dedup / lookups) plus their raw-case originals
-    # (the label_from_dir fallback reads the folder's real name), aligned
-    # with the feature rows.
-    raw_paths = [os.path.abspath(md.iloc[int(i)]["path"]) for i in indices]
+    # Portable paths (see docstring) plus their raw-case originals (the
+    # label_from_dir fallback reads the folder's real name), aligned with
+    # the feature rows. The cache stores these; consumers resolve them.
+    raw_paths = [canonical_directory(
+        os.path.abspath(md.iloc[int(i)]["path"])) for i in indices]
     paths = [os.path.normcase(p) for p in raw_paths]
 
     os.makedirs(os.path.dirname(cpath), exist_ok=True)
@@ -1170,6 +1177,10 @@ def run_deduplication(config, config_path=None):
         paths, raw_paths, feats = _extract_root_features(
             entry, meta, model, device, output_dir, bundle_id,
             sample_max, seed, dl_cfg, only=entry.get("only"))
+        # The cache stores PORTABLE paths (CWD-relative — see docstring);
+        # the selection pipeline works with absolute filesystem paths.
+        paths = [os.path.abspath(p) for p in paths]
+        raw_paths = [os.path.abspath(p) for p in raw_paths]
         # Label per cell: the file-list CSVs' label column wins, then the
         # label_csv map, else the parent folder name (label_from_dir — the
         # RAW-case path, so the folder's real name is what shows up, not a

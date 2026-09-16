@@ -95,20 +95,36 @@ def test_figures_build():
 
 def test_line_groups_and_sem_points():
     df = _df()
-    fig = P.make_line(df, y="value", x="well", color="condition")
+    fig = P.make_line(df, y="value", x="well", color="condition",
+                      show_points=True)
     ax = fig.axes[0]
     # Raw-points scatter + one errorbar per color group.
     assert len(ax.collections) >= 2
     # X ticks are the 4 well levels (color lives in the legend, NOT on the
-    # x axis) — one connected line per color group spans those levels.
+    # x axis) — one smooth curve per color group spans those levels.
     ticks = {t.get_text() for t in ax.get_xticklabels()}
     assert ticks == {"A0", "A1", "A2", "A3"}
-    # One solid connecting line per color group (2 conditions), each spanning
-    # the 4 wells; errorbar marker lines carry linestyle 'None'.
+    # One smooth fit line per color group (2 conditions), drawn as a DENSE
+    # spline (many more x samples than the 4 wells); errorbar marker lines
+    # carry linestyle 'None'.
     connect_lines = [l for l in ax.lines if l.get_linestyle() == "-"]
     assert len(connect_lines) == 2
     for line in connect_lines:
-        assert len(line.get_xdata()) == 4
+        assert len(line.get_xdata()) > 4
+        assert len(line.get_xdata()) == len(line.get_ydata())
+
+
+def test_line_smooth_curve_defaults():
+    """_smooth_curve: spline for 4+ points, polyline below that; no raises."""
+    xs = [0.0, 1.0, 2.0, 3.0]
+    ys = [0.0, 1.0, 0.5, 2.0]
+    gx, gy = P._smooth_curve(xs, ys)
+    assert len(gx) == len(gy) > 4          # dense spline samples
+    assert gx[0] == 0.0 and gx[-1] == 3.0
+    # Fewer than 4 points: the raw polyline passes through unchanged.
+    assert P._smooth_curve(xs[:3], ys[:3])[0].tolist() == xs[:3]
+    # Degenerate input degrades instead of raising.
+    assert len(P._smooth_curve([1.0, 1.0, 1.0, 1.0], ys)[0]) >= 1
 
 
 def test_make_line_requires_x_semantics():
@@ -198,3 +214,108 @@ def test_legends_sit_outside_the_axes():
         for leg in fig.legends:
             assert leg.get_window_extent().x0 / width >= axes_right - 0.005, (
                 "a legend overlaps the plot area")
+
+
+def test_facets_share_axes_scatter():
+    """Facet panels share limits: wildly different ranges still align."""
+    df = pd.DataFrame({
+        "x": [1.0, 2.0, 300.0, 400.0],
+        "y": [10.0, 20.0, 3000.0, 4000.0],
+        "g": ["p", "p", "q", "q"],
+    })
+    fig = P.make_scatter(df, x="x", y="y", facet_cols=["g"])
+    fig.canvas.draw()  # materialize the shared autoscale limits
+    ax1, ax2 = fig.axes[0], fig.axes[1]
+    assert ax1.get_xlim() == ax2.get_xlim()
+    assert ax1.get_ylim() == ax2.get_ylim()
+
+
+def test_facet_categorical_positions_are_global():
+    """A category missing from one facet still occupies its global slot."""
+    df = pd.DataFrame({
+        "cat": ["b", "a", "a"],          # facet p only has "b"
+        "y": [1.0, 2.0, 3.0],
+        "g": ["p", "q", "q"],
+    })
+    fig = P.make_scatter(df, x="cat", y="y", facet_cols=["g"])
+    fig.canvas.draw()
+    for ax in fig.axes:
+        labels = [t.get_text() for t in ax.get_xticklabels()]
+        assert labels == ["a", "b"]
+    # Facet p's single point must sit at "b"'s global index 1 (not 0).
+    pts = fig.axes[0].collections[0].get_offsets()
+    assert pts[0][0] == 1.0
+
+
+def test_facet_boxplot_positions_are_global():
+    """Boxes land on the same x slots in every facet panel."""
+    df = pd.DataFrame({
+        "x": ["g1", "g2", "g2", "g2"],
+        "y": [1.0, 2.0, 2.5, 3.0],
+        "g": ["p", "q", "q", "q"],
+    })
+    fig = P.make_boxplot(df, y="y", x="x", facet_cols=["g"])
+    fig.canvas.draw()
+    panels = [ax for ax in fig.axes if ax.get_visible()]
+    assert len(panels) == 2
+    for ax in panels:
+        assert [t.get_text() for t in ax.get_xticklabels()] == ["g1", "g2"]
+        assert ax.get_ylim() == panels[0].get_ylim()
+    # Panel p has only g1 — its box must sit at the global slot 1 (not 0).
+    centers = []
+    for patch in panels[0].patches:
+        xs = patch.get_path().vertices[:, 0]
+        centers.append((xs.min() + xs.max()) / 2)
+    assert np.allclose(centers, 1.0)
+
+
+def test_facet_line_positions_are_global():
+    """Line nodes land on the same x slots in every facet panel."""
+    df = pd.DataFrame({
+        "x": ["s1", "s2", "s2", "s2"],
+        "y": [1.0, 2.0, 2.5, 3.0],
+        "g": ["p", "q", "q", "q"],
+    })
+    fig = P.make_line(df, y="y", x="x", facet_cols=["g"])
+    fig.canvas.draw()
+    panels = [ax for ax in fig.axes if ax.get_visible()]
+    assert len(panels) == 2
+    for ax in panels:
+        assert [t.get_text() for t in ax.get_xticklabels()] == ["s1", "s2"]
+    # Facet p's single node sits at s1's global slot 0, facet q's at 1 —
+    # read the errorbar markers (the dots behind carry jitter).
+    for panel, slot in ((panels[0], 0.0), (panels[1], 1.0)):
+        marker_lines = [l for l in panel.lines if l.get_marker() == "o"]
+        assert marker_lines
+        assert np.allclose(np.concatenate(
+            [l.get_xdata() for l in marker_lines]), slot)
+
+
+def test_facet_panels_show_axis_numbers():
+    """Every facet panel shows its own tick numbers despite sharing axes."""
+    df = _df()
+    fig = P.make_scatter(df, x="value", y="area", facet_cols=["field"])
+    for ax in fig.axes:
+        assert all(t.get_visible() for t in ax.get_xticklabels())
+        assert all(t.get_visible() for t in ax.get_yticklabels())
+
+
+def test_line_continuous_x_is_numeric_axis():
+    """Continuous X in line mode: numeric axis + smooth fit of raw y on x
+    (no per-value grouping, no category tick labels)."""
+    grid = np.linspace(0.0, 10.0, 200)
+    df = pd.DataFrame({"x": grid, "y": np.sin(grid), "g": ["p", "q"] * 100})
+    fig = P.make_line(df, y="y", x="x")
+    ax = fig.axes[0]
+    # A real numeric axis: few auto ticks spanning the data range (the
+    # locator pads one step outward), NOT one category per distinct value.
+    ticks = ax.get_xticks()
+    assert ticks.min() <= 0.0 and ticks.max() >= 10.0 and len(ticks) < 12
+    assert ax.get_xlabel() == "x"
+    # One dense smooth fit line; no errorbar nodes on the continuous axis.
+    lines = [l for l in ax.lines if l.get_linestyle() == "-"]
+    assert len(lines) == 1 and len(lines[0].get_xdata()) > 4
+    # Categorical color splits into one fit per level over the same axis.
+    fig2 = P.make_line(df, y="y", x="x", color="g")
+    lines2 = [l for l in fig2.axes[0].lines if l.get_linestyle() == "-"]
+    assert len(lines2) == 2

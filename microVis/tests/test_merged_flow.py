@@ -659,13 +659,13 @@ def test_legacy_relative_dir_click_crops_clicked_site(tmp_path, qt_app,
 
         # Which mask did the crop actually use?
         import microVis.main_window as MW
-        real_crop = MW.crop_object_rgb
+        real_crop = MW.crop_cell_rgb_normalized
         used = {}
         def spy(img_data, mask, label, *a, **k):
             used["mask"] = np.array(mask)
             used["label"] = label
             return real_crop(img_data, mask, label, *a, **k)
-        monkeypatch.setattr(MW, "crop_object_rgb", spy)
+        monkeypatch.setattr(MW, "crop_cell_rgb_normalized", spy)
 
         # Click the scatter point of well B01, label 2 (via its plotted
         # coordinates recovered from the tagged collection).
@@ -702,3 +702,252 @@ def test_mpl_to_qt_xy_flips_and_scales():
     # Canvas corners map to corners.
     assert _mpl_to_qt_xy(600, 1.0, 0, 600) == (0, 0)
     assert _mpl_to_qt_xy(600, 1.0, 0, 0) == (0, 600)
+
+
+def test_cell_render_widget_guard_accepts_non_widgets(qt_app):
+    """The app-wide event filter also delivers non-QWidget watchers
+    (e.g. a QWindow) — the cell-render exemption must not raise on them."""
+    from microVis.widgets.data_plot import DataPlotView
+
+    pv = DataPlotView()
+    try:
+        assert pv._is_cell_render_widget(None) is False
+        assert pv._is_cell_render_widget(123) is False
+        from PySide6.QtGui import QWindow
+        assert pv._is_cell_render_widget(QWindow()) is False
+        assert pv._is_cell_render_widget(pv._cell_low) is True
+        # A child of a control (e.g. the spin box's internal line edit).
+        assert pv._is_cell_render_widget(pv._cell_low.lineEdit()) is True
+        # And the eventFilter itself survives a synthetic non-widget event.
+        from PySide6.QtCore import QEvent
+        win = QWindow()
+        assert pv.eventFilter(win, QEvent(QEvent.Type.MouseButtonPress)) is False
+    finally:
+        pv.deleteLater()
+
+
+# ── DB-only session: everything works without a loaded dataset ────────────────
+
+
+def _db_only_paths(tmp_path):
+    """profiler.db + infer.db describing 4 objects (no images needed)."""
+    entries = [(well, f"{well}_f1_ch1.tiff") for well in WELLS]
+    profiler = tmp_path / "profiler.db"
+    infer = tmp_path / "infer.db"
+    _write_profiler_db(profiler, tmp_path, entries)
+    _write_infer_db(infer, tmp_path, entries)
+    return [profiler, infer]
+
+
+def test_db_merge_and_metadata_merge_without_dataset(qt_app, tmp_path):
+    """Select DB(s) + Excel metadata merge must work with NO dataset loaded."""
+    from microVis.main_window import MainWindow
+
+    win = MainWindow()
+    try:
+        assert win._dm is None  # no dataset loaded
+        win.load_db_files(_db_only_paths(tmp_path))
+
+        assert win._merged is not None
+        assert len(win._merged.table) == 4
+        # The plot view adopted the integrated table and can draw it.
+        assert win._plot_view._df is not None
+        win._plot_view._x_combo.setCurrentText("umap_1")
+        win._plot_view._y_combo.setCurrentText("umap_2")
+        win._plot_view._on_plot()
+        qt_app.processEvents()
+        assert win._plot_view._figure is not None
+        assert "profiler.db + infer.db" in win._data_view._db_status_label.text()
+        # The DB selection enables the metadata browse + clear actions.
+        assert win._data_view.metadata_browse_button.isEnabled()
+
+        # Excel metadata merges into the integrated table without a dataset.
+        import pandas as pd
+        win._metadata_df = pd.DataFrame({"well": WELLS, "batch": [1, 2]})
+        win._on_metadata_merge()
+        assert "batch" in win._plot_view._df.columns
+        assert "(+ metadata)" in win._data_view._db_status_label.text()
+    finally:
+        win.close()
+
+
+def test_write_to_db_without_dataset_asks_location(qt_app, tmp_path, monkeypatch):
+    """Write to DB without a dataset falls back to a save dialog."""
+    from PySide6.QtWidgets import QFileDialog
+
+    from microVis.main_window import MainWindow
+
+    win = MainWindow()
+    try:
+        win.load_db_files(_db_only_paths(tmp_path))
+        import pandas as pd
+        win._metadata_df = pd.DataFrame({"well": WELLS, "batch": [1, 2]})
+        win._on_metadata_merge()
+
+        out = tmp_path / "chosen" / "out.db"
+        monkeypatch.setattr(
+            QFileDialog, "getSaveFileName",
+            staticmethod(lambda *a, **k: (str(out), "SQLite DB (*.db)")))
+        # The success confirmation is a MODAL box — stub it like the main
+        # e2e test does, or the offscreen run blocks forever.
+        from PySide6.QtWidgets import QMessageBox
+        monkeypatch.setattr(
+            QMessageBox, "information",
+            staticmethod(lambda *a, **k: QMessageBox.Ok))
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            staticmethod(lambda *a, **k: QMessageBox.Ok))
+        win._on_write_to_db()
+        assert out.exists()
+
+        # The written file re-loads as a fused table (with the mask tag).
+        from microVis.io.merged_data import MergedData
+        reloaded = MergedData.load([out])
+        assert len(reloaded.table) == 4
+        assert "batch" in reloaded.table.columns
+    finally:
+        win.close()
+
+
+def test_facet_clear_unchecks_all(qt_app):
+    """The facet Clear button unchecks every facet variable in one click."""
+    import pandas as pd
+    from PySide6.QtCore import Qt
+
+    from microVis.widgets.data_plot import DataPlotView
+
+    pv = DataPlotView()
+    try:
+        pv.set_frame(pd.DataFrame({"a": [1, 2], "b": ["x", "y"]}))
+        assert pv._facet_list.count() == 2
+        for i in range(pv._facet_list.count()):
+            pv._facet_list.item(i).setCheckState(Qt.Checked)
+        assert len(pv._facet_selected()) == 2
+        pv._facet_clear_btn.click()
+        assert pv._facet_selected() == []
+    finally:
+        pv.deleteLater()
+
+
+def test_plot_pickers_default_empty(qt_app):
+    """X/Y/Color/Size start EMPTY (no '(none)' item): empty means unset,
+    and the editable combo invites typing to filter-find a column."""
+    import pandas as pd
+
+    from microVis.widgets.data_plot import DataPlotView
+
+    pv = DataPlotView()
+    try:
+        pv.set_frame(pd.DataFrame({"a": [1, 2], "b": [1.0, 2.0],
+                                   "w": ["x", "y"]}))
+        for combo in (pv._x_combo, pv._y_combo, pv._color_combo,
+                      pv._size_combo):
+            assert combo.currentText() == ""
+        # All columns are listed (numeric-only for Size) for the filter.
+        assert pv._x_combo.count() == 3
+        assert pv._size_combo.count() == 2
+        assert "(none)" not in [pv._x_combo.itemText(i)
+                                for i in range(pv._x_combo.count())]
+        # An empty picker is 'unset'; picking a column works as before.
+        assert pv._selected(pv._x_combo) is None
+        pv._x_combo.setCurrentText("a")
+        assert pv._selected(pv._x_combo) == "a"
+    finally:
+        pv.deleteLater()
+
+
+def test_wheel_blocker_passes_through_open_popup(qt_app, monkeypatch):
+    """Wheel inside an OPEN combo popup must reach the popup (scroll the
+    option list) instead of being redirected to the enclosing scroll area."""
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtWidgets import QApplication, QComboBox, QScrollArea, QWidget
+
+    from microVis.app import _WheelBlocker
+
+    host = QScrollArea()
+    inner = QComboBox()
+    host.setWidget(inner)
+    popup = QComboBox()          # stands in for the open popup container
+    child = QWidget(popup)       # the wheel target inside the popup
+
+    def _wheel():
+        return QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(0, 0),
+                           QPoint(0, 120), Qt.NoButton, Qt.NoModifier,
+                           Qt.ScrollUpdate, False)
+
+    monkeypatch.setattr(QApplication, "widgetAt",
+                        staticmethod(lambda *a, **k: child))
+    monkeypatch.setattr(QApplication, "activePopupWidget",
+                        staticmethod(lambda: popup))
+    blocker = _WheelBlocker()
+
+    # Popup "open": the event passes through (False = not consumed).
+    assert blocker.eventFilter(inner, _wheel()) is False
+
+    # Popup closed: the wheel is consumed / redirected (True) so the page
+    # scrolls without changing the combo value.
+    monkeypatch.setattr(QApplication, "activePopupWidget",
+                        staticmethod(lambda: None))
+    assert blocker.eventFilter(inner, _wheel()) is True
+
+
+def test_pane_input_font_matches_data_page(qt_app):
+    """Image-page control panes use the SAME 9pt input text as the Data
+    page (the global stylesheet's 11pt must not leak into the panes)."""
+    from PySide6.QtWidgets import QLabel
+
+    from microVis.widgets.well_grid_controls import WellGridControls
+
+    # The offscreen font database reports identical metrics for 9pt/11pt,
+    # so pin the contract on the style source: every pane input selector
+    # must carry the 9pt content scale.
+    from microVis.widgets.ui_spec import controls_pane_style
+
+    style = controls_pane_style()
+    for selector in ("QComboBox, QDoubleSpinBox, QSpinBox, QSlider, QCheckBox",
+                     "QLabel"):
+        block = style.split(selector, 1)[1].split("}", 1)[0]
+        assert "font-size: 9pt" in block, f"{selector} missing 9pt"
+
+    bar = WellGridControls()
+    try:
+        bar.show()
+        qt_app.processEvents()
+        small = QLabel("Color by")
+        small.setStyleSheet("font-size: 9pt;")
+        # The pane combo resolves to the same metrics as an explicit 9pt.
+        assert bar.column.fontMetrics().height() == small.fontMetrics().height()
+    finally:
+        bar.deleteLater()
+
+
+def test_control_panes_share_fixed_width(qt_app):
+    """Every page's left control rail (Image sidebar, well-grid bar, Data
+    plot column) shares ONE fixed width."""
+    from PySide6.QtWidgets import QApplication, QScrollArea
+
+    from microVis.widgets.data_plot import DataPlotView
+    from microVis.widgets.image_controls import ImageControls
+    from microVis.widgets.ui_spec import CONTROLS_WIDTH
+    from microVis.widgets.well_grid_controls import WellGridControls
+
+    panes = [ImageControls(), WellGridControls()]
+    try:
+        for pane in panes:
+            pane.show()
+        plot = DataPlotView()
+        plot.show()
+        qt_app.processEvents()
+        # Image sidebar + well-grid bar are the rail themselves.
+        for pane in panes:
+            assert pane.width() == CONTROLS_WIDTH, type(pane).__name__
+        # The Data plot column's controls scroll area carries the width.
+        areas = [a for a in plot.findChildren(QScrollArea)
+                 if a.parentWidget() is plot]
+        assert areas[0].width() == CONTROLS_WIDTH
+        QApplication.processEvents()
+    finally:
+        for pane in panes:
+            pane.deleteLater()
+        plot.deleteLater()

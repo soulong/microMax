@@ -80,6 +80,24 @@ def num_prefix_tokens(backbone):
     return int(vit.num_prefix_tokens)
 
 
+def is_vit_backbone(backbone):
+    """True for token-grid backbones, False for conv/feature-map backbones.
+
+    ViT here means either a timm ViT (carries a `num_prefix_tokens`
+    attribute) or the pretrain masked-ViT wrapper (exposes `encode()`;
+    its `.vit` holds the inner ViT). Conv nets like timm's ConvNeXt ALSO
+    define `forward_features` — but it returns a (B, C, H, W) feature map,
+    not a token grid — so `forward_features` alone must never select the
+    token path.
+    """
+    inner = getattr(backbone, "vit", None)
+    if inner is not None and \
+            getattr(inner, "num_prefix_tokens", None) is not None:
+        return True
+    return (hasattr(backbone, "encode")
+            or getattr(backbone, "num_prefix_tokens", None) is not None)
+
+
 def pool_embedding(tokens, num_prefix, source, patch_mask=None):
     """Pool the token grid into an image embedding per source.
 
@@ -123,11 +141,13 @@ def pool_embedding(tokens, num_prefix, source, patch_mask=None):
 class EmbedExtractor(nn.Module):
     """Backbone wrapper whose forward outputs the pooled image embedding (B, D).
 
-    ViT backbones (timm forward_features, or the pretrain masked-ViT wrapper's
-    encode) are pooled on the token grid per `source` (see pool_embedding);
-    conv backbones are globally mean-pooled and source/mask do not apply.
-    mask_weighted enables the binary foreground-patch selection — the mask is
-    then passed per forward call (forward(x, mask=...)).
+    Routing (see is_vit_backbone): ViT backbones (timm ViTs, or the pretrain
+    masked-ViT wrapper's encode) are pooled on the token grid per `source`
+    (see pool_embedding); conv backbones (ConvNeXt & co.) are spatially
+    mean-pooled — source/mask do not apply, `source="patch"` is the only
+    meaningful value (a hard error otherwise: no CLS token exists).
+    mask_weighted enables the binary foreground-patch selection on ViTs —
+    the mask is then passed per forward call (forward(x, mask=...)).
 
     fc_norm: timm applies its final LayerNorm AFTER pooling on the Eva/avg
     path (DINOv3), so the pooled embedding is normed here to stay bit-equal
@@ -140,7 +160,11 @@ class EmbedExtractor(nn.Module):
         self.backbone = backbone
         self.source = validate_embed_source(source)
         self.mask_weighted = bool(mask_weighted)
-        self.vit = hasattr(backbone, "forward_features") or hasattr(backbone, "encode")
+        self.vit = is_vit_backbone(backbone)
+        if not self.vit and self.source != "patch":
+            raise MicroMaxError(
+                f"Error: conv backbone '{type(backbone).__name__}' has no CLS "
+                f"token — embed_source must be 'patch', got {self.source!r}")
         fc = getattr(backbone, "fc_norm", None)
         self.fc_norm = None if fc is None or isinstance(fc, nn.Identity) else fc
         if self.vit:
@@ -152,6 +176,10 @@ class EmbedExtractor(nn.Module):
 
     def forward(self, x, mask=None):
         if not self.vit:
+            # Conv backbones: global spatial mean. timm conv models return
+            # either the (B, C, H, W) feature map (forward_features) or the
+            # already-pooled (B, C) rows (num_classes=0 forward) — and the
+            # stub-based tests pass a (B, N, C) sequence; accept all three.
             out = self.backbone(x)
             if out.ndim == 4:
                 return out.mean(dim=(2, 3))

@@ -1,12 +1,10 @@
-"""Tests for the label app's write/undo/auto mechanics.
+"""Tests for the label app's write/undo mechanics and queue ranking.
 
-Covers the rigorous-write path introduced with the label/ package: the
-auto-annotate pass must fire on BATCH threshold jumps (the old equality
-check silently skipped 19 -> 22 positive jumps), "Remove auto" must reset
-the per-label fired marker, every user action is one undoable op (batch
-applies across several labels included), legacy project DBs migrate to the
-unified label.db, explicit negatives store/export correctly, and the
-leave-one-out review flags inconsistent decisions.
+Covers the AnnotationDB write path (batch applies, undo, exports, legacy
+DB migration), the Collect ranking (exemplar scores, explicit negatives
+pushing lookalikes down, multi-label batches writing every target label),
+the leave-one-out review that flags inconsistent decisions, and the manual
+Refresh-model logistic fits (model scoring, staleness, skips, mode drops).
 """
 
 import os
@@ -121,6 +119,24 @@ def test_undo_restores_previous_state_exactly(tmp_path):
     assert db.undo_last_op(1) is None                  # nothing left
 
 
+def test_old_project_db_migrates(tmp_path):
+    """A pre-op_id project DB opens on the new schema and keeps working."""
+    p = str(tmp_path / "label_multiple.db")
+    conn = sqlite3.connect(p)
+    conn.executescript("""
+        CREATE TABLE cell_labels(cell_id INTEGER, label_id INTEGER,
+            state INTEGER, updated_at TEXT, session_id INTEGER,
+            PRIMARY KEY (cell_id, label_id));
+        INSERT INTO cell_labels VALUES (5, 6, 1, 't', 1);
+    """)
+    conn.commit()
+    conn.close()
+    db = AnnotationDB(p)                            # migration runs here
+    assert db.cell_states()[(5, 6)] == 1            # pre-existing decision
+    db.set_label(5, 6, state=0, session_id=2)       # write on migrated table
+    assert db.cell_states()[(5, 6)] == 0
+
+
 def test_review_items_flags_inconsistent_decisions():
     """A positive sitting next to a negative and far from its own positives
     is flagged first, with the contradicting cell as evidence."""
@@ -145,7 +161,7 @@ def test_review_items_flags_inconsistent_decisions():
 # Server-level: one page of TIFFs + a hand-built embedding space
 # ----------------------------------------------------------------------------
 
-def _make_server(tmp_path, n_cells, min_positives=5):
+def _make_server(tmp_path, n_cells):
     root = tmp_path / "cells"
     root.mkdir(parents=True)
     rng = np.random.default_rng(0)
@@ -157,7 +173,6 @@ def _make_server(tmp_path, n_cells, min_positives=5):
         "model": None,
         "data": {"file_dir": [str(root)], "channels": [1],
                  "channel_layout": None, "max_value": 65535},
-        "auto_label": {"min_positives": min_positives, "threshold": 0.9},
     }
     srv = LabelServer(config, open_browser=False)
     srv.app.run = lambda **kw: None
@@ -168,60 +183,68 @@ def _make_server(tmp_path, n_cells, min_positives=5):
 def _identity_space(srv, n):
     W = np.eye(n, dtype=np.float32)
     srv.engine = SuggestEngine(W, knn_k=1, neg_weight=0.5)
-    srv.ml_engine = None
     srv.cid_row = {cell["cell_id"]: i for i, cell in enumerate(srv.cells)}
     srv.row_cid = {i: cell["cell_id"] for i, cell in enumerate(srv.cells)}
     return W
 
 
-def test_auto_fires_on_batch_jump(tmp_path):
-    """One batch crossing min_positives from below MUST run the auto pass —
-    the old `n_pos == threshold` equality skipped jumps like 4 -> 7."""
+def test_collect_ranking_prefers_lookalikes(tmp_path):
+    """Collect ranks undecided cells by the exemplar score: cells close to
+    the positives lead, unrelated cells trail."""
     srv = _make_server(tmp_path, n_cells=10)
     c = srv.app.test_client()
     W = _identity_space(srv, 10)
-    lb = c.post("/api/labels", json={"name": "mitotic"}).get_json()
-    lid = lb["label_id"]
-    # Cells 7-9 are near-clones of positive cell 0: confident candidates.
-    W[7:10] = W[0] + 0.01
+    # Cells 2-4 become near-clones of positive cell 0.
+    W[2:5] = W[0] + 0.01
     W /= np.linalg.norm(W, axis=1, keepdims=True)
-    fps = [cell["filepath"] for cell in srv.cells[:7]]
-    resp = c.post("/api/annotate_batch", json={
-        "filepaths": fps, "label_id": lid, "state": 1}).get_json()
-    assert resp["ok"] is True
-    assert resp["auto_applied"] == 3                  # cells 7-9 annotated
-    q = c.get(f"/api/queue?mode=label_all&scope=with&label_id={lid}").get_json()
-    autos = [cell for cell in q["cells"] if cell.get("auto")]
-    assert len(autos) == 3
-    # The fired label does NOT re-run on the next write: more positives in
-    # the clone cluster change nothing until Remove auto resets the marker.
-    resp = c.post("/api/annotate_batch", json={
-        "filepaths": [srv.cells[10]["filepath"]], "label_id": lid,
-        "state": 1}).get_json() if len(srv.cells) > 10 else None
-
-
-def test_remove_auto_resets_and_reapplies(tmp_path):
-    """Remove auto clears the auto decisions AND the fired marker, so the
-    next positive write re-runs the pass (fresh, with current scores)."""
-    srv = _make_server(tmp_path, n_cells=10)
-    c = srv.app.test_client()
-    W = _identity_space(srv, 10)
-    lb = c.post("/api/labels", json={"name": "mitotic"}).get_json()
-    lid = lb["label_id"]
-    W[7:10] = W[0] + 0.01
-    W /= np.linalg.norm(W, axis=1, keepdims=True)
+    lid = c.post("/api/labels", json={"name": "mitotic"}).get_json()["label_id"]
     c.post("/api/annotate_batch", json={
-        "filepaths": [cell["filepath"] for cell in srv.cells[:5]],
+        "filepaths": [srv.cells[0]["filepath"]], "label_id": lid, "state": 1})
+    q = c.get(f"/api/queue?scope=undecided&label_id={lid}&limit=10").get_json()
+    names = [cell["filename"] for cell in q["cells"]]
+    assert set(names[:3]) == {"cell_02.tif", "cell_03.tif", "cell_04.tif"}
+    # Every cell carries the score the queue sorted by.
+    assert all(cell["score"] is not None for cell in q["cells"])
+    assert q["cells"][0]["score"] > q["cells"][-1]["score"]
+
+
+def test_explicit_negative_pushes_lookalike_down(tmp_path):
+    """An explicit negative is a ranking term, not just a veto: the cell it
+    resembles loses the top spot to a less similar undecided cell."""
+    srv = _make_server(tmp_path, n_cells=7)
+    c = srv.app.test_client()
+    u = np.zeros(4, dtype=np.float32); u[0] = 1.0
+    v = np.zeros(4, dtype=np.float32); v[1] = 1.0
+    w1 = np.zeros(4, dtype=np.float32); w1[2] = 1.0
+    w2 = np.zeros(4, dtype=np.float32); w2[3] = 1.0
+    def unit(x):
+        return (x / np.linalg.norm(x)).astype(np.float32)
+    W = np.vstack([
+        unit(u + 0.05 * v),                     # 0 positive exemplar
+        unit(u + 0.05 * v + 0.01 * w1),         # 1 positive exemplar
+        unit(u + 0.30 * v),                     # 2 top lookalike
+        unit(u - 0.30 * v),                     # 3 the other lookalike
+        unit(u + 0.30 * v + 0.001 * w1),        # 4 negative ~ clone of 2
+        unit(w1),                               # 5 unrelated
+        unit(w2),                               # 6 unrelated
+    ])
+    srv.engine = SuggestEngine(W, knn_k=1, neg_weight=0.5)
+    srv.cid_row = {cell["cell_id"]: i for i, cell in enumerate(srv.cells)}
+    srv.row_cid = {i: cell["cell_id"] for i, cell in enumerate(srv.cells)}
+    lid = c.post("/api/labels", json={"name": "mitotic"}).get_json()["label_id"]
+    c.post("/api/annotate_batch", json={
+        "filepaths": [srv.cells[0]["filepath"], srv.cells[1]["filepath"]],
         "label_id": lid, "state": 1})
-    j = c.post("/api/auto_clear", json={"label_id": lid}).get_json()
-    assert j["removed"] == 3
-    q = c.get(f"/api/queue?mode=label_all&scope=with&label_id={lid}").get_json()
-    assert q["total"] == 5                            # manual ones survive
-    # One more positive write -> the pass re-runs and re-annotates 7-9.
-    resp = c.post("/api/annotate_batch", json={
-        "filepaths": [srv.cells[5]["filepath"]], "label_id": lid,
-        "state": 1}).get_json()
-    assert resp["auto_applied"] == 3
+    q1 = c.get(f"/api/queue?scope=undecided&label_id={lid}&limit=10").get_json()
+    assert q1["cells"][0]["filename"] == "cell_02.tif"
+    # Mark cell_05 (a clone of the leader) as an explicit negative.
+    c.post("/api/annotate", json={
+        "filepath": srv.cells[4]["filepath"], "label_id": lid, "state": 0})
+    q2 = c.get(f"/api/queue?scope=undecided&label_id={lid}&limit=10").get_json()
+    assert q2["cells"][0]["filename"] == "cell_03.tif"
+    scores1 = {cell["filename"]: cell["score"] for cell in q1["cells"]}
+    scores2 = {cell["filename"]: cell["score"] for cell in q2["cells"]}
+    assert scores2["cell_02.tif"] < scores1["cell_02.tif"]
 
 
 def test_undo_batch_and_multilabel_op(tmp_path):
@@ -258,12 +281,12 @@ def test_undo_batch_and_multilabel_op(tmp_path):
     assert srv.db.cell_states() == {}
 
 
-def test_explicit_negative_powers_and_survives(tmp_path):
-    """Apply − stores explicit negatives that veto the kNN suggestion and
-    survive Remove-auto / clears (only auto rows are ever bulk-removed)."""
+def test_explicit_negative_survives_and_stays_out_of_export(tmp_path):
+    """Apply − stores explicit negatives that stay as ranking terms and
+    never leak into the positive-only training export."""
     srv = _make_server(tmp_path, n_cells=8)
     c = srv.app.test_client()
-    W = _identity_space(srv, 8)
+    _identity_space(srv, 8)
     lid = c.post("/api/labels", json={"name": "mitotic"}).get_json()["label_id"]
     # Cell 0 positive, cell 1 an explicit negative of the same label.
     c.post("/api/annotate_batch", json={
@@ -275,16 +298,12 @@ def test_explicit_negative_powers_and_survives(tmp_path):
     states = srv.db.cell_states()
     assert states[(srv.cells[0]["cell_id"], lid)] == 1
     assert states[(srv.cells[1]["cell_id"], lid)] == 0
-    # A positive write runs the auto pass; the explicit negative is never
-    # touched by it (only undecided cells become auto positives).
-    W[2:5] = W[0] + 0.01
-    W /= np.linalg.norm(W, axis=1, keepdims=True)
-    srv.db.mark_auto_fired(lid)  # below min_positives anyway; keep control
+    # A later positive write leaves the negative untouched.
     resp = c.post("/api/annotate_batch", json={
         "filepaths": [srv.cells[6]["filepath"]], "label_id": lid,
         "state": 1}).get_json()
     assert resp["ok"] is True
-    assert states[(srv.cells[1]["cell_id"], lid)] == 0
+    assert srv.db.cell_states()[(srv.cells[1]["cell_id"], lid)] == 0
     # Export: only the positives.
     df = srv.db.export_frame()
     assert list(df["filepath"]).count(srv.cells[1]["raw_path"]) == 0
@@ -347,39 +366,6 @@ def test_single_exclusivity_and_undo(tmp_path):
     assert (srv.cells[0]["cell_id"], lb) not in states
 
 
-def test_single_auto_skips_positive_holders(tmp_path):
-    """Single mode: the auto pass must never hand a second positive to a
-    cell that already holds another label's positive (exclusivity)."""
-    srv = _make_server(tmp_path, n_cells=8, min_positives=2)
-    c = srv.app.test_client()
-    c.post("/api/label_mode", json={"mode": "single"})
-    W = _identity_space(srv, 8)   # AFTER the switch: cell ids are single-DB
-    la = c.post("/api/labels", json={"name": "class_a"}).get_json()["label_id"]
-    lb = c.post("/api/labels", json={"name": "class_b"}).get_json()["label_id"]
-    # Cells 2/3 are near-clones of A-positive cell 0: the A pass picks them.
-    W[2:4] = W[0] + 0.01
-    W /= np.linalg.norm(W, axis=1, keepdims=True)
-    c.post("/api/annotate_batch", json={
-        "filepaths": [srv.cells[0]["filepath"], srv.cells[1]["filepath"]],
-        "label_id": la, "state": 1})
-    states = srv.db.cell_states()
-    assert states[(srv.cells[2]["cell_id"], la)] == 1
-    # Now cells 6/7 AND the A-holding 2/3 all look like B-positive clones.
-    W[2:4] = W[4] + 0.01
-    W[6:8] = W[4] + 0.01
-    W /= np.linalg.norm(W, axis=1, keepdims=True)
-    srv._bump_engines()
-    c.post("/api/annotate_batch", json={
-        "filepaths": [srv.cells[4]["filepath"], srv.cells[5]["filepath"]],
-        "label_id": lb, "state": 1})
-    states = srv.db.cell_states()
-    # Cells 6/7 (no prior positive) got B; the A-holding 2/3 did NOT.
-    assert states[(srv.cells[6]["cell_id"], lb)] == 1
-    assert states[(srv.cells[7]["cell_id"], lb)] == 1
-    assert (srv.cells[2]["cell_id"], lb) not in states
-    assert states[(srv.cells[2]["cell_id"], la)] == 1
-
-
 def test_export_files_per_mode(tmp_path):
     """Each mode writes its own export CSV; the stores stay separate."""
     srv = _make_server(tmp_path, n_cells=4)
@@ -403,3 +389,150 @@ def test_export_files_per_mode(tmp_path):
         assert "class_x" in f.read()
     with open(multi_csv, encoding="utf-8") as f:
         assert "morph" in f.read()
+
+
+def test_label_colors_stay_distinct(tmp_path):
+    """New labels take the first UNUSED palette color (not the count-based
+    one, so deletions can never cause repeats), and a DB whose labels
+    somehow share a color is repaired on open: the first keeper keeps it,
+    later duplicates get unused colors."""
+    from microModel.label import PALETTE
+    p = str(tmp_path / "l.db")
+    db = AnnotationDB(p)
+    a = db.add_label("a")
+    b = db.add_label("b")
+    # Simulate the historical corruption: two labels, one shared color.
+    conn = sqlite3.connect(p)
+    conn.executemany("UPDATE labels SET color = ? WHERE label_id = ?",
+                     [(PALETTE[0], a["label_id"]), (PALETTE[0], b["label_id"])])
+    conn.commit()
+    conn.close()
+    # A new label skips the taken color instead of counting.
+    c = db.add_label("c")
+    assert c["color"] == PALETTE[1]
+    # Reopening repairs the duplicates: three distinct colors remain.
+    rows = AnnotationDB(p).list_labels()
+    colors = {lb["name"]: lb["color"] for lb in rows}
+    assert len(set(colors.values())) == 3
+    assert colors["a"] == PALETTE[0]            # first keeper keeps it
+    assert colors["b"] not in (colors["a"], colors["c"])
+
+
+def test_manage_negatives_scope_reviews_and_clears(tmp_path):
+    """The Manage 'neg' scope lists exactly the label's explicit negatives,
+    ranked most positive-like first (the likely wrongly-marked ones carry
+    a certainty badge), and Remove clears a selection of them."""
+    srv = _make_server(tmp_path, n_cells=6)
+    c = srv.app.test_client()
+    u = np.zeros(4, dtype=np.float32); u[0] = 1.0
+    v = np.zeros(4, dtype=np.float32); v[1] = 1.0
+    def unit(x):
+        return (x / np.linalg.norm(x)).astype(np.float32)
+    W = np.vstack([u, u, u,                     # 0-2 positives
+                   unit(u + 0.3 * v),           # 3 negative, very pos-like
+                   v, v])                       # 4-5 negatives
+    srv.engine = SuggestEngine(W, knn_k=1, neg_weight=0.5)
+    srv.cid_row = {cell["cell_id"]: i for i, cell in enumerate(srv.cells)}
+    srv.row_cid = {i: cell["cell_id"] for i, cell in enumerate(srv.cells)}
+    lid = c.post("/api/labels", json={"name": "mitotic"}).get_json()["label_id"]
+    c.post("/api/annotate_batch", json={
+        "filepaths": [srv.cells[i]["filepath"] for i in (0, 1, 2)],
+        "label_id": lid, "state": 1})
+    c.post("/api/annotate_batch", json={
+        "filepaths": [srv.cells[i]["filepath"] for i in (3, 4, 5)],
+        "label_id": lid, "state": 0})
+
+    # The neg scope lists exactly the three negatives; most positive-like
+    # first under Certainty descending, each with its certainty badge.
+    q = c.get(f"/api/queue?scope=neg&label_id={lid}"
+              f"&sort=desc&limit=10").get_json()
+    names = [cell["filename"] for cell in q["cells"]]
+    assert names == ["cell_03.tif", "cell_04.tif", "cell_05.tif"]
+    certs = [cell["cert"] for cell in q["cells"]]
+    assert certs[0] > certs[1] and all(cv is not None for cv in certs)
+
+    # Remove the suspicious negative: it vanishes from the scope and its
+    # decision is really gone from the DB.
+    c.post("/api/annotate_batch", json={
+        "filepaths": [srv.cells[3]["filepath"]], "label_id": lid,
+        "state": "clear"})
+    q2 = c.get(f"/api/queue?scope=neg&label_id={lid}"
+               f"&limit=10").get_json()
+    assert [cell["filename"] for cell in q2["cells"]] == \
+        ["cell_04.tif", "cell_05.tif"]
+    assert (srv.cells[3]["cell_id"], lid) not in srv.db.cell_states()
+    # The flipped workflow also works: Apply + makes it a positive again.
+    c.post("/api/annotate_batch", json={
+        "filepaths": [srv.cells[3]["filepath"]], "label_id": lid, "state": 1})
+    assert srv.db.cell_states()[(srv.cells[3]["cell_id"], lid)] == 1
+    # A neg scope without a known label is an error, like with / without.
+    r = c.get("/api/queue?scope=neg&limit=10")
+    assert r.status_code == 400
+
+
+def test_refresh_model_scores_stales_and_skips(tmp_path):
+    """Refresh model fits a per-label logistic scorer: a refreshed label's
+    Collect score becomes the model probability, new writes mark it stale
+    until the next refresh, labels below the exemplar minimum keep the kNN
+    score, and a mode switch drops the fits entirely."""
+    srv = _make_server(tmp_path, n_cells=12)
+    c = srv.app.test_client()
+    u = np.zeros(4, dtype=np.float32); u[0] = 1.0
+    v = np.zeros(4, dtype=np.float32); v[1] = 1.0
+    def unit(x):
+        return (x / np.linalg.norm(x)).astype(np.float32)
+    W = np.vstack(
+        [unit(u + 0.02 * v) for _ in range(5)]     # 0-4 positive exemplars
+        + [unit(v) for _ in range(4)]              # 5-8 explicit negatives
+        + [unit(u + 0.05 * v),                     # 9 undecided, pos-like
+           unit(v + 0.2 * u),                      # 10 undecided, neg-like
+           unit(u + v)])                           # 11 undecided, boundary
+    srv.engine = SuggestEngine(W, knn_k=1, neg_weight=0.5)
+    srv.cid_row = {cell["cell_id"]: i for i, cell in enumerate(srv.cells)}
+    srv.row_cid = {i: cell["cell_id"] for i, cell in enumerate(srv.cells)}
+    lid = c.post("/api/labels", json={"name": "mitotic"}).get_json()["label_id"]
+    lid2 = c.post("/api/labels", json={"name": "tiny"}).get_json()["label_id"]
+    c.post("/api/annotate_batch", json={
+        "filepaths": [cc["filepath"] for cc in srv.cells[:5]],
+        "label_id": lid, "state": 1})
+    c.post("/api/annotate_batch", json={
+        "filepaths": [cc["filepath"] for cc in srv.cells[5:9]],
+        "label_id": lid, "state": 0})
+    # A second label with 2 positives and NO negative — below the fit bar.
+    c.post("/api/annotate_batch", json={
+        "filepaths": [srv.cells[0]["filepath"], srv.cells[1]["filepath"]],
+        "label_id": lid2, "state": 1})
+
+    j = c.post("/api/refresh_model").get_json()
+    assert j["fitted"] == ["mitotic"] and j["skipped"] == ["tiny"]
+    st = c.get("/api/state").get_json()
+    assert st["models_fitted"] == 1 and st["models_stale"] is False
+    # The Collect queue now scores undecided cells with the model
+    # probability: the pos-like cell leads (> 0.5), the neg-like trails
+    # (< 0.5), the boundary cell sits between them.
+    q = c.get(f"/api/queue?scope=undecided&label_id={lid}&limit=10").get_json()
+    by_name = {cell["filename"]: cell["score"] for cell in q["cells"]}
+    assert set(by_name) == {"cell_09.tif", "cell_10.tif", "cell_11.tif"}
+    s9, s10, s11 = (by_name[f"cell_{i:02d}.tif"] for i in (9, 10, 11))
+    assert s9 > s11 > s10 and s9 > 0.5 > s10 and 0 < s11 < 1
+
+    # A new write marks the fit stale but the model keeps scoring — the
+    # undecided cells' scores are unchanged until the next refresh.
+    c.post("/api/annotate_batch", json={
+        "filepaths": [srv.cells[11]["filepath"]], "label_id": lid,
+        "state": 0})
+    st = c.get("/api/state").get_json()
+    assert st["models_stale"] is True
+    q2 = c.get(f"/api/queue?scope=undecided&label_id={lid}&limit=10").get_json()
+    assert {cell["filename"]: cell["score"]
+            for cell in q2["cells"]}["cell_09.tif"] == s9
+    # Refreshing again catches up (and clears the flag).
+    j = c.post("/api/refresh_model").get_json()
+    assert j["fitted"] == ["mitotic"]
+    st = c.get("/api/state").get_json()
+    assert st["models_stale"] is False
+
+    # A mode switch drops the fits — the other DB's decisions must not
+    # leak into them.
+    c.post("/api/label_mode", json={"mode": "single"})
+    assert srv.label_models == {} and srv._model_scores == {}
