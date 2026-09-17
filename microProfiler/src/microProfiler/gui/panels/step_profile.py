@@ -610,7 +610,11 @@ class ImageProfileBlockWidget(QWidget):
                 self._image_ch_cbs.append(cb)
 
                 th_widget = QDoubleSpinBox()
-                th_widget.setRange(-99999.0, 99999.0)
+                # Foreground cutoff compared as img >= threshold on
+                # non-negative intensities — 0 means "no threshold"
+                # (get_thresholds drops it), so the widget cannot hold a
+                # value the config would silently reject.
+                th_widget.setRange(0.0, 99999.0)
                 th_widget.setDecimals(3)
                 th_widget.setValue(0.0)
                 th_widget.setButtonSymbols(QAbstractSpinBox.NoButtons)

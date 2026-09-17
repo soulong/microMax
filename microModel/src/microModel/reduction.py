@@ -479,7 +479,27 @@ def _load_cell_image(d, mode, view):
         return None
 
 
-def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
+def _cached_cell_image(d, mode, view, cache):
+    """Render one DB row through the sheet pipeline, memoized per run.
+
+    The same row is a representative in EVERY resolution's sheet; without
+    the memo each sheet re-decodes, re-crops and re-normalizes it. Keyed by
+    the row's source identity rather than the uid — uid is only unique
+    within one DB, the dicts may span several. mask_filename is part of the
+    key: whole-image rows of the same site and label cropped under
+    different masks render differently; _root anchors stale CWD-relative
+    directory values in resolve_directory, so it belongs to the key too.
+    """
+    key = (d.get("directory"), d.get("_root"), d.get("filename"),
+           d.get("mask_filename"), d.get("label"))
+    if key in cache:
+        return cache[key]
+    img = _load_cell_image(d, mode, view)
+    cache[key] = img
+    return img
+
+
+def _write_cluster_sheet(ids_all, W, dicts, path, mode, view, cache=None):
     """Contact-sheet PDF for one Leiden partition: representative cells per cluster.
 
     Representatives are CONTACT_SHEET_PER_CLUSTER members drawn RANDOMLY from
@@ -494,7 +514,12 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
     EVERY candidate fails it (glass scratches / dust — Leiden groups debris
     coherently) fall back to their unfiltered crops, still titled "no
     cell-like crops". Every cell is rendered as its inference-mode input
-    (bundle augmentation_infer pipeline -> uniform image size).
+    (bundle augmentation_infer pipeline -> uniform image size), memoized in
+    *cache* across sheets.
+
+    Only IDs actually present in *ids_all* get a block — a baseline kNN
+    inherits the baseline's whole ID set, so absent IDs must not become
+    phantom empty columns. Blocks keep their real 1-based IDs in titles.
 
     Layout: cluster blocks fill COLUMN-major (top -> bottom, then the next
     column), at most CONTACT_SHEET_MAX_ROWS rows, and at most
@@ -505,20 +530,19 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
     cluster ID and each page hugs its grid (no blank margins, no bbox
     tightening).
     """
-    n_ids = int(ids_all.max())  # IDs are 1-based
+    cache = {} if cache is None else cache
+    present = np.unique(ids_all)  # realized 1-based IDs, ascending
+    n_ids = len(present)
     n_per = CONTACT_SHEET_PER_CLUSTER
     rows = min(n_ids, CONTACT_SHEET_MAX_ROWS)
     groups = -(-n_ids // rows)  # ceil -> number of cluster-block columns
     per_page = CONTACT_SHEET_GROUPS_PER_PAGE
 
     # ---- Phase A: representatives per cluster (the slow image loading) ----
-    # reps[cid] = (imgs, debris, n_member); imgs=None marks an empty cluster.
+    # reps[cid] = (imgs, debris, n_member) for every present ID.
     reps = {}
-    for cid in range(1, n_ids + 1):
+    for cid in present:
         member = np.where(ids_all == cid)[0]
-        if member.size == 0:
-            reps[cid] = (None, False, 0)
-            continue
         # Per-cluster RNG stream: deterministic across regeneration.
         rng = np.random.default_rng([CONTACT_SHEET_SEED, cid])
         member_W = W[member]
@@ -549,7 +573,7 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
             if len(imgs) >= n_per or scanned >= CONTACT_SHEET_MAX_SCAN:
                 break
             scanned += 1
-            img = _load_cell_image(dicts[idx], mode, view)
+            img = _cached_cell_image(dicts[idx], mode, view, cache)
             if img is None or _foreground_fraction(img) < CONTACT_SHEET_MIN_FOREGROUND:
                 continue
             imgs.append(img)
@@ -561,7 +585,7 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
             for idx in order:
                 if len(imgs) >= n_per:
                     break
-                img = _load_cell_image(dicts[idx], mode, view)
+                img = _cached_cell_image(dicts[idx], mode, view, cache)
                 if img is not None:
                     imgs.append(img)
         if len(imgs) < n_per:
@@ -584,16 +608,13 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
                 rows, page_groups * (n_per + 1),
                 figsize=(1.15 * page_groups * (n_per + 0.45), 1.35 * rows),
                 squeeze=False, gridspec_kw={"width_ratios": width_ratios})
-            first_cid = page_start * rows + 1
-            last_cid = min(first_cid + page_groups * rows, n_ids + 1)
-            for cid in range(first_cid, last_cid):
+            first = page_start * rows            # index into `present`
+            last = min(first + page_groups * rows, n_ids)
+            for pos in range(first, last):
+                cid = int(present[pos])
                 imgs, debris, n_member = reps[cid]
-                g, r = divmod(cid - first_cid, rows)  # column-major in page
+                g, r = divmod(pos - first, rows)  # column-major in page
                 base = g * (n_per + 1)
-                if imgs is None:  # empty cluster: blank block, no title
-                    for j in range(n_per + 1):
-                        axes[r][base + j].axis("off")
-                    continue
                 for j in range(n_per):
                     ax = axes[r][base + j]
                     ax.set_xticks([])
@@ -606,9 +627,10 @@ def _write_cluster_sheet(ids_all, W, dicts, path, mode, view):
                             title += "\nno cell-like crops"
                         ax.set_title(title, fontsize=8)
                 axes[r][base + n_per].axis("off")  # spacer after the group
-            # Trailing cluster slots beyond n_ids on this page stay empty.
-            for cid in range(last_cid, first_cid + page_groups * rows):
-                g, r = divmod(cid - first_cid, rows)
+            # Trailing block slots beyond the last cluster on this page
+            # stay empty.
+            for slot in range(last - first, page_groups * rows):
+                g, r = divmod(slot, rows)
                 base = g * (n_per + 1)
                 for j in range(n_per + 1):
                     axes[r][base + j].axis("off")
@@ -1069,9 +1091,14 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
             channels = list(channels_cfg) if channels_cfg else [1]
             channel_layout = config["data"].get("channel_layout")
             cell_view = _build_cell_view(config, mode, channels, channel_layout)
+            # One render memo for the whole sheet phase: every resolution's
+            # sheet reuses the same representative rows.
+            img_cache = {}
             for d in save_dirs:
                 for res in cluster_res_list:
-                    n_cl = int(cluster_ids[res].max())
+                    # Distinct realized IDs — a baseline kNN inherits the
+                    # baseline's ID set, and only its members are real.
+                    n_cl = len(np.unique(cluster_ids[res]))
                     if n_cl > CONTACT_SHEET_MAX_CLUSTERS:
                         logger.info("Skipping cluster sheet for resolution %g: "
                                     "%d clusters > %d", res, n_cl,
@@ -1080,7 +1107,7 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
                     _write_cluster_sheet(
                         cluster_ids[res], W, dicts_all,
                         os.path.join(d, f"cluster_res{_res_tag(res)}.pdf"),
-                        mode, cell_view)
+                        mode, cell_view, img_cache)
 
     # Phase 7: write per-DB tables
     t0 = time.perf_counter()

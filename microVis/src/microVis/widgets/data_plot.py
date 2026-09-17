@@ -21,15 +21,24 @@ rendering. Channel colors follow the Image page either way.
 
 from __future__ import annotations
 
+import logging
+
 import matplotlib
 import pandas as pd
 
 matplotlib.rcParams["pdf.fonttype"] = 42
 matplotlib.rcParams["ps.fonttype"] = 42
 
-from matplotlib import pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
-from PySide6.QtCore import QEvent, QPoint, Qt, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QRunnable,
+    Qt,
+    Signal,
+    QThreadPool,
+)
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -56,6 +65,8 @@ from PySide6.QtWidgets import (
 
 from microVis._settings import CMAP_OPTIONS, DEFAULT_CMAP, QUALITATIVE_PALETTES
 from microVis.processing import plotting as P
+
+logger = logging.getLogger(__name__)
 from microVis.widgets._event_filter import (
     NoScrollComboBox,
     NoScrollDoubleSpinBox,
@@ -155,6 +166,37 @@ class _CellPopup(QFrame):
         self.raise_()
 
 
+class _PlotRenderSignals(QObject):
+    finished = Signal(int, object)  # (render generation, (figure, info text))
+    error = Signal(int, str)        # (render generation, message)
+
+
+class _PlotRenderWorker(QRunnable):
+    """Builds one chart figure off the GUI thread.
+
+    The chart builders run per-facet groupbys and spline fits over the
+    merged table and assemble thousands of matplotlib artists — seconds on
+    large tables. Figures are constructed WITHOUT pyplot (see
+    plotting._new_grid), so the build touches no global figure manager and
+    is safe off the main thread; the canvas attaches on the GUI thread when
+    the finished figure arrives.
+    """
+
+    def __init__(self, build, gen: int):
+        super().__init__()
+        self.signals = _PlotRenderSignals()
+        self._build = build
+        self._gen = gen
+
+    def run(self) -> None:
+        try:
+            result = self._build()
+            self.signals.finished.emit(self._gen, result)
+        except Exception as e:
+            logger.exception("Plot render failed")
+            self.signals.error.emit(self._gen, str(e))
+
+
 class DataPlotView(QWidget):
     """Plot builder over the merged object table (one per Data page)."""
 
@@ -174,6 +216,9 @@ class DataPlotView(QWidget):
         self._toolbar = None
         self._popup = _CellPopup()
         self._popup_pending_pos = QCursor.pos()
+        # Renders are generation-guarded: a newer Plot click invalidates
+        # the results of every worker still in flight.
+        self._render_gen = 0
         # Any interaction outside the plot canvas dismisses the single-cell
         # popup: application-wide events catch clicks on buttons/pages, wheel
         # and focus changes so the popup never lingers on screen.
@@ -427,6 +472,10 @@ class DataPlotView(QWidget):
     def set_frame(self, df: pd.DataFrame) -> None:
         """Adopt the (re-)merged table and refresh every picker."""
         self._df = df
+        # The pickers rebuild below — a render in flight plots the OLD
+        # frame against the OLD pickers, so invalidate it.
+        self._render_gen += 1
+        self._plot_btn.setEnabled(True)
         names = [c for c in df.columns]
         numeric = [c for c in names
                    if pd.api.types.is_numeric_dtype(df[c])]
@@ -460,6 +509,11 @@ class DataPlotView(QWidget):
         to their construction defaults here.
         """
         self._df = None
+        # A render in flight belongs to the dropped frame — invalidate it
+        # (its handler discards a stale generation) and free the Plot
+        # button for the next frame.
+        self._render_gen += 1
+        self._plot_btn.setEnabled(True)
         self._hide_cell_image()
         self._set_figure(None)
         self._export_btn.setEnabled(False)
@@ -623,6 +677,11 @@ class DataPlotView(QWidget):
         facets = self._facet_selected()
         palette = self._colors_combo.currentText()
         ncols = self._facet_cols.value()
+        # Every picker/control read happens HERE on the GUI thread — the
+        # worker closure only touches plain Python values.
+        size = self._selected(self._size_combo)
+        point_size = self._scatter_size.value()
+        show_points = self._show_points.isChecked()
 
         total_rows = len(df)
         df, err = P.apply_filter(df, self._filter_edit.text())
@@ -638,39 +697,71 @@ class DataPlotView(QWidget):
         if chart == _CHART_SCATTER:
             cap = self._cap_spin.value()
             sub, sampled, total = P.apply_point_cap(df, cap)
-            fig = P.make_scatter(
-                sub, x=x, y=y, color=color, size=self._selected(self._size_combo),
-                facet_cols=facets, palette=palette, cmap=palette,
-                point_size=self._scatter_size.value(), ncols=ncols)
             if sampled:
-                self.info(f"Scatter sampled {len(sub):,} of {total:,} rows "
-                          f"(cap {cap:,}; set 0 for all).{filtered}")
+                info = (f"Scatter sampled {len(sub):,} of {total:,} rows "
+                        f"(cap {cap:,}; set 0 for all).{filtered}")
             else:
-                self.info(f"Scatter: {len(sub):,} rows.{filtered}")
+                info = f"Scatter: {len(sub):,} rows.{filtered}"
         elif chart == _CHART_LINE:
-            fig = P.make_line(df, y=y, x=x, color=color, facet_cols=facets,
-                              palette=palette, ncols=ncols,
-                              show_points=self._show_points.isChecked())
-            self.info(
-                f"Smooth line (mean fit ± SEM): {len(df):,} rows.{filtered}")
+            sub = df
+            info = f"Smooth line (mean fit ± SEM): {len(df):,} rows.{filtered}"
         elif chart == _CHART_BOXPLOT:
-            fig = P.make_boxplot(df, y=y, x=x, color=color, facet_cols=facets,
-                                 palette=palette,
-                                 show_points=self._show_points.isChecked(),
-                                 ncols=ncols)
-            self.info(f"Boxplot: {len(df):,} rows.{filtered}")
+            sub = df
+            info = f"Boxplot: {len(df):,} rows.{filtered}"
         else:
-            fig = P.make_barplot_mean_sem(df, y=y, x=x, color=color,
-                                          facet_cols=facets, palette=palette,
-                                          ncols=ncols)
-            self.info(f"Barplot (mean ± SEM): {len(df):,} rows.{filtered}")
+            sub = df
+            info = f"Barplot (mean ± SEM): {len(df):,} rows.{filtered}"
+
+        def build():
+            if chart == _CHART_SCATTER:
+                fig = P.make_scatter(
+                    sub, x=x, y=y, color=color, size=size,
+                    facet_cols=facets, palette=palette, cmap=palette,
+                    point_size=point_size, ncols=ncols)
+            elif chart == _CHART_LINE:
+                fig = P.make_line(sub, y=y, x=x, color=color,
+                                  facet_cols=facets, palette=palette,
+                                  ncols=ncols, show_points=show_points)
+            elif chart == _CHART_BOXPLOT:
+                fig = P.make_boxplot(sub, y=y, x=x, color=color,
+                                     facet_cols=facets, palette=palette,
+                                     show_points=show_points, ncols=ncols)
+            else:
+                fig = P.make_barplot_mean_sem(sub, y=y, x=x, color=color,
+                                              facet_cols=facets,
+                                              palette=palette, ncols=ncols)
+            return fig, info
+
+        # The figure build (per-facet groupbys, spline fits, thousands of
+        # artists) is the slow part — run it on the thread pool; the canvas
+        # attaches on this thread when the worker delivers the figure.
+        self._render_gen += 1
+        self._plot_btn.setEnabled(False)
+        self.info("Rendering...")
+        worker = _PlotRenderWorker(build, self._render_gen)
+        worker.signals.finished.connect(self._on_render_finished)
+        worker.signals.error.connect(self._on_render_error)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_render_finished(self, gen: int, result) -> None:
+        if gen != self._render_gen:
+            return  # a newer Plot click superseded this render
+        self._plot_btn.setEnabled(True)
+        fig, info = result
+        self.info(info)
         self._set_figure(fig)
+
+    def _on_render_error(self, gen: int, msg: str) -> None:
+        if gen != self._render_gen:
+            return
+        self._plot_btn.setEnabled(True)
+        self.info(f"Render failed: {msg}", error=True)
 
     # ── Figure lifecycle / info / export ──────────────────────────────────
 
     def _set_figure(self, fig) -> None:
-        if self._figure is not None:
-            plt.close(self._figure)
+        # Figures are built without pyplot (no figure manager) — replacing
+        # one simply drops the old figure for garbage collection.
         if self._canvas is not None:
             self._canvas.setParent(None)
             self._canvas.deleteLater()

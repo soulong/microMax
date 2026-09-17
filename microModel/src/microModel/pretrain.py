@@ -923,12 +923,18 @@ def run_pretrain(config, config_path=None):
         if count:
             logger.info("Gram refresh schedule resumed: origin=%d, %d update(s) done",
                         origin, count)
-        elif model._gram_max_updates <= 0:
-            logger.info("Gram refresh disabled (max_updates=0): anchor frozen "
-                        "at the resume model for the whole run")
         else:
-            logger.info("Gram refresh schedule starts fresh at local step 0 "
-                        "(first update after %d batches)", model._gram_update_frequency)
+            # Models without the gram head never get the attribute (treated
+            # as disabled); None means the refresh budget is uncapped, i.e.
+            # the schedule is active and starts fresh on this run's axis.
+            gram_max = getattr(model, "_gram_max_updates", 0)
+            if gram_max is None or gram_max > 0:
+                logger.info("Gram refresh schedule starts fresh at local step 0 "
+                            "(first update after %d batches)",
+                            model._gram_update_frequency)
+            else:
+                logger.info("Gram refresh disabled (max_updates=0): anchor frozen "
+                            "at the resume model for the whole run")
     if resume_type == "transfer":
         # Transfer: short warmup (default 1 epoch) — pretrained weights only
         # need a brief warmup for the fresh optimizer to estimate gradient

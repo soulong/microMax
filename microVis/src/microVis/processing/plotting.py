@@ -17,9 +17,9 @@ import math
 import matplotlib
 import numpy as np
 import pandas as pd
-from matplotlib import pyplot as plt
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
+from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from natsort import natsort_key
 
@@ -142,15 +142,15 @@ def _new_grid(n_panels: int, ncols: int):
     All panels SHARE both axes (facet panels exist to be compared, so
     limits and autoscale stay identical across the grid). The callers
     likewise build every category->position mapping from the FULL table,
-    not per panel.
+    not per panel. The figure is built WITHOUT pyplot (no figure manager)
+    so rendering can run on a worker thread; the Qt widget attaches the
+    canvas later on the GUI thread.
     """
     ncols_eff = max(1, min(ncols, n_panels))
     nrows = int(math.ceil(n_panels / ncols_eff))
-    fig, axes = plt.subplots(
-        nrows, ncols_eff,
-        figsize=(4.6 * ncols_eff, 3.4 * nrows),
-        squeeze=False, sharex=True, sharey=True,
-    )
+    fig = Figure(figsize=(4.6 * ncols_eff, 3.4 * nrows))
+    axes = fig.subplots(nrows, ncols_eff, squeeze=False, sharex=True,
+                        sharey=True)
     axes = list(axes.ravel())
     # Sharing hides the inner panels' tick labels by default — facet panels
     # exist to be compared, so EVERY panel shows its own axis numbers.
@@ -162,7 +162,7 @@ def _new_grid(n_panels: int, ncols: int):
 def _palette_map(values, palette: str) -> dict:
     """Stable value -> RGBA mapping for a categorical column."""
     uniq = _sorted_values(pd.Series(values))
-    cmap = plt.get_cmap(palette)
+    cmap = matplotlib.colormaps[palette]
     # Sequential/qualitative colormaps both work; cycle if there are more
     # categories than entries (keeps the plot drawable, warns via gray tones).
     return {v: cmap((i % max(1, cmap.N - 1)) / max(1, cmap.N - 1))
@@ -427,7 +427,7 @@ def make_scatter(
 
     color_map = None
     norm = None
-    cmap_obj = plt.get_cmap(cmap)
+    cmap_obj = matplotlib.colormaps[cmap]
     if color and color in df.columns:
         if is_continuous(df[color]):
             vals = pd.to_numeric(df[color], errors="coerce")
@@ -647,7 +647,10 @@ def make_barplot_mean_sem(
     for ax, (label, sub) in zip(axes, groups):
         grouped = _group_series(sub, "__y__", keys)
         means = [vals.mean() for _, vals in grouped]
-        sems = [vals.std(ddof=1) / math.sqrt(len(vals)) if len(vals) > 1 else 0.0
+        # A single observation has no SEM — NaN (matplotlib draws no bar)
+        # instead of 0.0, which would read as "mean of many, tiny variance".
+        sems = [vals.std(ddof=1) / math.sqrt(len(vals)) if len(vals) > 1
+                else float("nan")
                 for _, vals in grouped]
         if not means:
             ax.set_visible(False)
@@ -774,7 +777,10 @@ def make_line(
 
         def _mean_sem(vals):
             m = vals.mean()
-            e = vals.std(ddof=1) / math.sqrt(len(vals)) if len(vals) > 1 else 0.0
+            # n=1 has no SEM — NaN keeps the node but draws no error bar
+            # (0.0 would fake certainty for a single observation).
+            e = vals.std(ddof=1) / math.sqrt(len(vals)) if len(vals) > 1 \
+                else float("nan")
             return m, e
 
         if split_color:

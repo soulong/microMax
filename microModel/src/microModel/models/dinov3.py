@@ -976,7 +976,7 @@ def train_step(model, batch, optimizer, epoch, total_epochs, device, criterion,
 
     loss = (model._dino_loss_weight * dg_scale * dino_global
             + model._dino_loss_weight * dl_scale * local_weight * dino_local
-            + model._koleo_loss_weight * n_g * koleo
+            + model._koleo_loss_weight * koleo
             + model._ibot_loss_weight * ibot)
     if gram_loss is not None:
         loss = loss + gram_weight * gram_loss

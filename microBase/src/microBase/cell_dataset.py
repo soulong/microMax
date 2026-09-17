@@ -10,6 +10,7 @@ Optional `image_pattern` parses each filename to extract metadata columns
 infer single_cell mode where per-cell metadata is written to the DB.
 """
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -17,8 +18,10 @@ import pandas as pd
 from natsort import natsorted
 
 from . import io as _io
-from .errors import ConfigError, DataError, DatasetError
+from .errors import ConfigError, DataError, DatasetError, ImageReadError
 from .schema import MetadataSchema
+
+logger = logging.getLogger(__name__)
 
 
 class CellDataset:
@@ -154,13 +157,26 @@ class CellDataset:
         return self
 
     def _auto_detect_image_properties(self):
-        """Read the first cell TIFF to get shape, dtype, and channel count."""
+        """Read the first READABLE cell TIFF to get shape, dtype, and channels.
+
+        Unreadable candidates are skipped (warning) instead of raising — the
+        same policy as ImageDataset: a broken first file must not abort
+        dataset construction, the broken row is quarantined when it is
+        reached. Only when every candidate fails do the properties stay
+        unset.
+        """
         if len(self._metadata) == 0:
             return
-        path = self._metadata.iloc[0]["path"]
-        self._img_shape, n_channels, self._img_dtype = _io.detect_tiff_properties(
-            path, self.channel_layout)
-        self._intensity_colnames = [f"ch{i}" for i in range(1, n_channels + 1)]
+        for _, row in self._metadata.iterrows():
+            try:
+                self._img_shape, n_channels, self._img_dtype = \
+                    _io.detect_tiff_properties(row["path"], self.channel_layout)
+            except ImageReadError as e:
+                logger.warning(
+                    "Skipping unreadable cell TIFF for shape detection: %s", e)
+                continue
+            self._intensity_colnames = [f"ch{i}" for i in range(1, n_channels + 1)]
+            return
 
     def get_cell(self, idx):
         """Read one cell TIFF.

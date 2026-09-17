@@ -149,6 +149,29 @@ def dataset(tmp_path):
     return root
 
 
+def _pump_until(qt_app, cond, timeout_s=10.0,
+                message="condition not reached"):
+    """Pump the Qt event loop until cond() holds.
+
+    The DB merge, the plot render and the Write-to-DB run on the thread
+    pool and deliver through queued signals — a single processEvents()
+    cannot wait for them.
+    """
+    import time
+    deadline = time.monotonic() + timeout_s
+    while not cond() and time.monotonic() < deadline:
+        qt_app.processEvents()
+        qt_app.thread().msleep(5)
+    qt_app.processEvents()
+    assert cond(), message
+
+
+def _wait_merged(window, qt_app):
+    """Wait until the async Select-DB merge has landed."""
+    _pump_until(qt_app, lambda: window._merged is not None,
+                message="DB merge did not finish")
+
+
 # ── The flow simulation ──────────────────────────────────────────────────────
 
 
@@ -157,7 +180,7 @@ def test_merged_db_flow(dataset, window, qt_app):
 
     # ── Select DB: both files of the dataset ──
     window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
-    qt_app.processEvents()
+    _wait_merged(window, qt_app)
 
     assert window._merged is not None
     table = window._merged.table
@@ -193,8 +216,8 @@ def test_merged_db_flow(dataset, window, qt_app):
     pv._y_combo.setCurrentText("area")
     pv._color_combo.setCurrentText("pred_class")
     pv._on_plot()
-    qt_app.processEvents()
-    assert pv._figure is not None
+    _pump_until(qt_app, lambda: pv._figure is not None,
+                message="plot render did not finish")
 
     # ── Left-click a scatter point → popup shows the cropped cell ──
     from matplotlib.backend_bases import MouseEvent
@@ -253,6 +276,7 @@ def test_merged_db_flow(dataset, window, qt_app):
     from PySide6.QtWidgets import QMessageBox
     # Auto-answer the confirm dialog AND auto-dismiss the result dialog —
     # a modal either way would block the offscreen event loop forever.
+    # The stubs must stay installed while the async write completes.
     orig_question = QMessageBox.question
     orig_information = QMessageBox.information
     orig_warning = QMessageBox.warning
@@ -261,14 +285,14 @@ def test_merged_db_flow(dataset, window, qt_app):
     QMessageBox.warning = staticmethod(lambda *a, **k: QMessageBox.Ok)
     try:
         window._on_write_to_db()
+        merge_db = dataset / "merge.db"
+        _pump_until(qt_app, lambda: merge_db.exists(),
+                    message="merged DB write did not finish")
     finally:
         QMessageBox.question = orig_question
         QMessageBox.information = orig_information
         QMessageBox.warning = orig_warning
-    qt_app.processEvents()
 
-    merge_db = dataset / "merge.db"
-    assert merge_db.exists()
     conn = sqlite3.connect(str(merge_db))
     rows = conn.execute(f"SELECT COUNT(*) FROM {MERGED_TABLE}").fetchone()[0]
     cols = {r[1] for r in conn.execute(f"PRAGMA table_info({MERGED_TABLE})")}
@@ -290,7 +314,7 @@ def test_reset_then_reload_restores_plot_area(dataset, window, qt_app):
     which DB was selected afterwards.
     """
     window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
-    qt_app.processEvents()
+    _wait_merged(window, qt_app)
     assert window._data_view._plot_view is window._plot_view
 
     window._on_full_reset()
@@ -310,7 +334,7 @@ def test_reset_then_reload_restores_plot_area(dataset, window, qt_app):
         qt_app.thread().msleep(5)
     assert window._dm is not None, "dataset did not load after reset"
     window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
-    qt_app.processEvents()
+    _wait_merged(window, qt_app)
     assert window._plot_view._df is not None
     # The view is back in the page layout (offscreen windows are never
     # shown, so check ancestry, not isVisible()).
@@ -324,7 +348,7 @@ def test_reset_restores_plot_controls(dataset, window, qt_app):
     the previous DB's columns and options.
     """
     window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
-    qt_app.processEvents()
+    _wait_merged(window, qt_app)
     pv = window._plot_view
     pv._chart_combo.setCurrentText("boxplot")
     pv._filter_edit.setText("area > 1")
@@ -370,13 +394,13 @@ def test_cell_popup_dismissed_on_page_switch_and_outside_click(
     window.show()
     qt_app.processEvents()
     window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
-    qt_app.processEvents()
+    _wait_merged(window, qt_app)
     pv = window._plot_view
     pv._x_combo.setCurrentText("umap_1")
     pv._y_combo.setCurrentText("area")
     pv._on_plot()
-    qt_app.processEvents()
-    assert pv._figure is not None
+    _pump_until(qt_app, lambda: pv._figure is not None,
+                message="plot render did not finish")
 
     def click_first_point():
         ax = pv._figure.axes[0]
@@ -442,7 +466,7 @@ def test_channel_vmin_vmax_follow_integer_dtype(dataset, window, qt_app):
 def test_facet_filter_hides_columns_but_keeps_selection(dataset, window, qt_app):
     """The type-to-filter box hides rows without touching the selection."""
     window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
-    qt_app.processEvents()
+    _wait_merged(window, qt_app)
     pv = window._plot_view
     checked_before = pv._facet_selected()
 
@@ -546,7 +570,7 @@ def test_different_masks_stack_and_log_file_in_dataset(tmp_path, qt_app):
         assert (root / "microVis.log").exists()
 
         win.load_db_files([root / "profiler.db", root / "infer.db"])
-        qt_app.processEvents()
+        _wait_merged(win, qt_app)
         table = win._merged.table
         # nuclei infer rows must NOT fuse with cell profiler rows.
         assert len(table) == 8
@@ -646,7 +670,7 @@ def test_legacy_relative_dir_click_crops_clicked_site(tmp_path, qt_app,
         assert win._dm is not None, "dataset did not load"
 
         win.load_db_files([root / "profiler.db", root / "infer.db"])
-        qt_app.processEvents()
+        _wait_merged(win, qt_app)
         assert win._merged is not None
         assert len(win._merged.table) == 4   # 2 wells x 2 objects, fused
 
@@ -654,8 +678,8 @@ def test_legacy_relative_dir_click_crops_clicked_site(tmp_path, qt_app,
         pv._x_combo.setCurrentText("umap_1")
         pv._y_combo.setCurrentText("umap_2")
         pv._on_plot()
-        qt_app.processEvents()
-        assert pv._figure is not None
+        _pump_until(qt_app, lambda: pv._figure is not None,
+                    message="plot render did not finish")
 
         # Which mask did the crop actually use?
         import microVis.main_window as MW
@@ -747,6 +771,7 @@ def test_db_merge_and_metadata_merge_without_dataset(qt_app, tmp_path):
     try:
         assert win._dm is None  # no dataset loaded
         win.load_db_files(_db_only_paths(tmp_path))
+        _wait_merged(win, qt_app)
 
         assert win._merged is not None
         assert len(win._merged.table) == 4
@@ -755,8 +780,8 @@ def test_db_merge_and_metadata_merge_without_dataset(qt_app, tmp_path):
         win._plot_view._x_combo.setCurrentText("umap_1")
         win._plot_view._y_combo.setCurrentText("umap_2")
         win._plot_view._on_plot()
-        qt_app.processEvents()
-        assert win._plot_view._figure is not None
+        _pump_until(qt_app, lambda: win._plot_view._figure is not None,
+                    message="plot render did not finish")
         assert "profiler.db + infer.db" in win._data_view._db_status_label.text()
         # The DB selection enables the metadata browse + clear actions.
         assert win._data_view.metadata_browse_button.isEnabled()
@@ -780,6 +805,7 @@ def test_write_to_db_without_dataset_asks_location(qt_app, tmp_path, monkeypatch
     win = MainWindow()
     try:
         win.load_db_files(_db_only_paths(tmp_path))
+        _wait_merged(win, qt_app)
         import pandas as pd
         win._metadata_df = pd.DataFrame({"well": WELLS, "batch": [1, 2]})
         win._on_metadata_merge()
@@ -798,7 +824,8 @@ def test_write_to_db_without_dataset_asks_location(qt_app, tmp_path, monkeypatch
             QMessageBox, "warning",
             staticmethod(lambda *a, **k: QMessageBox.Ok))
         win._on_write_to_db()
-        assert out.exists()
+        _pump_until(qt_app, lambda: out.exists(),
+                    message="merged DB write did not finish")
 
         # The written file re-loads as a fused table (with the mask tag).
         from microVis.io.merged_data import MergedData

@@ -644,6 +644,11 @@ def _cluster_groups(W, seed, resolution=None, resolutions=CLUSTER_RESOLUTIONS):
                     "(modularity %.4f)", res, k, mod)
         swept.append((mod, res, k, memb))
     best_mod = max(s[0] for s in swept)
+    if best_mod < 0:
+        # Every swept resolution stayed a single community (their modularity
+        # is -1.0): the documented no-partition outcome — all-zeros labels,
+        # no resolution. Reaching here must not crash the empty `eligible`.
+        return np.zeros(n, dtype=int), None
     eligible = [s for s in swept if s[0] >= best_mod * CLUSTER_MOD_TOL]
     best = min(eligible, key=lambda s: (s[2], s[1]))
     return best[3], best[1]

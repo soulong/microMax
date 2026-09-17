@@ -569,6 +569,9 @@ def run_train(config, config_path=None):
     train_loss_history = []
     val_acc_history = []
     val_f1_history = []
+    # Model selection + early stopping criterion: accuracy for single-label,
+    # macro-F1 for multi-label (exact-match subset accuracy plateaus near
+    # zero once classes multiply, which would starve both mechanisms).
     best_acc = 0.0
     best_state = None
     patience_counter = 0
@@ -639,8 +642,9 @@ def run_train(config, config_path=None):
         val_acc_history.append(acc)
         val_f1_history.append(f1)
 
-        if acc > best_acc:
-            best_acc = acc
+        sel = f1 if multi_label else acc
+        if sel > best_acc:
+            best_acc = sel
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
             marker = " *"
@@ -665,7 +669,8 @@ def run_train(config, config_path=None):
             logger.info("Early stopping at epoch %d", epoch + 1)
             break
 
-    logger.info("Training done. Best val accuracy: %.4f", best_acc)
+    logger.info("Training done. Best validation %s: %.4f",
+                "macro-F1" if multi_label else "accuracy", best_acc)
 
     # ---- Rebuild eval model from best_state ----
     # Must use the backbone that was actually trained (trained_backbone/
@@ -712,7 +717,7 @@ def run_train(config, config_path=None):
             f.write(f"Num classes: {num_classes}\n")
             f.write(f"Classes: {class_names_sorted}\n\n")
             f.write(f"Total epochs: {len(train_loss_history)}\n")
-            f.write(f"Best validation accuracy: {best_acc:.4f}\n\n")
+            f.write(f"Best validation {'macro-F1' if multi_label else 'accuracy'}: {best_acc:.4f}\n\n")
             f.write("Per-epoch metrics:\n")
             f.write(f"{'Epoch':>6}  {'Train Loss':>11}  {'Val Acc':>8}  {'Val F1':>8}\n")
             f.write("-" * 42 + "\n")
@@ -749,7 +754,7 @@ def run_train(config, config_path=None):
         train_loss_history, val_acc_history, val_f1_history, final=True,
         scaler=scaler)
     logger.info("Train bundle saved to %s", bundle_path)
-    logger.info("  num_classes=%d  best_val_acc=%.4f  ssl_method=%s",
+    logger.info("  num_classes=%d  best_val=%.4f  ssl_method=%s",
                 num_classes, best_acc, ssl_method)
 
     return {"best_acc": best_acc, "bundle_path": bundle_path,

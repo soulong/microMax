@@ -567,6 +567,75 @@ class _DatasetLoadWorker(QObject):
             self.error.emit("Dataset load failed")
 
 
+# -- DB Merge Worker --
+
+
+class _MergeSignals(QObject):
+    finished = Signal(int, object)  # (generation, MergedData)
+    error = Signal(int, str)        # (generation, message)
+
+
+class DBMergeWorker(QRunnable):
+    """Merges profiler/infer DBs into ONE integrated table off the UI thread.
+
+    MergedData.load reads every selected SQLite file into pandas and folds
+    them with repeated outer merges — seconds to minutes on large DBs, so
+    it must not run on the GUI thread. The caller guards staleness with a
+    generation counter (a newer selection or a Clear supersedes in-flight
+    merges).
+    """
+
+    def __init__(self, paths, gen: int):
+        super().__init__()
+        self.signals = _MergeSignals()
+        self._paths = list(paths)
+        self._gen = gen
+
+    def run(self) -> None:
+        try:
+            from microVis.io.merged_data import MergedData
+            merged = MergedData.load(self._paths)
+            self.signals.finished.emit(self._gen, merged)
+        except Exception as e:
+            logger.exception("DB merge failed")
+            self.signals.error.emit(self._gen, str(e))
+
+
+# -- Merged-DB Write Worker --
+
+
+class _WriteSignals(QObject):
+    finished = Signal(object)  # (written_path, n_rows)
+    error = Signal(str)
+
+
+class DBWriteWorker(QRunnable):
+    """Writes the integrated merged table into a NEW SQLite DB off the UI
+    thread.
+
+    ``df.to_sql`` of a multi-million-row object table blocks for minutes —
+    the GUI thread only prepares the frame and adopts the result through
+    the signals. The output file is always a NEW database (sources are
+    never modified), so a background write cannot race another writer.
+    """
+
+    def __init__(self, df, out_path, mask=None):
+        super().__init__()
+        self.signals = _WriteSignals()
+        self._df = df
+        self._out = str(out_path)
+        self._mask = mask
+
+    def run(self) -> None:
+        try:
+            from microVis.io.merged_data import write_merged_db
+            written = write_merged_db(self._df, self._out, mask=self._mask)
+            self.signals.finished.emit((written, len(self._df)))
+        except Exception as e:
+            logger.exception("Merged DB write failed")
+            self.signals.error.emit(str(e))
+
+
 # -- Object Export Worker --
 
 

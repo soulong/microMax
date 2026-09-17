@@ -696,14 +696,22 @@ class ImageControls(QScrollArea):
         self._class_select_scroll.setVisible(False)
 
     def _on_remove_class(self) -> None:
-        """Remove the last added class."""
+        """Remove the class named in the input, or the last added one.
+
+        The Del button sits next to the class-name edit, so a typed name
+        wins when it matches an existing class; with an empty (or
+        non-matching) input it falls back to the most recently added class.
+        """
         if not self._class_checkboxes:
             return
-        # Get last class name (dict preserves insertion order in Python 3.7+)
-        name = list(self._class_checkboxes.keys())[-1]
+        typed = self._class_input.text().strip()
+        name = typed if typed in self._class_checkboxes \
+            else list(self._class_checkboxes.keys())[-1]
         cb = self._class_checkboxes.pop(name)
         self._class_select_layout.removeWidget(cb)
         cb.deleteLater()
+        if typed == name:
+            self._class_input.clear()
         # Hide multi-select section if no classes left
         if not self._class_checkboxes:
             self._class_select_label.setVisible(False)

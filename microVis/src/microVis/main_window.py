@@ -43,7 +43,6 @@ from microVis.io import merged_data
 from microVis.io.merged_data import (
     MergedData,
     merge_metadata_into,
-    write_merged_db,
 )
 from microVis.log_utils import get_logger, set_log_file
 from microVis.widgets._event_filter import RotatedLabel
@@ -68,6 +67,8 @@ from microVis.widgets.well_grid_canvas import WellGridCanvas
 from microVis.widgets.well_grid_controls import WellGridControls
 from microVis.worker import (
     CropWorker,
+    DBMergeWorker,
+    DBWriteWorker,
     ImageWorker,
     ImageWorkerConfig,
     crop_cell_rgb_normalized,
@@ -150,6 +151,20 @@ class _RowCache:
         with self._lock:
             self._entries.clear()
             self._total = 0
+
+    def keep_only(self, row_idxs) -> None:
+        """Evict every entry whose row_idx is not in *row_idxs*.
+
+        A filter/well change makes cached rows outside the new selection
+        dead weight, while rows still selected keep their payloads — raw
+        pixels do not depend on the filters — so incremental selection
+        re-renders from RAM instead of re-reading every image from disk.
+        """
+        keep = set(row_idxs)
+        with self._lock:
+            for row_idx in [r for r in self._entries if r not in keep]:
+                _, nbytes = self._entries.pop(row_idx)
+                self._total -= nbytes
 
 
 def _build_meta_label(meta: "pd.DataFrame", row_idx: int,
@@ -260,6 +275,15 @@ class MainWindow(QMainWindow):
         # Full-res zoom cache
         self._thread_pool = QThreadPool.globalInstance()
         self._pending_workers: int = 0
+        # DB-merge generations: a newer selection (or a Clear / dataset
+        # switch) invalidates merges still in flight on the thread pool.
+        self._merge_gen: int = 0
+        self._merge_paths: list | None = None
+        # True while THIS window holds the merge busy override cursor —
+        # exactly one push/pop pair per merge sequence, never leaked.
+        self._merge_busy: bool = False
+        # Output path of the in-flight Write-to-DB (for the error message).
+        self._write_out_path: str | None = None
         # True while a channel-toggle batch is in flight — the batch-finish
         # (in-place pixmap update) must also run when every worker ERRORS,
         # otherwise _pending_workers reaches 0 with no update ever dispatched.
@@ -709,17 +733,33 @@ class MainWindow(QMainWindow):
         self._clear_db_state()
         logger.info("Select DB: %d file(s) — %s",
                     len(paths), ", ".join(Path(x).name for x in paths))
-        try:
-            self._merged = MergedData.load(paths)
-        except Exception as e:
-            logger.warning("Failed to merge DBs %s: %s", paths, e)
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "Invalid DB", str(e))
-            # With no integrated table there is nothing for the metadata
-            # merge to join into — a previously-selected metadata file must
-            # not keep its Merge button enabled.
-            self._data_view.set_meta_browse_enabled(False)
-            return
+        # The merge reads every DB into pandas and folds them with outer
+        # joins — seconds to minutes on large files — so it runs on the
+        # thread pool behind a busy cursor; a newer selection supersedes
+        # in-flight merges via the generation counter.
+        self._merge_gen += 1
+        self._merge_paths = paths
+        if not self._merge_busy:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self._merge_busy = True
+        worker = DBMergeWorker(paths, self._merge_gen)
+        worker.signals.finished.connect(self._on_merged_loaded)
+        worker.signals.error.connect(self._on_merge_failed)
+        self._thread_pool.start(worker)
+
+    def _release_merge_cursor(self) -> None:
+        """Pop the merge busy cursor if this window currently holds it."""
+        if self._merge_busy:
+            self._merge_busy = False
+            QApplication.restoreOverrideCursor()
+
+    def _on_merged_loaded(self, gen: int, merged) -> None:
+        """Merge worker finished: adopt the integrated table (main thread)."""
+        if self._shutting_down or gen != self._merge_gen:
+            return  # a newer selection owns the cursor and the state
+        self._release_merge_cursor()
+        paths = self._merge_paths
+        self._merged = merged
         logger.info("Integrated table: %d rows x %d columns",
                     len(self._merged.table), len(self._merged.table.columns))
 
@@ -743,6 +783,18 @@ class MainWindow(QMainWindow):
         self._populate_overlay_columns()
         self._update_grid()
         self._data_view.set_write_to_db_enabled(True)
+
+    def _on_merge_failed(self, gen: int, msg: str) -> None:
+        if self._shutting_down or gen != self._merge_gen:
+            return
+        self._release_merge_cursor()
+        logger.warning("Failed to merge DBs %s: %s", self._merge_paths, msg)
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.warning(self, "Invalid DB", msg)
+        # With no integrated table there is nothing for the metadata
+        # merge to join into — a previously-selected metadata file must
+        # not keep its Merge button enabled.
+        self._data_view.set_meta_browse_enabled(False)
 
     def _clear_db_state(self) -> None:
         """Drop every loaded/merged DB source: the merged table, the plot
@@ -802,6 +854,12 @@ class MainWindow(QMainWindow):
     def _reset_merged_data(self) -> None:
         """Drop the merged table and the plot view's data."""
         self._merged = None
+        # Any merge still in flight would repopulate the just-dropped state
+        # — invalidate it so its late result is discarded as stale, and
+        # give up the busy cursor it pushed (no handler will claim it).
+        self._merge_gen += 1
+        self._merge_paths = None
+        self._release_merge_cursor()
         self._data_view.set_write_to_db_enabled(False)
         self._data_view.set_clear_db_enabled(False)
         self._data_view.set_db_status("")
@@ -1309,10 +1367,16 @@ class MainWindow(QMainWindow):
             self._metadata_df = parse_plate_metadata(path)
             self._data_view.set_metadata_label(Path(path).name)
 
-        except Exception:
+        except Exception as e:
             logger.exception("Failed to load metadata from %s", path)
             self._metadata_df = None
             self._data_view.set_metadata_label(None)
+            # A rejected file must tell the user why — a silent reset would
+            # leave the Merge button dead with no explanation.
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Metadata Load Failed",
+                f"Could not load plate metadata from:\n{path}\n\n{e}")
 
     def _on_metadata_merge(self) -> None:
         if self._metadata_df is None or self._merged is None:
@@ -1395,26 +1459,32 @@ class MainWindow(QMainWindow):
                 return
         logger.info("Write to DB: %d rows x %d columns -> %s",
                     len(df), len(df.columns), out)
-        try:
-            # A single-mask fused table carries no mask column — pass the
-            # mask explicitly so the written file re-loads under its real
-            # mask (the table name alone would resolve as "merged").
-            mask = (self._merged.masks[0]
-                    if len(self._merged.masks) == 1 else None)
-            written_path = write_merged_db(df, out, mask=mask)
-        except Exception:
-            logger.exception("Failed to write merged DB")
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.warning(
-                self, "Write Failed",
-                f"Could not write {out}. See log for details.")
-            return
+        # A single-mask fused table carries no mask column — pass the
+        # mask explicitly so the written file re-loads under its real
+        # mask (the table name alone would resolve as "merged").
+        mask = (self._merged.masks[0]
+                if len(self._merged.masks) == 1 else None)
+        # to_sql of a large object table blocks for minutes — write on the
+        # thread pool behind a busy cursor; the button stays disabled until
+        # the write lands so a second click cannot start a second write.
+        self._write_out_path = out
+        self._data_view.set_write_to_db_enabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        worker = DBWriteWorker(df, out, mask=mask)
+        worker.signals.finished.connect(self._on_write_finished)
+        worker.signals.error.connect(self._on_write_failed)
+        self._thread_pool.start(worker)
+
+    def _on_write_finished(self, result) -> None:
+        QApplication.restoreOverrideCursor()
+        written_path, n_rows = result
+        self._data_view.set_write_to_db_enabled(True)
         from PySide6.QtWidgets import QMessageBox
         QMessageBox.information(
             self, "Merged DB Written",
-            f"Wrote {len(df):,} rows ({len(df.columns)} columns) to "
+            f"Wrote {n_rows:,} rows to "
             f"{written_path} (table '{merged_data.MERGED_TABLE}').")
-        logger.info("Merged DB written: %s (%d rows)", written_path, len(df))
+        logger.info("Merged DB written: %s (%d rows)", written_path, n_rows)
         # Write-to-DB is an action button — persist patterns + channel
         # colors to session.yml (write-on-action contract).
         if self._session is not None:
@@ -1425,6 +1495,14 @@ class MainWindow(QMainWindow):
                 image_subdir_pattern=subdir_pat,
             )
             self._persist_channel_colors()
+
+    def _on_write_failed(self, msg: str) -> None:
+        QApplication.restoreOverrideCursor()
+        self._data_view.set_write_to_db_enabled(True)
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.warning(
+            self, "Write Failed",
+            f"Could not write {self._write_out_path}. See log for details.")
 
     # ── Grid Handlers ────────────────────────────────────────────────────────
 
@@ -1871,11 +1949,36 @@ class MainWindow(QMainWindow):
             self._mask_cache.clear()
             self._polygon_cache.clear()
         if not use_cache:
-            self._raw_cache.clear()
             self._mask_cache.clear()
             self._polygon_cache.clear()
+            if change == "filters":
+                # Wells/filters changed: prune to the selection instead of
+                # dropping everything — still-selected rows stay cached, so
+                # clicking wells one by one stays incremental.
+                self._prune_raw_cache_to_selection()
+            else:
+                self._raw_cache.clear()
 
         self._dispatch_image_workers(thumb_size, saved_state=saved_state)
+
+    def _prune_raw_cache_to_selection(self) -> None:
+        """Evict raw-cache rows outside the current filter selection.
+
+        Mirrors the row lookup the dispatch itself uses (wells + structural
+        filter widgets). Extra-column filters only ADD restrictions, so rows
+        they exclude may stay cached — harmless, the byte-capped LRU bounds
+        retention anyway.
+        """
+        if self._dm is None or not self._raw_cache:
+            return
+        ic = self._image_controls
+        matches = self._dm.lookup_row_indices(
+            sorted(self._selected_wells),
+            ic.get_selected_fields(),
+            ic.get_selected_stacks(),
+            ic.get_selected_timepoints(),
+        )
+        self._raw_cache.keep_only(row_idx for row_idx, *_ in matches)
 
     def _dispatch_image_workers(self, thumb_size: int, saved_state: dict | None = None,
                                 channel_toggle: bool = False) -> None:

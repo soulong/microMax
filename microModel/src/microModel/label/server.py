@@ -62,6 +62,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import webbrowser
 
 import numpy as np
@@ -201,6 +202,14 @@ class LabelServer:
         self.label_mode = "multi"
         self.db = None
         self.session_id = None
+        # In-memory mirror of the cell_labels table (see _get_states) —
+        # keeps the per-request hot path free of full-table scans.
+        self._states_cache = None
+        self._states_lock = threading.Lock()
+        # Serializes DB write + mirror update in _annotate_core so two
+        # concurrent annotates apply to the DB and the mirror in the SAME
+        # order (the mirror can never diverge from the DB).
+        self._write_lock = threading.Lock()
         self.cells = []            # full DB cell table, ordered by cell_id
         self.cell_by_fp = {}       # portable identity -> cell dict
         self.cid_cell = {}         # cell_id -> cell dict
@@ -494,6 +503,9 @@ class LabelServer:
         self.db = AnnotationDB(self._db_path(mode))
         self.db.set_meta("label_mode", mode)
         self.session_id = self.db.new_session()
+        # The new project store starts empty — drop the previous mode's
+        # states mirror so nothing leaks across the switch.
+        self._states_cache = None
         # The refit models were trained on the OTHER mode's decisions —
         # drop them instead of leaking scores across projects.
         self.label_models.clear()
@@ -729,7 +741,7 @@ class LabelServer:
         if self.engine is None:
             return jsonify({"error": "refresh model needs a model bundle"}), 400
         log = logging.getLogger(__name__)
-        label_rows = self._label_rows(self.db.cell_states())
+        label_rows = self._label_rows(self._get_states())
         fitted, skipped = [], []
         for lb in self.labels_cache:
             lid = lb["label_id"]
@@ -763,6 +775,29 @@ class LabelServer:
     # ------------------------------------------------------------------
     # Payload helpers
     # ------------------------------------------------------------------
+
+    def _get_states(self):
+        """A consistent snapshot of the current decisions as
+        {(cell_id, label_id): state}, from an in-memory mirror of the
+        cell_labels table.
+
+        Queue paging, cluster cards and the header stats read decisions on
+        EVERY request — the mirror keeps those reads off the SQLite table.
+        It loads lazily and is kept in step by the same write paths that
+        touch the DB (_annotate_core mirrors its exact rows); actions that
+        revert rows wholesale (undo, label deletion) drop it for a lazy
+        reload. Callers get a private COPY so they can iterate freely while
+        a concurrent annotate mutates the mirror under the lock.
+        """
+        with self._states_lock:
+            if self._states_cache is None:
+                self._states_cache = self.db.cell_states()
+            return dict(self._states_cache)
+
+    def _drop_states_cache(self):
+        """Invalidate the states mirror (next read reloads from the DB)."""
+        with self._states_lock:
+            self._states_cache = None
 
     def _label_rows(self, states):
         """Per-label positive/negative W rows from the current states."""
@@ -913,6 +948,8 @@ class LabelServer:
         except (TypeError, ValueError):
             return jsonify({"error": f"bad label_id: {data.get('label_id')!r}"}), 400
         removed = self.db.delete_label(lid)
+        # The label's decision rows went with it — drop the mirror.
+        self._drop_states_cache()
         self._refresh_labels()
         self._bump_label(lid)
         # A deleted label cannot keep a model fitted on its decisions.
@@ -974,7 +1011,7 @@ class LabelServer:
             scope = "undecided"
         lids = self._label_ids()
         have_label = label_id is not None and label_id in lids
-        states = self.db.cell_states()
+        states = self._get_states()
         out = []
         for cid in self.cluster_ids:
             rows = np.flatnonzero(self.cluster_memb == cid - 1)
@@ -1090,7 +1127,7 @@ class LabelServer:
             return jsonify({"error": "sort=prob needs a classify "
                                      "bundle"}), 400
 
-        states = self.db.cell_states()
+        states = self._get_states()
         label_rows = self._label_rows(states) \
             if self.engine is not None else {}
         cells = [c for c in self.cells
@@ -1303,7 +1340,12 @@ class LabelServer:
             knn_cert = part.mean(axis=1).astype(np.float32)
         elif len(others) == 1:
             sims = W[rows] @ W[others[0]]
-            # Single other positive: the same top-1 mean.
+            # Same self-exclusion as the multi-positive branch: in the
+            # `with` scope the listed cell may BE that one positive, and
+            # its 1.0 self-similarity is not evidence for itself.
+            self_mask = np.asarray(rows, dtype=np.int64) == others[0]
+            if self_mask.any():
+                sims = np.where(self_mask, -2.0, sims)
             knn_cert = sims.astype(np.float32)
 
         cert = knn_cert
@@ -1375,7 +1417,7 @@ class LabelServer:
                                      "label_id (the queue's label)"}), 400
         source = data.get("source") or None
 
-        states = self.db.cell_states()
+        states = self._get_states()
         cids = []
         for row in np.flatnonzero(self.cluster_memb == cluster_id - 1):
             cid = self.row_cid.get(int(row))
@@ -1444,18 +1486,36 @@ class LabelServer:
             return jsonify({"error": f"unknown cell(s): {unknown[:3]}"
                                       f"{'...' if len(unknown) > 3 else ''}"}), 400
 
-        op_id = self.db.next_op_id()
-        n = self.db.apply_batch(cids, lids, db_state, self.session_id, op_id)
-        if self.label_mode == "single" and db_state == STATE_POS:
-            # Single-label mode is mutually exclusive: a cell holds at most
-            # ONE positive. Keep-set semantics — every positive written by
-            # THIS action stays, all other positives of those cells go
-            # (each logged under the same op, so one undo reverts the
-            # whole action). Negatives are untouched.
-            cleared = self.db.clear_other_positives(cids, lids,
-                                                    self.session_id, op_id)
-            for lid in {lid for _cid, lid in cleared}:
-                self._bump_label(lid)
+        # DB write and mirror update happen under one lock so concurrent
+        # annotates land in the same order on both sides.
+        with self._write_lock:
+            op_id = self.db.next_op_id()
+            n = self.db.apply_batch(cids, lids, db_state, self.session_id,
+                                    op_id)
+            # Mirror the exact rows written into the states cache (state
+            # None means row deletion, mirroring _write_one).
+            with self._states_lock:
+                if self._states_cache is not None:
+                    for cid in cids:
+                        for lid in lids:
+                            if db_state is None:
+                                self._states_cache.pop((cid, lid), None)
+                            else:
+                                self._states_cache[(cid, lid)] = int(db_state)
+            if self.label_mode == "single" and db_state == STATE_POS:
+                # Single-label mode is mutually exclusive: a cell holds at
+                # most ONE positive. Keep-set semantics — every positive
+                # written by THIS action stays, all other positives of those
+                # cells go (each logged under the same op, so one undo
+                # reverts the whole action). Negatives are untouched.
+                cleared = self.db.clear_other_positives(cids, lids,
+                                                        self.session_id, op_id)
+                with self._states_lock:
+                    if self._states_cache is not None:
+                        for pair in cleared:
+                            self._states_cache.pop(pair, None)
+                for lid in {lid for _cid, lid in cleared}:
+                    self._bump_label(lid)
         for lid in lids:
             self._bump_label(lid)
         self._mark_models_stale()
@@ -1478,6 +1538,9 @@ class LabelServer:
         if result is None:
             return jsonify({"ok": True, "undone": False, "n": 0,
                             "message": "nothing to undo"})
+        # The undo rewrote an arbitrary set of rows — drop the mirror and
+        # let the next read reload it from the DB.
+        self._drop_states_cache()
         self._bump_engines()
         self._mark_models_stale()
         self._refresh_labels()
