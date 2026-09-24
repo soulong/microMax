@@ -87,13 +87,14 @@ def test_empty_method_list_fits_nothing(tmp_path):
 
 def test_loaded_reducer_reuse_with_plots_and_clusters(tmp_path):
     """The documented baseline-reuse flow with save_plots=True (CLI default)
-    AND cluster finding — both consume X_fit.
+    AND cluster finding — plots and tables both consume the embedded rows.
 
-    Regression: X_fit took the LOADED reducer's baseline .embedding_ (60
-    baseline rows) while labels/cluster ids belong to the current 40-row
-    dataset — the cluster-ID ordering crashed on the boolean index, and the
-    uncolored plot silently drew baseline coordinates. The loaded reducer
-    must transform the current features for BOTH X_all and X_fit.
+    Regression: the plot embedding took the LOADED reducer's baseline
+    .embedding_ (60 baseline rows) while labels/cluster ids belong to the
+    current 40-row dataset — the cluster-ID ordering crashed on the boolean
+    index, and the uncolored plot silently drew baseline coordinates. The
+    loaded reducer must transform the current features for the tables and
+    the plots alike.
     """
     rng = np.random.default_rng(1)
     feats_a = rng.normal(size=(60, 8)).astype(np.float32)
@@ -143,3 +144,41 @@ def test_loaded_reducer_reuse_with_plots_and_clusters(tmp_path):
     # Every current-dataset uid got a cluster id (1-based).
     assert len(cluster_rows) == len(feats_b)
     assert all(isinstance(r[1], int) and r[1] >= 1 for r in cluster_rows)
+
+
+def test_sample_per_class_never_subsamples_the_fit(tmp_path):
+    """sample_per_class thins ONLY the plot points: the reducers (and the
+    cluster whitening) must be fit on ALL rows even when it is tiny."""
+    rng = np.random.default_rng(2)
+    # Distinct rows so any small subsample's mean differs from the global one.
+    feats = (np.arange(50 * 8, dtype=np.float64).reshape(50, 8)
+             + rng.normal(scale=1e-3, size=(50, 8))).astype(np.float32)
+
+    root = tmp_path / "dataset"
+    root.mkdir()
+    _write_features_db(root / "infer.db", feats)
+
+    config = {
+        "data": {"file_dir": [str(root)]},
+        "inference": {"db_name": "infer.db"},
+        "reduction": {
+            "method": ["pca"],
+            "cluster_res": [],
+            "show_cluster_image": False,
+            "sample_per_class": 2,
+        },
+    }
+    run_reduction(config, save_plots=False, raise_on_error=True)
+
+    # The fitted PCA saw every row: its mean_ equals the full-data mean. (A
+    # fit on a 2-point subsample — the old behavior — would be far off.)
+    with open(root / "reduction_pca.pkl", "rb") as f:
+        pca = pickle.load(f)
+    np.testing.assert_allclose(
+        pca.mean_, feats.mean(axis=0, dtype=np.float64), atol=1e-3)
+
+    # And the table still carries every object.
+    conn = sqlite3.connect(str(root / "infer.db"))
+    rows = conn.execute("SELECT uid FROM reduction_pca ORDER BY uid").fetchall()
+    conn.close()
+    assert len(rows) == len(feats)

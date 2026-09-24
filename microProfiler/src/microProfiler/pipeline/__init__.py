@@ -18,9 +18,14 @@ from microProfiler.pipeline.steps import (
     _build_dataset,
     _is_fit_only_basic,
     _step_will_execute,
+    regenerate_merged_db,
 )
 
 logger = logging.getLogger(__name__)
+
+# Steps that write/read the object DBs whose fused view merged.db holds —
+# a single-step GUI run of one of these refreshes merged.db at the end.
+_DB_OUTPUT_STEPS = frozenset({"image_profile", "object_profile", "inference"})
 
 
 def apply_filters(ds, filters) -> None:
@@ -93,6 +98,10 @@ def run_step(
 
     kwargs = {"result_db": result_db} if step_name in _PROFILE_STEPS else {}
     ds = fn(cfg, ds, root_dir, progress, **kwargs)
+    # A single-step run of a DB-writing step must leave merged.db current,
+    # exactly like the equivalent full-pipeline run.
+    if step_name in _DB_OUTPUT_STEPS:
+        regenerate_merged_db(root_dir)
     if _step_will_execute(cfg, step_name, root_dir, ds=ds) and not (
         step_name == "basic" and _is_fit_only_basic(cfg)
     ):
@@ -169,5 +178,10 @@ def run_pipeline(
             _persist_applied(root_dir, [step_name])
 
     applied_steps = sorted(set(prev_applied) | set(applied_steps))
+
+    # The run's final output: merged.db ALWAYS reflects the current
+    # profiler.db + infer_<model>.db sources when the last step ends —
+    # downstream tools (microVis) load it directly and never merge.
+    regenerate_merged_db(root_dir)
 
     return ds, applied_steps

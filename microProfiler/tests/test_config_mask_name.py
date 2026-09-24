@@ -28,8 +28,8 @@ def test_prefixed_inference_mask_name_is_rejected():
     with pytest.raises(ValueError, match="bare"):
         section_to_dataclass("inference", {
             "run": True,
-            "configs": [{"model": "model.pt", "mask_name": "mask_cell",
-                         "channels": ["ch1"]}],
+            "configs": [{"model": "model.pt", "model_name": "puncta",
+                         "mask_name": "mask_cell", "channels": ["ch1"]}],
         })
 
 

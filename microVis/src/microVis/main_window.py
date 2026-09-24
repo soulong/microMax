@@ -38,7 +38,7 @@ from microVis._settings import (
     QUALITATIVE_PALETTES,
 )
 from microVis.io.data_module import DataModule, _safe_str, aggregate_by_well
-from microBase.db_contracts import DIRECTORY_COLUMN
+from microBase.db_contracts import DIRECTORY_COLUMN, MERGED_DB_NAME, PROFILER_DB_NAME
 from microVis.io import merged_data
 from microVis.io.merged_data import (
     MergedData,
@@ -301,8 +301,9 @@ class MainWindow(QMainWindow):
         self._metadata_df: pd.DataFrame | None = None
         self._metadata_merged: pd.DataFrame | None = None
 
-        # Integrated Data-page table: any mix of profiler.db + infer.db
-        # files of the current dataset, merged per object (io/merged_data).
+        # Integrated Data-page table: the dataset's merged.db (the
+        # pipeline's fused per-mask output — possibly many tables), read
+        # through io/merged_data.
         self._merged: MergedData | None = None
 
         self._build_ui()
@@ -699,8 +700,40 @@ class MainWindow(QMainWindow):
                 out.append(p)
         return out
 
+    @staticmethod
+    def _auto_db_paths(dataset_dir) -> list[str]:
+        """DB file the Data page auto-selects after loading a dataset.
+
+        merged.db (the pipeline's fused per-mask output — possibly many
+        tables, one per mask) is THE source; a dataset without it falls
+        back to a plain profiler.db. Anything else stays a manual
+        Select DB job.
+        """
+        d = Path(dataset_dir)
+        if (d / MERGED_DB_NAME).exists():
+            return [str(d / MERGED_DB_NAME)]
+        if (d / PROFILER_DB_NAME).exists():
+            return [str(d / PROFILER_DB_NAME)]
+        return []
+
+    def _auto_load_db_selection(self) -> None:
+        """Auto-pick the DB selection for the freshly loaded dataset.
+
+        Runs the same load_db_files path as a manual Select DB (async merge,
+        status label, grid/overlay columns), so the Data page shows the
+        integrated table without a second click.
+        """
+        paths = self._auto_db_paths(self._dataset_dir)
+        if not paths:
+            logger.info("No DB file in %s — Data page left unselected",
+                        self._dataset_dir)
+            return
+        logger.info("Auto-loading DB(s): %s",
+                    ", ".join(Path(p).name for p in paths))
+        self.load_db_files(paths)
+
     def _on_select_db_browse(self) -> None:
-        """Open a file dialog for profiler.db and/or infer.db files.
+        """Open a file dialog for a DB file (merged.db by default).
 
         Works with or without a loaded dataset — the merge + plot chain is
         dataset-independent (see load_db_files).
@@ -866,16 +899,21 @@ class MainWindow(QMainWindow):
         self._plot_view.clear()
 
     def _update_db_status(self) -> None:
-        """Show the fused DB sources next to Select DB.
+        """Show the loaded DB source(s) next to Select DB.
 
-        Format: ``a.db + b.db (+ metadata) -> merge``.
+        One source (the usual merged.db) reads as just its name; a manual
+        multi-file selection keeps ``a.db + b.db (+ metadata) -> merge``.
         """
         if self._merged is None:
             self._data_view.set_db_status("")
             return
         names = [Path(p).name for p in self._merged.paths]
         suffix = " (+ metadata)" if self._metadata_merged is not None else ""
-        self._data_view.set_db_status(" + ".join(names) + suffix + " -> merge")
+        if len(names) == 1:
+            self._data_view.set_db_status(names[0] + suffix)
+        else:
+            self._data_view.set_db_status(
+                " + ".join(names) + suffix + " -> merge")
 
     def _refresh_merged_plot(self) -> None:
         """Re-apply the Excel metadata merge and feed the plot view."""
@@ -1029,6 +1067,11 @@ class MainWindow(QMainWindow):
             # Initial render
             self._update_grid()
             self._schedule_image_refresh()
+
+            # Auto-load the dataset's merged.db (else profiler.db) for the
+            # Data page — the same path as a manual Select DB, so a later
+            # manual pick simply replaces it.
+            self._auto_load_db_selection()
         except Exception:
             logger.exception("Failed to initialize UI for dataset %s", p)
             import traceback

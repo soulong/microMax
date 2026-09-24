@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from microProfiler.gui.dpi import dp
 from microProfiler.gui.ui_spec import SIDEBAR_WIDTH
+from microProfiler.user_defaults import get_user_defaults
 
 
 def _make_divider() -> QFrame:
@@ -141,11 +142,18 @@ class Sidebar(QWidget):
         self._vmax_spin.valueChanged.connect(lambda _: self._emit_display_range())
         layout.addLayout(_make_spin_row("vmax", self._vmax_spin, "Upper percentile bound for display contrast"))
 
-        # Thread count spinbox
+        # Thread count spinbox. Restored from the shared ~/.micromax
+        # (sidebar.threads) so the last used worker count survives restarts;
+        # missing/invalid values fall back to half the CPUs. setValue happens
+        # BEFORE the valueChanged connect so the restore emits no signal.
         n_cpu = os.cpu_count() or 1
         self._thread_spin = QSpinBox()
         self._thread_spin.setRange(1, 64)
-        self._thread_spin.setValue(max(1, n_cpu // 2))
+        try:
+            threads = int((get_user_defaults().get("sidebar") or {}).get("threads", 0))
+        except (TypeError, ValueError):
+            threads = 0
+        self._thread_spin.setValue(threads if 1 <= threads <= 64 else max(1, n_cpu // 2))
         self._thread_spin.setToolTip("Number of worker processes for parallel profiling")
         self._thread_spin.valueChanged.connect(self.thread_count_changed.emit)
         layout.addLayout(_make_spin_row("Thread", self._thread_spin, "Number of worker processes for parallel profiling"))
@@ -181,6 +189,10 @@ class Sidebar(QWidget):
     def set_action_buttons_enabled(self, enabled: bool) -> None:
         """Enable/disable Run All (disabled while a run is active)."""
         self._run_all_btn.setEnabled(enabled)
+
+    def thread_count(self) -> int:
+        """Current Thread spin value (profiling worker count)."""
+        return self._thread_spin.value()
 
     def _emit_display_range(self) -> None:
         self.display_range_changed.emit(self._vmin_spin.value(), self._vmax_spin.value())

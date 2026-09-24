@@ -62,6 +62,8 @@ from .patterns import (
 from .db_contracts import (
     PROFILER_DB_NAME,
     INFER_DB_NAME,
+    INFER_DB_STEM_PREFIX,
+    MERGED_DB_NAME,
     IMAGE_TABLE,
     INFERENCE_TABLE,
     REDUCTION_TABLE_PREFIX,
@@ -86,6 +88,8 @@ from .db_contracts import (
     reserved_inference_columns,
     mask_column,
     bare_mask_name,
+    infer_db_file_name,
+    model_name_from_infer_db,
     sql_ident,
     is_numeric_sql_type,
     canonical_directory,
@@ -100,6 +104,8 @@ from .db_merge import (
     read_infer_frames,
     fuse_frames,
     merge_dbs,
+    absorb_infer_db,
+    build_merged_db,
     write_merged_db,
 )
 
@@ -135,6 +141,8 @@ __all__ = [
     "DEFAULT_IMAGE_SUBDIR_PATTERN",
     "PROFILER_DB_NAME",
     "INFER_DB_NAME",
+    "INFER_DB_STEM_PREFIX",
+    "MERGED_DB_NAME",
     "IMAGE_TABLE",
     "INFERENCE_TABLE",
     "REDUCTION_TABLE_PREFIX",
@@ -159,6 +167,8 @@ __all__ = [
     "reserved_inference_columns",
     "mask_column",
     "bare_mask_name",
+    "infer_db_file_name",
+    "model_name_from_infer_db",
     "sql_ident",
     "is_numeric_sql_type",
     "canonical_directory",
@@ -171,6 +181,8 @@ __all__ = [
     "read_infer_frames",
     "fuse_frames",
     "merge_dbs",
+    "absorb_infer_db",
+    "build_merged_db",
     "write_merged_db",
 ]
 

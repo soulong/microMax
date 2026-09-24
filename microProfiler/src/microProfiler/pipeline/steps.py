@@ -19,7 +19,7 @@ from microBase.db_contracts import IMAGE_TABLE, PROFILER_DB_NAME
 from microProfiler.config import (
     SECTION_ATTRS,
     PipelineConfig,
-    resolve_inference_db,
+    infer_db_name,
 )
 from microProfiler.io import Database, rebuild_dataset
 from microProfiler.pipeline.errors import MetadataValidationError
@@ -305,42 +305,24 @@ def _run_object_profile(
     return rebuild_dataset(ds)
 
 
-def _auto_merge_infer(root_dir: Path, entry, infer_db: Path) -> None:
-    """Merge one inference block's results with the profiler objects of the
-    SAME mask into ``merge_<mask>.db`` next to the dataset.
+def regenerate_merged_db(root_dir: Path) -> None:
+    """Rebuild ``<dataset>/merged.db`` from profiler.db + every infer DB.
 
-    The mask comes from the infer DB's `mask_name` column (written by
-    microModel), falling back to the config entry; the profiler table is
-    matched by the table-name convention (the table must be named after its
-    mask — a previous merge output carries a `mask` column instead). Source
-    DBs are never modified.
+    Called at the end of every pipeline run (and after GUI single-step runs
+    of the DB-writing steps), so the merged output ALWAYS exists and ALWAYS
+    reflects the current sources — downstream (microVis) reads merged.db
+    directly and never merges anything itself. Failures are logged, never
+    raised: a merge problem must not lose the just-written inference or
+    profiling results (the next run rebuilds the file).
     """
     from microBase import db_merge
 
-    infer_frames = db_merge.read_infer_frames(str(infer_db))
-    # The infer DB itself names its mask (mask_name column, written by
-    # microModel); fall back to the config entry.
-    mask = (infer_frames[0].mask if infer_frames else None) or entry.mask_name
-    if not mask:
-        logger.warning("Auto-merge skipped: no mask name for %s", infer_db.name)
-        return
-
-    profiler_db = root_dir / PROFILER_DB_NAME
-    obj_frames: list = []
-    if profiler_db.exists():
-        obj_frames = [f for f in db_merge.read_profiler_frames(str(profiler_db))
-                      if f.mask == mask]
-    if not obj_frames:
-        logger.warning(
-            "Auto-merge skipped: %s has no object table for mask '%s' "
-            "(profile this mask first)", profiler_db.name, mask)
-        return
-
-    fused = db_merge.fuse_frames(obj_frames + infer_frames, default_mask=mask)
-    out = root_dir / f"merge_{mask}.db"
-    db_merge.write_merged_db(fused, out, mask=mask)
-    logger.info("Auto-merge: %d rows x %d columns -> %s",
-                len(fused), len(fused.columns), out.name)
+    try:
+        out = db_merge.build_merged_db(root_dir)
+        if out:
+            logger.info("merged.db ready: %s", out)
+    except Exception:
+        logger.warning("Building merged.db failed", exc_info=True)
 
 
 def _run_inference(
@@ -351,16 +333,25 @@ def _run_inference(
 ):
     """Per-object inference with trained microModel bundles (whole-image).
 
-    Each enabled block runs run_inference (+ optional plot-less PCA/UMAP
-    reduction) writing <dataset>/<output_db>. microModel is imported lazily —
-    a missing install raises RuntimeError (GUI popup; CLI hard-exits on the
-    batch-level pre-check in cli.main before any dataset is touched).
+    Each enabled block runs microModel inference (+ optional DR reduction)
+    into the transient scratch file ``_infer_raw.db`` (microModel's raw CLI
+    layout), then ABSORBS it into the block's per-model DB
+    ``infer_<model_name>.db``: one wide table per mask (inference +
+    reduction + find_cluster columns uid-joined, table name = mask name),
+    so the per-model DB has the same structure as profiler.db. The scratch
+    file is deleted after a successful absorb and kept on failure (the
+    results must not be lost; the next run overwrites it). microModel is
+    imported lazily — a missing install raises RuntimeError (GUI popup; CLI
+    hard-exits on the batch-level pre-check in cli.main before any dataset
+    is touched).
     """
     section = cfg.inference
     if not section or not section.run or not section.configs:
         return ds
 
+    from microBase import db_merge
     from microProfiler.pipeline._micromodel_bridge import (
+        SCRATCH_INFER_DB_NAME,
         _build_mm_inference_config,
         _call_micromodel,
         run_mm_inference,
@@ -394,8 +385,12 @@ def _run_inference(
             raise RuntimeError(f"Model bundle not found: {model_path}")
 
         mm_cfg = _build_mm_inference_config(entry, cfg, ds, root_dir)
-        db_name = resolve_inference_db(entry)
-        label = f"{entry.mask_name or 'objects'} -> {db_name}"
+        db_name = infer_db_name(entry)
+        scratch = root_dir / SCRATCH_INFER_DB_NAME
+        # A stale scratch (a previous run died between inference and
+        # absorb) is this block's business — start clean.
+        scratch.unlink(missing_ok=True)
+        label = f"{entry.mask_name} -> {db_name}"
         progress.step_start(
             f"inference ({label})",
             f"Inferring objects with {os.path.basename(entry.model)} ({label})...",
@@ -418,29 +413,34 @@ def _run_inference(
             )
             progress.step_end(f"reduction ({label})", f"Reduction complete ({label})")
 
-        # Auto-merge this block's infer results with the profiler objects
-        # of the same mask -> merge_<mask>.db (a merge problem must not
-        # lose the just-written inference results, so only log failures).
+        # Absorb the raw microModel tables into the per-model DB (one table
+        # per mask). On failure the scratch file SURVIVES — deleting it
+        # would throw the just-computed results away; the next run
+        # overwrites it.
         try:
-            _auto_merge_infer(root_dir, entry, root_dir / db_name)
+            db_merge.absorb_infer_db(
+                scratch, root_dir / db_name, default_mask=entry.mask_name)
+            scratch.unlink(missing_ok=True)
         except Exception:
-            logger.warning("Auto-merge failed for mask '%s'",
-                           entry.mask_name, exc_info=True)
+            logger.warning(
+                "Absorbing %s into %s failed — the raw file is kept",
+                SCRATCH_INFER_DB_NAME, db_name, exc_info=True)
         if first_ran is None:
             first_ran = entry
         ran_any = True
 
     # Remember this run's inference choices at user level (~/.micromax):
     # the Inference panel pre-fills new runs with the last run's model /
-    # reducer(s) / cluster.pkl. Only saved when at least one block actually
-    # ran, and only from the FIRST block that ran (the GUI's "+ Add" copies
-    # it) — a skipped block 0 must not overwrite the remembered values. A
-    # run with both groups unchecked carries no `reduction` key — the
-    # remembered reducer/cluster paths stay untouched then.
+    # model name / reducer(s) / cluster.pkl. Only saved when at least one
+    # block actually ran, and only from the FIRST block that ran (the GUI's
+    # "+ Add" copies it) — a skipped block 0 must not overwrite the
+    # remembered values. A run with no reduction configured carries no
+    # `reducer`/`cluster` update — the remembered paths stay untouched then.
     if ran_any and first_ran is not None:
         try:
             updates = {"model": os.path.abspath(first_ran.model)
-                       if first_ran.model else None}
+                       if first_ran.model else None,
+                       "model_name": first_ran.model_name}
             if first_ran.reduction is not None:
                 updates["reducer"] = first_ran.reduction.reducer
                 updates["cluster"] = first_ran.reduction.cluster

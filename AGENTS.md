@@ -54,15 +54,17 @@ Console scripts after install:
 
 * The tools talk to each other through **on-disk artifacts**: TIFF images,
   segmentation masks, `profiler.db` (profiling, owned by microProfiler, read
-  by microVis), `infer.db` (predictions/features, owned by microModel), and
+  by microVis), `infer_<model name>.db` + `merged.db` (per-model inference
+  results and the dataset-wide fused table, owned by microProfiler), and
   per-dataset `session.yml` (deep-merged by microProfiler and microVis so
   each tool owns its own keys; microModel does NOT use session.yml — it
   reads patterns from its own config files).
 
 * `microProfiler` produces the dataset (TIFFs, masks, `profiler.db`,
-  `session.yml`) that `microVis` and `microModel` consume. The tools may
-  also be used independently: microModel accepts pre-cropped single-cell
-  folders (e.g. exported by microVis) or whole-image datasets with masks.
+  `merged.db`, `session.yml`) that `microVis` and `microModel` consume. The
+  tools may also be used independently: microModel accepts pre-cropped
+  single-cell folders (e.g. exported by microVis) or whole-image datasets
+  with masks.
 
 ***
 
@@ -101,8 +103,8 @@ Module map (overview):
 | `image_dataset.py` | Whole-image loader: regex metadata, masks, LRU cache, cell cropping                      |
 | `cell_dataset.py`  | Pre-cropped single-cell TIFF loader (one TIFF per cell)                                  |
 | `patterns.py`      | Default regex patterns for common microscope file layouts                                |
-| `db_contracts.py`  | Shared profiler.db / infer.db table+column names and SQL helpers                          |
-| `db_merge.py`      | Mask-aware merge of profiler/infer DBs into fused per-object tables (+ merge-DB writer)    |
+| `db_contracts.py`  | Shared profiler.db / infer DB / merged.db table+column names and SQL helpers               |
+| `db_merge.py`      | Mask-aware fusion of profiler-style object tables; absorbs raw microModel infer DBs into per-model per-mask tables; builds `merged.db` |
 | `errors.py`        | Exception hierarchy (`MicroMaxError`, `ImageReadError`, `ConfigError`, ...)                |
 
 Key concepts:
@@ -180,14 +182,16 @@ Package layout (overview):
 
 * `user_defaults.py` — per-user GUI defaults in the shared file `~/.micromax`
   (microProfiler's `microprofiler` section; key-merged, atomic): the
-  inference step records the last run's model / reducer(s) / cluster.pkl
-  there and the GUI panel pre-fills from it — a remembered reducer/cluster
-  path IS the run flag (the old DR/Cluster group checkboxes are gone: an
-  empty path means the stage is skipped). The main
-  window also stores/restores its size in the `window` sub-section. A
+  inference step records the last run's model / model name / reducer(s) /
+  cluster.pkl there and the GUI panel pre-fills from it — a remembered
+  reducer/cluster path IS the run flag (the old DR/Cluster group checkboxes
+  are gone: an empty path means the stage is skipped). The main
+  window also stores/restores its size in the `window` sub-section, and the
+  sidebar's Thread spin (profiling worker count, pushed to the profiling
+  panels) in the `sidebar` sub-section (`threads`). A
   missing file is ignored at startup; after the first run the file is
-  (re)created and completed with every known key (window, model,
-  reducer(s), cluster) so it can be hand-edited. This file is GUI
+  (re)created and completed with every known key (window, sidebar threads,
+  model, reducer(s), cluster) so it can be hand-edited. This file is GUI
   preferences only — the pipeline run config is a separate YAML passed to
   the CLI.
 
@@ -224,19 +228,32 @@ The pipeline:
 * The optional inference step lazily imports microModel to run per-object
   inference and optional DR reduction / cluster prediction (one or more
   pre-fitted reducer pickles of any DR mix, and/or a baseline cluster.pkl
-  that kNN-predicts the find_cluster table), writing a per-block DB under
-  the dataset dir and remembering the used model / reducer(s) / cluster.pkl
-  in `~/.micromax` (user level — the next run defaults to them). Each
-  finished block is then AUTO-MERGED with the
-  profiler object table of the SAME mask (via microBase `db_merge`;
-  sources untouched) into `<dataset>/merge_<mask>.db`. Merges match object
-  tables to masks by the table-name convention (the table must be named
-  after its mask, i.e. a custom `output_table_name` must equal the mask
-  name); written merge outputs carry a `mask` column instead.
+  whose kNN predicts cluster IDs). Every block config carries a
+  `model_name` (the GUI replaces the old `DB` widget): microModel writes
+  its raw CLI layout (inference + reduction_<method> + find_cluster
+  tables) into a transient scratch file, which the step ABSORBS via
+  microBase `db_merge.absorb_infer_db` into the per-model DB
+  `<dataset>/infer_<model_name>.db` — one wide TABLE per mask, named after
+  the mask, holding that mask's inference/reduction/find_cluster columns
+  uid-merged (same structure as profiler.db; the scratch file is deleted
+  after a successful absorb and kept on failure). Blocks sharing a
+  model_name accumulate in one DB (one table per mask); the same mask
+  under different models lands in different DBs under the same table
+  name; a duplicate (model_name, mask_name) pair is rejected by config
+  validation (the blocks would overwrite each other's rows). When the
+  run's last step ends, `run_pipeline` ALWAYS rebuilds
+  `<dataset>/merged.db` (microBase `db_merge.build_merged_db`): profiler.db
+  fused with every `infer_<model_name>.db` by table name (= mask name),
+  one merged table per mask — with TWO OR MORE infer DBs every model's
+  data columns carry its `<model_name>_` prefix, a single infer DB keeps
+  bare names. The used model / model name / reducer(s) / cluster.pkl are
+  remembered in `~/.micromax` (user level — the next run defaults to
+  them).
 
 * Outputs: in-place processed TIFFs, `<stem>_cp_masks_<obj>.png` masks,
-  `profiler.db` (image + per-object tables), `<dataset>/<output_db>`
-  (inference), `<dataset>/merge_<mask>.db` (per-mask auto-merge), and
+  `profiler.db` (image + per-object tables), `<dataset>/infer_<model_name>.db`
+  (per-model inference, one table per mask), `<dataset>/merged.db`
+  (dataset-wide per-mask fusion, always rebuilt at the end of a run), and
   `session.yml` (applied steps + patterns). The terminal log is mirrored to
   `<dataset>/microProfiler.log` (one file per dataset, INFO; GUI and CLI).
 
@@ -262,12 +279,10 @@ Package layout (overview):
   `microBase.ImageDataset` + `profiler.db`.
 
 * `io/merged_data.py` — `MergedData`, a thin GUI wrapper over microBase
-  `db_merge`: the integrated per-object table from any mix of profiler.db
-  (object tables) and infer.db files, fused ONLY within the same mask
-  (identity columns well/label/directory/...; colliding columns prefixed
-  `<db-stem>/`; different masks stack, tagged in a `mask` column; infer
-  rows without mask info join the profiler's mask with a log hint). Also
-  the Excel-metadata merge and the dataset directory scoping.
+  `db_merge`: the integrated per-object table read from DB files (each
+  table IS one mask's fused result; different masks stack, tagged in a
+  `mask` column; remaining column collisions take the `<db-stem>/` rename).
+  Also the Excel-metadata merge and the dataset directory scoping.
 
 * `widgets/` — image display (thumbnail grid + full-res view), channel
   controls, image filters, well-grid canvas, label annotation panel, pixel
@@ -322,22 +337,22 @@ Data flow:
   **Browse... → Load Dataset** sit on that row with **Reset** at the far right,
   and the whole top control area is a titleless rounded box (as is the
   plot-control column, whose width and x match the Image page's control boxes).
-  The DB **Select DB** button accepts any number of profiler.db AND infer.db
-  files of
-  that dataset (a single selection is used as-is); the fused sources are
-  shown next to the button as `a.db + b.db (+ metadata) -> merge`. The
-  selection works WITHOUT a loaded dataset too — the merge, the plot and
+  The DB **Select DB** button loads a DB file (multi-select still fuses
+  generically); the loaded source is shown next to the button as
+  `merged.db (+ metadata)`.
+  Loading a dataset AUTO-loads `<dataset>/merged.db` (the pipeline's always
+  present fused output — possibly MANY tables, one per mask; a dataset
+  without it falls back to a plain `profiler.db`) — a manual Select DB
+  replaces it. The
+  selection works WITHOUT a loaded dataset too — the load, the plot and
   the Excel-metadata merge are dataset-independent; only the point-click
   cell popup (needs images) and the well-grid color-by merge/* entries
   (needs the DataModule) wait for a dataset, and Write to DB then asks for
-  a save location instead of writing next to the dataset. Their
-  object rows are
-  fused into ONE integrated table per mask (microBase `db_merge`: outer
-  merge on the identity columns — well, label, directory, ... — so
-  profiler measurements and infer predictions/coordinates meet in a single
-  row per object; colliding columns are prefixed `<db-stem>/`; different
-  masks stack with a `mask` tag; infer rows without mask info join the
-  profiler's mask, logged as a hint). One plot area renders that table:
+  a save location instead of writing next to the dataset. The file's
+  per-mask tables are fused into ONE integrated table (microBase
+  `db_merge`: different masks stack with a `mask` tag; everything is
+  already fused per mask by the pipeline, so nothing is merged twice).
+  One plot area renders that table:
   scatter / smooth
   line (scipy-default spline fit; categorical x → per-group means ± SEM on
   shared level positions, continuous x → a numeric-axis fit of the raw y
@@ -401,7 +416,9 @@ Package layout (overview):
 
 * `reduction.py` — DR reduction + Leiden cluster finding over infer.db
   features (pca/umap/pacmap/localmap; a baseline cluster.pkl kNN-predicts
-  new datasets). Implements the `reduction` command.
+  new datasets; reducers and the cluster whitening are always fit on ALL
+  rows — `sample_per_class` thins only the plot points, and the tables
+  always keep every object). Implements the `reduction` command.
 
 * `reduction_vis.py` — Flask server for interactive point inspection (the
   `reduction-vis` command).

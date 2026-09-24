@@ -263,10 +263,11 @@ class ObjectProfileBlockWidget(QWidget):
                 for other in self._channels:
                     if other > ch:
                         pair_cb = QCheckBox(f"{ch}-{other}")
-                        # The pair lives in userData: channel names are regex
-                        # captures and may contain '-', so splitting the text
-                        # is not a safe way back to the pair.
-                        pair_cb.setData(Qt.UserRole, (ch, other))
+                        # The pair lives in a widget property: channel names
+                        # are regex captures and may contain '-', so
+                        # splitting the text is not a safe way back to the
+                        # pair (QCheckBox has no item userData).
+                        pair_cb.setProperty("pair", (ch, other))
                         self._corr_layout.addWidget(pair_cb)
                         self._corr_cbs.append(pair_cb)
         else:
@@ -338,7 +339,7 @@ class ObjectProfileBlockWidget(QWidget):
             "radial": {cb.text() for cb in self._radial_cbs if cb.isChecked()},
             "granularity": {cb.text() for cb in self._granularity_cbs if cb.isChecked()},
             "glcm": {cb.text() for cb in self._glcm_cbs if cb.isChecked()},
-            "correlation": {cb.data(Qt.UserRole) for cb in self._corr_cbs if cb.isChecked()},
+            "correlation": {tuple(cb.property("pair")) for cb in self._corr_cbs if cb.isChecked()},
         }
 
         # Remove placeholders and existing checkboxes
@@ -392,8 +393,9 @@ class ObjectProfileBlockWidget(QWidget):
             for other in channels:
                 if other > ch:
                     pair_cb = QCheckBox(f"{ch}-{other}")
-                    # Pair in userData — channel names may contain '-'.
-                    pair_cb.setData(Qt.UserRole, (ch, other))
+                    # Pair in a widget property — channel names may
+                    # contain '-' (QCheckBox has no item userData).
+                    pair_cb.setProperty("pair", (ch, other))
                     pair_cb.setChecked((ch, other) in saved["correlation"])
                     self._corr_layout.insertWidget(1 + len(self._corr_cbs), pair_cb)
                     self._corr_cbs.append(pair_cb)
@@ -423,7 +425,7 @@ class ObjectProfileBlockWidget(QWidget):
         pairs = []
         for cb in self._corr_cbs:
             if cb.isChecked():
-                a, b = cb.data(Qt.UserRole)
+                a, b = cb.property("pair")
                 pairs.append([a, b])
         return pairs or None
 
@@ -872,4 +874,4 @@ class ObjectProfilingStepPanel(BlockContainerPanel):
         BaseStepPanel._set_checked_states(block._glcm_cbs, cfg.get("glcm_channels"))
         corr_pairs = [tuple(p) for p in (cfg.get("correlation_pairs") or [])]
         for cb in block._corr_cbs:
-            cb.setChecked(tuple(cb.data(Qt.UserRole)) in corr_pairs)
+            cb.setChecked(tuple(cb.property("pair")) in corr_pairs)

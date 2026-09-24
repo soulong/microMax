@@ -1,6 +1,8 @@
 # microProfiler batch-run pipeline config (`microprofiler run --config <this file>`).
 # GUI and CLI build the same PipelineConfig — every key here has a panel
-# equivalent. Unknown keys raise a validation error listing the valid ones.
+# equivalent, EXCEPT the no-widget reduction keys (color_by, cluster_res,
+# sample_per_class) which round-trip verbatim. Unknown keys raise a
+# validation error listing the valid ones.
 # Each step has a `run` flag (default false — nothing runs unless enabled).
 
 # dataset format
@@ -88,21 +90,21 @@ segment:
 # blocked Run with no selection). To profile channels, list them explicitly.
 image_profile:
   run: false
-  n_workers: 6
+  n_workers: 8                      # profiling worker processes (GUI: sidebar Thread spin)
   image_channels:
     - ch1
   image_thresholds: null               # optional per-channel foreground thresholds
 
 # object profiling (one profiler.db table per block; features per single cell).
-# Every block is bookkept in profiler.db's `_table_masks` (table -> mask),
-# which drives the per-mask merges of the inference step.
+# Tables are matched to masks BY NAME in the end-of-run merged.db fusion, so
+# a custom output_table_name must EQUAL the mask name (the default).
 object_profile:
   run: true
-  n_workers: 8
+  n_workers: 8                      # profiling worker processes (GUI: sidebar Thread spin)
   configs:
     - mask_name: cell                 # which masks to crop objects from (bare name)
       parent_mask_name: null          # parent objects this one lives in (e.g. cell for nuclei)
-      output_table_name: cell         # table name in profiler.db (null = mask_name)
+      output_table_name: cell         # table name in profiler.db (null = mask_name; must EQUAL mask_name — the inference merges match object tables to masks by table name)
       overwrite_db: false             # drop + rewrite the table on re-run
       intensity_channels:             # per-channel mean/median/std/sum stats
         - ch1
@@ -110,7 +112,7 @@ object_profile:
       radial_bins: 4
       granularity_channels:           # granularity (texture spectra); null = off
         - ch1
-      granularity_spectrum_length: 8
+      granularity_spectrum_length: 5
       granularity_subsample_ratio: 0.5       # pixel subsampling inside the object
       granularity_background_subsample_ratio: 0.25
       granularity_background_radius: 10      # background ring width around the object
@@ -133,38 +135,43 @@ object_profile:
       correlation_pairs: null
 
 # per-object inference with trained microModel bundles (optional; requires
-# microModel to be installed). Each block writes <dataset>/<output_db> with
-# the microModel CLI table format (`inference` + optional reduction tables),
-# then AUTO-MERGES with the profiler object table of the SAME mask into
-# <dataset>/merge_<mask>.db (source DBs are never modified).
+# microModel to be installed). Each block writes the per-model DB
+# <dataset>/infer_<model_name>.db — ONE TABLE PER MASK inside it, named
+# after the mask, holding that mask's inference + reduction + find_cluster
+# results uid-merged into one wide row per object (same structure as
+# profiler.db). Several blocks sharing a model_name (e.g. the same model
+# over different masks) accumulate in ONE DB; different models never share
+# a file.
+# When the run ends, <dataset>/merged.db is ALWAYS (re)built from
+# profiler.db + every infer_<model_name>.db: one table per mask with the
+# profiler measurements fused into every model's predictions (with 2+
+# infer DBs each model's data columns carry its `<model_name>_` prefix; a
+# single infer DB keeps bare names). microVis loads merged.db directly.
 # max_value is REQUIRED per block (65535 for 16-bit, 255 for 8-bit) and is
 # always trusted as configured. For SSL bundles only `feature` applies —
 # pred_class is ignored (microModel downgrades with a warning). pred_prob is
 # not a config key: microModel writes it together with pred_class.
-# Every inference row stores its `mask_name` in infer.db — the per-mask
-# grouping key for the merge.
-# NOTE: the last run's model / reducer(s) / cluster.pkl are remembered at
-# user level in the single file ~/.micromax and pre-fill the GUI panel;
-# disable the reduction/cluster groups there per run if not wanted.
-# inference:
-#   run: true
-#   configs:
-#     - model: D:\models\runs\model.pt
-#       mask_name: cell               # bare name; also recorded in infer.db rows
-#       channels: null            # ORDERED channel names; top-to-bottom = model input order; null/[] = block SKIPPED (never "all")
-#       feature: true
-#       pred_class: true
-#       output_db: infer.db
-#       max_value: 65535
-#       reduction:                # omit/null = no dimension reduction
-#         enabled: true           # dimension-reduction group: write reduction_<method> tables
-#         reducer: null           # one or MORE pre-fitted reducer pickles (pca/umap/pacmap/localmap —
-#                                 #   types detected, run in order); null = fit `method` fresh;
-#                                 #   when set, `method` is ignored entirely
-#         cluster_enabled: true   # cluster group: predict from a baseline cluster.pkl
-#         cluster: null           # baseline cluster.pkl -> find_cluster table (kNN-predicted IDs;
-#                                 #   prediction runs only when cluster_enabled AND cluster are set)
-#         method: [pca, umap]     # methods to fit when reducer is null (subset of pca/umap/pacmap/localmap)
-#         color_by: pred_class    # plot-only; the tables always contain EVERY object
-#         cluster_res: [0.5, 1]   # fresh Leiden resolutions (higher = more clusters); null/[] = none
-#         sample_per_class: 10000 # fit-only subsampling; plot-only concern, tables stay complete
+# NOTE: the last run's model / model name / reducer(s) / cluster.pkl are
+# remembered at user level in the single file ~/.micromax and pre-fill the
+# GUI panel — a remembered Reducer/Cluster path IS the run flag, so clear a
+# path field there to skip that stage.
+inference:
+  run: false
+  configs: []            # add blocks in the GUI, or uncomment the example below
+#  - model: <path/to/model.pt>
+#    model_name: puncta           # names the output DB: infer_puncta.db
+#    mask_name: cell               # bare name; ALSO the output table name in the per-model DB
+#    channels:       # ORDERED channel names; top-to-bottom = model input order; null/[] = block SKIPPED (never "all")
+#      - ch1
+#    feature: true
+#    pred_class: true
+#    max_value: 65535
+#    reduction:                # omit/null = no dimension reduction
+#      enabled: true           # dimension-reduction group: write reduction_<method> tables
+#      reducer: null           # one or MORE pre-fitted reducer pickles (pca/umap/pacmap/localmap — types detected, run in order); null = fit `method` fresh; when set, `method` is ignored entirely
+#      method: [pca, umap, localmap]     # methods to fit when reducer is null (subset of pca/umap/pacmap/localmap)
+#      cluster_enabled: false   # cluster group switch: baseline prediction (below) AND fresh Leiden (cluster_res) — false = no cluster work at all
+#      cluster: null           # baseline cluster.pkl -> find_cluster table (kNN-predicted IDs; prediction runs only when cluster_enabled AND cluster are set)
+#      cluster_res: [0.5, 1]   # fresh Leiden resolutions (higher = more clusters); null/[] = none; needs cluster_enabled: true (ignored while the group is off)
+#      color_by: pred_class    # plot-only: colors the reduction PDF pages + stratifies the plot subsample; tables unaffected
+#      sample_per_class: 2000  # plot-only: max points per class DRAWN in the reduction PDFs / reduction-vis browser (0/null = draw all) — reducers and clusters are ALWAYS fit on ALL rows and every table keeps EVERY object (microprofiler run writes no PDFs, so this key only matters for standalone micromodel reduction / reduction-vis)

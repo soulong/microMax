@@ -72,7 +72,8 @@ def test_ensure_user_defaults_creates_missing_file(defaults_dir):
 # ── The pipeline save hook ───────────────────────────────────────────────────
 
 
-def _inference_cfg(model_path, reducer=None, cluster=None, channels=None):
+def _inference_cfg(model_path, model_name="testmodel",
+                   reducer=None, cluster=None, channels=None):
     from microProfiler.config import PipelineConfig
     from microProfiler.config import (
         InferenceConfig, InferenceEntry, InferenceReductionConfig)
@@ -83,7 +84,7 @@ def _inference_cfg(model_path, reducer=None, cluster=None, channels=None):
             enabled=True, reducer=reducer, cluster_enabled=bool(cluster),
             cluster=cluster)
     entry = InferenceEntry(
-        model=model_path, mask_name="cell",
+        model=model_path, model_name=model_name, mask_name="cell",
         # channels=null/[] means the block is SKIPPED — never "all".
         channels=channels if channels is not None else ["ch1"],
         max_value=65535.0, reduction=red)
@@ -91,7 +92,7 @@ def _inference_cfg(model_path, reducer=None, cluster=None, channels=None):
 
 
 def _run_inference_isolated(tmp_path, monkeypatch, cfg):
-    """Run _run_inference with microModel and the auto-merge stubbed out."""
+    """Run _run_inference with microModel and the DB absorb stubbed out."""
     import microProfiler.pipeline._micromodel_bridge as bridge
     import microProfiler.pipeline.steps as steps
     from microProfiler.progress_collector import NullProgressCollector
@@ -99,7 +100,8 @@ def _run_inference_isolated(tmp_path, monkeypatch, cfg):
     monkeypatch.setattr(bridge, "_build_mm_inference_config",
                         lambda *a, **k: {})
     monkeypatch.setattr(bridge, "_call_micromodel", lambda *a, **k: None)
-    monkeypatch.setattr(steps, "_auto_merge_infer", lambda *a, **k: None)
+    monkeypatch.setattr("microBase.db_merge.absorb_infer_db",
+                        lambda *a, **k: None)
     steps._run_inference(cfg, ds=None, root_dir=tmp_path,
                          progress=NullProgressCollector())
 
@@ -115,6 +117,7 @@ def test_run_inference_remembers_model_reducers_cluster(
 
     inf = get_user_defaults()["inference"]
     assert inf["model"] == str(model)
+    assert inf["model_name"] == "testmodel"
     assert inf["reducer"] == ["D:/r/pca.pkl", "D:/r/umap.pkl"]
     assert inf["cluster"] == "D:/r/cluster.pkl"
 
@@ -157,6 +160,7 @@ def test_panel_prefills_from_user_defaults(defaults_dir, monkeypatch):
 
     update_user_defaults("inference", {
         "model": "D:/m/model.pt",
+        "model_name": "puncta",
         "reducer": ["D:/r/pca.pkl", "D:/r/umap.pkl"],
         "cluster": "D:/r/cluster.pkl"})
 
@@ -170,6 +174,7 @@ def test_panel_prefills_from_user_defaults(defaults_dir, monkeypatch):
     panel._apply_user_defaults()
 
     assert block.get_model_path() == "D:/m/model.pt"
+    assert block.get_model_name() == "puncta"
     assert block._reducer_path.text() == "D:/r/pca.pkl;D:/r/umap.pkl"
     assert block._cluster_path.text() == "D:/r/cluster.pkl"
     # No group checkboxes anymore — the remembered paths are the run flags.

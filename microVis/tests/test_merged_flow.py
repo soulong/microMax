@@ -1,9 +1,10 @@
 """End-to-end simulation of the Data page's merged-DB flow (offscreen Qt).
 
-Builds a tiny dataset (images + masks), a profiler.db and an infer.db that
-describe the SAME objects, then drives MainWindow through the real flow:
+Builds a tiny dataset (images + masks), a profiler.db and a NEW-STYLE
+inference output (infer_testmodel.db + merged.db, the way microProfiler
+writes them), then drives MainWindow through the real flow:
 
-select dir → load dataset → Select DB (both files) → merged table asserts →
+select dir → load dataset → merged.db auto-loads → merged table asserts →
 plot → left-click a scatter point (cropped-cell popup) → click empty space
 (popup hides) → Excel metadata merge → Write to DB (merge.db).
 """
@@ -19,12 +20,15 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 from PIL import Image  # noqa: E402
 
+from microBase.db_merge import absorb_infer_db, build_merged_db  # noqa: E402
+
 pytest.importorskip("PySide6")
 
 IMAGE_PATTERN = r"(?P<well>[A-Z]\d{2})_f(?P<field>\d+)_ch1\.tiff"
 MASK_PATTERN = r"(?P<well>[A-Z]\d{2})_f(?P<field>\d+)_ch1_cp_masks_(?P<mask_name>.+)\.png"
 
 WELLS = ["A01", "B01"]
+MODEL_NAME = "testmodel"
 
 
 def _canonical(p) -> str:
@@ -146,6 +150,12 @@ def dataset(tmp_path):
     entries = _write_images(root)
     _write_profiler_db(root / "profiler.db", root, entries)
     _write_infer_db(root / "infer.db", root, entries)
+    # microProfiler's post-run outputs: absorb the raw infer tables into
+    # the per-model DB and build the dataset-wide merged.db.
+    absorb_infer_db(root / "infer.db", root / f"infer_{MODEL_NAME}.db",
+                    default_mask="cell")
+    (root / "infer.db").unlink()
+    build_merged_db(root)
     return root
 
 
@@ -178,8 +188,8 @@ def _wait_merged(window, qt_app):
 def test_merged_db_flow(dataset, window, qt_app):
     from microVis.io.merged_data import MERGED_TABLE
 
-    # ── Select DB: both files of the dataset ──
-    window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
+    # ── Select DB: the dataset's fused merged.db ──
+    window.load_db_files([dataset / "merged.db"])
     _wait_merged(window, qt_app)
 
     assert window._merged is not None
@@ -205,10 +215,10 @@ def test_merged_db_flow(dataset, window, qt_app):
         # No raw profiler-table duplicates once the merged table exists.
         assert not any(lbl.startswith("cell/") for lbl in labels), labels
 
-    # The fused-source readout next to Select DB names the inputs + result.
+    # The fused-source readout next to Select DB names the single source.
     status = window._data_view._db_status_label.text()
-    assert "profiler.db + infer.db" in status, status
-    assert status.endswith("-> merge"), status
+    assert "merged.db" in status, status
+    assert "-> merge" not in status, status
 
     # ── The plot view has the columns and can render ──
     pv = window._plot_view
@@ -266,7 +276,7 @@ def test_merged_db_flow(dataset, window, qt_app):
     window._on_metadata_clear()
     qt_app.processEvents()
     status = window._data_view._db_status_label.text()
-    assert "(+ metadata)" not in status and status.endswith("-> merge")
+    assert "(+ metadata)" not in status and "merged.db" in status
     # The cleared metadata must be merged again (the write below expects it).
     window._metadata_df = pd.DataFrame({"well": WELLS, "batch": [1, 2]})
     window._on_metadata_merge()
@@ -313,7 +323,7 @@ def test_reset_then_reload_restores_plot_area(dataset, window, qt_app):
     the controls+canvas column stayed gone forever after a Reset, no matter
     which DB was selected afterwards.
     """
-    window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
+    window.load_db_files([dataset / "merged.db"])
     _wait_merged(window, qt_app)
     assert window._data_view._plot_view is window._plot_view
 
@@ -333,7 +343,7 @@ def test_reset_then_reload_restores_plot_area(dataset, window, qt_app):
             break
         qt_app.thread().msleep(5)
     assert window._dm is not None, "dataset did not load after reset"
-    window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
+    window.load_db_files([dataset / "merged.db"])
     _wait_merged(window, qt_app)
     assert window._plot_view._df is not None
     # The view is back in the page layout (offscreen windows are never
@@ -347,7 +357,7 @@ def test_reset_restores_plot_controls(dataset, window, qt_app):
     Regression: Reset dropped the table/figure but left every picker with
     the previous DB's columns and options.
     """
-    window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
+    window.load_db_files([dataset / "merged.db"])
     _wait_merged(window, qt_app)
     pv = window._plot_view
     pv._chart_combo.setCurrentText("boxplot")
@@ -393,7 +403,7 @@ def test_cell_popup_dismissed_on_page_switch_and_outside_click(
     # the window (still offscreen) before driving the flow.
     window.show()
     qt_app.processEvents()
-    window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
+    window.load_db_files([dataset / "merged.db"])
     _wait_merged(window, qt_app)
     pv = window._plot_view
     pv._x_combo.setCurrentText("umap_1")
@@ -465,7 +475,7 @@ def test_channel_vmin_vmax_follow_integer_dtype(dataset, window, qt_app):
 
 def test_facet_filter_hides_columns_but_keeps_selection(dataset, window, qt_app):
     """The type-to-filter box hides rows without touching the selection."""
-    window.load_db_files([dataset / "profiler.db", dataset / "infer.db"])
+    window.load_db_files([dataset / "merged.db"])
     _wait_merged(window, qt_app)
     pv = window._plot_view
     checked_before = pv._facet_selected()
@@ -761,6 +771,60 @@ def _db_only_paths(tmp_path):
     _write_profiler_db(profiler, tmp_path, entries)
     _write_infer_db(infer, tmp_path, entries)
     return [profiler, infer]
+
+
+def test_auto_db_paths_sequence(tmp_path):
+    """The auto-selection sequence: merged.db wins over everything; a
+    dataset without it falls back to a plain profiler.db; none -> []."""
+    from microVis.main_window import MainWindow
+
+    pick = MainWindow._auto_db_paths
+
+    # Nothing on disk.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert pick(empty) == []
+
+    # merged.db beats everything else.
+    mg = tmp_path / "mg"
+    mg.mkdir()
+    (mg / "profiler.db").write_bytes(b"x")
+    (mg / "infer_puncta.db").write_bytes(b"x")
+    (mg / "merged.db").write_bytes(b"x")
+    assert pick(mg) == [str(mg / "merged.db")]
+
+    # profiler only (a dataset without inference yet).
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    (prof / "profiler.db").write_bytes(b"x")
+    assert pick(prof) == [str(prof / "profiler.db")]
+
+    # Neither -> nothing auto-selected.
+    inf = tmp_path / "inf"
+    inf.mkdir()
+    (inf / "infer_puncta.db").write_bytes(b"x")
+    assert pick(inf) == []
+
+
+def test_dataset_load_autoselects_dbs(dataset, window, qt_app):
+    """Loading a dataset auto-picks merged.db through the same load path as
+    a manual Select DB — no second click needed."""
+    # The window fixture only waits for the dataset scan; the auto-load's
+    # merge runs async behind it.
+    _wait_merged(window, qt_app)
+
+    assert window._merged is not None
+    assert len(window._merged.table) == 4
+    status = window._data_view._db_status_label.text()
+    assert "merged.db" in status, status
+    assert "-> merge" not in status, status
+    # Column dropdowns follow the integrated table, like a manual selection.
+    gw_labels = [window._grid_controls.column.itemText(i)
+                 for i in range(window._grid_controls.column.count())]
+    assert "merge/area" in gw_labels
+    # The DataModule points at merged.db for grid/overlay aggregates.
+    assert window._dm._db_path is not None
+    assert window._dm._db_path.name == "merged.db"
 
 
 def test_db_merge_and_metadata_merge_without_dataset(qt_app, tmp_path):

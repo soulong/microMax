@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from microBase import load_yaml
-from microBase.db_contracts import INFER_DB_NAME, MASK_COLUMN_PREFIX
+from microBase.db_contracts import MASK_COLUMN_PREFIX, infer_db_file_name
 
 logger = logging.getLogger(__name__)
 
@@ -219,11 +219,15 @@ class InferenceReductionConfig:
     cluster_enabled + cluster: the Cluster group — predict-only clustering
         from a baseline cluster.pkl (its stored kNN models label every
         object, cluster IDs stay baseline-aligned) writing the find_cluster
-        table. Runs only when BOTH are set.
+        table. Runs only when BOTH are set. cluster_enabled gates the WHOLE
+        cluster group: fresh Leiden over cluster_res also needs it, so a
+        leftover cluster_res in a config with the group off does nothing.
     color_by / sample_per_class / method / cluster_res: no-widget YAML keys,
-        round-tripped verbatim. color_by and sample_per_class only shape
-        the reducer FIT and the PDF plots (which this pipeline never
-        writes) — the reduction_<method> tables always contain EVERY object.
+        round-tripped verbatim. color_by (PDF page coloring + plot-subsample
+        stratification) and sample_per_class (max points per class drawn per
+        PDF page; 0/null = draw all) are PLOT-only keys — microModel always
+        fits the reducers and the cluster whitening on ALL rows, and the
+        reduction_<method> tables always contain EVERY object.
     """
 
     enabled: bool = False
@@ -240,19 +244,23 @@ class InferenceReductionConfig:
 class InferenceEntry:
     """One inference block: a trained microModel bundle applied per object.
 
-    feature/pred_class are output toggles; SSL bundles only support features
-    (pred_class is gated in the GUI). pred_prob is always written together
-    with pred_class by microModel — no separate toggle. max_value is the
-    maximum possible intensity of the input dtype (65535 for 16-bit, 255 for
-    8-bit) and is always read from config — it is trusted as-is.
+    model_name labels the model — every block with the same model_name
+    writes into the SAME per-model DB ``infer_<model_name>.db`` (one table
+    per mask inside it), so the same model over different masks accumulates
+    in one DB and different models never share a file. feature/pred_class
+    are output toggles; SSL bundles only support features (pred_class is
+    gated in the GUI). pred_prob is always written together with pred_class
+    by microModel — no separate toggle. max_value is the maximum possible
+    intensity of the input dtype (65535 for 16-bit, 255 for 8-bit) and is
+    always read from config — it is trusted as-is.
     """
 
     model: str = ""
+    model_name: Optional[str] = None
     mask_name: Optional[str] = None
     channels: Optional[List[str]] = None
     feature: bool = True
     pred_class: bool = True
-    output_db: str = INFER_DB_NAME
     max_value: Optional[float] = None
     reduction: Optional[InferenceReductionConfig] = None
 
@@ -263,14 +271,34 @@ class InferenceConfig:
     configs: List[InferenceEntry] = field(default_factory=list)
 
 
-def resolve_inference_db(entry: InferenceEntry) -> str:
+def infer_db_name(entry: InferenceEntry) -> str:
     """Resolve an inference block's output DB file name.
 
-    ``output_db`` may be null in YAML — the default name is ``infer.db``.
-    Single source of truth used by the pipeline (steps), the CLI
-    completeness check, and the microModel bridge (``db_name`` key).
+    ``infer_<model_name>.db`` under the dataset dir — the per-model
+    inference DB holding one table per mask. Single source of truth used by
+    the pipeline (steps), the CLI completeness check, and the microModel
+    bridge (scratch ``db_name`` is derived separately).
     """
-    return entry.output_db or INFER_DB_NAME
+    return infer_db_file_name(entry.model_name)
+
+
+def _validate_model_name(value, context: str) -> str:
+    """Sanitize a model name (it becomes a DB file name).
+
+    A trailing ``.db`` is stripped (users habitually type it); path
+    separators and dot-names are rejected — the name must stay a single
+    safe file-stem component.
+    """
+    name = str(value or "").strip()
+    if name.endswith(".db"):
+        name = name[:-3].strip()
+    if not name:
+        raise ValueError(f"{context} must not be empty")
+    if name in (".", "..") or any(sep in name for sep in ("/", "\\", os.sep)):
+        raise ValueError(
+            f"{context} must be a plain name without path separators "
+            f"(got {name!r})")
+    return name
 
 
 @dataclass
@@ -521,7 +549,16 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
             entry = _entry_from_section(attr, InferenceEntry, entry_dict)
             if entry.model is None or not entry.model:
                 raise ValueError("'inference.configs[].model' must not be empty")
+            # model_name names the output DB (infer_<model_name>.db); an
+            # active block without it has no defined output file.
+            entry.model_name = _validate_model_name(
+                entry.model_name, "'inference.configs[].model_name'")
             _check_bare_mask_name(entry.mask_name, "'inference.configs[].mask_name'")
+            if entry.mask_name is None or not entry.mask_name:
+                # The mask name IS the output table name in
+                # infer_<model_name>.db — an active block without it has no
+                # defined output.
+                raise ValueError("'inference.configs[].mask_name' must not be empty")
             if entry.max_value is not None and entry.max_value <= 0:
                 raise ValueError(
                     f"'inference.configs[].max_value' must be > 0, got {entry.max_value}")
@@ -565,14 +602,19 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
                         "(reduction reads the features BLOB)."
                     )
             entries.append(entry)
-        # Duplicate output_db names would overwrite each other's inference
-        # rows — reject in both GUI and CLI (single validation source).
-        db_names = [resolve_inference_db(e) for e in entries if e.channels]
-        dups = sorted({n for n in db_names if db_names.count(n) > 1})
+        # Duplicate (model_name, mask_name) pairs would overwrite each
+        # other's rows in the same per-mask table — reject in both GUI and
+        # CLI (single validation source). The same model over DIFFERENT
+        # masks is fine (one table per mask); the same mask under
+        # DIFFERENT models is fine (one DB per model).
+        pairs = [(e.model_name, e.mask_name) for e in entries if e.channels]
+        dups = sorted({p for p in pairs if pairs.count(p) > 1})
         if dups:
             raise ValueError(
-                f"Duplicate inference output_db name(s): {dups}. Rename one "
-                f"of the blocks."
+                f"Duplicate inference (model_name, mask_name) pair(s): "
+                f"{dups}. Each block writes table '<mask_name>' of "
+                f"infer_<model_name>.db — give the block a distinct "
+                f"model_name or mask_name."
             )
         return InferenceConfig(
             run=_coerce_bool(section.get("run", False), "inference.run"),

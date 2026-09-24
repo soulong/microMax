@@ -19,6 +19,29 @@ import os
 # ── Artifact file names ──────────────────────────────────────────────────
 PROFILER_DB_NAME = "profiler.db"
 INFER_DB_NAME = "infer.db"
+# microProfiler's inference outputs: one DB per model name, one TABLE per
+# mask inside it, plus the dataset-wide merged output.
+INFER_DB_STEM_PREFIX = "infer_"
+MERGED_DB_NAME = "merged.db"
+
+
+def infer_db_file_name(model_name) -> str:
+    """``puncta`` -> ``infer_puncta.db`` (the per-model inference DB name)."""
+    return f"{INFER_DB_STEM_PREFIX}{model_name}.db"
+
+
+def model_name_from_infer_db(filename) -> str:
+    """``infer_puncta.db`` -> ``puncta`` (inverse of infer_db_file_name).
+
+    Only the leading ``infer_`` stem prefix and the ``.db`` suffix are
+    stripped; anything else passes through unchanged.
+    """
+    name = str(filename)
+    if name.endswith(".db"):
+        name = name[:-3]
+    if name.startswith(INFER_DB_STEM_PREFIX):
+        name = name[len(INFER_DB_STEM_PREFIX):]
+    return name
 
 # ── profiler.db tables ───────────────────────────────────────────────────
 IMAGE_TABLE = "image"

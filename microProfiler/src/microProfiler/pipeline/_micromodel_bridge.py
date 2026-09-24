@@ -17,9 +17,18 @@ from pathlib import Path
 
 from microBase import MicroMaxError
 from microBase.db_contracts import FIND_CLUSTER_TABLE, reduction_table_name
-from microProfiler.config import PipelineConfig, resolve_inference_db
+from microProfiler.config import PipelineConfig
 
 logger = logging.getLogger(__name__)
+
+# microModel writes its raw CLI layout (inference + reduction_<method> +
+# find_cluster tables) into this transient file in the dataset root; the
+# pipeline absorbs it into the per-model DB (infer_<model_name>.db, one
+# table per mask) right after and deletes it. It lives in the dataset root
+# so run_reduction's pickles land next to the data (it saves them into the
+# DB's parent dir), and its `_` prefix keeps it out of the `infer_*.db`
+# glob that build_merged_db consumes.
+SCRATCH_INFER_DB_NAME = "_infer_raw.db"
 
 
 def _detect_reducer_kind(path) -> str:
@@ -54,27 +63,35 @@ def _detect_reducer_kind(path) -> str:
 
 
 def _reduction_run_state(entry):
-    """(enabled, cluster_active) — whether reduction and/or cluster prediction runs.
+    """(enabled, cluster_active, fresh_cluster) — what the reduction stage does.
 
-    enabled: the Dimension-reduction group. cluster_active: the Cluster
-    group checked AND a cluster.pkl chosen (prediction needs both).
+    enabled: the Dimension-reduction group (the stage is scheduled at all).
+    cluster_active: the Cluster group checked AND a cluster.pkl chosen
+    (baseline prediction needs both). fresh_cluster: fresh Leiden over
+    cluster_res — a sub-option of the SAME cluster group, so it requires
+    cluster_enabled too; a leftover cluster_res list in a config with the
+    group off must never re-cluster a dataset (and never make the batch
+    completeness check demand a find_cluster table the run will not write).
     """
     red = entry.reduction
     cluster_active = bool(red.cluster_enabled and red.cluster)
-    return bool(red.enabled or cluster_active), cluster_active
+    fresh_cluster = bool(red.cluster_enabled and not red.cluster and red.cluster_res)
+    return bool(red.enabled or cluster_active), cluster_active, fresh_cluster
 
 
 def expected_reduction_tables(entry) -> frozenset:
     """Tables run_reduction will write for one entry's reduction config.
 
     One reduction_<method> table per configured method plus find_cluster
-    when cluster prediction runs. Mirrors _build_mm_inference_config's method
-    selection exactly, so the completeness check can never demand a table the
-    bridge will not write (or miss one it will).
+    when the cluster group runs (baseline prediction or fresh cluster_res
+    Leiden — both gated by cluster_enabled). Mirrors
+    _build_mm_inference_config's method selection exactly, so the
+    completeness check can never demand a table the bridge will not write
+    (or miss one it will).
     """
     if not entry.reduction:
         return frozenset()
-    enabled, cluster_active = _reduction_run_state(entry)
+    enabled, cluster_active, fresh_cluster = _reduction_run_state(entry)
     if not enabled:
         return frozenset()
     red = entry.reduction
@@ -103,10 +120,15 @@ def expected_reduction_tables(entry) -> frozenset:
             red.method if red.method is not None
             else (["pca", "umap"] if red.enabled else ["pca"])
         )
-        if not methods and cluster_active:
-            methods = {"pca"}
+        if not methods:
+            if cluster_active:
+                methods = {"pca"}
+            else:
+                # No method and no baseline prediction: the bridge schedules
+                # no reduction stage at all, so nothing is expected.
+                return frozenset()
     tables = {reduction_table_name(m) for m in methods}
-    if cluster_active or red.cluster_res:
+    if cluster_active or fresh_cluster:
         tables.add(FIND_CLUSTER_TABLE)
     return frozenset(tables)
 
@@ -320,18 +342,23 @@ def _build_mm_inference_config(entry, cfg: PipelineConfig, ds, root_dir: Path) -
         "inference": {
             "pred_class": bool(entry.pred_class),
             "feature": bool(entry.feature),
-            "db_name": resolve_inference_db(entry),
+            # Raw microModel layout lands in the transient scratch file;
+            # the pipeline absorbs it into infer_<model_name>.db afterwards.
+            "db_name": SCRATCH_INFER_DB_NAME,
             "batch_size": 128,
         },
     }
     if entry.reduction:
-        enabled, cluster_active = _reduction_run_state(entry)
+        enabled, cluster_active, fresh_cluster = _reduction_run_state(entry)
         if not enabled:
             return mm_cfg
         red_cfg = {
             "color_by": entry.reduction.color_by,
             "cluster": entry.reduction.cluster if cluster_active else None,
-            "cluster_res": entry.reduction.cluster_res,
+            # cluster_res only reaches microModel when the cluster group is
+            # on and no baseline predicts — otherwise a leftover template
+            # value would silently run a fresh Leiden clustering.
+            "cluster_res": entry.reduction.cluster_res if fresh_cluster else None,
             "sample_per_class": entry.reduction.sample_per_class if entry.reduction.sample_per_class is not None else 10000,
         }
         if entry.reduction.reducer:

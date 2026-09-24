@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from microBase.db_contracts import INFER_DB_NAME
+from microBase.db_contracts import infer_db_file_name
 
 from microProfiler.gui.dpi import dp
 from microProfiler.gui.panels.base_step_panel import BaseStepPanel, make_hsep
@@ -46,6 +47,22 @@ _DTYPE_MAX = {
 }
 
 
+def _suggest_model_name(path: str) -> Optional[str]:
+    """Derive a model-name suggestion from a bundle path.
+
+    The bundle file stem is 'model' for almost every microModel bundle —
+    too generic to tell runs apart — so the parent folder name carries the
+    identity ('.../2026-09-15_train_puncta/model.pt' ->
+    '2026-09-15_train_puncta'). A non-generic stem wins ('resnet_ft').
+    """
+    p = Path(path)
+    stem = p.stem
+    if stem and stem != "model":
+        return stem
+    parent = p.parent.name
+    return parent or (stem or None)
+
+
 class InferenceBlockWidget(QWidget):
 
     def __init__(
@@ -65,12 +82,17 @@ class InferenceBlockWidget(QWidget):
         # or block copy) — the dataset-dtype default must never overwrite it.
         self._max_value_explicit = False
         # No-widget reduction keys, round-tripped verbatim from YAML.
-        # color_by / sample_per_class only shape the reducer fit and the
-        # PDF plots (which this pipeline never writes) — the tables always
-        # contain every object, so neither has a GUI widget.
+        # color_by (PDF page coloring + plot-subsample stratification) and
+        # sample_per_class (max points per class drawn per PDF page) are
+        # PLOT-only — microModel always fits reducers/clusters on ALL rows
+        # and the tables keep every object, so neither needs a GUI widget.
         self._color_by = "pred_class"
         self._cluster_res = None
         self._sample_per_class = 10000
+        # The model name last auto-derived from the bundle path: a later
+        # path change only overwrites the name field while it still holds
+        # THIS suggestion (a user-edited or restored name is never clobbered).
+        self._last_suggested: Optional[str] = None
         self._build_ui()
 
     # ── UI ──────────────────────────────────────────────────────────────
@@ -162,7 +184,7 @@ class InferenceBlockWidget(QWidget):
             self._channels_row.addWidget(self._chan_placeholder)
         layout.addLayout(row_mask)
 
-        # Row 3: outputs + DB + max_value
+        # Row 3: outputs + model name + max_value
         row_out = QHBoxLayout()
         self._feature_cb = QCheckBox("feature")
         self._feature_cb.setChecked(True)
@@ -173,11 +195,14 @@ class InferenceBlockWidget(QWidget):
         self._pred_class_cb.setToolTip("Write the predicted class (requires a train bundle)")
         row_out.addWidget(self._pred_class_cb)
         row_out.addSpacing(10)
-        row_out.addWidget(QLabel("DB:"))
-        self._output_db = QLineEdit(INFER_DB_NAME)
-        self._output_db.setMaximumWidth(150)
-        self._output_db.setToolTip("SQLite DB file name written under the dataset dir (table names are fixed)")
-        row_out.addWidget(self._output_db)
+        row_out.addWidget(QLabel("Model name:"))
+        self._model_name = QLineEdit()
+        self._model_name.setMaximumWidth(150)
+        self._model_name.setToolTip(
+            "Name identifying this model — its results DB is "
+            f"{infer_db_file_name('<model name>')} (one table per mask). "
+            "Suggested from the bundle path; edit freely.")
+        row_out.addWidget(self._model_name)
         row_out.addSpacing(10)
         row_out.addWidget(QLabel("max_value:"))
         self._max_value_label = QLabel(f"{DEFAULT_MAX_VALUE:g}")
@@ -254,8 +279,24 @@ class InferenceBlockWidget(QWidget):
 
         # ── behavior wiring ──
         self._browse_btn.clicked.connect(self._on_browse)
+        self._model_path.textChanged.connect(self._on_model_path_changed)
         self._reducer_browse_btn.clicked.connect(self._on_browse_reducer)
         self._cluster_browse_btn.clicked.connect(self._on_browse_cluster)
+
+    def _on_model_path_changed(self, path: str) -> None:
+        """Keep the model-name suggestion in step with the bundle path.
+
+        Only fills/updates the field while it is empty or still holds the
+        previous suggestion — a name the user typed (or a config restored)
+        is never overwritten.
+        """
+        derived = _suggest_model_name(path)
+        if not derived:
+            return
+        current = self._model_name.text().strip()
+        if not current or current == self._last_suggested:
+            self._model_name.setText(derived)
+        self._last_suggested = derived
 
     def _update_capability_ui(self) -> None:
         if self._classify_capable is None:
@@ -341,8 +382,8 @@ class InferenceBlockWidget(QWidget):
     def get_model_path(self) -> str:
         return self._model_path.text().strip()
 
-    def get_output_db(self) -> str:
-        return self._output_db.text().strip() or INFER_DB_NAME
+    def get_model_name(self) -> str:
+        return self._model_name.text().strip()
 
     def get_mask_name(self) -> str:
         return self._mask_combo.currentText().strip() or ""
@@ -475,11 +516,11 @@ class InferenceBlockWidget(QWidget):
     def build_config_section(self) -> dict:
         section = {
             "model": self.get_model_path(),
+            "model_name": self.get_model_name() or None,
             "mask_name": self.get_mask_name() or None,
             "channels": self.get_checked_channels() or None,
             "feature": self._feature_cb.isChecked(),
             "pred_class": self._pred_class_cb.isChecked(),
-            "output_db": self.get_output_db(),
             "max_value": self._max_value,
         }
         reducers = [p.strip() for p in self._reducer_path.text().split(";")
@@ -542,6 +583,10 @@ class InferenceStepPanel(BlockContainerPanel):
         model = defaults.get("model")
         if model:
             block._model_path.setText(str(model))
+        model_name = defaults.get("model_name")
+        if model_name:
+            block._model_name.setText(str(model_name))
+            block._last_suggested = block.get_model_name()
         reducer = defaults.get("reducer") or []
         if isinstance(reducer, str):
             reducer = [reducer]
@@ -553,7 +598,7 @@ class InferenceStepPanel(BlockContainerPanel):
 
     def _connect_block_signals(self, block: InferenceBlockWidget) -> None:
         super()._connect_block_signals(block)
-        for w in (block._model_path, block._output_db, block._mask_combo,
+        for w in (block._model_path, block._model_name, block._mask_combo,
                   block._feature_cb, block._pred_class_cb,
                   block._reducer_path, block._cluster_path,
                   *block._method_cbs.values()):
@@ -578,7 +623,8 @@ class InferenceStepPanel(BlockContainerPanel):
                 block.ensure_capability()
             except Exception:
                 pass
-            block._output_db.setText(src.get_output_db())
+            block._model_name.setText(src.get_model_name())
+            block._last_suggested = src._last_suggested
             block.set_max_value(src.get_max_value(), explicit=src._max_value_explicit)
             block._feature_cb.setChecked(src._feature_cb.isChecked())
             block._pred_class_cb.setChecked(src._pred_class_cb.isChecked())
@@ -603,9 +649,12 @@ class InferenceStepPanel(BlockContainerPanel):
         model = cfg.get("model", "")
         if model:
             block._model_path.setText(str(model))
-        db_name = cfg.get("output_db", "")
-        if db_name:
-            block._output_db.setText(str(db_name))
+        model_name = cfg.get("model_name") or ""
+        if model_name:
+            # A restored name is user intent — protected from the path
+            # suggestion by registering it as the current suggestion.
+            block._model_name.setText(str(model_name).removesuffix(".db"))
+            block._last_suggested = block.get_model_name()
         max_value = cfg.get("max_value")
         if max_value is not None:
             block.set_max_value(float(max_value), explicit=True)
@@ -693,13 +742,28 @@ class InferenceStepPanel(BlockContainerPanel):
             model = block.get_model_path()
             if not model:
                 return "Every inference block needs a model bundle path."
-            db = block.get_output_db()
-            if db in seen:
+            if not block.get_checked_channels():
+                # A block with no checked channels is skipped at runtime —
+                # not an error (empty channels = skip, never "all").
+                continue
+            name = block.get_model_name()
+            if not name:
                 return (
-                    f"Duplicate output_db name '{db}' in inference blocks. "
-                    f"Rename one of them."
+                    "Every inference block needs a model name (its results "
+                    "DB is infer_<model name>.db)."
                 )
-            seen[db] = True
+            # Two blocks over the SAME (model, mask) would overwrite each
+            # other's rows in the same per-mask table — same rule as the
+            # CLI/config validation.
+            pair = (name, block.get_mask_name())
+            if pair in seen:
+                return (
+                    f"Duplicate inference (model name, mask) pair "
+                    f"'{pair[0]}' + '{pair[1]}': both blocks write table "
+                    f"'{pair[1]}' of infer_{pair[0]}.db. Give one block a "
+                    f"different model name or mask."
+                )
+            seen[pair] = True
             if block.is_reduction_or_cluster_enabled() and not block._feature_cb.isChecked():
                 return (
                     "Dimension reduction / Cluster require the 'feature' "

@@ -53,7 +53,7 @@ reduction:
   method: [pca, umap, pacmap, localmap]    # list, DR methods to run (subset of pca/umap/pacmap/localmap)
   color_by: null                      # list, null = single light-blue page; first = stratification column
   cluster_res: [0.5, 1, 2, 4]         # list, Leiden resolutions (higher = more clusters); null/empty = no cluster finding (ignored when cluster is set)
-  sample_per_class: null              # max points per class to fit reducers; 0/null = all
+  sample_per_class: null              # max points per class DRAWN per PDF page (stratified by the first color_by); 0/null = draw all — fitting always uses every row
   show_cluster_image: true           # output per-resolution representative-image sheets (cluster_res<res>.pdf); false = skip (faster, no model bundle load)
   reduction_pca: null                 # path to a pre-fitted reduction_pca.pkl; null = fit new
   reduction_umap: null                # path to a pre-fitted reduction_umap.pkl; null = fit new

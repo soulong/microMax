@@ -113,7 +113,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._state = PipelineState()
         # The input dir is the dataset dir: results (profiler.db, masks,
-        # session.yml, infer.db) are always written next to the sources.
+        # session.yml, infer_<model>.db, merged.db) are always written
+        # next to the sources.
         self._loaded_dataset_dir = None
         self._pending_filters = None
 
@@ -459,6 +460,10 @@ class MainWindow(QMainWindow):
     def _connect_signals(self):
         self._sidebar.navigation_changed.connect(self._on_navigation_changed)
         self._sidebar.thread_count_changed.connect(self._on_thread_count_changed)
+        # The sidebar restored its Thread spin from ~/.micromax silently (no
+        # signal before wiring) — push that value into the profiling panels
+        # so they start from the remembered worker count, not their default.
+        self._on_thread_count_changed(self._sidebar.thread_count())
         self._sidebar.display_range_changed.connect(self._on_vmin_vmax_changed)
         self._input_browse.clicked.connect(self._browse_input)
         self._input_dir.textChanged.connect(self._on_input_dir_edited)
@@ -940,12 +945,15 @@ class MainWindow(QMainWindow):
         self._sidebar.set_cancel_visible(running)
 
     def closeEvent(self, event):
-        # Remember the window size and complete the shared GUI config before
-        # any shutdown work so a slow/cancelled worker never prevents the
-        # geometry/preferences from being persisted.
+        # Remember the window size + thread count and complete the shared GUI
+        # config before any shutdown work so a slow/cancelled worker never
+        # prevents the geometry/preferences from being persisted.
         self._save_window_size()
+        update_user_defaults(
+            "sidebar", {"threads": self._sidebar.thread_count()})
         ensure_user_defaults(
-            "inference", {"model": None, "reducer": None, "cluster": None})
+            "inference", {"model": None, "model_name": None,
+                          "reducer": None, "cluster": None})
         # Cooperative shutdown: signal every worker's cancel flag and wait.
         # Threads are never terminated while they execute Python code.
         workers = [self._ctrl._worker, self._ctrl._preview_worker]

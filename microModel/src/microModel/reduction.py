@@ -661,14 +661,14 @@ def _dr_transform(method, reducer, feats):
     return reducer.transform(feats)  # pacmap / localmap (n_components=2)
 
 
-def _fit_embedding(method, reducer, feats_fit):
-    """Embedding of the FIT subset itself.
+def _fit_embedding(method, reducer, feats):
+    """Embedding of the rows the reducer was FIT on (here: every row).
 
     The nonlinear methods store their fit embedding — transforming the fit
     rows would only re-approximate it.
     """
     if method == "pca":
-        return reducer.transform(feats_fit)
+        return reducer.transform(feats)
     if method == "umap":
         return reducer["umap"].embedding_
     return reducer.embedding_  # pacmap / localmap
@@ -717,6 +717,12 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
     values render as continuous viridis pages, everything else as labeled
     categorical pages. color_by null = a single page with all points in the
     default light blue.
+
+    reduction.sample_per_class caps the points DRAWN per color_by class on
+    those PDF pages (stratified by the first color_by entry; 0/null = draw
+    all). It never subsamples a fit: the reducers, the cluster whitening and
+    the written tables always use EVERY row. reduction-vis applies the same
+    key to its browser display.
 
     save_plots=False skips the PDF outputs (tables are still written) —
     used by microProfiler, which is a data-only analysis suite.
@@ -834,38 +840,32 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
     cb_continuous = {cb: _color_column_continuous(cb, dicts_all)
                      for cb in color_by_vals}
 
-    # Phase 2: sample subset for fitting (null/0 = use all points)
+    # Phase 2: plot subsample (null/0 = draw every point). Reducers and the
+    # cluster whitening are ALWAYS fit on ALL rows — sample_per_class only
+    # thins the points drawn on the PDF pages (reduction-vis uses the same
+    # key to thin its browser display).
     sample_per_class = red_cfg.get("sample_per_class") or 0
-    # Sampling gates whichever reducer still needs FITTING.
-    needs_fit = any(not red_cfg.get(f"reduction_{m}") for m in methods)
 
     dirs_all = [d["directory"] for d in dicts_all]
     probs_all = [parse_pred_prob(d.get("pred_prob")) for d in dicts_all]
-    if sample_per_class > 0 and needs_fit:
+    if sample_per_class > 0:
         if first_cb is not None:
             first_labels_all, _ = _extract_color_data(first_cb, dicts_all, dirs_all, probs_all)
         else:
             first_labels_all = None
-        fit_indices = _sample_fit_indices(
+        plot_indices = _sample_plot_indices(
             n_all, first_labels_all, sample_per_class, seed,
             uniform=(first_cb is None or cb_continuous.get(first_cb, False)))
-        feats_fit = feats_all[fit_indices]
-        dicts_fit = [dicts_all[i] for i in fit_indices]
-        dirs_fit = [dirs_all[i] for i in fit_indices]
-        probs_fit = [probs_all[i] for i in fit_indices]
-        logger.info("Sampled %d of %d rows for reducer fitting (sample_per_class=%d)",
-                    len(fit_indices), n_all, sample_per_class)
+        logger.info("Sampled %d of %d points for the reduction plots (sample_per_class=%d)",
+                    len(plot_indices), n_all, sample_per_class)
     else:
-        fit_indices = np.arange(n_all)
-        feats_fit, dicts_fit = feats_all, dicts_all
-        dirs_fit, probs_fit = dirs_all, probs_all
-    sampled = len(fit_indices) < n_all
+        plot_indices = np.arange(n_all)
 
-    if len(dicts_fit) < 2:
+    if n_all < 2:
         if raise_on_error:
             raise RuntimeError(
-                f"Too few samples for reduction view (< 2), got {len(dicts_fit)}")
-        logger.error("Too few samples for reduction view (< 2), got %d", len(dicts_fit))
+                f"Too few samples for reduction view (< 2), got {n_all}")
+        logger.error("Too few samples for reduction view (< 2), got %d", n_all)
         return
 
     # Phase 3: fit (or load) one reducer per method
@@ -887,49 +887,39 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
             logger.info("%s: loaded reducer from %s", m.upper(), pre_path)
             continue
         if m == "pca":
-            reducers[m] = PCA(n_components=2, random_state=seed).fit(feats_fit)
+            reducers[m] = PCA(n_components=2, random_state=seed).fit(feats_all)
         elif m == "umap":
-            dim = feats_fit.shape[1]
-            n_pre = min(UMAP_PRE_COMPONENTS, feats_fit.shape[0], dim)
-            pca_pre = (PCA(n_components=n_pre, random_state=seed).fit(feats_fit)
+            dim = feats_all.shape[1]
+            n_pre = min(UMAP_PRE_COMPONENTS, feats_all.shape[0], dim)
+            pca_pre = (PCA(n_components=n_pre, random_state=seed).fit(feats_all)
                        if n_pre < dim else None)
             # n_jobs=1 pairs with the fixed random_state (reproducible
             # embedding) and silences umap's override warning.
             model = umap.UMAP(random_state=seed, n_jobs=1)
-            model.fit(pca_pre.transform(feats_fit) if pca_pre is not None else feats_fit)
+            model.fit(pca_pre.transform(feats_all) if pca_pre is not None else feats_all)
             reducers[m] = {"pca_pre": pca_pre, "umap": model}
         elif m == "pacmap":
             # PaCMAP reduces its input internally (apply_pca=True default);
             # save_tree keeps the neighbor index inside the pickled reducer.
             reducers[m] = pacmap.PaCMAP(
-                n_components=2, random_state=seed, save_tree=True).fit(feats_fit)
+                n_components=2, random_state=seed, save_tree=True).fit(feats_all)
         else:  # localmap
             reducers[m] = pacmap.LocalMAP(
-                n_components=2, random_state=seed, save_tree=True).fit(feats_fit)
+                n_components=2, random_state=seed, save_tree=True).fit(feats_all)
         for d in save_dirs:
             save_reducer(reducers[m], os.path.join(d, f"reduction_{m}.pkl"))
-        logger.info("%s: fitted on %d points", m.upper(), feats_fit.shape[0])
+        logger.info("%s: fitted on %d points", m.upper(), feats_all.shape[0])
 
-    # Phase 4: transform. The fit subset feeds the plots + cluster ordering;
-    # the full merge feeds the DB tables. When nothing was sampled, a
-    # FRESHLY fitted nonlinear reducer's fit embedding IS the full embedding
-    # (transform would only re-approximate it). A LOADED reducer's
-    # .embedding_ belongs to its baseline fit set — never this dataset's
-    # rows — so loaded methods must always transform the current features,
-    # for BOTH the fit subset and the full merge.
-    X_fit = {
-        m: (
-            _dr_transform(m, reducers[m], feats_fit)
-            if m in loaded_methods
-            else _fit_embedding(m, reducers[m], feats_fit)
-        )
-        for m in methods
-    }
+    # Phase 4: embed ALL rows — fitting used every row, so a FRESHLY fitted
+    # nonlinear reducer's fit embedding IS the full embedding (transform
+    # would only re-approximate it). A LOADED reducer's .embedding_ belongs
+    # to its baseline fit set — never this dataset's rows — so loaded
+    # methods always transform the current features.
     X_all = {
         m: (
             _dr_transform(m, reducers[m], feats_all)
-            if sampled or m in loaded_methods
-            else X_fit[m]
+            if m in loaded_methods
+            else _fit_embedding(m, reducers[m], feats_all)
         )
         for m in methods
     }
@@ -975,19 +965,19 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
             # points voting for the winning cluster (max class probability).
             cluster_probs[res] = knn.predict_proba(W).max(axis=1)
     elif cluster_res_list:
-        dim = feats_fit.shape[1]
+        dim = feats_all.shape[1]
         # Clustering-space dimensionality: smallest k covering
         # CLUSTER_VARIANCE_TARGET of the feature variance (measured on the
-        # fit subset), capped at CLUSTER_MAX_COMPONENTS (see the constants'
-        # whiten noise-amplification note).
-        n_cap = min(CLUSTER_MAX_COMPONENTS, feats_fit.shape[0], dim)
-        probe = PCA(n_components=n_cap, random_state=seed).fit(feats_fit)
+        # full feature set), capped at CLUSTER_MAX_COMPONENTS (see the
+        # constants' whiten noise-amplification note).
+        n_cap = min(CLUSTER_MAX_COMPONENTS, feats_all.shape[0], dim)
+        probe = PCA(n_components=n_cap, random_state=seed).fit(feats_all)
         n_white = int(np.searchsorted(
             np.cumsum(probe.explained_variance_ratio_),
             CLUSTER_VARIANCE_TARGET) + 1)
         n_white = max(1, min(n_white, n_cap))
         pca_w = PCA(n_components=n_white, whiten=True,
-                    random_state=seed).fit(feats_fit)
+                    random_state=seed).fit(feats_all)
         W = pca_w.transform(feats_all)
         W = W / np.maximum(np.linalg.norm(W, axis=1, keepdims=True), 1e-8)
         ref = "umap" if "umap" in methods else methods[0]
@@ -1002,12 +992,10 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
             raw_ids = _leiden_partition(W, res, seed)
             n_cl = int(raw_ids.max()) + 1
             # Order clusters by their centroid distance to the reference
-            # plot's origin. A cluster absent from the fit subset (reducer
-            # sampling) sorts last via an infinite distance.
-            ref_fit_ids = raw_ids[fit_indices]
+            # plot's origin. The partition covers every row, so each cluster
+            # always has members here.
             cent = np.array([
-                X_fit[ref][ref_fit_ids == c].mean(axis=0)
-                if np.any(ref_fit_ids == c) else np.full(2, np.inf)
+                X_all[ref][raw_ids == c].mean(axis=0)
                 for c in range(n_cl)])
             order = np.argsort(np.linalg.norm(cent, axis=1))
             id_map = np.empty(n_cl, dtype=int)
@@ -1027,6 +1015,12 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
 
     # Phase 6: plots — one multi-page PDF per method
     if save_plots:
+        # Plot views: the (possibly subsampled) points actually drawn on the
+        # PDF pages — fitting and the tables above always used every row.
+        X_plot = {m: X_all[m][plot_indices] for m in methods}
+        dicts_plot = [dicts_all[i] for i in plot_indices]
+        dirs_plot = [dirs_all[i] for i in plot_indices]
+        probs_plot = [probs_all[i] for i in plot_indices]
         for d in save_dirs:
             for m in methods:
                 axis_name = DR_AXIS_NAMES[m]
@@ -1034,11 +1028,11 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
                 with PdfPages(pdf_path) as pdf:
                     if not color_by_vals and not cluster_res_list:
                         _plot_reduction_page(
-                            X_fit[m], f"{axis_name} of feature vectors",
+                            X_plot[m], f"{axis_name} of feature vectors",
                             f"{axis_name} 1", f"{axis_name} 2", pdf)
                     for cb in color_by_vals:
                         labels, label_names = _extract_color_data(
-                            cb, dicts_fit, dirs_fit, probs_fit)
+                            cb, dicts_plot, dirs_plot, probs_plot)
                         if cb_continuous[cb]:
                             # Continuous page: pred_prob keeps its fixed [0,1]
                             # scale and title; other numeric columns scale to
@@ -1055,28 +1049,28 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
                                     cmax = cmin + 1.0
                                 clabel = cb
                             _plot_reduction_page(
-                                X_fit[m], f"{axis_name} of feature vectors (colored by {cb})",
+                                X_plot[m], f"{axis_name} of feature vectors (colored by {cb})",
                                 f"{axis_name} 1", f"{axis_name} 2", pdf,
                                 labels=labels, label_names=label_names,
-                                pred_probs=probs_fit, continuous=True,
+                                pred_probs=probs_plot, continuous=True,
                                 cont_values=vals, cont_range=(cmin, cmax),
                                 cont_label=clabel)
                         else:
                             _plot_reduction_page(
-                                X_fit[m], f"{axis_name} of feature vectors (colored by {cb})",
+                                X_plot[m], f"{axis_name} of feature vectors (colored by {cb})",
                                 f"{axis_name} 1", f"{axis_name} 2", pdf,
                                 labels=labels, label_names=label_names,
-                                pred_probs=probs_fit)
+                                pred_probs=probs_plot)
                     for res in cluster_res_list:
-                        ids_fit = cluster_ids[res][fit_indices]
-                        n_cl = len(np.unique(ids_fit))
+                        ids_plot = cluster_ids[res][plot_indices]
+                        n_cl = len(np.unique(ids_plot))
                         _plot_reduction_page(
-                            X_fit[m],
+                            X_plot[m],
                             f"{axis_name} of feature vectors (colored by Leiden "
                             f"cluster, res={_res_tag(res)}, n={n_cl})",
                             f"{axis_name} 1", f"{axis_name} 2", pdf,
-                            labels=list(ids_fit),
-                            label_names=[str(i) for i in ids_fit])
+                            labels=list(ids_plot),
+                            label_names=[str(i) for i in ids_plot])
                 logger.info("Reduction plot saved to %s", pdf_path)
         # Representative-cell sheet per resolution (CONTACT_SHEET_PER_CLUSTER
         # random dense-core members per cluster, uniform cell size). Gated by
@@ -1194,9 +1188,9 @@ def run_reduction(config, save_plots=True, raise_on_error=False):
                     "/".join(methods), end - start, db_path,
                     time.perf_counter() - t_db0)
 
-    logger.info("Reduction complete: methods=%s, cluster_res=%s, fitted on %d "
-                "samples, transformed %d DB(s), outputs in %s",
-                methods, cluster_res_list or None, feats_fit.shape[0], len(db_entries),
+    logger.info("Reduction complete: methods=%s, cluster_res=%s, fitted on all "
+                "%d rows, transformed %d DB(s), outputs in %s",
+                methods, cluster_res_list or None, n_all, len(db_entries),
                 save_dirs)
 
 
@@ -1326,8 +1320,9 @@ def _extract_color_data(cb, dicts, dirs, probs):
     return vals, ["__missing__" if v is None else str(v) for v in vals]
 
 
-def _sample_fit_indices(n_orig, labels, sample_per_class, seed, uniform):
-    """Select indices for reducer fitting, stratified by `labels`.
+def _sample_plot_indices(n_orig, labels, sample_per_class, seed, uniform):
+    """Select the points DRAWN on the reduction plot pages, stratified by
+    `labels` — never the rows used for fitting (those are always all rows).
 
     uniform=True samples without stratification (color_by null, or a
     continuous column — stratifying by raw floats would create one stratum

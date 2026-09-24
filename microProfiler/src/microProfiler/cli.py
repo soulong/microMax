@@ -7,9 +7,18 @@ import sys
 from pathlib import Path
 
 from microBase import ImageDataset, MicroMaxError, SessionFile
-from microBase.db_contracts import IMAGE_TABLE, INFERENCE_TABLE, PROFILER_DB_NAME
+from microBase.db_contracts import (
+    CLUSTER_RES_PREFIX,
+    IMAGE_TABLE,
+    MERGED_DB_NAME,
+    PROFILER_DB_NAME,
+    REDUCTION_TABLE_PREFIX,
+    reduction_coord_prefix,
+    sql_ident,
+)
+from microBase.db_merge import table_names_of
 
-from microProfiler.config import config_to_dict, load_config, PipelineConfig, resolve_inference_db
+from microProfiler.config import config_to_dict, load_config, PipelineConfig, infer_db_name
 from microProfiler.io import Database
 from microProfiler.log_utils import set_default_logging_level, set_log_file, setup_logging
 from microProfiler.pipeline import apply_filters, run_pipeline
@@ -44,14 +53,17 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
     """Check whether every output this config enables already exists.
 
     Profiling tables are required only when the config enables the matching
-    section; the inference DB check is independent, so an inference-only
-    config can be skipped too (previously an empty `expected` set returned
-    False before the inference check ever ran). The `image` table must
-    contain one row per dataset image — a partial table (e.g. from an
-    interrupted or failed run) must not be treated as complete.
-    When inference is enabled, each block's output DB must exist with its
-    `inference` table (plus the reduction tables when reduction is on) —
-    table existence only, no row-count guard (masks can change between runs).
+    section; the inference check is independent, so an inference-only
+    config can be skipped too. The `image` table must contain one row per
+    dataset image — a partial table (e.g. from an interrupted or failed
+    run) must not be treated as complete.
+    The NEW output style is what gets checked: each inference block's
+    ``infer_<model_name>.db`` must exist and carry the block's per-mask
+    table (`<mask_name>`), holding the reduction coordinate columns when
+    reduction is configured (they are uid-joined INTO the mask table, so
+    there are no separate reduction tables anymore). A dataset with object
+    outputs must additionally have ``merged.db`` — the run's final fused
+    output; without it downstream tools have nothing to load.
     A config that enables NO checked output at all (pure preprocessing or
     pure segmentation) has no notion of "complete": every dataset must run,
     and the applied_steps gate alone protects the destructive steps.
@@ -118,38 +130,69 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
                 )
                 return False
 
+    has_inference_checks = False
     if cfg.inference and cfg.inference.run and cfg.inference.configs:
         for entry in cfg.inference.configs:
             if not entry.channels:
                 # A block with no channels is skipped at runtime — its DB is
                 # not expected.
                 continue
-            infer_db = dataset_dir / resolve_inference_db(entry)
-            tables = {INFERENCE_TABLE}
-            if entry.reduction:
-                try:
-                    tables |= expected_reduction_tables(entry)
-                except Exception as e:
-                    # A corrupt/unknown reducer pickle must not silently mark
-                    # the dataset complete (it would never be reprocessed and
-                    # the error would stay hidden) — reprocess instead.
-                    logger.warning(
-                        "Cannot determine expected reduction tables for %s: %s "
-                        "— reprocessing", infer_db, e,
-                    )
-                    return False
-            missing = tables - _existing_tables(infer_db)
-            if missing:
+            has_inference_checks = True
+            infer_db = dataset_dir / infer_db_name(entry)
+            tables = _existing_tables(infer_db)
+            if entry.mask_name not in tables:
                 logger.info(
-                    "Incomplete inference DB %s for %s (missing %s) — reprocessing",
-                    infer_db, dataset_dir, sorted(missing),
+                    "Incomplete inference DB %s for %s (missing table '%s') "
+                    "— reprocessing", infer_db, dataset_dir, entry.mask_name,
                 )
                 return False
+            # Reduction results live as COLUMNS of the mask table now —
+            # one coordinate column per configured method, and a
+            # cluster_res column when the cluster group runs.
+            try:
+                expected_red = expected_reduction_tables(entry)
+            except Exception as e:
+                # A corrupt/unknown reducer pickle must not silently mark
+                # the dataset complete (it would never be reprocessed and
+                # the error would stay hidden) — reprocess instead.
+                logger.warning(
+                    "Cannot determine expected reduction output for %s: %s "
+                    "— reprocessing", infer_db, e,
+                )
+                return False
+            if expected_red:
+                cols = _existing_columns(infer_db, entry.mask_name)
+                missing_red = []
+                for table in expected_red:
+                    if table.startswith(REDUCTION_TABLE_PREFIX):
+                        col = reduction_coord_prefix(
+                            table[len(REDUCTION_TABLE_PREFIX):]) + "_1"
+                        if col not in cols:
+                            missing_red.append(col)
+                    else:  # find_cluster -> any cluster_res column
+                        if not any(c.startswith(CLUSTER_RES_PREFIX)
+                                   for c in cols):
+                            missing_red.append(CLUSTER_RES_PREFIX + "*")
+                if missing_red:
+                    logger.info(
+                        "Incomplete inference DB %s for %s (mask '%s' lacks "
+                        "reduction columns %s) — reprocessing",
+                        infer_db, dataset_dir, entry.mask_name, missing_red,
+                    )
+                    return False
 
-    has_inference_checks = bool(
-        cfg.inference and cfg.inference.run and cfg.inference.configs
-        and any(e.channels for e in cfg.inference.configs))
-    if not expected and not has_inference_checks:
+    # merged.db is built from OBJECT tables (the `image` table is not an
+    # object table), so only object-output configs require it.
+    object_outputs = bool(expected - {IMAGE_TABLE}) or has_inference_checks
+    has_object_outputs = object_outputs
+    if object_outputs and not (dataset_dir / MERGED_DB_NAME).exists():
+        # The run's final fused output is part of "complete" — a dataset
+        # whose merged.db is missing (old-style results, deleted file) is
+        # reprocessed so the end-of-run rebuild recreates it.
+        logger.info("Missing %s in %s — reprocessing", MERGED_DB_NAME, dataset_dir)
+        return False
+
+    if not (expected or has_inference_checks):
         # No checked output is configured (pure preprocessing / pure
         # segmentation): the dataset is never "complete" — run it. The
         # in-place steps are still gated by session.yml applied_steps, so
@@ -162,13 +205,26 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
 def _existing_tables(db_path: Path) -> set[str]:
     if not db_path.exists():
         return set()
-    db = Database(db_path)
     try:
-        return db.list_tables()
+        return set(table_names_of(str(db_path)))
+    except Exception:
+        return set()
+
+
+def _existing_columns(db_path: Path, table: str) -> set[str]:
+    """Column names of one table (empty set when the DB/table is missing)."""
+    if table not in _existing_tables(db_path):
+        return set()
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return {row[1] for row in conn.execute(
+            f"PRAGMA table_info({sql_ident(table)})")}
     except Exception:
         return set()
     finally:
-        db.close()
+        conn.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -243,23 +299,27 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            # Duplicate output_db names would silently overwrite each other's
-            # inference rows — the GUI's validate_blocks rejects these, so the
-            # CLI must too.
-            seen_dbs: dict = {}
+            # Duplicate (model_name, mask_name) pairs would silently
+            # overwrite each other's rows in the same per-mask table — the
+            # GUI's validate_blocks rejects these, so the CLI must too
+            # (config validation is the single source; this is the
+            # batch-level pre-check before any dataset is touched).
+            seen_pairs: dict = {}
             for entry in cfg.inference.configs:
                 if not entry.channels:
                     continue
-                db_name = resolve_inference_db(entry)
-                if db_name in seen_dbs:
+                pair = (entry.model_name, entry.mask_name)
+                if pair in seen_pairs:
                     print(
-                        f"Error: duplicate inference output_db '{db_name}' used "
-                        f"by blocks '{seen_dbs[db_name]}' and '{entry.model}'. "
-                        f"Rename one of them.",
+                        f"Error: duplicate inference (model_name, mask_name) "
+                        f"pair '{pair}' — blocks '{seen_pairs[pair]}' and "
+                        f"'{entry.model}' would overwrite each other's rows "
+                        f"in table '{entry.mask_name}' of "
+                        f"infer_{entry.model_name}.db.",
                         file=sys.stderr,
                     )
                     sys.exit(1)
-                seen_dbs[db_name] = entry.model
+                seen_pairs[pair] = entry.model
 
         datasets = resolve_datasets(dataset_dir, dataset_pattern)
         if not datasets:

@@ -7,8 +7,9 @@ state. It is GUI-preferences only — the pipeline run config is a separate
 YAML passed to the CLI.
 
 Today microProfiler stores its remembered inference inputs (last run's model
-bundle, reducer pickle(s) and baseline cluster.pkl) and the main window size
-there. Updates are key-merged (unknown future keys survive) and atomic.
+bundle, reducer pickle(s) and baseline cluster.pkl), the main window size,
+and the sidebar's Thread spin (profiling worker count) there. Updates are
+key-merged (unknown future keys survive) and atomic.
 """
 
 from __future__ import annotations

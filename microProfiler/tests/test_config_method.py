@@ -13,6 +13,8 @@ def _inference_section(reduction):
         "run": True,
         "configs": [{
             "model": "model.pt",
+            "model_name": "puncta",
+            "mask_name": "cell",
             "channels": ["ch1"],
             "max_value": 65535,
             "feature": True,

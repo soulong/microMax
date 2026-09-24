@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from microBase import db_merge
+from microBase.db_contracts import infer_db_file_name
 
 
 def _write_profiler(path, masks):
@@ -277,3 +278,297 @@ def test_equal_columns_do_not_duplicate(tmp_path):
     assert "area_cell_y" not in fused.columns
     assert fused["area_cell"].iloc[0] == 10.0
     assert fused["pred_class"].iloc[0] == "drug"
+
+
+def _write_mask_db(path, mask_name, rows, cls_by_uid=None):
+    """A NEW-STYLE per-model infer DB: one wide table named after the mask.
+
+    rows: (uid, directory, label). Same directories/labels as the profiler
+    fixtures so same-mask frames fuse into one row per object.
+    """
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {mask_name} ("
+        "directory TEXT, label INTEGER, well TEXT, pred_class TEXT, "
+        "pred_prob REAL, umap_1 REAL, umap_2 REAL)")
+    for uid, directory, label in rows:
+        cls = (cls_by_uid or {}).get(uid, "drug")
+        conn.execute(
+            f"INSERT INTO {mask_name} VALUES (?, ?, 'A1', ?, 0.9, ?, ?)",
+            (directory, label, cls, float(uid), -float(uid)))
+    conn.commit()
+    conn.close()
+
+
+def test_multiple_prefixed_sources_get_model_prefix(tmp_path):
+    """With infer frames from TWO OR MORE prefixed DBs, EVERY prefixed
+    source's data columns are namespaced `<prefix>_<col>` (identity columns
+    stay bare) — which model produced a column never depends on the order,
+    and identical-named prediction columns can never collapse into one."""
+    prof = tmp_path / "profiler.db"
+    _write_profiler(prof, {"cell": [("A1", 1, 10.0)]})
+    a = tmp_path / "infer_puncta.db"
+    _write_mask_db(a, "cell", [(1, "C:/ds/Images", 1)])
+    b = tmp_path / "infer_mito.db"
+    _write_mask_db(b, "cell", [(1, "C:/ds/Images", 1)], cls_by_uid={1: "ctrl"})
+
+    frames = (db_merge.read_profiler_frames(str(prof))
+              + db_merge.read_profiler_frames(str(a), prefix="puncta")
+              + db_merge.read_profiler_frames(str(b), prefix="mito"))
+    fused = db_merge.fuse_frames(frames)
+
+    # Fused per object (not stacked): profiler + BOTH models in one row.
+    assert len(fused) == 1
+    assert fused["area_cell"].iloc[0] == 10.0
+    assert fused["puncta_pred_class"].iloc[0] == "drug"
+    assert fused["mito_pred_class"].iloc[0] == "ctrl"
+    assert "pred_class" not in fused.columns
+    # Identity columns stay bare — they are the join keys.
+    assert fused["well"].iloc[0] == "A1"
+    assert fused["label"].iloc[0] == 1
+    assert fused["directory"].iloc[0] == "C:/ds/Images"
+
+
+def test_single_prefixed_source_keeps_bare_names(tmp_path):
+    """One prefixed infer DB in the fusion keeps the concise bare names."""
+    prof = tmp_path / "profiler.db"
+    _write_profiler(prof, {"cell": [("A1", 1, 10.0)]})
+    a = tmp_path / "infer_puncta.db"
+    _write_mask_db(a, "cell", [(1, "C:/ds/Images", 1)])
+
+    frames = (db_merge.read_profiler_frames(str(prof))
+              + db_merge.read_profiler_frames(str(a), prefix="puncta"))
+    fused = db_merge.fuse_frames(frames)
+
+    assert fused["pred_class"].iloc[0] == "drug"
+    assert not any(c.startswith("puncta_") for c in fused.columns)
+
+
+def _write_raw_infer(path, mask_name, rows, cls_by_uid=None):
+    """A raw microModel infer DB: inference + reduction_umap + find_cluster.
+
+    rows: (uid, directory, label). Repeated calls append rows (the CREATEs
+    are IF NOT EXISTS), so one file can hold several masks. cls_by_uid
+    defaults to a fixed class.
+    """
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS inference (uid INTEGER PRIMARY KEY, "
+        "directory TEXT, filename TEXT, mask_name TEXT, label INTEGER, "
+        "pred_class TEXT, pred_prob REAL, features BLOB)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS reduction_umap (uid INTEGER PRIMARY KEY, "
+        "umap_1 REAL, umap_2 REAL)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS find_cluster (uid INTEGER PRIMARY KEY, "
+        "cluster_res_1 INTEGER, cluster_prob_1 REAL)")
+    for uid, directory, label in rows:
+        cls = (cls_by_uid or {}).get(uid, "drug")
+        conn.execute(
+            "INSERT INTO inference VALUES (?, ?, ?, ?, ?, ?, 0.9, NULL)",
+            (uid, directory, f"{uid}.tiff", mask_name, label, cls))
+        conn.execute("INSERT INTO reduction_umap VALUES (?, ?, ?)",
+                     (uid, float(uid), -float(uid)))
+        conn.execute("INSERT INTO find_cluster VALUES (?, ?, ?)",
+                     (uid, label, 0.8))
+    conn.commit()
+    conn.close()
+
+
+def test_absorb_writes_one_wide_table_per_mask(tmp_path):
+    """absorb_infer_db folds inference + reduction + find_cluster into ONE
+    table named after the mask — the file ends up profiler.db-shaped."""
+    raw = tmp_path / "infer.db"
+    _write_raw_infer(raw, "cell", [(1, "C:/ds", 1), (2, "C:/ds", 2)])
+    out = tmp_path / "infer_puncta.db"
+
+    written = db_merge.absorb_infer_db(raw, out, default_mask="cell")
+
+    assert written == ["cell"]
+    conn = sqlite3.connect(str(out))
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    df = pd.read_sql("SELECT * FROM cell", conn)
+    conn.close()
+    assert tables == {"cell"}
+    assert len(df) == 2
+    # The uid join brought the coordinates and cluster columns along; the
+    # infer-internal uid / features BLOB / mask_name are gone.
+    for col in ("pred_class", "pred_prob", "umap_1", "umap_2",
+                "cluster_res_1", "cluster_prob_1", "label", "directory"):
+        assert col in df.columns, col
+    for col in ("uid", "features", "mask_name"):
+        assert col not in df.columns, col
+    assert (df["umap_1"] == [1.0, 2.0]).all()
+    assert (df["cluster_res_1"] == [1, 2]).all()
+
+    # The raw file is untouched.
+    src = sqlite3.connect(str(raw))
+    assert src.execute("SELECT COUNT(*) FROM inference").fetchone()[0] == 2
+    src.close()
+
+
+def test_absorb_splits_masks_into_tables(tmp_path):
+    raw = tmp_path / "infer.db"
+    _write_raw_infer(raw, "cell", [(1, "C:/ds", 1)])
+    _write_raw_infer(raw, "nuclei", [(2, "C:/ds", 1)])
+    out = tmp_path / "infer_puncta.db"
+
+    written = db_merge.absorb_infer_db(raw, out)
+    assert sorted(written) == ["cell", "nuclei"]
+    conn = sqlite3.connect(str(out))
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    conn.close()
+    assert tables == {"cell", "nuclei"}
+
+
+def test_absorb_replaces_rows_per_directory(tmp_path):
+    """Re-absorbing the same directories replaces their rows (re-run
+    protection, mirroring microModel's writer) instead of duplicating."""
+    raw = tmp_path / "infer.db"
+    _write_raw_infer(raw, "cell", [(1, "C:/ds", 1)])
+    out = tmp_path / "infer_puncta.db"
+    db_merge.absorb_infer_db(raw, out, default_mask="cell")
+
+    # Same directory, new prediction: the row is replaced.
+    raw2 = tmp_path / "infer2.db"
+    _write_raw_infer(raw2, "cell", [(9, "C:/ds", 1)], cls_by_uid={9: "ctrl"})
+    db_merge.absorb_infer_db(raw2, out, default_mask="cell")
+
+    conn = sqlite3.connect(str(out))
+    df = pd.read_sql("SELECT * FROM cell", conn)
+    conn.close()
+    assert len(df) == 1
+    assert (df["pred_class"] == "ctrl").all()
+
+    # A DIFFERENT directory appends (the other run's rows survive).
+    raw3 = tmp_path / "infer3.db"
+    _write_raw_infer(raw3, "cell", [(5, "C:/other", 3)])
+    db_merge.absorb_infer_db(raw3, out, default_mask="cell")
+    conn = sqlite3.connect(str(out))
+    df = pd.read_sql("SELECT * FROM cell", conn)
+    conn.close()
+    assert len(df) == 2
+
+
+def test_absorb_without_any_mask_raises(tmp_path):
+    raw = tmp_path / "infer.db"
+    conn = sqlite3.connect(str(raw))
+    conn.execute(
+        "CREATE TABLE inference (uid INTEGER PRIMARY KEY, directory TEXT, "
+        "label INTEGER, pred_class TEXT)")
+    conn.execute("INSERT INTO inference VALUES (1, 'C:/ds', 1, 'drug')")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(ValueError, match="mask name"):
+        db_merge.absorb_infer_db(raw, tmp_path / "infer_x.db")
+
+
+def _profiler_and_infer(root, infer_names=("puncta",)):
+    """profiler.db (cell + nuclei) + one absorbed infer DB per name."""
+    _write_profiler(root / "profiler.db",
+                    {"cell": [("A1", 1, 10.0)],
+                     "nuclei": [("A1", 1, 99.0)]})
+    for name in infer_names:
+        raw = root / f"raw_{name}.db"
+        # Same directory+label as the profiler objects -> the frames fuse.
+        _write_raw_infer(raw, "cell", [(1, "C:/ds/Images", 1)])
+        db_merge.absorb_infer_db(raw, root / infer_db_file_name(name),
+                                 default_mask="cell")
+        raw.unlink()
+
+
+def test_build_merged_db_single_infer_db_bare(tmp_path):
+    """merged.db: profiler objects fused with the infer rows per mask; ONE
+    infer DB keeps bare column names; each mask stays its own table."""
+    _profiler_and_infer(tmp_path)
+
+    out = db_merge.build_merged_db(tmp_path)
+    assert out and out.endswith("merged.db")
+    conn = sqlite3.connect(out)
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    cell = pd.read_sql("SELECT * FROM cell", conn)
+    nuclei = pd.read_sql("SELECT * FROM nuclei", conn)
+    conn.close()
+
+    assert tables == {"cell", "nuclei"}
+    assert len(cell) == 1      # fused: profiler object + infer row
+    assert cell["area_cell"].iloc[0] == 10.0
+    assert cell["pred_class"].iloc[0] == "drug"
+    assert "umap_1" in cell.columns
+    # Bare names with a single infer DB.
+    assert not any(c.startswith("puncta_") for c in cell.columns)
+    # The nuclei table is the profiler table alone (its mask has no infer).
+    assert len(nuclei) == 1
+    assert nuclei["area_nuclei"].iloc[0] == 99.0
+    assert "pred_class" not in nuclei.columns
+
+
+def test_build_merged_db_multi_infer_db_prefixes(tmp_path):
+    _profiler_and_infer(tmp_path, infer_names=("puncta", "mito"))
+
+    out = db_merge.build_merged_db(tmp_path)
+    conn = sqlite3.connect(out)
+    cell = pd.read_sql("SELECT * FROM cell", conn)
+    conn.close()
+
+    assert len(cell) == 1
+    assert "puncta_pred_class" in cell.columns
+    assert "mito_pred_class" in cell.columns
+    assert "pred_class" not in cell.columns
+    assert cell["puncta_pred_class"].iloc[0] == "drug"
+
+
+def test_build_merged_db_rebuilt_from_scratch(tmp_path):
+    """A stale mask table in merged.db does not survive a rebuild."""
+    _profiler_and_infer(tmp_path)
+    stale = tmp_path / "merged.db"
+    conn = sqlite3.connect(str(stale))
+    conn.execute("CREATE TABLE ghost (label INTEGER)")
+    conn.commit()
+    conn.close()
+
+    db_merge.build_merged_db(tmp_path)
+    conn = sqlite3.connect(str(stale))
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    conn.close()
+    assert "ghost" not in tables
+
+
+def test_build_merged_db_skips_raw_infer_dbs(tmp_path):
+    """A raw (not absorbed) infer DB must not masquerade as an object
+    table — the `inference` table is not a per-mask profiler table."""
+    _write_profiler(tmp_path / "profiler.db", {"cell": [("A1", 1, 10.0)]})
+    _write_raw_infer(tmp_path / "infer_raw.db", "cell", [(1, "C:/ds", 1)])
+
+    out = db_merge.build_merged_db(tmp_path)
+    conn = sqlite3.connect(out)
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    cell = pd.read_sql("SELECT * FROM cell", conn)
+    conn.close()
+    assert tables == {"cell"}
+    assert "pred_class" not in cell.columns    # raw rows did not sneak in
+
+
+def test_build_merged_db_without_sources_removes_stale_output(tmp_path):
+    stale = tmp_path / "merged.db"
+    stale.write_bytes(b"x")
+    assert db_merge.build_merged_db(tmp_path) is None
+    assert not stale.exists()
+
+
+def test_build_merged_db_profiler_only(tmp_path):
+    """No infer DBs: merged.db mirrors profiler.db's object tables."""
+    _write_profiler(tmp_path / "profiler.db", {"cell": [("A1", 1, 10.0)]})
+    out = db_merge.build_merged_db(tmp_path)
+    assert out
+    conn = sqlite3.connect(out)
+    df = pd.read_sql("SELECT * FROM cell", conn)
+    conn.close()
+    assert len(df) == 1
+    assert df["area_cell"].iloc[0] == 10.0
