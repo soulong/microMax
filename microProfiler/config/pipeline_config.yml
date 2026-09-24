@@ -157,21 +157,21 @@ object_profile:
 # path field there to skip that stage.
 inference:
   run: false
-  configs: []            # add blocks in the GUI, or uncomment the example below
-#  - model: <path/to/model.pt>
-#    model_name: puncta           # names the output DB: infer_puncta.db
-#    mask_name: cell               # bare name; ALSO the output table name in the per-model DB
-#    channels:       # ORDERED channel names; top-to-bottom = model input order; null/[] = block SKIPPED (never "all")
-#      - ch1
-#    feature: true
-#    pred_class: true
-#    max_value: 65535
-#    reduction:                # omit/null = no dimension reduction
-#      enabled: true           # dimension-reduction group: write reduction_<method> tables
-#      reducer: null           # one or MORE pre-fitted reducer pickles (pca/umap/pacmap/localmap — types detected, run in order); null = fit `method` fresh; when set, `method` is ignored entirely
-#      method: [pca, umap, localmap]     # methods to fit when reducer is null (subset of pca/umap/pacmap/localmap)
-#      cluster_enabled: false   # cluster group switch: baseline prediction (below) AND fresh Leiden (cluster_res) — false = no cluster work at all
-#      cluster: null           # baseline cluster.pkl -> find_cluster table (kNN-predicted IDs; prediction runs only when cluster_enabled AND cluster are set)
-#      cluster_res: [0.5, 1]   # fresh Leiden resolutions (higher = more clusters); null/[] = none; needs cluster_enabled: true (ignored while the group is off)
-#      color_by: pred_class    # plot-only: colors the reduction PDF pages + stratifies the plot subsample; tables unaffected
-#      sample_per_class: 2000  # plot-only: max points per class DRAWN in the reduction PDFs / reduction-vis browser (0/null = draw all) — reducers and clusters are ALWAYS fit on ALL rows and every table keeps EVERY object (microprofiler run writes no PDFs, so this key only matters for standalone micromodel reduction / reduction-vis)
+  configs:
+    - model: D:/Model/2026-09-15_train_puncta/model.pt
+      model_name: puncta           # names the output DB: infer_puncta.db
+      mask_name: cell               # bare name; ALSO the output table name in the per-model DB
+      channels:       # ORDERED channel names; top-to-bottom = model input order; null/[] = block SKIPPED (never "all")
+        - ch1
+      feature: true
+      pred_class: true
+      max_value: 65535
+      reduction:                # omit/null = no dimension reduction
+        enabled: true           # dimension-reduction group: write reduction_<method> tables
+        reducer: null           # one or MORE pre-fitted reducer pickles (pca/umap/pacmap/localmap — types detected, run in order); null = fit `method` fresh; when set, `method` is ignored entirely
+        method: [pca, umap, localmap]     # methods to fit when reducer is null (subset of pca/umap/pacmap/localmap)
+        cluster_enabled: false   # cluster group switch: baseline prediction (below) AND fresh Leiden (cluster_res) — false = no cluster work at all
+        cluster: null           # baseline cluster.pkl -> find_cluster table (kNN-predicted IDs; prediction runs only when cluster_enabled AND cluster are set)
+        cluster_res: [0.5, 1]   # fresh Leiden resolutions (higher = more clusters); null/[] = none; needs cluster_enabled: true (ignored while the group is off)
+        color_by: pred_class    # plot-only: colors the reduction PDF pages + stratifies the plot subsample; tables unaffected
+        sample_per_class: 2000  # plot-only: max points per class DRAWN in the reduction PDFs / reduction-vis browser (0/null = draw all) — reducers and clusters are ALWAYS fit on ALL rows and every table keeps EVERY object (microprofiler run writes no PDFs, so this key only matters for standalone micromodel reduction / reduction-vis)
