@@ -521,6 +521,17 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
                     "'object_profile.configs[].parent_mask_name' must differ "
                     "from mask_name (a mask cannot be its own parent)."
                 )
+            # merged.db matches object tables to masks BY NAME, so a custom
+            # output_table_name must equal the mask name — a distinct name
+            # would fork the mask into a table the inference results never
+            # join.
+            if entry.output_table_name and entry.output_table_name != entry.mask_name:
+                raise ValueError(
+                    f"'object_profile.configs[].output_table_name' "
+                    f"({entry.output_table_name}) must equal the mask name "
+                    f"({entry.mask_name}) — merged.db matches tables to "
+                    f"masks by name. Drop the custom table name."
+                )
             entries.append(entry)
         # Duplicate output table names would replace each other (first flush
         # uses if_exists='replace') — validate once here for GUI and CLI.
@@ -528,8 +539,9 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
         dups = sorted({t for t in table_names if t and table_names.count(t) > 1})
         if dups:
             raise ValueError(
-                f"Duplicate object_profile output table(s): {dups}. Set a "
-                f"distinct output_table_name per block."
+                f"Duplicate object_profile mask(s)/table(s): {dups}. Each "
+                f"mask is profiled by ONE block (its table name IS the "
+                f"mask name)."
             )
         n_workers = section.get("n_workers")
         if n_workers is None:
@@ -559,6 +571,15 @@ def section_to_dataclass(attr: str, section: Dict) -> Any:
                 # infer_<model_name>.db — an active block without it has no
                 # defined output.
                 raise ValueError("'inference.configs[].mask_name' must not be empty")
+            if entry.mask_name == "inference":
+                # A per-mask table of that name makes the per-model DB read
+                # as a RAW microModel infer DB — build_merged_db would skip
+                # the whole file and silently drop the model's data.
+                raise ValueError(
+                    "'inference.configs[].mask_name' must not be 'inference' "
+                    "(that table name is reserved by the raw infer-DB "
+                    "layout)."
+                )
             if entry.max_value is not None and entry.max_value <= 0:
                 raise ValueError(
                     f"'inference.configs[].max_value' must be > 0, got {entry.max_value}")

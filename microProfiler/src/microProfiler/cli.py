@@ -184,7 +184,6 @@ def _is_dataset_complete(cfg: PipelineConfig, dataset_dir: Path) -> bool:
     # merged.db is built from OBJECT tables (the `image` table is not an
     # object table), so only object-output configs require it.
     object_outputs = bool(expected - {IMAGE_TABLE}) or has_inference_checks
-    has_object_outputs = object_outputs
     if object_outputs and not (dataset_dir / MERGED_DB_NAME).exists():
         # The run's final fused output is part of "complete" — a dataset
         # whose merged.db is missing (old-style results, deleted file) is

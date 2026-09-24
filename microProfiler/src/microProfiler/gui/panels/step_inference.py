@@ -742,20 +742,34 @@ class InferenceStepPanel(BlockContainerPanel):
             model = block.get_model_path()
             if not model:
                 return "Every inference block needs a model bundle path."
-            if not block.get_checked_channels():
-                # A block with no checked channels is skipped at runtime —
-                # not an error (empty channels = skip, never "all").
-                continue
+            # model_name + mask_name are required for EVERY block — even a
+            # skipped one (no channels) must form a complete, runnable
+            # config, same rule as the strict config validation.
             name = block.get_model_name()
             if not name:
                 return (
                     "Every inference block needs a model name (its results "
                     "DB is infer_<model name>.db)."
                 )
+            mask = block.get_mask_name()
+            if not mask:
+                return (
+                    "Every inference block needs a mask name (its results "
+                    "table is named after the mask)."
+                )
+            if mask.startswith("mask_"):
+                return (
+                    f"Mask name {mask!r} must be the bare mask name without "
+                    f"the 'mask_' prefix (use {mask[5:]!r})."
+                )
+            if not block.get_checked_channels():
+                # A block with no checked channels is skipped at runtime —
+                # not an error (empty channels = skip, never "all").
+                continue
             # Two blocks over the SAME (model, mask) would overwrite each
             # other's rows in the same per-mask table — same rule as the
             # CLI/config validation.
-            pair = (name, block.get_mask_name())
+            pair = (name, mask)
             if pair in seen:
                 return (
                     f"Duplicate inference (model name, mask) pair "
@@ -769,8 +783,6 @@ class InferenceStepPanel(BlockContainerPanel):
                     "Dimension reduction / Cluster require the 'feature' "
                     "output. Check 'feature' in the block before running."
                 )
-            # NOTE: a block with no checked channels is NOT an error — it is
-            # skipped at runtime (empty channels = skip, never "all").
             err = block.ensure_capability()
             if err:
                 return err

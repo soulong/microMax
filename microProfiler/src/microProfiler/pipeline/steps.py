@@ -414,17 +414,18 @@ def _run_inference(
             progress.step_end(f"reduction ({label})", f"Reduction complete ({label})")
 
         # Absorb the raw microModel tables into the per-model DB (one table
-        # per mask). On failure the scratch file SURVIVES — deleting it
-        # would throw the just-computed results away; the next run
-        # overwrites it.
+        # per mask). Failure aborts the run: the scratch file holds the
+        # just-computed results and the next block would overwrite it, so
+        # continuing would silently lose this block's work — the raw file
+        # is kept for inspection instead (the next run starts clean).
         try:
             db_merge.absorb_infer_db(
                 scratch, root_dir / db_name, default_mask=entry.mask_name)
-            scratch.unlink(missing_ok=True)
-        except Exception:
-            logger.warning(
-                "Absorbing %s into %s failed — the raw file is kept",
-                SCRATCH_INFER_DB_NAME, db_name, exc_info=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Absorbing {SCRATCH_INFER_DB_NAME} into {db_name} failed "
+                f"— the raw file is kept for inspection: {scratch}") from exc
+        scratch.unlink(missing_ok=True)
         if first_ran is None:
             first_ran = entry
         ran_any = True

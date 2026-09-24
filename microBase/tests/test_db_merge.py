@@ -522,6 +522,37 @@ def test_build_merged_db_multi_infer_db_prefixes(tmp_path):
     assert cell["puncta_pred_class"].iloc[0] == "drug"
 
 
+def test_build_merged_db_prefixes_disjoint_masks(tmp_path):
+    """The dataset-level prefix rule does not depend on mask overlap: two
+    infer DBs over DIFFERENT masks still namespace every model's columns —
+    a mask's columns must never flip bare/prefixed when a second model is
+    run on it later."""
+    _write_profiler(tmp_path / "profiler.db",
+                    {"cell": [("A1", 1, 10.0)],
+                     "nuclei": [("A1", 1, 99.0)]})
+    raw_a = tmp_path / "raw_a.db"
+    _write_raw_infer(raw_a, "cell", [(1, "C:/ds/Images", 1)])
+    db_merge.absorb_infer_db(raw_a, tmp_path / infer_db_file_name("puncta"),
+                             default_mask="cell")
+    raw_b = tmp_path / "raw_b.db"
+    _write_raw_infer(raw_b, "nuclei", [(1, "C:/ds/Images", 1)])
+    db_merge.absorb_infer_db(raw_b, tmp_path / infer_db_file_name("mito"),
+                             default_mask="nuclei")
+
+    out = db_merge.build_merged_db(tmp_path)
+    conn = sqlite3.connect(out)
+    cell = pd.read_sql("SELECT * FROM cell", conn)
+    nuclei = pd.read_sql("SELECT * FROM nuclei", conn)
+    conn.close()
+
+    assert len(cell) == 1
+    assert cell["puncta_pred_class"].iloc[0] == "drug"
+    assert "pred_class" not in cell.columns
+    assert len(nuclei) == 1
+    assert nuclei["mito_pred_class"].iloc[0] == "drug"
+    assert "pred_class" not in nuclei.columns
+
+
 def test_build_merged_db_rebuilt_from_scratch(tmp_path):
     """A stale mask table in merged.db does not survive a rebuild."""
     _profiler_and_infer(tmp_path)

@@ -176,6 +176,26 @@ def _pump_until(qt_app, cond, timeout_s=10.0,
     assert cond(), message
 
 
+def _db_has_tables(path) -> bool:
+    """True when the SQLite file exists AND holds at least one table.
+
+    sqlite's connect() creates the (empty) file before any table is
+    written, so an exists()-only wait races the writer and reads a
+    zero-table DB.
+    """
+    if not path.exists():
+        return False
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table'"
+        ).fetchone()[0] > 0
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        conn.close()
+
+
 def _wait_merged(window, qt_app):
     """Wait until the async Select-DB merge has landed."""
     _pump_until(qt_app, lambda: window._merged is not None,
@@ -888,7 +908,9 @@ def test_write_to_db_without_dataset_asks_location(qt_app, tmp_path, monkeypatch
             QMessageBox, "warning",
             staticmethod(lambda *a, **k: QMessageBox.Ok))
         win._on_write_to_db()
-        _pump_until(qt_app, lambda: out.exists(),
+        # Wait for a READABLE table, not merely the file: sqlite's connect()
+        # creates the empty file before the write lands (see _db_has_tables).
+        _pump_until(qt_app, lambda: _db_has_tables(out),
                     message="merged DB write did not finish")
 
         # The written file re-loads as a fused table (with the mask tag).

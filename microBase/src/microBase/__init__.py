@@ -15,7 +15,7 @@ Provides:
 - db_contracts    : shared profiler.db / infer.db table/column names + SQL helpers
 """
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 
 import os as _os
 _os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")

@@ -332,17 +332,22 @@ def _prefixed_frame(frame: SourceFrame) -> SourceFrame:
 
 
 def fuse_frames(frames: list[SourceFrame],
-                default_mask: str | None = None) -> pd.DataFrame:
+                default_mask: str | None = None,
+                force_prefix: bool = False) -> pd.DataFrame:
     """Fuse source frames into ONE table, grouped by mask.
 
     Frames of the same mask are fused (outer merge on identity columns);
     different masks are stacked and tagged in the `mask` column. A frame
     with an unknown mask (single-cell infer rows) joins `default_mask` —
     normally the profiler's mask — with a log hint; with no default it
-    forms its own group. When the fusion holds frames from TWO OR MORE
-    distinct prefixes (microProfiler tags every infer_<model>.db frame with
-    its model name), every prefixed frame's data columns are namespaced
-    `<prefix>_<column>` first (a single prefixed source keeps bare names).
+    forms its own group. Prefixed frames' data columns are namespaced
+    `<prefix>_<column>` when the fusion holds TWO OR MORE distinct
+    prefixes (microProfiler tags every infer_<model>.db frame with its
+    model name); a single prefixed source keeps bare names. force_prefix
+    applies that namespacing whenever ANY prefixed frame exists — the
+    dataset-level rule (two or more infer DBs prefix EVERY model's
+    columns) for fusions where each per-mask group would hold a single
+    prefix.
     """
     if not frames:
         raise ValueError("No selectable object data in the selected DB(s)")
@@ -353,7 +358,7 @@ def fuse_frames(frames: list[SourceFrame],
     # different-valued — prediction columns can never silently collapse
     # into one).
     prefixes = {f.prefix for f in frames if f.prefix}
-    if len(prefixes) >= 2:
+    if len(prefixes) >= 2 or (force_prefix and prefixes):
         frames = [_prefixed_frame(f) if f.prefix else f for f in frames]
 
     # Unknown-mask frames fall into the default group (hint in the log).
@@ -517,7 +522,11 @@ def build_merged_db(root_dir) -> str | None:
     if profiler_db.exists():
         frames.extend(read_profiler_frames(str(profiler_db)))
     # Dataset-level prefix rule: with several infer DBs every model's
-    # columns carry its name; a single infer DB stays bare.
+    # columns carry its name — even when the models cover DIFFERENT masks
+    # (each per-mask group would otherwise hold a single prefix and stay
+    # bare, and a mask's columns would flip bare/prefixed the day a second
+    # model is run on it). A single infer DB stays bare.
+    force_prefix = len(infer_dbs) >= 2
     for db in infer_dbs:
         if INFERENCE_TABLE in table_names_of(str(db)):
             # A raw (not yet absorbed) microModel infer DB — its `inference`
@@ -526,7 +535,7 @@ def build_merged_db(root_dir) -> str | None:
                 "%s is a raw microModel infer DB (absorb it first) — "
                 "skipped in %s", db.name, out.name)
             continue
-        prefix = model_name_from_infer_db(db.name) if len(infer_dbs) >= 2 else None
+        prefix = model_name_from_infer_db(db.name) if force_prefix else None
         frames.extend(read_profiler_frames(str(db), prefix=prefix))
     if not frames:
         if out.exists():
@@ -551,7 +560,7 @@ def build_merged_db(root_dir) -> str | None:
     if out.exists():
         out.unlink()
     for mask, group in groups.items():
-        fused = fuse_frames(group, default_mask=mask)
+        fused = fuse_frames(group, default_mask=mask, force_prefix=force_prefix)
         if MASK_COLUMN in fused.columns:
             fused = fused.drop(columns=[MASK_COLUMN])
         _write_mask_table(fused, out, str(mask))
