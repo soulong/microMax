@@ -99,7 +99,7 @@ image_profile:
 # Tables are matched to masks BY NAME in the end-of-run merged.db fusion, so
 # a custom output_table_name must EQUAL the mask name (the default).
 object_profile:
-  run: true
+  run: false
   n_workers: 8                      # profiling worker processes (GUI: sidebar Thread spin)
   configs:
     - mask_name: cell                 # which masks to crop objects from (bare name)
@@ -169,8 +169,8 @@ inference:
       reduction:                # omit/null = no dimension reduction
         enabled: true           # dimension-reduction group: write reduction_<method> tables
         reducer: null           # one or MORE pre-fitted reducer pickles (pca/umap/pacmap/localmap — types detected, run in order); null = fit `method` fresh; when set, `method` is ignored entirely
-        method: [pca, umap, localmap]     # methods to fit when reducer is null (subset of pca/umap/pacmap/localmap)
-        cluster_enabled: false   # cluster group switch: baseline prediction (below) AND fresh Leiden (cluster_res) — false = no cluster work at all
+        method: [pca, umap]     # methods to fit when reducer is null (subset of pca/umap/pacmap/localmap)
+        cluster_enabled: false  # cluster group switch: baseline prediction (below) AND fresh Leiden (cluster_res) — false = no cluster work at all
         cluster: null           # baseline cluster.pkl -> find_cluster table (kNN-predicted IDs; prediction runs only when cluster_enabled AND cluster are set)
         cluster_res: [0.5, 1]   # fresh Leiden resolutions (higher = more clusters); null/[] = none; needs cluster_enabled: true (ignored while the group is off)
         color_by: pred_class    # plot-only: colors the reduction PDF pages + stratifies the plot subsample; tables unaffected
