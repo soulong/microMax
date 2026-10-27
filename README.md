@@ -146,8 +146,9 @@ Typical flow:
    vector PDFs with editable text.
 3. **Select Metadata** (Excel) then **Merge** to add the plate metadata
    columns to the integrated table (**Clear** removes them); **Write to DB**
-   writes the integrated table into a NEW database (name editable next to
-   the button, default `merge.db`) — source DBs are never modified.
+   writes the integrated table into a database next to the dataset (name
+   editable next to the button, default `merged.db` — the pipeline's own
+   fused output, overwritten on write) — source DBs are never modified.
 4. Inspect images: thumbnail grid, well-plate grid, filters on well/field/
    stack/timepoint and any extra metadata columns, per-channel color and
    contrast controls, full-resolution zoom, pixel readout. Both **Color by**

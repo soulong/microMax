@@ -49,19 +49,19 @@ inference:
 #   show_cluster_image is false). Per-resolution kNN classifiers persist to cluster.pkl. cluster: <path to a baseline cluster.pkl> kNN-predicts ALL stored
 #   resolutions for this dataset instead of re-fitting — cluster IDs stay baseline-aligned (cluster_res is ignored then).
 reduction:
-  method: [umap]                      # list, DR methods to run (subset of pca/umap/pacmap/localmap)
-  color_by: null                      # list, null = single light-blue page; entries = any inference/find_cluster column except uid/features
-  cluster_res: null                   # list, Leiden resolutions (higher = more clusters); null/empty = no cluster finding (ignored when cluster is set)
-  sample_per_class: null              # max points per class DRAWN per PDF page (stratified by the first color_by); 0/null = draw all — fitting always uses every row
-  show_cluster_image: false           # output per-resolution representative-image sheets (cluster_res<res>.pdf); false = skip (faster, no model bundle load)
-  # reduction_pca: null                 # path to a pre-fitted reduction_pca.pkl; null = fit new
-  # reduction_umap: null                # path to a pre-fitted reduction_umap.pkl; null = fit new
-  # reduction_pacmap: null              # path to a pre-fitted reduction_pacmap.pkl; null = fit new
-  # reduction_localmap: null            # path to a pre-fitted reduction_localmap.pkl; null = fit new
-  # cluster: null                       # path to a baseline cluster.pkl; null = fit new (and save cluster.pkl)
-  reduction_pca: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_pca.pkl          # e.g. reuse the baseline reducers
-  reduction_umap: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_umap.pkl
-  reduction_pacmap: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_pacmap.pkl
-  reduction_localmap: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_localmap.pkl
-  cluster: D:/Model/2026-09-15_train_puncta/infer_sc/cluster.pkl                # e.g. predict the baseline clusters
+  method: [pca, umap, pacmap, localmap]                      # list, DR methods to run (subset of pca/umap/pacmap/localmap)
+  color_by: ground_truth                      # list, null = single light-blue page; entries = any inference/find_cluster column except uid/features
+  cluster_res: [0.4, 1, 2]                   # list, Leiden resolutions (higher = more clusters); null/empty = no cluster finding (ignored when cluster is set)
+  sample_per_class: 2000              # max points per class DRAWN per PDF page (stratified by the first color_by); 0/null = draw all — fitting always uses every row
+  show_cluster_image: true           # output per-resolution representative-image sheets (cluster_res<res>.pdf); false = skip (faster, no model bundle load)
+  reduction_pca: null                 # path to a pre-fitted reduction_pca.pkl; null = fit new
+  reduction_umap: null                # path to a pre-fitted reduction_umap.pkl; null = fit new
+  reduction_pacmap: null              # path to a pre-fitted reduction_pacmap.pkl; null = fit new
+  reduction_localmap: null            # path to a pre-fitted reduction_localmap.pkl; null = fit new
+  cluster: null                       # path to a baseline cluster.pkl; null = fit new (and save cluster.pkl)
+  # reduction_pca: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_pca.pkl          # e.g. reuse the baseline reducers
+  # reduction_umap: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_umap.pkl
+  # reduction_pacmap: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_pacmap.pkl
+  # reduction_localmap: D:/Model/2026-09-15_train_puncta/infer_sc/reduction_localmap.pkl
+  # cluster: D:/Model/2026-09-15_train_puncta/infer_sc/cluster.pkl                # e.g. predict the baseline clusters
 

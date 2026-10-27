@@ -284,7 +284,12 @@ Package layout (overview):
   `mask` column; remaining column collisions take the `<db-stem>/` rename).
   Also the Excel-metadata merge and the dataset directory scoping.
 
-* `widgets/` — image display (thumbnail grid + full-res view), channel
+* `widgets/` — image display (thumbnail grid + full-res view; right-click
+  on a thumbnail offers clipboard copies of the visible view region —
+  "Copy current" = every enabled channel's composite, "Copy <channel>" =
+  that single channel with its own color/vmin/vmax, both re-rendered at
+  full resolution through the SAME enhancement path as the display so
+  contrast/gamma/invert follow the live settings), channel
   controls, image filters, well-grid canvas, label annotation panel, pixel
   info, data view, and `data_plot.py` — THE single plot view over the merged
   table (all pickers editable, left-click a scatter point shows the cropped
@@ -359,9 +364,12 @@ Data flow:
   per categorical color; the Show points toggle also gates its raw dots) /
   boxplot / barplot mean±SEM with
   X/Y/color/size/facets and palette; X/Y accept every merged column,
-  categoricals plotted on level ticks. Facet panels SHARE both axes and place categories/groups at their
-  GLOBAL level positions (a category missing from one panel still occupies
-  its slot there), so panels compare like with like. Every picker combo is editable — type to filter long column lists.
+  categoricals plotted on level ticks. Free X / Free Y checkboxes (both
+  default CHECKED = free) decide per direction whether facet panels
+  autoscale their own axis to their own data (free) or share one scale
+  (unchecked); categories/groups always place at their GLOBAL level
+  positions (a category missing from one panel still occupies its slot
+  there) in BOTH modes. Every picker combo is editable — type to filter long column lists.
   A free-form pandas-expression filter (directly below Chart) is applied
   before plotting. Plot
   controls sit in a left column with the interactive canvas on the right;
@@ -380,9 +388,11 @@ Data flow:
 * Excel plate metadata (**Select Metadata**) is merged by `well`
   into the integrated table on **Merge** (in memory — no DB write) and
   un-merged on **Clear**. **Write to DB** writes the integrated table
-  (profiler + infer + merged metadata columns) into a NEW database next to
+  (profiler + infer + merged metadata columns) into a database next to
   the dataset — the small edit after the button controls the file name
-  (default merge.db, table `merged`); the source DBs are never modified.
+  (default merged.db — the pipeline's own fused output, overwritten
+  WHOLESALE on write so no stale table survives, table `merged`); the
+  source DBs are never modified.
 
 **Adding a new widget:** add the class under `widgets/`, instantiate it in
 `MainWindow.__init__` and wire its signals to private `_on_*` handlers; access

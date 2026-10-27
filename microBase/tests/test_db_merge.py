@@ -195,6 +195,22 @@ def test_write_and_reload_round_trip(tmp_path):
     assert masks == ["cell", "nuclei"]
 
 
+def test_write_merged_db_overwrites_wholesale(tmp_path):
+    """Write to DB overwrites the WHOLE file (default name is the
+    pipeline's own merged.db): a stale table from an earlier write or a
+    pipeline run must not survive next to the new `merged` table."""
+    out = tmp_path / "merged.db"
+    _write_profiler(out, {"nuclei": [("A1", 1, 99.0)]})  # a leftover table
+    p_prof = tmp_path / "profiler.db"
+    _write_profiler(p_prof, {"cell": [("A1", 1, 10.0)]})
+    fused = db_merge.fuse_frames(db_merge.read_db_frames(str(p_prof)))
+
+    db_merge.write_merged_db(fused, out, mask="cell")
+    frames = db_merge.read_db_frames(out)
+    # Only the fresh `merged` table remains — `nuclei` is gone.
+    assert [(f.table, f.mask) for f in frames] == [("merged", "cell")]
+
+
 def test_fuse_without_frames_raises():
     with pytest.raises(ValueError):
         db_merge.fuse_frames([])

@@ -73,6 +73,7 @@ from microVis.worker import (
     ImageWorkerConfig,
     crop_cell_rgb_normalized,
     crop_object_rgb,
+    crop_rgb_fraction,
 )
 
 logger = get_logger("microVis.main_window")
@@ -256,6 +257,11 @@ class MainWindow(QMainWindow):
         self._overlay_alpha: float = 0.0
         self._object_mask_selected: str = ""  # "" = None; else mask name without "mask_" prefix
         self._image_blocked: bool = False
+        # Right-click clipboard copy: generation guard + the visible-region
+        # fractions / channel selection of the copy currently in flight.
+        self._copy_gen: int = 0
+        self._copy_fractions: tuple = (0.0, 0.0, 1.0, 1.0)
+        self._copy_channel: str | None = None
 
         # Image debounce timer
         self._debounce = QTimer(singleShot=True, interval=300, timeout=self._refresh_images)
@@ -540,6 +546,9 @@ class MainWindow(QMainWindow):
         # Image display (pixel click)
         self._image_display.pixel_clicked.connect(self._on_pixel_clicked)
         self._image_display.full_res_requested.connect(self._on_full_res_requested)
+        # Right-click on a thumbnail → clipboard copy of the view region.
+        self._image_display.copy_region_requested.connect(
+            self._on_copy_region_requested)
 
         # Label annotation controls
         ic.label_class_added.connect(self._on_label_class_added)
@@ -1481,8 +1490,9 @@ class MainWindow(QMainWindow):
         The table fuses profiler measurements, infer predictions/coordinates
         and (if merged) the Excel metadata columns, one row per object.
         The output file lives next to the dataset; its name comes from the
-        small edit next to the button (default merge.db). Source DBs are
-        never modified.
+        small edit next to the button (default merged.db — the pipeline's
+        own fused output name) and an existing file is overwritten.
+        Source DBs are never modified.
         """
         if self._merged is None:
             logger.info("Write to DB: no DBs are merged")
@@ -2308,12 +2318,15 @@ class MainWindow(QMainWindow):
         self._channel_toggle_batch = False
         if self._image_blocked:
             return
-        # Collect thumbnails currently showing full-res
+        # Collect thumbnails currently zoomed (full-res displayed OR its
+        # render still in flight — `_is_full_res` is the state, the item
+        # may not exist yet). Re-dispatching bumps their generation, so an
+        # in-flight render with the OLD channel settings is rejected.
         full_res_keys = set()
         from microVis.widgets.image_display import _ThumbnailView
         for row_widget, _ in self._image_display._row_widgets.values():
             for thumb in row_widget.findChildren(_ThumbnailView):
-                if thumb._is_full_res and thumb._full_res_item is not None:
+                if thumb._is_full_res:
                     full_res_keys.add(thumb._row_idx)
 
         self._image_display.update_pixmaps_in_place(
@@ -2494,7 +2507,78 @@ class MainWindow(QMainWindow):
                         polygons=polygons,
                         overlay_alpha=self._overlay_alpha,
                         overlay_cmap=self._overlay_cmap)
-                    return
+        # No early return: a just-rebuilt display can transiently hold BOTH
+        # the dying old widget and its replacement for the same row — every
+        # match must receive the render (applying to a dying widget is
+        # harmless; skipping the live one would leave it without full-res).
+
+    # ── Right-click clipboard copy ───────────────────────────────────────────
+
+    def _on_copy_region_requested(self, row_idx: int, fractions: tuple,
+                                  global_pos) -> None:
+        """Right-click on a thumbnail: offer clipboard copies of the view.
+
+        "Copy current" renders every ENABLED channel (the displayed
+        composite); "Copy <channel>" renders that single channel with its
+        own color/vmin/vmax — both through the same enhancement path as
+        the display, at full resolution, cropped to the visible region.
+        """
+        if self._dm is None or self._image_blocked:
+            return
+        from PySide6.QtWidgets import QMenu
+        channels = list(self._ch_config.keys())
+        if not channels:
+            return
+        menu = QMenu(self)
+        act_current = menu.addAction("Copy current")
+        menu.addSeparator()
+        ch_actions = [menu.addAction(f"Copy {ch}") for ch in channels]
+        chosen = menu.exec(global_pos)
+        if chosen is None:
+            return
+        only_channel = None
+        if chosen is not act_current:
+            only_channel = channels[ch_actions.index(chosen)]
+        self._dispatch_copy_view(row_idx, fractions, only_channel)
+
+    def _dispatch_copy_view(self, row_idx: int, fractions: tuple,
+                            only_channel: str | None) -> None:
+        """Render the requested channel selection in a background worker.
+
+        The visible-region fractions are remembered for the finish handler;
+        the generation counter discards the result of a superseded copy.
+        """
+        from microVis.worker import CopyViewWorker
+        # Read the LIVE channel config (the cached self._ch_config only
+        # refreshes on dispatch/reset — a just-moved slider must be honored).
+        self._ch_config = self._image_controls.get_channel_config()
+        dmax = DTYPE_MAX.get(str(self._dm.img_dtype), 65535.0)
+        self._copy_gen += 1
+        self._copy_fractions = fractions
+        self._copy_channel = only_channel
+        worker = CopyViewWorker(
+            dm=self._dm, row_idx=row_idx,
+            channel_names=list(self._ch_config.keys()),
+            ch_config=self._ch_config, dmax=dmax,
+            contrast_method=self._contrast_method,
+            contrast_gamma=self._contrast_gamma, invert=self._invert,
+            only_channel=only_channel, gen=self._copy_gen)
+        worker.signals.finished.connect(self._on_copy_finished)
+        worker.signals.error.connect(
+            lambda msg: logger.warning("Copy view worker error: %s", msg))
+        self._start_worker(worker)
+
+    def _on_copy_finished(self, row_idx: int, gen: int, rgb) -> None:
+        """Crop the rendered frame to the copied region → clipboard."""
+        if gen != self._copy_gen:
+            return  # a newer copy (or channel change) superseded this one
+        from PySide6.QtGui import QImage
+        crop = crop_rgb_fraction(rgb, self._copy_fractions)
+        h, w = crop.shape[:2]
+        qimg = QImage(crop.data, w, h, 3 * w, QImage.Format_RGB888)
+        QApplication.clipboard().setImage(qimg.copy())
+        logger.info("Copied %dx%d px (%s) of row %d to clipboard", w, h,
+                    self._copy_channel or "current channels", row_idx)
 
     # ── Label Annotation Handlers ────────────────────────────────────────────
 

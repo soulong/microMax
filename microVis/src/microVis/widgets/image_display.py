@@ -10,7 +10,7 @@ matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PySide6.QtCore import QMimeData, Qt, Signal
+from PySide6.QtCore import QMimeData, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QCursor, QDrag, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
@@ -48,6 +48,9 @@ class _ThumbnailView(QGraphicsView):
 
     pixel_clicked = Signal(int, int, int, int, int)  # row_idx, x, y, pixmap_w, pixmap_h
     full_res_requested = Signal(int, int)  # row_idx, gen
+    # Right-click copy request: row_idx, visible-region fractions
+    # (x, y, w, h of the displayed pixmap), global cursor pos.
+    copy_region_requested = Signal(int, object, object)
 
     def __init__(
         self,
@@ -265,6 +268,30 @@ class _ThumbnailView(QGraphicsView):
         self.reset_zoom()
         event.accept()
 
+    def contextMenuEvent(self, event) -> None:
+        """Right-click: request a clipboard copy of the visible view region.
+
+        The visible viewport rect is mapped to scene (thumbnail pixel)
+        coordinates and clipped to the displayed pixmap — fitInView
+        letterboxing and over-panning must not produce negative or
+        out-of-range crops. It is emitted as FRACTIONS of the pixmap so
+        the receiver can crop ANY resolution render of the same field of
+        view (thumbnail, full-res, or a single-channel re-render).
+        """
+        pixmap = self._pixmap_item.pixmap()
+        pw, ph = pixmap.width(), pixmap.height()
+        if pw <= 0 or ph <= 0:
+            return
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        visible = visible.intersected(QRectF(0, 0, pw, ph))
+        if visible.isEmpty():
+            return
+        fractions = (visible.x() / pw, visible.y() / ph,
+                     visible.width() / pw, visible.height() / ph)
+        self.copy_region_requested.emit(self._row_idx, fractions,
+                                        event.globalPos())
+        event.accept()
+
     def _start_object_drag(self, label: int) -> None:
         """Initiate a QDrag carrying the ObjectKey for a mask object."""
         from microVis.widgets.label_annotation import ObjectKey, encode_object_key
@@ -469,7 +496,15 @@ class _ThumbnailView(QGraphicsView):
         self.verticalScrollBar().setValue(state["v_scroll"])
         # A zoomed transform on a freshly rebuilt thumbnail shows a blurry
         # scaled thumbnail — re-request the full-res render when zoomed.
+        # The zoom state MUST mirror wheelEvent's zoom-in (_is_full_res
+        # True + fresh gen): the full-res item renders ON TOP of the base
+        # pixmap, so a later set_pixmap (channel toggle) skips the base —
+        # only the re-dispatched full-res render updates what is shown.
+        # Without the flag, toggling a channel left the old full-res
+        # render on screen forever.
         if not self._is_full_res and self.transform().m11() > 1.0:
+            self._is_full_res = True
+            self._full_res_gen += 1
             self.full_res_requested.emit(self._row_idx, self._full_res_gen)
 
 
@@ -478,6 +513,7 @@ class ImageDisplay(QScrollArea):
 
     pixel_clicked = Signal(int, int, int, int, int)  # row_idx, x, y, pixmap_w, pixmap_h
     full_res_requested = Signal(int, int)  # row_idx, gen
+    copy_region_requested = Signal(int, object, object)  # forwarded from thumbnails
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -831,6 +867,7 @@ class ImageDisplay(QScrollArea):
         )
         thumb.pixel_clicked.connect(self.pixel_clicked)
         thumb.full_res_requested.connect(self.full_res_requested)
+        thumb.copy_region_requested.connect(self.copy_region_requested)
         if saved_state:
             key = r.get("row_idx", -1)
             if key in saved_state:
@@ -870,6 +907,7 @@ class ImageDisplay(QScrollArea):
         )
         thumb.pixel_clicked.connect(self.pixel_clicked)
         thumb.full_res_requested.connect(self.full_res_requested)
+        thumb.copy_region_requested.connect(self.copy_region_requested)
         if saved_state:
             key = r.get("row_idx", -1)
             if key in saved_state:

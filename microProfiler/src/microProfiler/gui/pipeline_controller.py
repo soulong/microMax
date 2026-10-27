@@ -689,6 +689,15 @@ class PipelineController(QObject):
         if block_index >= len(blocks):
             return
         block = blocks[block_index]
+        # A block with no Chan1 checked can never preview — the run path
+        # skips such blocks (empty means skip, never "all"), so the preview
+        # declines the same way instead of crashing inside segment_single.
+        if not block.get_chan1():
+            self._view.progress_show_status(
+                "Preview needs at least one Chan1 channel checked — "
+                "select the channels to segment first."
+            )
+            return
         idx = self._random_row_idx
         seg_params = block.build_config_section()
         seg_params.pop("object_name", None)

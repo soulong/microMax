@@ -19,7 +19,9 @@ from microVis.widgets.ui_spec import (
     PATTERN_LABEL_STYLE,
 )
 
-DEFAULT_MERGE_DB = "merge.db"
+# Default output file name of Write to DB — the SAME name the pipeline's
+# fused output uses; writing overwrites that file wholesale.
+DEFAULT_MERGE_DB = "merged.db"
 
 
 class DataView(QWidget):
@@ -31,8 +33,9 @@ class DataView(QWidget):
     and/or infer DB files of the current dataset; their objects are merged
     into one table rendered by the single plot view set via
     :meth:`set_plot_view`. "Write to DB" persists the integrated table
-    (profiler + infer + merged Excel metadata) into a NEW database whose
-    file name the small edit after the button controls (default merge.db).
+    (profiler + infer + merged Excel metadata) into a database whose
+    file name the small edit after the button controls (default merged.db —
+    the pipeline's own fused output, overwritten on write).
     """
 
     dataset_browse_clicked = Signal()
@@ -210,7 +213,8 @@ class DataView(QWidget):
         self._btn_write_db.setEnabled(False)
         self._btn_write_db.setToolTip(
             "Write the integrated table (profiler + infer + merged metadata "
-            "columns) into a NEW database next to the dataset.")
+            "columns) into the database next to the dataset — an existing "
+            "file of the same name is overwritten.")
         self._btn_write_db.clicked.connect(self._on_write_to_db)
         btn_row.addWidget(self._btn_write_db)
 
@@ -218,7 +222,8 @@ class DataView(QWidget):
         self._merge_db_edit = QLineEdit(DEFAULT_MERGE_DB)
         self._merge_db_edit.setToolTip(
             "File name of the database written by 'Write to DB' "
-            "(inside the dataset directory).")
+            "(inside the dataset directory; an existing file is "
+            "overwritten).")
         self._merge_db_edit.setFixedWidth(110)
         self._merge_db_edit.setStyleSheet(COMPACT_LINE_EDIT_STYLE)
         btn_row.addWidget(self._merge_db_edit)
@@ -308,7 +313,7 @@ class DataView(QWidget):
         """
 
     def get_merge_db_name(self) -> str:
-        """Output DB file name for Write to DB (defaults to merge.db)."""
+        """Output DB file name for Write to DB (defaults to merged.db)."""
         name = self._merge_db_edit.text().strip()
         return name if name else DEFAULT_MERGE_DB
 
@@ -357,8 +362,9 @@ class DataView(QWidget):
             self,
             "Write Merged Database",
             "This writes the integrated table (profiler + infer objects plus "
-            "the merged metadata columns) into a NEW database file inside "
-            "the dataset directory. The source DBs are not modified.\n\n"
+            "the merged metadata columns) into a database file inside "
+            "the dataset directory — an existing file of that name is "
+            "overwritten. The source DBs are not modified.\n\n"
             "Are you sure you want to continue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,

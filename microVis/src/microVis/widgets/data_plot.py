@@ -334,6 +334,31 @@ class DataPlotView(QWidget):
         facet_cols_row.setContentsMargins(68, 0, 0, 0)
         controls_layout.addLayout(facet_cols_row)
 
+        # Free X / Free Y — the facet axis mode (one row, indented like the
+        # Cols row; the control column is too narrow for a third control on
+        # that row). Checked: every facet panel scales its own axis from its
+        # own data; unchecked: the grid shares one scale per direction.
+        free_row = QHBoxLayout()
+        self._free_x = QCheckBox("Free X")
+        self._free_x.setChecked(True)
+        self._free_x.setToolTip(
+            "Checked: every facet panel autoscales its own X axis to its "
+            "own data. Unchecked: all panels share one X scale (aligned "
+            "comparison). Only used when Facet by is set; takes effect on "
+            "the next Plot.")
+        free_row.addWidget(self._free_x)
+        self._free_y = QCheckBox("Free Y")
+        self._free_y.setChecked(True)
+        self._free_y.setToolTip(
+            "Checked: every facet panel autoscales its own Y axis to its "
+            "own data. Unchecked: all panels share one Y scale (aligned "
+            "comparison). Only used when Facet by is set; takes effect on "
+            "the next Plot.")
+        free_row.addWidget(self._free_y)
+        free_row.addStretch()
+        free_row.setContentsMargins(68, 0, 0, 0)
+        controls_layout.addLayout(free_row)
+
         self._colors_combo = QComboBox()
         controls_layout.addLayout(_form_row("Colors", self._colors_combo))
 
@@ -538,6 +563,9 @@ class DataPlotView(QWidget):
         self._facet_list.clear()
         self._facet_filter.clear()
         self._facet_cols.setValue(3)
+        # Facet axis mode back to free scales (the construction defaults).
+        self._free_x.setChecked(True)
+        self._free_y.setChecked(True)
         # Scatter options.
         self._scatter_size.setValue(20.0)
         self._cap_spin.setValue(20000)
@@ -677,6 +705,10 @@ class DataPlotView(QWidget):
         facets = self._facet_selected()
         palette = self._colors_combo.currentText()
         ncols = self._facet_cols.value()
+        # Facet axis mode: Free checked = per-panel own scale, unchecked =
+        # one shared scale per direction (only used with facets set).
+        free_x = self._free_x.isChecked()
+        free_y = self._free_y.isChecked()
         # Every picker/control read happens HERE on the GUI thread — the
         # worker closure only touches plain Python values.
         size = self._selected(self._size_combo)
@@ -717,19 +749,23 @@ class DataPlotView(QWidget):
                 fig = P.make_scatter(
                     sub, x=x, y=y, color=color, size=size,
                     facet_cols=facets, palette=palette, cmap=palette,
-                    point_size=point_size, ncols=ncols)
+                    point_size=point_size, ncols=ncols,
+                    free_x=free_x, free_y=free_y)
             elif chart == _CHART_LINE:
                 fig = P.make_line(sub, y=y, x=x, color=color,
                                   facet_cols=facets, palette=palette,
-                                  ncols=ncols, show_points=show_points)
+                                  ncols=ncols, free_x=free_x, free_y=free_y,
+                                  show_points=show_points)
             elif chart == _CHART_BOXPLOT:
                 fig = P.make_boxplot(sub, y=y, x=x, color=color,
                                      facet_cols=facets, palette=palette,
-                                     show_points=show_points, ncols=ncols)
+                                     show_points=show_points, ncols=ncols,
+                                     free_x=free_x, free_y=free_y)
             else:
                 fig = P.make_barplot_mean_sem(sub, y=y, x=x, color=color,
                                               facet_cols=facets,
-                                              palette=palette, ncols=ncols)
+                                              palette=palette, ncols=ncols,
+                                              free_x=free_x, free_y=free_y)
             return fig, info
 
         # The figure build (per-facet groupbys, spline fits, thousands of

@@ -572,19 +572,25 @@ def build_merged_db(root_dir) -> str | None:
 # ── In-memory write (microVis Write to DB) ───────────────────────────────
 
 def write_merged_db(df: pd.DataFrame, path, mask: str | None = None) -> str:
-    """Write a fused table into a NEW SQLite DB (table `merged`).
+    """Write a fused table into a SQLite DB (table `merged`).
 
-    The parent directory is created if needed; the `merged` table is
-    replaced, other tables in the file are untouched. When a single mask
-    applies (the `mask` argument, or the frame's single distinct `mask`
-    value), the written table carries a `mask` column tagging every row —
-    re-loading the file then resolves the frame's mask from that column.
-    Multi-mask tables already carry the column and are written as-is.
+    The file is overwritten WHOLESALE (an existing file is deleted first —
+    same fresh-file rule as build_merged_db) so a stale table from an
+    earlier write or a pipeline run never survives next to the new `merged`
+    table; the default output name is therefore the pipeline's own
+    `merged.db`. When a single mask applies (the `mask` argument, or the
+    frame's single distinct `mask` value), the written table carries a
+    `mask` column tagging every row — re-loading the file then resolves the
+    frame's mask from that column. Multi-mask tables already carry the
+    column and are written as-is.
     """
     p = Path(path)
     if p.suffix == "":
         p = p.with_suffix(".db")
     p.parent.mkdir(parents=True, exist_ok=True)
+    # Fresh file: no leftover table from an earlier write can survive.
+    if p.exists():
+        p.unlink()
     if mask is None and MASK_COLUMN in df.columns:
         uniq = df[MASK_COLUMN].dropna().astype(str).unique()
         mask = uniq[0] if len(uniq) == 1 else None

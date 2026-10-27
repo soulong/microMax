@@ -314,6 +314,90 @@ class FullResWorker(QRunnable):
             self.signals.error.emit(str(e))
 
 
+class _CopyViewSignals(QObject):
+    finished = Signal(int, int, object)  # (row_idx, gen, RGB uint8 ndarray)
+    error = Signal(str)
+
+
+class CopyViewWorker(QRunnable):
+    """Render one image for the clipboard copy at FULL resolution.
+
+    Shares the exact per-channel enhancement + composite path with the
+    thumbnail/full-res render, so the copied pixels follow the display
+    settings (per-channel color/vmin/vmax, contrast method, gamma,
+    invert). `only_channel` limits the composite to that ONE channel
+    (with its own settings); None keeps every enabled channel — the
+    displayed composite. The caller crops the returned full frame to the
+    visible view region on the GUI thread (crop_rgb_fraction).
+    """
+
+    def __init__(self, dm, row_idx: int,
+                 channel_names: list[str], ch_config: dict, dmax: float,
+                 contrast_method: str, contrast_gamma: float, invert: bool,
+                 only_channel: str | None = None, gen: int = 0):
+        super().__init__()
+        self.signals = _CopyViewSignals()
+        self.setAutoDelete(False)
+        self._dm = dm
+        self._row_idx = row_idx
+        self._ch_names = channel_names
+        self._ch_config = ch_config
+        self._dmax = dmax
+        self._contrast = contrast_method
+        self._gamma = contrast_gamma
+        self._invert = invert
+        self._only_channel = only_channel
+        self._gen = gen
+
+    def run(self) -> None:
+        try:
+            from microVis.processing.compositing import composite_image
+
+            img_data, _mask_dict = self._dm.get_imageset(self._row_idx)
+
+            cfg = self._ch_config
+            if self._only_channel is not None:
+                # Single-channel copy: that channel keeps its settings,
+                # every other channel is disabled for THIS render only.
+                cfg = {name: {**c, "enabled": name == self._only_channel}
+                       for name, c in cfg.items()}
+
+            enhanced = _enhance_channels(
+                img_data, self._ch_names, cfg, self._dmax,
+                self._contrast, self._gamma, self._invert,
+            )
+            comp_config = {ch: {**c, "vmin": 0, "vmax": 1}
+                           for ch, c in cfg.items()}
+            rgb = composite_image(enhanced, self._ch_names, comp_config,
+                                  None, None)
+            self.signals.finished.emit(
+                self._row_idx, self._gen, np.ascontiguousarray(rgb))
+        except MicroMaxError as e:
+            logger.warning("Copy view worker skipped row %d: %s",
+                           self._row_idx, e)
+            self.signals.error.emit(str(e))
+        except Exception as e:
+            logger.exception("Copy view worker failed")
+            self.signals.error.emit(str(e))
+
+
+def crop_rgb_fraction(rgb: np.ndarray, fractions: tuple) -> np.ndarray:
+    """Crop an (H, W, C) array by FRACTIONS of its width/height.
+
+    `fractions` is (x, y, w, h) in [0, 1] relative to the full frame —
+    the visible-region fractions emitted by the thumbnail's right-click.
+    Clamped to the array bounds; an empty/degenerate rect yields a
+    1-pixel fallback so callers never receive a zero-size crop.
+    """
+    fx, fy, fw, fh = fractions
+    h, w = rgb.shape[:2]
+    x0 = min(max(int(round(fx * w)), 0), w - 1)
+    y0 = min(max(int(round(fy * h)), 0), h - 1)
+    x1 = min(max(int(round((fx + fw) * w)), x0 + 1), w)
+    y1 = min(max(int(round((fy + fh) * h)), y0 + 1), h)
+    return np.ascontiguousarray(rgb[y0:y1, x0:x1])
+
+
 # ── Crop Worker ───────────────────────────────────────────────────────────────
 
 
@@ -610,12 +694,12 @@ class _WriteSignals(QObject):
 
 
 class DBWriteWorker(QRunnable):
-    """Writes the integrated merged table into a NEW SQLite DB off the UI
+    """Writes the integrated merged table into a SQLite DB off the UI
     thread.
 
     ``df.to_sql`` of a multi-million-row object table blocks for minutes —
     the GUI thread only prepares the frame and adopts the result through
-    the signals. The output file is always a NEW database (sources are
+    the signals. The output file is overwritten wholesale (sources are
     never modified), so a background write cannot race another writer.
     """
 

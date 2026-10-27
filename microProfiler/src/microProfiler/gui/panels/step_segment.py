@@ -213,9 +213,12 @@ class SegmentBlockWidget(QWidget):
         row5.addStretch()
         layout.addLayout(row5)
 
-        # Preview row — centered C1/C2 images, tightly packed (2/3 size).
+        # Preview row — centered C1/C2 images. The viewers are the dominant
+        # element of the block: a large square area is needed to actually
+        # judge a segmentation (mask boundaries, merged objects), so both
+        # viewers and the container carry the same generous minimum.
         self._preview_container = QWidget()
-        self._preview_container.setMinimumHeight(dp(146))
+        self._preview_container.setMinimumHeight(dp(330))
         preview_container_layout = QVBoxLayout(self._preview_container)
         preview_container_layout.setContentsMargins(0, 0, 0, 0)
         preview_container_layout.setSpacing(0)
@@ -234,7 +237,7 @@ class SegmentBlockWidget(QWidget):
         c1_label.setContentsMargins(0, 0, 0, 0)
         c1_col.addWidget(c1_label)
         self._c1_view = ImageViewer()
-        self._c1_view.setMinimumSize(dp(133), dp(133))
+        self._c1_view.setMinimumSize(dp(300), dp(300))
         self._c1_view.set_show_axes(True)
         c1_col.addWidget(self._c1_view)
         preview_row.addLayout(c1_col, 1)
@@ -247,7 +250,7 @@ class SegmentBlockWidget(QWidget):
         c2_label.setContentsMargins(0, 0, 0, 0)
         c2_col.addWidget(c2_label)
         self._c2_view = ImageViewer()
-        self._c2_view.setMinimumSize(dp(133), dp(133))
+        self._c2_view.setMinimumSize(dp(300), dp(300))
         self._c2_view.set_show_axes(True)
         c2_col.addWidget(self._c2_view)
         preview_row.addLayout(c2_col, 1)

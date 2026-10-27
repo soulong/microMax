@@ -6,7 +6,8 @@ writes them), then drives MainWindow through the real flow:
 
 select dir → load dataset → merged.db auto-loads → merged table asserts →
 plot → left-click a scatter point (cropped-cell popup) → click empty space
-(popup hides) → Excel metadata merge → Write to DB (merge.db).
+(popup hides) → Excel metadata merge → Write to DB (default merged.db,
+overwriting the pipeline's own file).
 """
 
 import os
@@ -302,7 +303,8 @@ def test_merged_db_flow(dataset, window, qt_app):
     window._on_metadata_merge()
     qt_app.processEvents()
 
-    # ── Write to DB → merge.db with the integrated table ──
+    # ── Write to DB → merged.db (default name: OVERWRITES the pipeline's
+    #    own fused output wholesale) ──
     from PySide6.QtWidgets import QMessageBox
     # Auto-answer the confirm dialog AND auto-dismiss the result dialog —
     # a modal either way would block the offscreen event loop forever.
@@ -315,8 +317,12 @@ def test_merged_db_flow(dataset, window, qt_app):
     QMessageBox.warning = staticmethod(lambda *a, **k: QMessageBox.Ok)
     try:
         window._on_write_to_db()
-        merge_db = dataset / "merge.db"
-        _pump_until(qt_app, lambda: merge_db.exists(),
+        merge_db = dataset / "merged.db"
+        assert merge_db.exists()  # the pipeline output being overwritten
+        # The file pre-exists, so "exists()" cannot signal completion —
+        # the write worker re-enables the Write button when it lands
+        # (both the success and the failure handler do).
+        _pump_until(qt_app, lambda: window._data_view._btn_write_db.isEnabled(),
                     message="merged DB write did not finish")
     finally:
         QMessageBox.question = orig_question
@@ -326,11 +332,16 @@ def test_merged_db_flow(dataset, window, qt_app):
     conn = sqlite3.connect(str(merge_db))
     rows = conn.execute(f"SELECT COUNT(*) FROM {MERGED_TABLE}").fetchone()[0]
     cols = {r[1] for r in conn.execute(f"PRAGMA table_info({MERGED_TABLE})")}
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
     conn.close()
     assert rows == 4
     assert {"area", "pred_class", "umap_1", "batch", "well", "label"} <= cols
+    # Wholesale overwrite: the fresh `merged` table is the ONLY table — the
+    # pipeline's per-mask table from the fixture did not survive.
+    assert tables == {MERGED_TABLE}
 
-    # ── merge.db itself is selectable as a DB source ──
+    # ── the overwritten merged.db itself is selectable as a DB source ──
     from microVis.io.merged_data import MergedData
     merged_again = MergedData.load([merge_db])
     assert len(merged_again.table) == 4
@@ -388,6 +399,8 @@ def test_reset_restores_plot_controls(dataset, window, qt_app):
     pv._size_combo.setCurrentText("area")
     pv._facet_filter.setText("pred")
     pv._facet_cols.setValue(5)
+    pv._free_x.setChecked(False)
+    pv._free_y.setChecked(False)
     pv._scatter_size.setValue(50.0)
     pv._cap_spin.setValue(100)
     pv._show_points.setChecked(False)
@@ -406,6 +419,7 @@ def test_reset_restores_plot_controls(dataset, window, qt_app):
     assert pv._facet_list.count() == 0
     assert pv._facet_filter.text() == ""
     assert pv._facet_cols.value() == 3
+    assert pv._free_x.isChecked() and pv._free_y.isChecked()
     assert pv._colors_combo.count() == 0
     assert pv._scatter_size.value() == 20.0
     assert pv._cap_spin.value() == 20000

@@ -143,6 +143,17 @@ def segment_single(
     model=None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
     """Segment a single image row using Cellpose-SAM."""
+    # Same contract as segment_dataset: an empty chan1 is a caller mistake —
+    # the resize branch below indexes chan1[0] and would crash with a cryptic
+    # IndexError before the missing-image ValueError ever fires.
+    if isinstance(chan1, str):
+        chan1 = [chan1]
+    if not chan1:
+        raise ValueError(
+            "segment_single requires at least one chan1 channel "
+            "(empty blocks are skipped by the pipeline, never 'all')."
+        )
+
     device = _get_device()
     if model is None:
         model = models.CellposeModel(device=device, pretrained_model=model_name)

@@ -217,17 +217,32 @@ def test_legends_sit_outside_the_axes():
 
 
 def test_facets_share_axes_scatter():
-    """Facet panels share limits: wildly different ranges still align."""
+    """Shared mode (Free X/Y unchecked): wildly different ranges align."""
+    df = pd.DataFrame({
+        "x": [1.0, 2.0, 300.0, 400.0],
+        "y": [10.0, 20.0, 3000.0, 4000.0],
+        "g": ["p", "p", "q", "q"],
+    })
+    fig = P.make_scatter(df, x="x", y="y", facet_cols=["g"],
+                         free_x=False, free_y=False)
+    fig.canvas.draw()  # materialize the shared autoscale limits
+    ax1, ax2 = fig.axes[0], fig.axes[1]
+    assert ax1.get_xlim() == ax2.get_xlim()
+    assert ax1.get_ylim() == ax2.get_ylim()
+
+
+def test_facets_free_axes_scatter():
+    """Free X/Y (the default): every panel scales to its own data."""
     df = pd.DataFrame({
         "x": [1.0, 2.0, 300.0, 400.0],
         "y": [10.0, 20.0, 3000.0, 4000.0],
         "g": ["p", "p", "q", "q"],
     })
     fig = P.make_scatter(df, x="x", y="y", facet_cols=["g"])
-    fig.canvas.draw()  # materialize the shared autoscale limits
+    fig.canvas.draw()
     ax1, ax2 = fig.axes[0], fig.axes[1]
-    assert ax1.get_xlim() == ax2.get_xlim()
-    assert ax1.get_ylim() == ax2.get_ylim()
+    assert ax1.get_xlim() != ax2.get_xlim()
+    assert ax1.get_ylim() != ax2.get_ylim()
 
 
 def test_facet_categorical_positions_are_global():
@@ -254,7 +269,7 @@ def test_facet_boxplot_positions_are_global():
         "y": [1.0, 2.0, 2.5, 3.0],
         "g": ["p", "q", "q", "q"],
     })
-    fig = P.make_boxplot(df, y="y", x="x", facet_cols=["g"])
+    fig = P.make_boxplot(df, y="y", x="x", facet_cols=["g"], free_y=False)
     fig.canvas.draw()
     panels = [ax for ax in fig.axes if ax.get_visible()]
     assert len(panels) == 2

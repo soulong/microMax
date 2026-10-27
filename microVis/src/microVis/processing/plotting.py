@@ -136,24 +136,27 @@ def apply_filter(df: pd.DataFrame, expr: str):
 # ── Internals ─────────────────────────────────────────────────────────────
 
 
-def _new_grid(n_panels: int, ncols: int):
+def _new_grid(n_panels: int, ncols: int, free_x: bool = True,
+              free_y: bool = True):
     """Create a facet grid sized to n_panels panels. Returns (fig, axes).
 
-    All panels SHARE both axes (facet panels exist to be compared, so
-    limits and autoscale stay identical across the grid). The callers
-    likewise build every category->position mapping from the FULL table,
-    not per panel. The figure is built WITHOUT pyplot (no figure manager)
-    so rendering can run on a worker thread; the Qt widget attaches the
-    canvas later on the GUI thread.
+    `free_x`/`free_y` pick the axis mode per direction: True gives every
+    panel its OWN scale (limits autoscale to that panel's data only),
+    False makes the whole grid share one scale (aligned comparison).
+    Independent of the mode, the callers build every category->position
+    mapping from the FULL table (a category missing from one panel keeps
+    its global slot). The figure is built WITHOUT pyplot (no figure
+    manager) so rendering can run on a worker thread; the Qt widget
+    attaches the canvas later on the GUI thread.
     """
     ncols_eff = max(1, min(ncols, n_panels))
     nrows = int(math.ceil(n_panels / ncols_eff))
     fig = Figure(figsize=(4.6 * ncols_eff, 3.4 * nrows))
-    axes = fig.subplots(nrows, ncols_eff, squeeze=False, sharex=True,
-                        sharey=True)
+    axes = fig.subplots(nrows, ncols_eff, squeeze=False,
+                        sharex=not free_x, sharey=not free_y)
     axes = list(axes.ravel())
-    # Sharing hides the inner panels' tick labels by default — facet panels
-    # exist to be compared, so EVERY panel shows its own axis numbers.
+    # Sharing hides the inner panels' tick labels by default — every panel
+    # shows its own axis numbers in BOTH modes.
     for ax in axes:
         ax.tick_params(labelleft=True, labelbottom=True)
     return fig, axes
@@ -414,6 +417,8 @@ def make_scatter(
     point_size: float = 20.0,
     max_size: float = 220.0,
     ncols: int = 3,
+    free_x: bool = True,
+    free_y: bool = True,
     max_combos: int = 24,
     hover_exclude=(),
 ):
@@ -423,7 +428,7 @@ def make_scatter(
     show a point's values on mouse-over.
     """
     groups, truncated = facet_groups(df, facet_cols, max_combos)
-    fig, axes = _new_grid(len(groups), ncols)
+    fig, axes = _new_grid(len(groups), ncols, free_x=free_x, free_y=free_y)
 
     color_map = None
     norm = None
@@ -442,8 +447,9 @@ def make_scatter(
 
     size_handles = []
     # Categorical levels come from the FULL table so every facet panel maps
-    # a category to the SAME position — the grid shares its axes, and
-    # per-panel mappings would scatter identical categories differently.
+    # a category to the SAME position — in BOTH axis modes (free axes only
+    # give each panel its own limits; positions stay globally aligned, and
+    # per-panel mappings would scatter identical categories differently).
     def _axis_map(col):
         if not is_continuous(df[col]):
             levels = _sorted_values(df[col])
@@ -548,6 +554,8 @@ def make_boxplot(
     palette: str = "Set1",
     show_points: bool = False,
     ncols: int = 3,
+    free_x: bool = True,
+    free_y: bool = True,
     max_combos: int = 24,
 ):
     """Faceted boxplot: one box per x (and categorical color) group.
@@ -558,14 +566,15 @@ def make_boxplot(
     yvals, yticks = axis_values(df[y])
     work = df.assign(__y__=yvals)
     groups, truncated = facet_groups(work, facet_cols, max_combos)
-    fig, axes = _new_grid(len(groups), ncols)
+    fig, axes = _new_grid(len(groups), ncols, free_x=free_x, free_y=free_y)
     keys, raw_global, split_color = _distribution_groups(work, "__y__", x, color)
     color_map = None
     if split_color:
         color_map = _palette_map(work[color], palette)
     # Global group order + positions: every facet panel places the groups
-    # it has at the SAME x positions (boxplot positions are 1-based), so
-    # the shared axis compares like with like.
+    # it has at the SAME x positions (boxplot positions are 1-based) —
+    # positions are global in BOTH axis modes, so panels compare like with
+    # like; free axes only scale the limits per panel.
     global_keys = [k for k, _ in raw_global]
     pos_of = {k: i + 1 for i, k in enumerate(global_keys)}
     global_labels = [_group_label(k) for k in global_keys]
@@ -622,6 +631,8 @@ def make_barplot_mean_sem(
     facet_cols=(),
     palette: str = "Set1",
     ncols: int = 3,
+    free_x: bool = True,
+    free_y: bool = True,
     max_combos: int = 24,
 ):
     """Faceted barplot: bar height = mean, error bar = SEM.
@@ -632,14 +643,14 @@ def make_barplot_mean_sem(
     yvals, yticks = axis_values(df[y])
     work = df.assign(__y__=yvals)
     groups, truncated = facet_groups(work, facet_cols, max_combos)
-    fig, axes = _new_grid(len(groups), ncols)
+    fig, axes = _new_grid(len(groups), ncols, free_x=free_x, free_y=free_y)
     keys, raw_global, split_color = _distribution_groups(work, "__y__", x, color)
     color_map = None
     if split_color:
         color_map = _palette_map(work[color], palette)
     # Global group order + positions (0-based bar slots): every facet panel
-    # draws its groups at the SAME x positions so the shared axis compares
-    # like with like.
+    # draws its groups at the SAME x positions — positions are global in
+    # BOTH axis modes; free axes only scale the limits per panel.
     global_keys = [k for k, _ in raw_global]
     slot_of = {k: i for i, k in enumerate(global_keys)}
     global_labels = [_group_label(k) for k in global_keys]
@@ -693,6 +704,8 @@ def make_line(
     facet_cols=(),
     palette: str = "Set1",
     ncols: int = 3,
+    free_x: bool = True,
+    free_y: bool = True,
     max_combos: int = 24,
     show_points: bool = False,
 ):
@@ -709,7 +722,7 @@ def make_line(
     yvals, yticks = axis_values(df[y])
     work = df.assign(__y__=yvals)
     groups, truncated = facet_groups(work, facet_cols, max_combos)
-    fig, axes = _new_grid(len(groups), ncols)
+    fig, axes = _new_grid(len(groups), ncols, free_x=free_x, free_y=free_y)
     x_continuous = bool(x) and is_continuous(work[x])
     keys, raw_global, split_color = _distribution_groups(work, "__y__", x, color)
     color_map = None
