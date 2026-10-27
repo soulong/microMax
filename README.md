@@ -61,16 +61,18 @@ python -m pip install git+https://github.com/facebookresearch/dinov3
 
 ### Installation
 
-Install the meta packages in dependency order:
+Install the meta packages with one command (pip resolves the local
+directories jointly, so no manual install order is needed):
 
 ```
 git clone https://github.com/soulong/microMax.git
 cd microMax
 
-python -m pip install -e microBase
-python -m pip install -e microProfiler
-python -m pip install -e microVis
-python -m pip install -e microModel
+# regular install
+python -m pip install ./microBase ./microProfiler ./microVis ./microModel
+
+# editable install (development workflow)
+python -m pip install -e ./microBase -e ./microProfiler -e ./microVis -e ./microModel
 ```
 
 

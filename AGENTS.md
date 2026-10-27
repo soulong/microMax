@@ -26,8 +26,12 @@ microMax/
 | Python    | `>=3.10`            |
 | Conda env | `micro`             |
 
-Install the packages bottom-up with editable installs:
-`microBase` → `microProfiler` → `microVis` → `microModel`.
+Install all four packages with one command — pip resolves the local
+directories jointly, so no manual ordering is needed:
+`python -m pip install ./microBase ./microProfiler ./microVis ./microModel`
+(regular), or the same command with `-e` before every path for the
+editable development install:
+`python -m pip install -e ./microBase -e ./microProfiler -e ./microVis -e ./microModel`.
 
 Console scripts after install:
 
