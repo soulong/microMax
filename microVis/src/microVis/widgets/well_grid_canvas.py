@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import numbers
 
 import numpy as np
@@ -8,7 +9,8 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.cm import ScalarMappable
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
-from PySide6.QtCore import QTimer, Signal
+from matplotlib.patches import Rectangle
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QSizePolicy, QToolTip, QVBoxLayout, QWidget
 
@@ -18,11 +20,46 @@ from microVis.log_utils import get_logger
 
 logger = get_logger("microVis.well_grid_canvas")
 
+# Click-vs-drag threshold in display pixels (same convention as the
+# thumbnail view's manhattanLength() > 4 check).
+_DRAG_THRESHOLD = 4
+
+# Accent colours for the rubber-band rectangle and its live preview ring
+# (same accent as the selection ring).
+_BAND_COLOR = "#5a8a9a"
+
+
+def _rect_cells(xmin, xmax, ymin, ymax, n_rows, n_cols):
+    """Integer (row, col) grid cells (1-based, row-major) whose unit square
+    (centred on the well point, spanning ±0.5) intersects the data-space
+    rectangle [xmin, xmax] × [ymin, ymax]. Clipped to the grid bounds;
+    empty list when the rectangle lies outside the grid."""
+    c_lo = max(1, math.ceil(xmin - 0.5))
+    c_hi = min(n_cols, math.floor(xmax + 0.5))
+    r_lo = max(1, math.ceil(ymin - 0.5))
+    r_hi = min(n_rows, math.floor(ymax + 0.5))
+    if c_lo > c_hi or r_lo > r_hi:
+        return []
+    return [(r, c) for r in range(r_lo, r_hi + 1) for c in range(c_lo, c_hi + 1)]
+
+
+def _combine_selection(current, wells, mode):
+    """Apply a band of wells to a selection according to the modifier mode:
+    ``replace`` (plain drag), ``add`` (Shift) or ``toggle`` (Ctrl)."""
+    if mode == "add":
+        return set(current) | wells
+    if mode == "toggle":
+        return set(current) ^ wells
+    return set(wells)  # replace
+
 
 class WellGridCanvas(QWidget):
     """Well plate grid visualization using matplotlib scatter plot."""
 
     well_clicked = Signal(str)
+    # Rubber-band selection finished: (set of well names under the band,
+    # mode) with mode one of "replace" / "add" / "toggle".
+    wells_band_selected = Signal(object, str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -46,8 +83,13 @@ class WellGridCanvas(QWidget):
         self._cbar_ax.set_visible(False)
 
         self._canvas = FigureCanvasQTAgg(self._figure)
-        self._canvas.mpl_connect("pick_event", self._on_pick)
+        # Clicks and rubber-band selection share one press/move/release state
+        # machine; matplotlib's pick_event is deliberately NOT used because a
+        # pick fires on mouse press and would toggle a well before a possible
+        # drag even starts.
+        self._canvas.mpl_connect("button_press_event", self._on_button_press)
         self._canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self._canvas.mpl_connect("button_release_event", self._on_button_release)
         self._canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._canvas.setStyleSheet("background-color: #252536;")
 
@@ -65,6 +107,18 @@ class WellGridCanvas(QWidget):
         self._sel_scatter = None
         self._prev_dims: tuple[int, int] = (0, 0)
         self._prev_fmt: str = ""
+        self._marker_size = 0
+        # Copy of the last drawn selection (preview math during a band drag)
+        self._selected_wells: set[str] = set()
+
+        # Rubber-band gesture state (armed on press, fired on release)
+        self._band_start = None       # (xdata, ydata) at press
+        self._band_press_px = None    # (x, y) display coords at press
+        self._band_last = None        # last valid in-axes (xdata, ydata)
+        self._band_moved = False
+        self._band_mode = "replace"
+        self._band_rect = None        # Rectangle patch shown while dragging
+        self._preview_scatter = None  # live preview ring of the pending result
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -72,6 +126,7 @@ class WellGridCanvas(QWidget):
 
     def clear(self) -> None:
         """Clear the canvas to an empty state."""
+        self._cancel_band()
         self._axes.clear()
         self._axes.set_facecolor("#252536")
         self._cbar_ax.clear()
@@ -85,6 +140,8 @@ class WellGridCanvas(QWidget):
         self._col_name = None
         self._prev_dims = (0, 0)
         self._prev_fmt = ""
+        self._marker_size = 0
+        self._selected_wells = set()
         self._canvas.draw_idle()
 
     def update_grid(
@@ -105,6 +162,9 @@ class WellGridCanvas(QWidget):
         ``value_map`` is a precomputed well→value map (merged Excel metadata or
         a loaded infer DB); when given, it bypasses ``dm.aggregate``.
         """
+        # A redraw mid-gesture (e.g. a color-by change while dragging) drops
+        # the band artists via axes.clear(); cancel the gesture cleanly.
+        self._cancel_band()
         rows, cols = dm.get_plate_dims()
         fmt_rows, fmt_cols = _get_format_dims(fmt_name)
         rows = max(rows, fmt_rows)
@@ -146,8 +206,12 @@ class WellGridCanvas(QWidget):
                     data_map = {}
             data_map = {normalize_well(k): v for k, v in data_map.items()}
         self._data_map = data_map
+        # Copy (not reference) — the preview math during a band drag reads
+        # this snapshot, while MainWindow keeps mutating its own set.
+        self._selected_wells = set(selected_wells)
 
         marker_size = _compute_marker_size(rows, cols)
+        self._marker_size = marker_size
         has_data = bool(data_map)
         cmap_obj = None
         norm = None
@@ -213,8 +277,6 @@ class WellGridCanvas(QWidget):
                 c=color_list,
                 edgecolors="#555555",
                 linewidths=0.5,
-                picker=True,
-                pickradius=5,
                 zorder=2,
             )
 
@@ -281,21 +343,34 @@ class WellGridCanvas(QWidget):
         self._prev_fmt = fmt_name
         self._canvas.draw()
 
-    def _on_pick(self, event) -> None:
-        ind = event.ind
-        if ind is not None and len(ind) > 0:
-            idx = ind[0]
-            for well, i in self._well_indices.items():
-                if i == idx:
-                    # Ignore clicks on empty (phantom) wells — they are drawn
-                    # but not real; selecting them would add invisible entries
-                    # to _selected_wells with no ring to clear.
-                    if well not in self._real_wells:
-                        return
-                    QTimer.singleShot(0, lambda w=well: self.well_clicked.emit(w))
-                    return
+    # ── Rubber-band selection + click state machine ──────────────────────────
+
+    def _on_button_press(self, event) -> None:
+        """Arm a click / band gesture on left-button press inside the grid."""
+        if event.button != 1 or event.dblclick:
+            return
+        if event.inaxes != self._axes or event.xdata is None or event.ydata is None:
+            return
+        self._band_start = (event.xdata, event.ydata)
+        self._band_press_px = (event.x, event.y)
+        self._band_last = self._band_start
+        self._band_moved = False
+        self._band_mode = self._modifier_mode(event)
 
     def _on_motion(self, event) -> None:
+        # While a gesture is armed, drive the rubber band and suppress the
+        # hover tooltip for its duration.
+        if self._band_start is not None:
+            QToolTip.hideText()
+            if (event.button == 1 and event.inaxes == self._axes
+                    and event.xdata is not None and event.ydata is not None):
+                self._band_last = (event.xdata, event.ydata)
+                if not self._band_moved and self._past_drag_threshold(event):
+                    self._band_moved = True
+                    self._begin_band_visuals()
+                if self._band_moved:
+                    self._update_band_visuals(*self._band_last)
+            return
         if event.inaxes != self._axes:
             QToolTip.hideText()
             return
@@ -322,6 +397,156 @@ class WellGridCanvas(QWidget):
                 QToolTip.hideText()
         else:
             QToolTip.hideText()
+
+    def _on_button_release(self, event) -> None:
+        """Finish the armed gesture: a click toggles one well, a drag fires
+        the band selection once (with the mode captured at press time)."""
+        start = self._band_start
+        if start is None:
+            return
+        moved = self._band_moved
+        mode = self._band_mode
+        last = self._band_last if self._band_last is not None else start
+        self._band_start = None
+        self._band_last = None
+
+        if moved:
+            self._remove_band_visuals()
+            xmin, xmax = min(start[0], last[0]), max(start[0], last[0])
+            ymin, ymax = min(start[1], last[1]), max(start[1], last[1])
+            wells = self._wells_in_rect(xmin, xmax, ymin, ymax)
+            # A plain band always fires (an empty band clears the selection,
+            # file-manager convention); add/toggle with an empty band are
+            # no-ops, so skip the redundant refresh entirely.
+            if wells or mode == "replace":
+                self.wells_band_selected.emit(wells, mode)
+            return
+
+        # Plain click (below the drag threshold): hit-test with the same cell
+        # rounding the hover tooltip uses — the whole cell square is
+        # clickable, not just the marker. Phantom wells are ignored.
+        self._remove_band_visuals()
+        if event.inaxes == self._axes and event.xdata is not None and event.ydata is not None:
+            well = self._well_at(event.xdata, event.ydata)
+            if well is not None:
+                self.well_clicked.emit(well)
+
+    def _modifier_mode(self, event) -> str:
+        """Map the keyboard modifiers held at press to the band mode:
+        Ctrl → toggle, Shift → add, plain → replace."""
+        gui = getattr(event, "guiEvent", None)
+        mods = (gui.modifiers() if gui is not None
+                else Qt.KeyboardModifier.NoModifier)
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            return "toggle"
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            return "add"
+        return "replace"
+
+    def _past_drag_threshold(self, event) -> bool:
+        """True once the pointer moved more than _DRAG_THRESHOLD display
+        pixels away from the press point (click vs. drag decision)."""
+        px = event.x if event.x is not None else self._band_press_px[0]
+        py = event.y if event.y is not None else self._band_press_px[1]
+        return (abs(px - self._band_press_px[0]) > _DRAG_THRESHOLD
+                or abs(py - self._band_press_px[1]) > _DRAG_THRESHOLD)
+
+    def _well_at(self, x, y):
+        """Well name under a data-space point (cell rounding), or None for
+        out-of-grid / phantom positions."""
+        col = round(x)
+        row = round(y)
+        if 1 <= row <= self._n_rows and 1 <= col <= self._n_cols:
+            well = f"{self._row_labels[row - 1]}{col}"
+            if well in self._real_wells:
+                return well
+        return None
+
+    def _well_point(self, well):
+        """(x, y) data position of a well, or None when unknown."""
+        idx = self._well_indices.get(well)
+        if idx is None:
+            return None
+        r, c = divmod(idx, self._n_cols)
+        return (c + 1, r + 1)
+
+    def _wells_in_rect(self, xmin, xmax, ymin, ymax):
+        """Real (non-phantom) wells whose cell squares intersect the
+        data-space rectangle."""
+        wells = set()
+        for r, c in _rect_cells(xmin, xmax, ymin, ymax, self._n_rows, self._n_cols):
+            well = f"{self._row_labels[r - 1]}{c}"
+            if well in self._real_wells:
+                wells.add(well)
+        return wells
+
+    # ── Band visuals ─────────────────────────────────────────────────────────
+
+    def _begin_band_visuals(self) -> None:
+        """Create the rubber-band rectangle and hide the committed selection
+        ring — the live preview shows the pending result instead (WYSIWYG)."""
+        if self._sel_scatter is not None:
+            self._sel_scatter.set_visible(False)
+        self._band_rect = Rectangle(
+            (0, 0), 0, 0,
+            facecolor=_BAND_COLOR, alpha=0.18,
+            edgecolor=_BAND_COLOR, linewidth=1, linestyle="--", zorder=5,
+        )
+        self._axes.add_patch(self._band_rect)
+
+    def _update_band_visuals(self, x, y) -> None:
+        """Resize the band rectangle and refresh the preview ring for the
+        wells it covers."""
+        x0, y0 = self._band_start
+        xmin, xmax = min(x0, x), max(x0, x)
+        ymin, ymax = min(y0, y), max(y0, y)
+        # Snap the rectangle to whole cell squares so its edges line up with
+        # the grid cells it selects.
+        self._band_rect.set_bounds(xmin - 0.5, ymin - 0.5,
+                                   xmax - xmin + 1, ymax - ymin + 1)
+        self._show_preview(self._wells_in_rect(xmin, xmax, ymin, ymax))
+        self._canvas.draw_idle()
+
+    def _show_preview(self, wells) -> None:
+        """Draw the ring the release would produce: the band combined with
+        the pre-drag selection according to the current mode."""
+        result = _combine_selection(self._selected_wells, wells, self._band_mode)
+        if self._preview_scatter is not None:
+            self._preview_scatter.remove()
+            self._preview_scatter = None
+        pts = [p for p in (self._well_point(w) for w in result) if p is not None]
+        if pts:
+            xs, ys = zip(*pts)
+            self._preview_scatter = self._axes.scatter(
+                xs, ys,
+                s=self._marker_size * 1.3,
+                facecolors="none",
+                edgecolors=_BAND_COLOR,
+                linewidths=2,
+                zorder=4,
+            )
+
+    def _remove_band_visuals(self) -> None:
+        """Tear down band rectangle + preview ring and restore the committed
+        selection ring. Safe to call without visuals (plain clicks)."""
+        if self._band_rect is not None:
+            self._band_rect.remove()
+            self._band_rect = None
+        if self._preview_scatter is not None:
+            self._preview_scatter.remove()
+            self._preview_scatter = None
+        if self._sel_scatter is not None:
+            self._sel_scatter.set_visible(True)
+
+    def _cancel_band(self) -> None:
+        """Drop an in-progress gesture without emitting (the grid was redrawn
+        or cleared; artists may already be destroyed by axes.clear())."""
+        self._band_start = None
+        self._band_press_px = None
+        self._band_last = None
+        self._band_moved = False
+        self._band_rect = None
+        self._preview_scatter = None
 
 
 def _row_labels(n: int) -> list[str]:

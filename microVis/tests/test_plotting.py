@@ -1,5 +1,7 @@
 """Tests for microVis.processing.plotting: facet/cap helpers + figures + PDF."""
 
+import re
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -33,21 +35,27 @@ def test_column_classification():
 
 def test_facet_groups_full_combination():
     df = _df()
-    groups, truncated = P.facet_groups(df, ["well", "condition"])
-    assert not truncated
-    # 4 wells × 2 conditions = 8 combinations (all non-empty here).
+    groups = P.facet_groups(df, ["well", "condition"])
+    # 4 wells × 2 conditions = 8 combinations (all non-empty here), the
+    # UNLIMITED cartesian product — no panel cap.
     assert len(groups) == 8
     labels = [label for label, _ in groups]
     assert "well=A0, condition=ctrl" in labels
-    total = sum(len(sub) for _label, sub in groups)
-    assert total == len(df)
+    total_rows = sum(len(sub) for _label, sub in groups)
+    assert total_rows == len(df)
 
 
-def test_facet_groups_truncation():
-    df = _df()
-    groups, truncated = P.facet_groups(df, ["well", "condition"], max_combos=3)
-    assert truncated is True
-    assert len(groups) == 3
+def test_bubble_area_scales_with_point_scale():
+    """With Size by, Point scale must zoom ALL bubbles together: the mapped
+    area stays proportional (low limit = base*scale, high limit =
+    base*scale*_SIZE_SPAN), and the default scale 1 reproduces the
+    historical 20..220 pt² anchors."""
+    assert (P._bubble_area(1.0, 0.0), P._bubble_area(1.0, 1.0)) == (20.0, 220.0)
+    # Doubling Point scale doubles every bubble's area, low and high alike.
+    assert (P._bubble_area(2.0, 0.0), P._bubble_area(2.0, 1.0)) == (40.0, 440.0)
+    fracs = np.array([0.0, 0.5, 1.0])
+    out = P._bubble_area(3.0, fracs)
+    assert out[1] == (out[0] + out[2]) / 2  # linear in between
 
 
 def test_point_cap():
@@ -147,20 +155,130 @@ def test_pdf_export_editable_text(tmp_path):
     assert matplotlib.rcParams["pdf.fonttype"] == 42
 
 
+def test_pdf_export_exact_page_size(tmp_path):
+    """save_figure_pdf(size=...) exports an exact W×H page: the MediaBox is
+    w*72 × h*72 points (bbox_inches='tight' would override the size), and
+    the live figure size is restored afterwards."""
+    fig = P.make_scatter(_df(), x="value", y="area", color="condition")
+    natural = fig.get_size_inches().tolist()
+
+    out = tmp_path / "sized.pdf"
+    P.save_figure_pdf(fig, out, size=(4.0, 3.0))
+    data = out.read_bytes()
+    assert data.startswith(b"%PDF")
+    boxes = re.findall(
+        rb"/MediaBox\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]",
+        data)
+    assert boxes, "PDF page has no MediaBox"
+    _, _, w, h = (float(v) for v in boxes[0])
+    assert (w, h) == (288, 216)  # 4 in / 3 in at 72 points per inch
+
+    # The resize/restore must leave the on-screen figure untouched.
+    assert fig.get_size_inches().tolist() == natural
+
+
+def _assert_no_layout_overlap(fig):
+    """Every panel title fits inside the figure and no title overlaps the
+    panel above it (1 px tolerance)."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    axes = fig.axes
+    height = fig.bbox.height
+    # Top row (title included) stays inside the figure.
+    assert axes[0].get_tightbbox(renderer).y1 <= height + 0.5
+    pos = [ax.get_position() for ax in axes]
+    for i, ax in enumerate(axes):
+        above = None  # same column, directly above
+        for j, other in enumerate(axes):
+            if (j != i and abs(pos[j].x0 - pos[i].x0) < 1e-6
+                    and pos[j].y0 > pos[i].y0):
+                if above is None or pos[j].y0 < pos[above].y0:
+                    above = j
+        if above is None:
+            continue
+        above_bottom = axes[above].get_tightbbox(renderer).y0
+        title_top = ax.title.get_window_extent(renderer).y1
+        assert title_top <= above_bottom + 1.0
+
+
+def test_facet_layout_clean_at_any_figure_size():
+    """The view / exact-size export resize the figure AFTER the build; the
+    layout must re-flow (constrained) instead of squeezing the build-time
+    gaps until titles overlap the row above's tick labels and the top row
+    clips — the reported Data-page bug."""
+    rng = np.random.default_rng(0)
+    n = 300
+    df = pd.DataFrame({
+        "cmpd": rng.choice(["DMSO", "drug"], n),
+        "cell": rng.choice(["a", "b", "c", "d", "e", "f"], n),
+        "area": rng.uniform(200, 900, n),
+        "score": rng.random(n),
+    })
+    fig = P.make_scatter(df, x="area", y="score",
+                         facet_cols=["cmpd", "cell"], ncols=2)
+    _assert_no_layout_overlap(fig)      # natural build size (9.2 × 20.4)
+    fig.set_size_inches(8, 6)           # what the interactive view does
+    _assert_no_layout_overlap(fig)      # layout must re-flow at this size
+
+
 def test_hover_shows_point_values():
     from matplotlib.backend_bases import MouseEvent
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
 
     df = _df()
     fig = P.make_scatter(df, x="value", y="area", color="condition")
+    # A real renderer is required: constrained layout only executes on a
+    # real draw (the renderer-less default canvas skips it silently).
+    canvas = FigureCanvasAgg(fig)
     P.attach_hover(fig)
-    fig.canvas.draw()
+    canvas.draw()
     ax = fig.axes[0]
     coll = ax.collections[0]
     x_disp, y_disp = ax.transData.transform(np.asarray(coll.get_offsets())[0])
-    event = MouseEvent("motion_notify_event", fig.canvas, x_disp, y_disp)
-    fig.canvas.callbacks.process("motion_notify_event", event)
+    event = MouseEvent("motion_notify_event", canvas, x_disp, y_disp)
+    canvas.callbacks.process("motion_notify_event", event)
     texts = [t.get_text() for t in ax.texts if t.get_text()]
     assert any("value:" in t and "area:" in t for t in texts), texts
+
+
+def test_hover_annotation_does_not_reflow_layout():
+    """The hover tooltip is a pure overlay: appearing/disappearing must not
+    re-flow the already-drawn figure (constrained layout used to squeeze
+    the axes every time the annotation's box hung outside the plot)."""
+    from matplotlib.backend_bases import MouseEvent
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    df = _df()
+    fig = P.make_scatter(df, x="value", y="area", color="condition")
+    canvas = FigureCanvasAgg(fig)
+    P.attach_hover(fig)
+    ax = fig.axes[0]
+    # Warm up the layout: the constrained solver settles after its first
+    # execution (sub-pixel drift from the default starting positions).
+    canvas.draw()
+    canvas.draw()
+    before = list(ax.get_position().bounds)
+
+    # Hover the point nearest the top-right corner so the tooltip box hangs
+    # PAST the axes edge — the case that used to squeeze the layout.
+    coll = ax.collections[0]
+    disp = ax.transData.transform(np.asarray(coll.get_offsets()))
+    tx, ty = ax.transAxes.transform((1.0, 1.0))
+    i = int(np.argmin((disp[:, 0] - tx) ** 2 + (disp[:, 1] - ty) ** 2))
+    event = MouseEvent("motion_notify_event", canvas, disp[i, 0], disp[i, 1])
+    canvas.callbacks.process("motion_notify_event", event)
+    assert ax.texts, "hover annotation missing"
+    ann_bb = ax.texts[0].get_window_extent(canvas.get_renderer())
+    assert ann_bb.x1 > ax.get_window_extent().x1, "tooltip stays inside; "
+    "test scenario no longer exercises the outside-the-axes case"
+    canvas.draw()
+
+    after = list(ax.get_position().bounds)
+    # Float noise in the solver is ~1e-9; any real re-flow (the old bug
+    # shifted the axes width by ~1.7e-2) is orders of magnitude larger.
+    assert all(abs(a - b) <= 1e-7 for a, b in zip(after, before))
 
 
 def test_scatter_collections_carry_hover_rows():
@@ -196,7 +314,10 @@ def test_categorical_x_and_y_are_plottable():
 
 
 def test_legends_sit_outside_the_axes():
-    """Every figure legend lives in the right strip, never on the data."""
+    """Legends live in the constrained-layout margins: never on the data,
+    and never stacked on each other (distinct corners)."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
     df = _df()
     figs = [
         P.make_scatter(df, x="value", y="area", color="condition", size="area"),
@@ -207,13 +328,19 @@ def test_legends_sit_outside_the_axes():
         P.make_line(df, y="value", x="well", color="condition"),
     ]
     for fig in figs:
-        fig.canvas.draw()
-        width = fig.bbox.width
-        axes_right = max(ax.get_window_extent().x1 for ax in fig.axes) / width
+        # Real renderer so constrained layout actually places the artists.
+        canvas = FigureCanvasAgg(fig)
+        canvas.draw()
+        renderer = canvas.get_renderer()
         assert fig.legends, "expected at least one figure legend"
-        for leg in fig.legends:
-            assert leg.get_window_extent().x0 / width >= axes_right - 0.005, (
-                "a legend overlaps the plot area")
+        leg_bboxes = [leg.get_window_extent(renderer) for leg in fig.legends]
+        for i, legbb in enumerate(leg_bboxes):
+            for ax in fig.axes:
+                assert not legbb.overlaps(ax.get_window_extent(renderer)), (
+                    f"legend {i} overlaps the plot area")
+        for j in range(i + 1, len(leg_bboxes)):
+            assert not legbb.overlaps(leg_bboxes[j]), (
+                "two legends drawn on top of each other")
 
 
 def test_facets_share_axes_scatter():

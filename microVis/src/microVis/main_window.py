@@ -526,6 +526,7 @@ class MainWindow(QMainWindow):
 
         # Well grid canvas
         self._grid_canvas.well_clicked.connect(self._on_well_clicked)
+        self._grid_canvas.wells_band_selected.connect(self._on_band_selected)
 
         # Image controls (filter widget signals connected in _populate_image_controls)
         ic = self._image_controls
@@ -1573,6 +1574,22 @@ class MainWindow(QMainWindow):
         self._update_grid()
         if is_real:
             self._schedule_image_refresh()
+
+    def _on_band_selected(self, wells, mode: str) -> None:
+        """Rubber-band selection on the well grid: apply the banded wells to
+        the selection in one step ("replace" plain drag, "add" Shift,
+        "toggle" Ctrl) with a single grid update + image refresh."""
+        if self._dm is None:
+            return
+        wells = set(wells)
+        if mode == "add":
+            self._selected_wells |= wells
+        elif mode == "toggle":
+            self._selected_wells ^= wells
+        else:  # replace
+            self._selected_wells = wells
+        self._update_grid()
+        self._schedule_image_refresh()
 
     def _on_select_all(self) -> None:
         if self._dm is None:

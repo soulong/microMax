@@ -294,7 +294,10 @@ Package layout (overview):
   that single channel with its own color/vmin/vmax, both re-rendered at
   full resolution through the SAME enhancement path as the display so
   contrast/gamma/invert follow the live settings), channel
-  controls, image filters, well-grid canvas, label annotation panel, pixel
+  controls, image filters, well-grid canvas (a click toggles one well; a
+  left-button drag rubber-band-selects — plain = replace the selection,
+  Shift = append, Ctrl = toggle — with a live preview ring and ONE batch
+  update per gesture), label annotation panel, pixel
   info, data view, and `data_plot.py` — THE single plot view over the merged
   table (all pickers editable, left-click a scatter point shows the cropped
   single cell in a near-cursor popup, empty click hides it); `ui_spec.py`
@@ -303,7 +306,12 @@ Package layout (overview):
 
 * `processing/` — multi-channel compositing, contrast, mask overlay; `plotting.py`
   builds facet-aware matplotlib figures (scatter / line mean±SEM / boxplot /
-  barplot mean±SEM) and exports vector PDFs with editable Type-42 text.
+  barplot mean±SEM; facets are the UNLIMITED cartesian product of levels —
+  no panel cap) on CONSTRAINED layout (figures re-flow at any view or
+  export size) and exports vector PDFs with editable Type-42 text. Scatter
+  Size-by maps the column's low/high limits to a bubble area proportional
+  to the integer Point scale (default 1 = default rendering), so the
+  control zooms all bubbles together.
 
 * `worker.py` — background `QRunnable` workers (thumbnail, full-res, crop,
   object export, dataset load).
@@ -387,7 +395,12 @@ Data flow:
   compares independent of absolute intensity; unchecked it falls back to
   the Image page's rendering. Channel colors follow the Image page either
   way. All plots export vector
-  PDFs with editable text. PyGwalker is not used.
+  PDFs with editable text — the Export PDF button shares one row with a
+  W × H pair (inches) at a FIXED default (7 × 12), freely editable per
+  export; the save dialog opens in the LAST used folder (persisted in
+  `~/.micromax`); the Plot button sits alone above that row. The Facet-by
+  list keeps checked columns grouped ABOVE the unchecked candidates,
+  re-ordered on every check/uncheck. PyGwalker is not used.
 
 * Excel plate metadata (**Select Metadata**) is merged by `well`
   into the integrated table on **Merge** (in memory — no DB write) and

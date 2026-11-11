@@ -401,7 +401,7 @@ def test_reset_restores_plot_controls(dataset, window, qt_app):
     pv._facet_cols.setValue(5)
     pv._free_x.setChecked(False)
     pv._free_y.setChecked(False)
-    pv._scatter_size.setValue(50.0)
+    pv._scatter_size.setValue(5)
     pv._cap_spin.setValue(100)
     pv._show_points.setChecked(False)
     qt_app.processEvents()
@@ -421,7 +421,7 @@ def test_reset_restores_plot_controls(dataset, window, qt_app):
     assert pv._facet_cols.value() == 3
     assert pv._free_x.isChecked() and pv._free_y.isChecked()
     assert pv._colors_combo.count() == 0
-    assert pv._scatter_size.value() == 20.0
+    assert pv._scatter_size.value() == 1
     assert pv._cap_spin.value() == 20000
     assert pv._show_points.isChecked()
 

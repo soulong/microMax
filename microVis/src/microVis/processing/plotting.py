@@ -29,6 +29,21 @@ matplotlib.rcParams["ps.fonttype"] = 42
 
 SINGLE_COLOR = "#4a90d9"
 
+# With Size by, the bubble AREA spans base*scale .. base*scale*_SIZE_SPAN,
+# anchored at the size column's low/high limits — the GUI "Point scale"
+# (integer, default 1) is a RELATIVE multiplier: it scales ALL bubbles (and
+# plain points) together while the rendering at scale 1 stays identical to
+# the historical default (base 20 → 20..220 pt²).
+_SIZE_SPAN = 11.0
+_BUBBLE_BASE = 20.0
+
+
+def _bubble_area(point_scale: float, frac):
+    """Marker area (pt²) for a Size-by fraction (0 = column low limit,
+    1 = column high limit); ``frac`` may be a scalar or an array."""
+    base = _BUBBLE_BASE * point_scale
+    return base + np.asarray(frac, dtype=float) * base * (_SIZE_SPAN - 1.0)
+
 
 # ── Column classification ─────────────────────────────────────────────────
 
@@ -78,21 +93,20 @@ def _apply_categorical_axis(ax, xticks, yticks) -> None:
 # ── Facets / sampling ─────────────────────────────────────────────────────
 
 
-def facet_groups(df: pd.DataFrame, facet_cols, max_combos: int = 24):
+def facet_groups(df: pd.DataFrame, facet_cols):
     """Split *df* into one sub-frame per full combination of facet columns.
 
-    Returns ``(groups, truncated)``: groups is a list of ``(label, sub_df)``;
-    combinations beyond ``max_combos`` are dropped and ``truncated`` is True
-    so the caller can warn. Empty combinations are skipped.
+    Returns a list of ``(label, sub_df)`` — the UNLIMITED cartesian product
+    of the facet levels (one subplot per combination; the on-screen grid may
+    cram, the user exports a bigger PDF instead). Empty combinations are
+    skipped.
     """
     facet_cols = [c for c in (facet_cols or []) if c in df.columns]
     if not facet_cols:
-        return [("", df)], False
+        return [("", df)]
     value_lists = [_sorted_values(df[c]) for c in facet_cols]
-    combos = list(itertools.product(*value_lists))
-    truncated = len(combos) > max_combos
     groups = []
-    for combo in combos[:max_combos]:
+    for combo in itertools.product(*value_lists):
         mask = pd.Series(True, index=df.index)
         for col, val in zip(facet_cols, combo):
             mask &= df[col] == val
@@ -103,7 +117,7 @@ def facet_groups(df: pd.DataFrame, facet_cols, max_combos: int = 24):
         groups.append((label, sub))
     if not groups:
         groups = [("", df)]
-    return groups, truncated
+    return groups
 
 
 def apply_point_cap(df: pd.DataFrame, cap: int, seed: int = 0):
@@ -151,7 +165,13 @@ def _new_grid(n_panels: int, ncols: int, free_x: bool = True,
     """
     ncols_eff = max(1, min(ncols, n_panels))
     nrows = int(math.ceil(n_panels / ncols_eff))
-    fig = Figure(figsize=(4.6 * ncols_eff, 3.4 * nrows))
+    # CONSTRAINED layout: it re-executes on EVERY draw at the figure's
+    # CURRENT size. The interactive canvas (and the exact-size PDF export)
+    # resizes the figure to the view, so a one-shot tight layout computed at
+    # build time would squeeze its fractional gaps under the fixed-point
+    # text — panel titles overlapping the row above's tick labels, top-row
+    # titles clipped. Constrained layout reserves real room every draw.
+    fig = Figure(figsize=(4.6 * ncols_eff, 3.4 * nrows), layout="constrained")
     axes = fig.subplots(nrows, ncols_eff, squeeze=False,
                         sharex=not free_x, sharey=not free_y)
     axes = list(axes.ravel())
@@ -222,44 +242,29 @@ def _axis_style(ax, title: str = ""):
     ax.grid(True, alpha=0.25, linewidth=0.6)
 
 
-# Fraction of the figure width reserved on the right edge for legends, so
-# they never overlap the plotted data.
-_LEGEND_STRIP = 0.11
+def _finish_grid(fig, axes, used, legends=(), colorbar=None):
+    """Hide unused panels; give legends / the colorbar reserved room in the
+    figure margins.
 
-
-def _finish_grid(fig, axes, used, facet_cols, truncated,
-                 legends=(), colorbar=None):
-    """Hide unused panels and place every legend on the RIGHT edge.
-
-    All figure legends live in a reserved strip along the figure's right
-    side (stacked top/bottom), so they never sit on top of the data points.
-    A continuous-color colorbar keeps its usual place just right of the
-    axes, before the legend strip.
+    The figure runs on matplotlib's CONSTRAINED layout (set in ``_new_grid``),
+    so nothing here positions artists by hand: ``outside`` legends reserve
+    their own margin, the colorbar steals space from the axes, and panel
+    titles / tick labels get real room at whatever size the figure is drawn
+    (view resize and exact-size PDF export re-flow cleanly).
     """
     for ax in axes[used:]:
         ax.set_visible(False)
-    fig.tight_layout()
-    right = 1.0 - _LEGEND_STRIP if (legends or colorbar is not None) else 1.0
-    if right < 1.0:
-        fig.subplots_adjust(right=right)
-    # Colorbar first: it needs the final axes bboxes; legends go right of it.
-    legend_left = right + 0.015
-    if colorbar is not None:
-        cbar = fig.colorbar(colorbar["mappable"], ax=axes[:used], shrink=0.8,
-                            label=colorbar.get("label") or None,
-                            fraction=0.045, pad=0.015)
-        legend_left = max(legend_left, cbar.ax.get_position().x1 + 0.01)
     for i, spec in enumerate(legends):
-        if i == 0:
-            loc, y = "upper left", 0.99
-        else:
-            loc, y = "lower left", 0.01
+        # Every figure legend lives OUTSIDE the axes, so it never sits on
+        # top of the plotted data. Corners are distinct so multiple entries
+        # never collide (constrained layout stacks same-corner entries on
+        # one baseline): color top-right, size bottom-right.
+        loc = "outside upper right" if i == 0 else "outside lower right"
         fig.legend(handles=spec["handles"], title=spec.get("title") or None,
-                   loc=loc, bbox_to_anchor=(legend_left, y),
-                   fontsize=7, title_fontsize=7, frameon=False)
-    if truncated:
-        fig.text(right - 0.01, 0.01, "facet combinations truncated",
-                 ha="right", va="bottom", fontsize=7, color="#b05050")
+                   loc=loc, fontsize=7, title_fontsize=7, frameon=False)
+    if colorbar is not None:
+        fig.colorbar(colorbar["mappable"], ax=axes[:used], shrink=0.8,
+                     label=colorbar.get("label") or None)
 
 
 # ── Scatter ───────────────────────────────────────────────────────────────
@@ -358,6 +363,11 @@ def attach_hover(fig, canvas=None) -> None:
                 bbox=dict(boxstyle="round,pad=0.4", fc="#ffffe0",
                           ec="#888888", alpha=0.95),
             )
+            # Pure overlay: excluded from the axes tightbbox so constrained
+            # layout never re-flows the already-drawn figure when the
+            # tooltip appears or disappears (it used to squeeze the axes
+            # on every hover).
+            ann.set_in_layout(False)
             state["annotation"] = ann
             state["key"] = key
         event.canvas.draw_idle()
@@ -414,12 +424,10 @@ def make_scatter(
     facet_cols=(),
     palette: str = "Set1",
     cmap: str = "viridis",
-    point_size: float = 20.0,
-    max_size: float = 220.0,
+    point_scale: float = 1.0,
     ncols: int = 3,
     free_x: bool = True,
     free_y: bool = True,
-    max_combos: int = 24,
     hover_exclude=(),
 ):
     """Faceted scatter: color and size may each map one variable.
@@ -427,7 +435,7 @@ def make_scatter(
     Every drawn collection is tagged with its rows so ``attach_hover`` can
     show a point's values on mouse-over.
     """
-    groups, truncated = facet_groups(df, facet_cols, max_combos)
+    groups = facet_groups(df, facet_cols)
     fig, axes = _new_grid(len(groups), ncols, free_x=free_x, free_y=free_y)
 
     color_map = None
@@ -473,14 +481,14 @@ def make_scatter(
         kept = sub[keep].reset_index(drop=True)
         # Point sizes
         if s_min is None:
-            sizes = np.full(len(xs), point_size)
+            sizes = np.full(len(xs), _BUBBLE_BASE * point_scale)
         else:
             svals = pd.to_numeric(sub[size], errors="coerce")[keep].to_numpy(dtype=float)
             if s_max > s_min:
                 frac = (svals - s_min) / (s_max - s_min)
             else:
                 frac = np.zeros_like(svals)
-            sizes = point_size + frac * max(0.0, max_size - point_size)
+            sizes = _bubble_area(point_scale, frac)
         # Colors
         if color_map is not None:
             cvals = [color_map.get(v, SINGLE_COLOR) for v in sub[color][keep]]
@@ -513,18 +521,18 @@ def make_scatter(
         colorbar = {"mappable": ScalarMappable(norm=norm, cmap=cmap_obj),
                     "label": color}
     if s_min is not None:
-        # Representative size legend (right strip, below the color legend).
+        # Representative size legend (bottom-right margin).
         reps = np.linspace(s_min, s_max, 3) if s_max > s_min else np.array([s_min])
         size_handles = [
             Line2D([], [], marker="o", linestyle="", markersize=math.sqrt(
-                point_size + (0 if s_max <= s_min else (v - s_min) / (s_max - s_min)
-                              * max(0.0, max_size - point_size))) * 0.8,
+                _bubble_area(point_scale, 0.0 if s_max <= s_min
+                             else (v - s_min) / (s_max - s_min))) * 0.8,
                    markerfacecolor="none", markeredgecolor="#666666",
                    label=f"{v:.3g}")
             for v in reps
         ]
         legends.append({"handles": size_handles, "title": size})
-    _finish_grid(fig, axes, len(groups), facet_cols, truncated,
+    _finish_grid(fig, axes, len(groups),
                  legends=legends, colorbar=colorbar)
     return fig
 
@@ -556,7 +564,6 @@ def make_boxplot(
     ncols: int = 3,
     free_x: bool = True,
     free_y: bool = True,
-    max_combos: int = 24,
 ):
     """Faceted boxplot: one box per x (and categorical color) group.
 
@@ -565,7 +572,7 @@ def make_boxplot(
     """
     yvals, yticks = axis_values(df[y])
     work = df.assign(__y__=yvals)
-    groups, truncated = facet_groups(work, facet_cols, max_combos)
+    groups = facet_groups(work, facet_cols)
     fig, axes = _new_grid(len(groups), ncols, free_x=free_x, free_y=free_y)
     keys, raw_global, split_color = _distribution_groups(work, "__y__", x, color)
     color_map = None
@@ -618,7 +625,7 @@ def make_boxplot(
                           markerfacecolor=c, markeredgecolor="none", label=str(v))
                    for v, c in color_map.items()]
         legends.append({"handles": handles, "title": color})
-    _finish_grid(fig, axes, len(groups), facet_cols, truncated,
+    _finish_grid(fig, axes, len(groups),
                  legends=legends)
     return fig
 
@@ -633,7 +640,6 @@ def make_barplot_mean_sem(
     ncols: int = 3,
     free_x: bool = True,
     free_y: bool = True,
-    max_combos: int = 24,
 ):
     """Faceted barplot: bar height = mean, error bar = SEM.
 
@@ -642,7 +648,7 @@ def make_barplot_mean_sem(
     """
     yvals, yticks = axis_values(df[y])
     work = df.assign(__y__=yvals)
-    groups, truncated = facet_groups(work, facet_cols, max_combos)
+    groups = facet_groups(work, facet_cols)
     fig, axes = _new_grid(len(groups), ncols, free_x=free_x, free_y=free_y)
     keys, raw_global, split_color = _distribution_groups(work, "__y__", x, color)
     color_map = None
@@ -691,7 +697,7 @@ def make_barplot_mean_sem(
                           markerfacecolor=c, markeredgecolor="none", label=str(v))
                    for v, c in color_map.items()]
         legends.append({"handles": handles, "title": color})
-    _finish_grid(fig, axes, len(groups), facet_cols, truncated,
+    _finish_grid(fig, axes, len(groups),
                  legends=legends)
     return fig
 
@@ -706,7 +712,6 @@ def make_line(
     ncols: int = 3,
     free_x: bool = True,
     free_y: bool = True,
-    max_combos: int = 24,
     show_points: bool = False,
 ):
     """Faceted smooth-line plot: a spline fit of y on x, ± SEM nodes.
@@ -721,7 +726,7 @@ def make_line(
     """
     yvals, yticks = axis_values(df[y])
     work = df.assign(__y__=yvals)
-    groups, truncated = facet_groups(work, facet_cols, max_combos)
+    groups = facet_groups(work, facet_cols)
     fig, axes = _new_grid(len(groups), ncols, free_x=free_x, free_y=free_y)
     x_continuous = bool(x) and is_continuous(work[x])
     keys, raw_global, split_color = _distribution_groups(work, "__y__", x, color)
@@ -855,7 +860,7 @@ def make_line(
                           markerfacecolor=c, markeredgecolor=c, label=str(v))
                    for v, c in color_map.items()]
         legends.append({"handles": handles, "title": color})
-    _finish_grid(fig, axes, len(groups), facet_cols, truncated,
+    _finish_grid(fig, axes, len(groups),
                  legends=legends)
     return fig
 
@@ -863,6 +868,24 @@ def make_line(
 # ── Export ────────────────────────────────────────────────────────────────
 
 
-def save_figure_pdf(fig, path) -> None:
-    """Write the figure as a vector PDF with editable text."""
-    fig.savefig(str(path), format="pdf", bbox_inches="tight")
+def save_figure_pdf(fig, path, size=None) -> None:
+    """Write the figure as a vector PDF with editable text.
+
+    ``size`` = (width_in, height_in) exports an EXACT page size: the figure
+    is resized to it and the tight crop is skipped (``bbox_inches="tight"``
+    would re-trim the page back to the drawn content, overriding the
+    requested size). The on-screen figure size is restored afterwards.
+    ``size=None`` keeps the default behaviour — natural figure size with a
+    tight crop.
+    """
+    if size is None:
+        fig.savefig(str(path), format="pdf", bbox_inches="tight")
+        return
+    old = fig.get_size_inches().tolist()
+    fig.set_size_inches(float(size[0]), float(size[1]))
+    try:
+        fig.savefig(str(path), format="pdf")
+    finally:
+        fig.set_size_inches(old)
+        if getattr(fig, "canvas", None) is not None:
+            fig.canvas.draw_idle()

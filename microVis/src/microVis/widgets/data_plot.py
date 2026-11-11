@@ -22,6 +22,7 @@ rendering. Channel colors follow the Image page either way.
 from __future__ import annotations
 
 import logging
+import os
 
 import matplotlib
 import pandas as pd
@@ -64,6 +65,7 @@ from PySide6.QtWidgets import (
 )
 
 from microVis._settings import CMAP_OPTIONS, DEFAULT_CMAP, QUALITATIVE_PALETTES
+from microVis.user_defaults import get_user_defaults, update_user_defaults
 from microVis.processing import plotting as P
 
 logger = logging.getLogger(__name__)
@@ -214,6 +216,13 @@ class DataPlotView(QWidget):
         self._figure = None
         self._canvas = None
         self._toolbar = None
+        # Pristine facet column order (set on every set_frame) — the order
+        # the facet list falls back to on Clear.
+        self._facet_order: list[str] = []
+        # Folder of the last PDF export — the default for the next save
+        # dialog (persisted in ~/.micromax so it survives restarts).
+        self._pdf_last_dir = str(get_user_defaults().get("export", {})
+                                 .get("pdf_dir") or "")
         self._popup = _CellPopup()
         self._popup_pending_pos = QCursor.pos()
         # Renders are generation-guarded: a newer Plot click invalidates
@@ -302,6 +311,10 @@ class DataPlotView(QWidget):
         self._facet_list.setToolTip(
             "Checked variables are faceted by their FULL combination of levels "
             "(cartesian product), one subplot per combination.")
+        # Checked facet columns always float ABOVE the unchecked candidates
+        # (the ticked set stays reachable without scrolling): every
+        # check/uncheck re-runs the ordering (see _order_facet_items).
+        self._facet_list.itemChanged.connect(self._on_facet_item_changed)
         # Type-to-filter box above the list: narrows the visible columns
         # without touching the checked selection.
         facet_box = QVBoxLayout()
@@ -370,14 +383,17 @@ class DataPlotView(QWidget):
         self._cap_spin.setToolTip("Max scatter points drawn (0 = all rows)")
         controls_layout.addLayout(_form_row("Cap", self._cap_spin))
 
-        # Scatter point size sits right below the cap (they shape the same
-        # scatter rendering).
+        # Scatter point scale sits right below the cap (they shape the same
+        # scatter rendering): a RELATIVE float multiplier on the marker area
+        # (1.00 = default rendering) — no absolute "pt" meaning anymore.
         self._scatter_size = QDoubleSpinBox()
-        self._scatter_size.setRange(1.0, 200.0)
-        self._scatter_size.setValue(20.0)
-        self._scatter_size.setSuffix(" pt")
+        self._scatter_size.setRange(0.1, 20.0)
+        self._scatter_size.setDecimals(2)
+        self._scatter_size.setValue(1.0)
+        self._scatter_size.setToolTip("Relative point/bubble scale "
+                                      "(1.00 = default size)")
         self._scatter_size.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        controls_layout.addLayout(_form_row("Point size", self._scatter_size))
+        controls_layout.addLayout(_form_row("Point scale", self._scatter_size))
 
         # Show points / Normalize / Low-High / Gamma are LEFT-aligned loose
         # rows (no input-column alignment): their controls carry fixed widths,
@@ -463,17 +479,42 @@ class DataPlotView(QWidget):
         self._info_label.setStyleSheet("color: #888888; font-size: 8pt;")
         controls_layout.addWidget(self._info_label)
 
-        # Plot / Export PDF sit below the info line, centered in the column;
-        # Plot is twice the natural caption length (per request).
+        # Plot sits alone under the info line, centered in the column; it is
+        # twice the natural caption length (per request).
         self._plot_btn = QPushButton("Plot")
         self._plot_btn.ensurePolished()
         self._plot_btn.setFixedWidth(self._plot_btn.sizeHint().width() * 2)
         self._plot_btn.clicked.connect(self._on_plot)
+        controls_layout.addLayout(centered_row(self._plot_btn))
 
+        # Export PDF and the page size share one row: the W/H boxes (inches)
+        # carry a FIXED default (7 × 12 — tall pages suit the many-row facet
+        # grids) with no auto-sync; the user edits them freely per export.
         self._export_btn = QPushButton("Export PDF")
         self._export_btn.setEnabled(False)
         self._export_btn.clicked.connect(self._on_export)
-        controls_layout.addLayout(centered_row(self._plot_btn, self._export_btn))
+        self._pdf_w = NoScrollDoubleSpinBox()
+        self._pdf_w.setRange(0.5, 100.0)
+        self._pdf_w.setDecimals(1)
+        self._pdf_w.setValue(7.0)
+        self._pdf_w.setFixedWidth(44)
+        self._pdf_w.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self._pdf_w.setToolTip("Export page width in inches")
+        self._pdf_h = NoScrollDoubleSpinBox()
+        self._pdf_h.setRange(0.5, 100.0)
+        self._pdf_h.setDecimals(1)
+        self._pdf_h.setValue(12.0)
+        self._pdf_h.setFixedWidth(44)
+        self._pdf_h.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self._pdf_h.setToolTip("Export page height in inches")
+        export_row = QHBoxLayout()
+        export_row.setSpacing(4)
+        export_row.addWidget(self._export_btn)
+        export_row.addWidget(QLabel("W"))
+        export_row.addWidget(self._pdf_w)
+        export_row.addWidget(QLabel("H"))
+        export_row.addWidget(self._pdf_h)
+        controls_layout.addLayout(export_row)
         controls_layout.addStretch()
 
         controls_scroll = QScrollArea()
@@ -515,12 +556,20 @@ class DataPlotView(QWidget):
             combo.setCurrentIndex(-1)
 
         checked = set(self._facet_selected())
+        # Build with signals blocked, then apply the checked-first order in
+        # one pass — otherwise every setCheckState during the rebuild would
+        # trigger a reorder per item.
+        self._facet_list.blockSignals(True)
         self._facet_list.clear()
         for name in names:
             item = QListWidgetItem(name)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked if name in checked else Qt.Unchecked)
             self._facet_list.addItem(item)
+        self._facet_list.blockSignals(False)
+        self._order_facet_items()
+        # Pristine column order, restored by Clear (see _clear_facets).
+        self._facet_order = [str(name) for name in names]
         # Keep the current text filter applied to the newly built list.
         self._apply_facet_filter(self._facet_filter.text())
 
@@ -567,7 +616,7 @@ class DataPlotView(QWidget):
         self._free_x.setChecked(True)
         self._free_y.setChecked(True)
         # Scatter options.
-        self._scatter_size.setValue(20.0)
+        self._scatter_size.setValue(1.0)
         self._cap_spin.setValue(20000)
         self._show_points.setChecked(True)
         # Cell popup rendering back to its construction defaults (the
@@ -619,6 +668,25 @@ class DataPlotView(QWidget):
                 out.append(item.text())
         return out
 
+    def _on_facet_item_changed(self, item) -> None:
+        """Check/uncheck on one facet column: re-run the checked-first
+        ordering so the ticked set stays grouped at the top."""
+        self._order_facet_items()
+
+    def _order_facet_items(self) -> None:
+        """Stable reorder of the facet list: checked columns above ALL
+        unchecked candidates (each group keeps its relative order), so the
+        ticked set — the one to review and uncheck — never hides at the
+        bottom. Row moves do not emit itemChanged (no recursion)."""
+        checked, unchecked = [], []
+        for i in range(self._facet_list.count()):
+            it = self._facet_list.item(i)
+            (checked if it.checkState() == Qt.Checked else unchecked).append(it)
+        for row, it in enumerate(checked + unchecked):
+            if self._facet_list.row(it) != row:
+                self._facet_list.takeItem(self._facet_list.row(it))
+                self._facet_list.insertItem(row, it)
+
     def _apply_facet_filter(self, text: str) -> None:
         """Hide facet columns not matching the typed text (display only).
 
@@ -633,12 +701,28 @@ class DataPlotView(QWidget):
     def _clear_facets(self) -> None:
         """Uncheck every facet variable in one click.
 
-        Like a manual uncheck, this takes effect on the next Plot.
+        Like a manual uncheck, this takes effect on the next Plot; signals
+        are blocked during the bulk uncheck (one reorder afterwards, not
+        one per item). Clear is a clean slate: the list returns to the
+        frame's pristine column order, not the last floated order.
         """
+        self._facet_list.blockSignals(True)
         for i in range(self._facet_list.count()):
             item = self._facet_list.item(i)
             if item.checkState() != Qt.Unchecked:
                 item.setCheckState(Qt.Unchecked)
+        self._facet_list.blockSignals(False)
+        items = {}
+        for i in range(self._facet_list.count()):
+            it = self._facet_list.item(i)
+            items[it.text()] = it
+        for row, name in enumerate(self._facet_order):
+            it = items.get(name)
+            if it is None:
+                continue
+            if self._facet_list.row(it) != row:
+                self._facet_list.takeItem(self._facet_list.row(it))
+                self._facet_list.insertItem(row, it)
 
     # ── Cell popup rendering controls ─────────────────────────────────────
 
@@ -712,7 +796,7 @@ class DataPlotView(QWidget):
         # Every picker/control read happens HERE on the GUI thread — the
         # worker closure only touches plain Python values.
         size = self._selected(self._size_combo)
-        point_size = self._scatter_size.value()
+        point_scale = float(self._scatter_size.value())
         show_points = self._show_points.isChecked()
 
         total_rows = len(df)
@@ -749,7 +833,7 @@ class DataPlotView(QWidget):
                 fig = P.make_scatter(
                     sub, x=x, y=y, color=color, size=size,
                     facet_cols=facets, palette=palette, cmap=palette,
-                    point_size=point_size, ncols=ncols,
+                    point_scale=point_scale, ncols=ncols,
                     free_x=free_x, free_y=free_y)
             elif chart == _CHART_LINE:
                 fig = P.make_line(sub, y=y, x=x, color=color,
@@ -830,16 +914,25 @@ class DataPlotView(QWidget):
         if self._figure is None:
             return
         chart = self._chart_combo.currentText()
+        # The save dialog opens in the LAST used folder (persisted in
+        # ~/.micromax), so repeated exports don't re-navigate.
+        default_path = f"merged_{chart.replace(' ', '_')}.pdf"
+        if self._pdf_last_dir:
+            default_path = os.path.join(self._pdf_last_dir, default_path)
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Plot as PDF",
-            f"merged_{chart.replace(' ', '_')}.pdf", "PDF (*.pdf)")
+            self, "Export Plot as PDF", default_path, "PDF (*.pdf)")
         if not path:
             return
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
+        w = self._pdf_w.value()
+        h = self._pdf_h.value()
         try:
-            P.save_figure_pdf(self._figure, path)
-            self.info(f"Exported PDF: {path}")
+            P.save_figure_pdf(self._figure, path, size=(w, h))
+            # Success: remember the folder for the next export.
+            self._pdf_last_dir = os.path.dirname(path)
+            update_user_defaults("export", {"pdf_dir": self._pdf_last_dir})
+            self.info(f"Exported PDF ({w:g} × {h:g} in): {path}")
         except Exception as e:
             QMessageBox.warning(self, "Export Failed", str(e))
 
