@@ -47,6 +47,18 @@ def z_project_dataset(
     delete_original: bool = True,
     progress: ProgressCollector = NullProgressCollector(),
 ) -> ImageDataset:
+    """Collapse every site's z-stack into one image per channel.
+
+    Rows are grouped by every metadata column except ``stack`` (one group =
+    one site); each channel's planes are projected and written under the
+    stack-0 file name, so the rebuilt dataset holds one row per site.
+
+    Channels may be acquired with DIFFERENT z-stack depths (e.g. a 2-plane
+    fluorescence channel next to a single-plane one). Each channel projects
+    its own planes; a channel with a single plane has nothing to collapse
+    and is carried over unchanged, but still moves to the stack-0 name so
+    the site stays ONE row holding all of its channels.
+    """
     metadata = ds.metadata
 
     if "stack" not in metadata.columns:
@@ -65,6 +77,9 @@ def z_project_dataset(
     grouped = metadata.groupby(group_cols, sort=False)
     all_groups = list(grouped)
     total = len(all_groups)
+    # {channel: number of single-plane images carried over unprojected} —
+    # reported once after the loop instead of one log line per group.
+    carried = {}
 
     with StepProgress("Z-projection", total, progress, desc="Z-projection", unit="group") as sp:
         for gi, (group_key, group_df) in enumerate(all_groups):
@@ -113,16 +128,13 @@ def z_project_dataset(
             for ch in ds.intensity_colnames:
                 paths = [p[ch] for p in plane_paths if ch in p]
                 imgs = [p[ch] for p in plane_imgs if ch in p]
-                if len(imgs) <= 1:
-                    if imgs:
-                        logger.warning(
-                            "Z-projection: fewer than 2 planes left for channel %s "
-                            "in group %s, skipping", ch, group_key,
-                        )
+                if not imgs:
+                    # The channel has no surviving plane in this group (never
+                    # acquired for this site, or all its planes quarantined).
                     continue
-                projected_any = True
 
-                projected = z_project_single(imgs, method)
+                # Every channel of the group is written under the SAME
+                # stack-0 name, so the rebuilt metadata keeps one row per site.
                 src_name = paths[0].name
                 m = re.compile(ds.image_pattern).match(src_name)
                 if m:
@@ -137,18 +149,35 @@ def z_project_dataset(
                     out_name = src_name
 
                 out_path = paths[0].parent / out_name
+
+                if len(imgs) == 1:
+                    # Channels can have different z-stack depths: this one
+                    # has a single plane, so there is nothing to collapse and
+                    # the plane is carried over unchanged. It must still move
+                    # to the stack-0 name — left under its own stack value it
+                    # would become a second row for the site, each of the two
+                    # rows missing the other one's channels.
+                    if out_path == paths[0]:
+                        # Already stored under the projected name.
+                        continue
+                    projected = imgs[0]
+                    carried[ch] = carried.get(ch, 0) + 1
+                else:
+                    projected = z_project_single(imgs, method)
+                projected_any = True
+
                 if delete_original:
                     for p in paths:
                         if p.exists():
                             p.unlink()
                 write_image(out_path, projected)
 
-            # Masks belong to individual planes — after projection they no
-            # longer correspond to any image, and leaving them behind creates
-            # orphan files that rebuild into mask-only rows. Delete them only
-            # once the group ACTUALLY projected something: a quarantine-
-            # reduced group whose channels all fall below 2 planes keeps its
-            # planes intact (image + mask) as ordinary rows.
+            # Masks belong to individual planes — once the group's images
+            # moved to the stack-0 name they no longer correspond to any
+            # image, and leaving them behind creates orphan files that
+            # rebuild into mask-only rows. Delete them only when the group
+            # ACTUALLY wrote something: a group left untouched (every
+            # channel already under the projected name) keeps its masks.
             if delete_original and projected_any:
                 for _ri, grow in group_df.iterrows():
                     for mask_col in ds.mask_colnames:
@@ -164,4 +193,11 @@ def z_project_dataset(
                                 "Z-projection: failed to delete %s", mpath)
 
         sp.finish("Z-projection complete")
+
+    if carried:
+        logger.info(
+            "Z-projection: single-plane images carried over unprojected "
+            "(channels with fewer z-planes than the rest) — %s",
+            ", ".join(f"{ch}: {n}" for ch, n in carried.items()),
+        )
     return rebuild_dataset(ds)

@@ -146,7 +146,10 @@ def test_zproject_quarantine_uses_global_row_position(tmp_path):
     projected = tmp_path / "r01c01f01p0-ch1.tiff"
     assert projected.exists()
     assert int(read_image(projected).max()) == 200
-    # Site 2 keeps its single surviving plane as a plain row (a one-plane
-    # group cannot be projected), so the rebuilt dataset has 2 rows.
-    assert (tmp_path / "r02c02f01p01-ch1.tiff").exists()
+    # Site 2's single surviving plane cannot be collapsed: it is carried over
+    # unchanged to the stack-0 name, so both sites end up as one row each.
+    assert not (tmp_path / "r02c02f01p01-ch1.tiff").exists()
+    carried = tmp_path / "r02c02f01p0-ch1.tiff"
+    assert carried.exists()
+    assert int(read_image(carried).max()) == 100
     assert len(out) == 2

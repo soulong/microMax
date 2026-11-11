@@ -16,7 +16,7 @@ microMax/
 | Package | Version | Console script |
 |---|---|---|
 | microBase | 0.17.0 | — (library) |
-| microProfiler | 1.19.0 | `microprofiler` |
+| microProfiler | 1.19.1 | `microprofiler` |
 | microVis | 1.12.0 | `microvis` |
 | microModel | 0.20.0 | `micromodel` |
 
